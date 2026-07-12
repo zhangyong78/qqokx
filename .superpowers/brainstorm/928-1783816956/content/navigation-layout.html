@@ -1,0 +1,104 @@
+<style>
+  .design-note { margin: 0 0 18px; color: #64748b; }
+  .cards { grid-template-columns: 1fr; gap: 22px; }
+  .card { overflow: hidden; }
+  .terminal { background:#eef3f8; border:1px solid #cbd5e1; border-radius:10px; overflow:hidden; color:#172033; font-size:12px; }
+  .global { height:42px; display:flex; align-items:center; gap:18px; padding:0 14px; color:#e8f4ff; background:#102235; }
+  .brand { font-weight:700; white-space:nowrap; }
+  .nav { display:flex; align-items:stretch; height:100%; gap:2px; }
+  .nav span { display:flex; align-items:center; padding:0 14px; color:#b8c8d8; }
+  .nav .active { color:white; background:#1f405d; border-bottom:3px solid #26b6a7; }
+  .grow { flex:1; }
+  .api { padding:6px 10px; border:1px solid #48647d; border-radius:6px; background:#17324a; white-space:nowrap; }
+  .ok { color:#59d6a8; }
+  .context { height:44px; display:flex; align-items:center; gap:10px; padding:0 14px; background:#fff; border-bottom:1px solid #d9e2ec; }
+  .symbol { font-size:15px; font-weight:700; }
+  .chip { padding:5px 9px; border:1px solid #cbd5e1; border-radius:5px; background:#f8fafc; }
+  .chip.on { color:#096b62; border-color:#77cbbf; background:#e9fbf7; }
+  .chip.off { color:#64748b; background:#f8fafc; }
+  .workspace { min-height:195px; display:grid; grid-template-columns:220px 1fr; gap:8px; padding:8px; }
+  .panel { background:#fff; border:1px solid #d6e0ea; border-radius:7px; padding:10px; }
+  .chart { position:relative; overflow:hidden; background:#0d1520; min-height:174px; color:#9fb1c5; }
+  .chart:before { content:""; position:absolute; inset:20px 0 0; background:repeating-linear-gradient(0deg, transparent, transparent 35px, #1d2a38 36px), repeating-linear-gradient(90deg, transparent, transparent 78px, #1d2a38 79px); }
+  .candles { position:absolute; left:8%; right:5%; bottom:30px; height:90px; background:linear-gradient(115deg, transparent 0 10%, #23c980 10.5% 11%, transparent 11.5% 18%, #ef4f83 18.5% 19%, transparent 19.5% 29%, #23c980 29.5% 30%, transparent 30.5% 42%, #23c980 42.5% 43%, transparent 43.5% 55%, #ef4f83 55.5% 56%, transparent 56.5% 68%, #23c980 68.5% 69%, transparent 69.5% 81%, #ef4f83 81.5% 82%, transparent 82.5%); }
+  .side-nav { width:58px; background:#12283c; color:#b9cada; display:flex; flex-direction:column; align-items:center; padding:8px 0; gap:8px; }
+  .side-item { width:42px; padding:8px 2px; border-radius:6px; text-align:center; font-size:10px; }
+  .side-item.active { color:white; background:#24516f; box-shadow:inset 3px 0 #2fc0ad; }
+  .layout-b { display:flex; min-height:280px; background:#eef3f8; }
+  .layout-b-main { flex:1; }
+  .tabs { height:38px; display:flex; align-items:end; gap:2px; padding:0 12px; background:#e8eef4; border-bottom:1px solid #cbd5e1; }
+  .tab { padding:9px 16px 8px; border:1px solid transparent; }
+  .tab.active { background:#fff; border-color:#cbd5e1; border-bottom-color:#fff; }
+  .menurow { height:30px; display:flex; align-items:center; gap:20px; padding:0 12px; background:#fff; border-bottom:1px solid #d9e2ec; }
+  .footer-line { display:flex; gap:14px; padding:8px 12px; background:#132b40; color:#c0d2df; }
+  .tag { color:#0b766c; font-weight:600; }
+  .recommend { color:#0c7a70; font-weight:700; }
+</style>
+
+<h2>量化交易终端：主入口布局选择</h2>
+<p class="subtitle">默认启动进入 K 线；“形态”默认关闭；API/环境/连接状态属于全局上下文，固定在最上层。点击一套你更认可的方向。</p>
+
+<div class="cards">
+  <div class="card" data-choice="a-terminal-workspace" onclick="toggleSelect(this)">
+    <div class="card-image">
+      <div class="terminal">
+        <div class="global">
+          <div class="brand">量化交易台</div>
+          <div class="nav"><span class="active">行情 / K线</span><span>持仓</span><span>专业套利</span><span>交易工具 ▾</span></div>
+          <div class="grow"></div>
+          <span class="ok">● WS 在线</span><span class="api">实盘 · moni ▾</span><span>任务 3</span><span>⚙</span>
+        </div>
+        <div class="context">
+          <span class="symbol">BTC-USDT-SWAP ▾</span><span class="chip">1m</span><span class="chip">15m</span><span class="chip on">4H</span><span class="chip">1D</span>
+          <span class="chip on">EMA15</span><span class="chip on">SMA50</span><span class="chip off">形态：关</span><span class="grow"></span><span class="chip">图表设置 ▾</span>
+        </div>
+        <div class="workspace">
+          <div class="panel"><b>当前标的工具</b><hr><div>画线与 RR</div><br><div>临时条件单</div><br><div>委托 / 持仓抽屉</div><br><div class="tag">高级功能按需展开</div></div>
+          <div class="panel chart"><b style="position:relative;z-index:2">BTC-USDT-SWAP · 4H</b><div class="candles"></div></div>
+        </div>
+      </div>
+    </div>
+    <div class="card-body">
+      <h3>A. 工作区导航 <span class="recommend">（推荐）</span></h3>
+      <p>像成熟交易客户端：第一行只放全局页面和账户上下文；第二行只放当前 K 线的标的、周期和显示选项。页面切换不另开主窗口。</p>
+    </div>
+  </div>
+
+  <div class="card" data-choice="b-left-rail" onclick="toggleSelect(this)">
+    <div class="card-image">
+      <div class="terminal layout-b">
+        <div class="side-nav"><div class="side-item active">K线</div><div class="side-item">持仓</div><div class="side-item">套利</div><div class="side-item">工具</div><div class="side-item">期权</div><div class="grow"></div><div class="side-item">设置</div></div>
+        <div class="layout-b-main">
+          <div class="global"><div class="brand">BTC-USDT-SWAP · 4H</div><div class="grow"></div><span class="ok">● 在线</span><span class="api">模拟 · moni ▾</span><span>任务 3</span></div>
+          <div class="context"><span class="chip on">4H</span><span class="chip on">EMA15</span><span class="chip on">SMA50</span><span class="chip off">形态：关</span><span class="grow"></span><span class="chip">更多 ▾</span></div>
+          <div class="workspace" style="grid-template-columns:1fr 190px"><div class="panel chart"><div class="candles"></div></div><div class="panel"><b>右侧交易栏</b><hr>临时下单<br><br>RR 条件单<br><br>持仓摘要</div></div>
+        </div>
+      </div>
+    </div>
+    <div class="card-body">
+      <h3>B. 左侧功能轨道</h3>
+      <p>扩展性最好，页面入口最稳定；但会持续占用横向空间，也更像大型综合终端，当前三大核心页面可能略显重。</p>
+    </div>
+  </div>
+
+  <div class="card" data-choice="c-classic-tabs" onclick="toggleSelect(this)">
+    <div class="card-image">
+      <div class="terminal">
+        <div class="menurow"><b>文件</b><b>行情</b><b>交易</b><b>期权</b><b>工具</b><b>帮助</b><div class="grow"></div><span class="ok">● WS 在线</span><span class="api">moni ▾</span></div>
+        <div class="tabs"><div class="tab active">K线分析</div><div class="tab">账户持仓</div><div class="tab">专业套利</div><div class="tab">＋</div></div>
+        <div class="context"><span class="symbol">BTC-USDT-SWAP</span><span class="chip on">4H</span><span class="chip on">EMA15</span><span class="chip on">SMA50</span><span class="chip off">形态：关</span><span class="grow"></span><span class="chip">隐藏图表</span></div>
+        <div class="workspace" style="grid-template-columns:1fr"><div class="panel chart"><div class="candles"></div></div></div>
+        <div class="footer-line"><span>账户：moni</span><span>RR 2</span><span>条件单 1</span><span class="grow"></span><span>行情延迟 42ms</span></div>
+      </div>
+    </div>
+    <div class="card-body">
+      <h3>C. 传统菜单 + 工作标签</h3>
+      <p>接近 MT4/桌面开发工具，多个分析工作区并行时很自然；但菜单层级更深，容易再次出现“入口到处都是”的问题。</p>
+    </div>
+  </div>
+</div>
+
+<div class="section">
+  <h3>三套共同规则</h3>
+  <p>启动默认进入 K 线；形态 1H/4H/1D 全部默认关闭；API 切换在全局顶部且同时显示模拟/实盘、账户名和连接状态；切换页面不停止 RR、条件单与短时套利任务。</p>
+</div>

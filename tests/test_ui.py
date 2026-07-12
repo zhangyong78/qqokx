@@ -1666,6 +1666,13 @@ HTTP 502: <!DOCTYPE html>
         self.assertEqual(_infer_session_runtime_status("启动默认不追老信号 | 方向=LONG"), "等待信号")
         self.assertEqual(_infer_session_runtime_status("启动追单窗口已过期，当前不追单 | 方向=LONG"), "等待信号")
         self.assertEqual(_infer_session_runtime_status("本轮持仓已结束，继续监控下一次信号。"), "等待信号")
+        self.assertEqual(
+            _infer_session_runtime_status(
+                "仓位关闭已确认 | 原开仓ordId=1001 | clOrdId=cl-1001 | 开仓门禁已释放 | 结算归因中 | 开始评估下一次委托",
+                "持仓监控中",
+            ),
+            "等待信号",
+        )
 
     def test_infer_session_runtime_status_maps_startup_chase_current_signal_to_entry_monitoring(self) -> None:
         self.assertEqual(
@@ -3639,6 +3646,27 @@ class StrategyTradeTrackingTest(TestCase):
         self.assertEqual(session.active_trade.protective_algo_cl_ord_id, "s01emaslg042300000897344")
         self.assertEqual(session.active_trade.initial_stop_price, Decimal("2320.66"))
         self.assertEqual(session.active_trade.current_stop_price, Decimal("2320.66"))
+        app._start_session_trade_reconciliation.assert_called_once()
+
+    def test_track_session_trade_runtime_starts_reconciliation_after_confirmed_close(self) -> None:
+        session = self._make_session()
+        session.active_trade = StrategyTradeRuntimeState(
+            round_id="S01-1",
+            opened_logged_at=datetime(2026, 7, 12, 14, 10, 14),
+            entry_order_id="1001",
+            entry_client_order_id="cl-1001",
+            entry_price=Decimal("1792.37"),
+            size=Decimal("0.838"),
+        )
+        app = self._make_app_for_tracking()
+
+        QuantApp._track_session_trade_runtime(
+            app,
+            session,
+            "仓位关闭已确认 | 原开仓ordId=1001 | clOrdId=cl-1001 | 开仓门禁已释放 | 结算归因中 | 开始评估下一次委托",
+        )
+
+        self.assertTrue(session.active_trade.reconciliation_started)
         app._start_session_trade_reconciliation.assert_called_once()
 
     def test_track_session_trade_runtime_captures_backfilled_exchange_stop(self) -> None:
@@ -6349,6 +6377,11 @@ class StrategyTradeTrackingTest(TestCase):
         self.assertEqual(result.ledger_record.close_reason, "OKX止损触发")
         self.assertEqual(result.ledger_record.gross_pnl, Decimal("-3.78"))
         self.assertEqual(result.ledger_record.net_pnl, Decimal("-3.87"))
+        self.assertIn("历史交易结算完成", result.attribution_summary)
+        self.assertIn("roundId=round-1", result.attribution_summary)
+        self.assertIn("原开仓ordId=1001", result.attribution_summary)
+        self.assertIn("clOrdId=s01emaent042300000897343", result.attribution_summary)
+        self.assertNotIn("本轮结束 |", result.attribution_summary)
         self.assertIn("原因=OKX止损触发", result.attribution_summary)
         self.assertIn("累计净盈亏=-3.87", result.cumulative_summary)
 

@@ -18,6 +18,11 @@ _EVENT_LIMIT = 120
 _STRUCTURE_SCAN_BAR_LIMIT = 180
 
 
+def _safe_int_at_least(value: object, *, default: int, minimum: int) -> int:
+    parsed = _safe_int(value)
+    return default if parsed is None or parsed < minimum else parsed
+
+
 def build_workspace_key(symbol: str, period: str) -> str:
     return f"{symbol.strip().upper()}|{period.strip()}"
 
@@ -27,6 +32,8 @@ def normalize_workspace_entry(payload: dict[str, object] | None) -> dict[str, ob
     alerts = raw.get("alerts") if isinstance(raw.get("alerts"), dict) else {}
     ma_cross = alerts.get("ma_cross") if isinstance(alerts, dict) and isinstance(alerts.get("ma_cross"), dict) else {}
     box_breakout = alerts.get("box_breakout") if isinstance(alerts, dict) and isinstance(alerts.get("box_breakout"), dict) else {}
+    visuals = raw.get("visuals") if isinstance(raw.get("visuals"), dict) else {}
+    auto_channel = raw.get("auto_channel") if isinstance(raw.get("auto_channel"), dict) else {}
     return {
         "lines": [_normalize_line_rule(item) for item in _safe_list(raw.get("lines"))],
         "rr": [dict(item) for item in _safe_list(raw.get("rr")) if isinstance(item, dict)],
@@ -39,6 +46,16 @@ def normalize_workspace_entry(payload: dict[str, object] | None) -> dict[str, ob
                 "enabled": _safe_bool(box_breakout.get("enabled"), default=False),
                 "last_event_candle_time": _safe_int(box_breakout.get("last_event_candle_time")),
             },
+        },
+        "visuals": {
+            "auto_box_visible": _safe_bool(visuals.get("auto_box_visible"), default=False),
+            "history_box_visible": _safe_bool(visuals.get("history_box_visible"), default=False),
+            "auto_channel_visible": _safe_bool(visuals.get("auto_channel_visible"), default=False),
+        },
+        "auto_channel": {
+            "anchor_distance": _safe_int_at_least(auto_channel.get("anchor_distance"), default=8, minimum=1),
+            "min_bars": _safe_int_at_least(auto_channel.get("min_bars"), default=18, minimum=2),
+            "max_violations": _safe_int_at_least(auto_channel.get("max_violations"), default=8, minimum=0),
         },
         "events": _normalize_events(_safe_list(raw.get("events"))),
     }
@@ -54,6 +71,8 @@ def evaluate_workspace_alerts(
 ) -> tuple[dict[str, object], list[dict[str, object]], dict[str, object]]:
     entry = normalize_workspace_entry(workspace_entry)
     alerts = dict(entry.get("alerts", {}))
+    visuals = dict(entry.get("visuals", {}))
+    auto_channel = dict(entry.get("auto_channel", {}))
     lines = [_normalize_line_rule(item) for item in _safe_list(entry.get("lines"))]
     rr_items = [dict(item) for item in _safe_list(entry.get("rr")) if isinstance(item, dict)]
     events = _normalize_events(_safe_list(entry.get("events")))
@@ -90,6 +109,8 @@ def evaluate_workspace_alerts(
         "lines": updated_lines,
         "rr": rr_items,
         "alerts": alerts,
+        "visuals": visuals,
+        "auto_channel": auto_channel,
         "events": merged_events,
     }, new_events, structure
 
@@ -293,6 +314,8 @@ def _normalize_line_rule(item: object) -> dict[str, object]:
         "price_b": price_b,
         "enabled": _safe_bool(raw.get("enabled"), default=True),
         "trade_enabled": _safe_bool(raw.get("trade_enabled"), default=False),
+        "trade_profile_name": _safe_text(raw.get("trade_profile_name")),
+        "trade_environment": _safe_text(raw.get("trade_environment")),
         "risk_amount": _safe_float(raw.get("risk_amount"), default=100.0),
         "stop_loss_price": _safe_float(raw.get("stop_loss_price")),
         "direct_take_profit_r": _safe_float(raw.get("direct_take_profit_r"), default=2.0),

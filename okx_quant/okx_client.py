@@ -24,6 +24,8 @@ from okx_quant.candle_cache import (
     save_candle_cache,
 )
 from okx_quant.models import Candle, Credentials, Instrument, OrderPlan, StrategyConfig, TriggerPriceType
+from okx_quant.okx_algo_ws import OkxAlgoWsConnection, OkxAlgoWsConnectionUnavailable
+from okx_quant.okx_candle_ws import CandleStreamKey, OkxCandleWsConnection, OkxCandleWsConnectionUnavailable
 from okx_quant.okx_private_ws import OkxPrivateWsConnection, OkxPrivateWsConnectionUnavailable
 from okx_quant.okx_public_ws import OkxPublicWsConnection, OkxPublicWsConnectionUnavailable
 from okx_quant.persistence import instrument_metadata_cache_file_path
@@ -475,6 +477,12 @@ class OkxRestClient:
         self._private_ws_lock = threading.Lock()
         self._private_ws_connections: dict[tuple[str, str, str], OkxPrivateWsConnection] = {}
         self._private_ws_error_once: set[tuple[str, str, str]] = set()
+        self._algo_ws_lock = threading.Lock()
+        self._algo_ws_connections: dict[tuple[str, str, str], OkxAlgoWsConnection] = {}
+        self._algo_ws_error_once: set[tuple[str, str, str]] = set()
+        self._candle_ws_lock = threading.Lock()
+        self._candle_ws_connections: dict[str, OkxCandleWsConnection] = {}
+        self._candle_ws_error_once: set[str] = set()
         self._instrument_cache_lock = threading.Lock()
         self._instrument_cache_loaded = False
         self._instrument_cache_by_id: dict[str, Instrument] = {}
@@ -1538,6 +1546,61 @@ class OkxRestClient:
         ]
         return version, statuses
 
+    def add_private_update_listener(
+        self,
+        credentials: Credentials,
+        *,
+        environment: str,
+        listener: Callable[[str, int], None],
+    ) -> Callable[[], None] | None:
+        """Subscribe to ordinary private-account WS cache updates for this API profile."""
+        connection = self._private_ws_connection_for(credentials, environment=environment)
+        if connection is None:
+            return None
+        return connection.add_update_listener(listener)
+
+    def get_cached_algo_order_statuses(
+        self,
+        credentials: Credentials,
+        *,
+        environment: str,
+        limit: int = 50,
+    ) -> tuple[int, list[OkxTradeOrderItem]] | None:
+        connection = self._algo_ws_connection_for(credentials, environment=environment)
+        if connection is None:
+            return None
+        payload = connection.get_latest_orders(limit=limit)
+        if payload is None:
+            return None
+        version, items = payload
+        return version, [
+            self._parse_algo_order_item(item, default_inst_type="")
+            for item in items
+        ]
+
+    def add_algo_order_update_listener(
+        self,
+        credentials: Credentials,
+        *,
+        environment: str,
+        listener: Callable[[str, int], None],
+    ) -> Callable[[], None] | None:
+        """Subscribe to algorithm-order WS updates for this API profile."""
+        connection = self._algo_ws_connection_for(credentials, environment=environment)
+        if connection is None:
+            return None
+        return connection.add_update_listener(listener)
+
+    def watch_candle(
+        self,
+        key: CandleStreamKey,
+        listener: Callable[[Candle, bool], None],
+    ) -> Callable[[], None] | None:
+        connection = self._candle_ws_connection_for(environment=key.environment)
+        if connection is None:
+            return None
+        return connection.watch(key, listener)
+
     def get_cached_private_positions(
         self,
         credentials: Credentials,
@@ -1615,9 +1678,17 @@ class OkxRestClient:
         value = os.getenv("QQOKX_PRIVATE_WS_ENABLED", "1").strip().lower()
         return value not in {"0", "false", "no", "off"}
 
+    def _algo_ws_enabled(self) -> bool:
+        value = os.getenv("QQOKX_ALGO_WS_ENABLED", "1").strip().lower()
+        return self._private_ws_enabled() and value not in {"0", "false", "no", "off"}
+
     def _public_ws_enabled(self) -> bool:
         value = os.getenv("QQOKX_PUBLIC_WS_ENABLED", "1").strip().lower()
         return value not in {"0", "false", "no", "off"}
+
+    def _candle_ws_enabled(self) -> bool:
+        value = os.getenv("QQOKX_CANDLE_WS_ENABLED", "1").strip().lower()
+        return self._public_ws_enabled() and value not in {"0", "false", "no", "off"}
 
     def _public_ws_connection_for(self, *, environment: str) -> OkxPublicWsConnection | None:
         if not self._public_ws_enabled():
@@ -1672,6 +1743,62 @@ class OkxRestClient:
                 if key not in self._private_ws_error_once:
                     self._logger(f"OKX 私有 WS 启动失败，继续回退 REST：{exc}")
                     self._private_ws_error_once.add(key)
+                return None
+        return connection
+
+    def _candle_ws_connection_for(self, *, environment: str) -> OkxCandleWsConnection | None:
+        if not self._candle_ws_enabled():
+            return None
+        key = environment.strip().lower() or "demo"
+        with self._candle_ws_lock:
+            connection = self._candle_ws_connections.get(key)
+            if connection is None:
+                connection = OkxCandleWsConnection(environment=key, logger=self._logger)
+                self._candle_ws_connections[key] = connection
+            try:
+                connection.start()
+            except OkxCandleWsConnectionUnavailable as exc:
+                if key not in self._candle_ws_error_once:
+                    self._logger(f"OKX K线 WS 不可用，继续回退 REST：{exc}")
+                    self._candle_ws_error_once.add(key)
+                return None
+            except Exception as exc:  # noqa: BLE001
+                if key not in self._candle_ws_error_once:
+                    self._logger(f"OKX K线 WS 启动失败，继续回退 REST：{exc}")
+                    self._candle_ws_error_once.add(key)
+                return None
+        return connection
+
+    def _algo_ws_connection_for(
+        self,
+        credentials: Credentials,
+        *,
+        environment: str,
+    ) -> OkxAlgoWsConnection | None:
+        if not self._algo_ws_enabled():
+            return None
+        profile_name = (credentials.profile_name or "").strip()
+        key = (credentials.api_key, profile_name, environment)
+        with self._algo_ws_lock:
+            connection = self._algo_ws_connections.get(key)
+            if connection is None:
+                connection = OkxAlgoWsConnection(
+                    credentials,
+                    environment=environment,
+                    logger=self._logger,
+                )
+                self._algo_ws_connections[key] = connection
+            try:
+                connection.start()
+            except OkxAlgoWsConnectionUnavailable as exc:
+                if key not in self._algo_ws_error_once:
+                    self._logger(f"OKX 算法单 WS 不可用，继续回退 REST：{exc}")
+                    self._algo_ws_error_once.add(key)
+                return None
+            except Exception as exc:  # noqa: BLE001
+                if key not in self._algo_ws_error_once:
+                    self._logger(f"OKX 算法单 WS 启动失败，继续回退 REST：{exc}")
+                    self._algo_ws_error_once.add(key)
                 return None
         return connection
 

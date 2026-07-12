@@ -52,6 +52,7 @@ from roll_terminal_qt.line_trading_core import (
     rr_annotation_from_payload,
 )
 from roll_terminal_qt.profile_access import ensure_profile_unlocked, load_profile_snapshots
+from roll_terminal_qt.workspace_shell import preferred_profile_name
 
 
 LINE_KIND_OPTIONS: tuple[tuple[str, str], ...] = (
@@ -543,7 +544,12 @@ class LineTradingQtWindow(QMainWindow):
         self._api_edit.blockSignals(False)
         if self._api_edit.count() <= 0:
             return
-        target = current or self._last_profile_name or selected_profile
+        target = preferred_profile_name(
+            list(self._profile_snapshots),
+            current=current,
+            last=self._last_profile_name,
+            selected=selected_profile,
+        )
         index = self._api_edit.findData(target)
         if index < 0:
             index = 0

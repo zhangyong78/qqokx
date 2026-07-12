@@ -2913,6 +2913,7 @@ def _infer_session_runtime_status(message: str, current_status: str = "") -> str
         or "开仓次数已达上限" in text
         or "信号次数已达上限" in text
         or "本轮持仓已结束，继续监控下一次信号" in text
+        or "仓位关闭已确认" in text
     ):
         return "等待信号"
     return current_status or None

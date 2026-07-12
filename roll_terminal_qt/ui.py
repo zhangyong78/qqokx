@@ -71,6 +71,7 @@ from roll_terminal_qt.spot_arbitrage_tools import (
     scan_opportunity_to_view,
 )
 from roll_terminal_qt.style import APP_STYLE
+from roll_terminal_qt.workspace_shell import LocalTaskCount, merge_local_task_counts
 from okx_quant.arbitrage.size_converter import preview_arbitrage_size
 from okx_quant.arbitrage.position_ledger import load_open_ledger_entries
 from okx_quant.app_paths import logs_dir_path
@@ -177,7 +178,7 @@ class RollTerminalWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle("专业套利终端")
         self.resize(1680, 980)
-        self._runtime = load_runtime("159") or load_runtime()
+        self._runtime = load_runtime("moni") or load_runtime()
         environment = self._runtime.environment if self._runtime is not None else "live"
         self._feed = MarketFeedThread(environment=environment)
         self._account_feed = AccountFeedThread(self._runtime)
@@ -194,6 +195,7 @@ class RollTerminalWindow(QMainWindow):
         self._private_threads_started = False
         self._runtime_thread_generation = 0
         self._auto_enabled = False
+        self._auto_task_runtime: ArbitrageTradeRuntime | None = None
         self._auto_triggered = False
         self._auto_threshold_value: Decimal | None = None
         self._current_position_key: str = ""
@@ -221,6 +223,56 @@ class RollTerminalWindow(QMainWindow):
             if self._last_profile_name:
                 self._unlocked_profiles.add(self._last_profile_name)
             self._start_private_threads()
+
+    def workspace_profile_name(self) -> str:
+        return self._last_profile_name
+
+    def connection_snapshot(self) -> dict[str, object]:
+        account_text = self._account_status.text().strip() if hasattr(self, "_account_status") else ""
+        private_online = "在线" in account_text and "未" not in account_text
+        if "未解锁" in account_text:
+            private_status = "账户未解锁"
+        elif private_online:
+            private_status = "私有WS在线"
+        else:
+            private_status = "账户连接中"
+        return {
+            "public_online": self._feed is not None,
+            "private_online": private_online,
+            "private_status": private_status,
+        }
+
+    def set_workspace_managed(self, managed: bool) -> None:
+        visible = not bool(managed)
+        self._api_label.setVisible(visible)
+        self._api.setVisible(visible)
+
+    def apply_workspace_profile(self, profile_name: str) -> None:
+        target = profile_name.strip()
+        if not target or target == self._last_profile_name:
+            return
+        self._unlocked_profiles.add(target)
+        self._apply_api_profile(target)
+
+    def _auto_execution_runtime(self):
+        if self._auto_enabled and self._auto_task_runtime is not None:
+            return self._auto_task_runtime
+        return self._runtime
+
+    def local_task_counts(self) -> tuple[LocalTaskCount, ...]:
+        runtimes: list[object] = []
+        if self._auto_enabled and self._auto_task_runtime is not None:
+            runtimes.append(self._auto_task_runtime)
+        elif self._execution_thread is not None and self._execution_thread.isRunning():
+            runtime = getattr(self._execution_thread, "_runtime", None)
+            if runtime is not None:
+                runtimes.append(runtime)
+        counts: list[LocalTaskCount] = []
+        for runtime in runtimes:
+            profile_name = str(getattr(runtime, "credential_profile_name", "") or "").strip()
+            if profile_name:
+                counts.append(LocalTaskCount(profile_name, arbitrage=1))
+        return merge_local_task_counts(counts)
 
     def closeEvent(self, event) -> None:  # noqa: ANN001
         if self._execution_thread is not None and self._execution_thread.isRunning():
@@ -367,9 +419,9 @@ class RollTerminalWindow(QMainWindow):
         mode_label.setObjectName("Subtle")
         header_layout.addWidget(mode_label)
         header_layout.addWidget(self._terminal_mode)
-        api_label = QLabel("API")
-        api_label.setObjectName("Subtle")
-        header_layout.addWidget(api_label)
+        self._api_label = QLabel("API")
+        self._api_label.setObjectName("Subtle")
+        header_layout.addWidget(self._api_label)
         header_layout.addWidget(self._api)
         header_layout.addWidget(self._account_status)
         header_layout.addWidget(self._order_status)
@@ -1178,14 +1230,15 @@ class RollTerminalWindow(QMainWindow):
         return right_mid - left_mid
 
     def _build_auto_execution_context(self, *, threshold: Decimal, for_trigger: bool) -> dict[str, object] | None:
-        assert self._runtime is not None
+        task_runtime = self._auto_execution_runtime()
+        assert task_runtime is not None
         condition_text = self._current_auto_condition_text(threshold)
         if self._is_roll_template_active():
             plan = self._build_execution_plan(force_completion=for_trigger)
             if plan is None:
                 return None
             return {
-                "thread": RollExecutionThread(runtime=self._runtime, plan=plan, auto_pause_threshold=threshold),
+                "thread": RollExecutionThread(runtime=task_runtime, plan=plan, auto_pause_threshold=threshold),
                 "task_label": "移仓",
                 "confirm_title": "确认启动自动交易监控",
                 "confirm_body": (
@@ -1210,7 +1263,7 @@ class RollTerminalWindow(QMainWindow):
             if plan is None:
                 return None
             return {
-                "thread": ProfessionalCloseExecutionThread(runtime=self._runtime, plan=plan, auto_pause_threshold=threshold),
+                "thread": ProfessionalCloseExecutionThread(runtime=task_runtime, plan=plan, auto_pause_threshold=threshold),
                 "task_label": "套利平仓",
                 "confirm_title": "确认启动自动交易监控",
                 "confirm_body": (
@@ -1237,7 +1290,7 @@ class RollTerminalWindow(QMainWindow):
             return None
         estimate_text = self._open_plan_estimate_text(plan)
         return {
-            "thread": ProfessionalOpenExecutionThread(runtime=self._runtime, plan=plan, auto_pause_threshold=threshold),
+            "thread": ProfessionalOpenExecutionThread(runtime=task_runtime, plan=plan, auto_pause_threshold=threshold),
             "task_label": "套利开仓",
             "confirm_title": "确认启动自动交易监控",
             "confirm_body": (
@@ -2217,7 +2270,11 @@ class RollTerminalWindow(QMainWindow):
             self._append_log("自动换月触发失败：执行参数无效。")
             return
         self._start_execution_thread(
-            RollExecutionThread(runtime=self._runtime, plan=plan, auto_pause_threshold=self._auto_threshold_value),
+            RollExecutionThread(
+                runtime=self._auto_execution_runtime(),
+                plan=plan,
+                auto_pause_threshold=self._auto_threshold_value,
+            ),
             log_message="自动换月已触发，开始执行...",
             task_label="移仓",
         )
@@ -2594,6 +2651,7 @@ class RollTerminalWindow(QMainWindow):
         if answer != QMessageBox.StandardButton.Yes:
             return
         self._auto_threshold_value = threshold
+        self._auto_task_runtime = self._runtime
         self._auto_enabled = True
         self._auto_triggered = False
         self._update_auto_controls_v2()
@@ -2608,6 +2666,7 @@ class RollTerminalWindow(QMainWindow):
         if thread is not None and thread.isRunning() and getattr(thread, "supports_stop_after_batch", False):
             requested = bool(thread.request_stop_after_batch())
             self._auto_enabled = False
+            self._auto_task_runtime = None
             self._auto_triggered = True
             self._update_auto_controls_v2()
             if requested:
@@ -2618,6 +2677,7 @@ class RollTerminalWindow(QMainWindow):
                 self._append_log("停止请求已登记：当前这一批完成后停止。")
             return
         self._auto_enabled = False
+        self._auto_task_runtime = None
         self._update_auto_controls_v2()
         self._auto_hint.setText("自动交易监控已停止：修改参数后可重新启动。")
         self._append_log("自动交易监控已停止。")
@@ -2655,6 +2715,7 @@ class RollTerminalWindow(QMainWindow):
         if answer != QMessageBox.StandardButton.Yes:
             return
         self._auto_threshold_value = threshold
+        self._auto_task_runtime = self._runtime
         self._auto_enabled = True
         self._auto_triggered = False
         self._update_auto_controls()
@@ -2670,6 +2731,7 @@ class RollTerminalWindow(QMainWindow):
     @Slot()
     def _stop_auto_roll(self) -> None:
         self._auto_enabled = False
+        self._auto_task_runtime = None
         self._update_auto_controls()
         self._auto_hint.setText("换月监控已停止：修改参数后可重新启动。")
         self._append_log("自动换月监控已停止。")

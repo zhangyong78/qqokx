@@ -1,0 +1,95 @@
+<style>
+  .terminal { background:#edf2f7; border:1px solid #c8d4df; border-radius:12px; overflow:hidden; color:#172033; font-size:13px; box-shadow:0 14px 35px rgba(24,39,56,.12); }
+  .global { height:48px; display:flex; align-items:center; gap:8px; padding:0 14px; color:#e8f2fb; background:#10273a; }
+  .brand { font-weight:700; font-size:15px; padding-right:14px; border-right:1px solid #355064; white-space:nowrap; }
+  .nav { height:100%; display:flex; align-items:stretch; }
+  .nav-item { display:flex; align-items:center; padding:0 18px; color:#b8cbd9; border-bottom:3px solid transparent; }
+  .nav-item.active { color:#fff; background:#1c3d55; border-bottom-color:#2cc5b2; }
+  .nav-item.more:after { content:' ▾'; color:#7fa0b6; }
+  .grow { flex:1; }
+  .status { color:#5dd9ad; white-space:nowrap; }
+  .api { background:#173950; border:1px solid #476579; border-radius:7px; padding:7px 11px; white-space:nowrap; }
+  .tasks { color:#dce9f2; border-left:1px solid #355064; padding-left:12px; white-space:nowrap; }
+  .context { min-height:44px; display:flex; flex-wrap:wrap; align-items:center; gap:7px; padding:5px 14px; background:#fff; border-bottom:1px solid #d7e0e8; }
+  .symbol { font-size:15px; font-weight:700; margin-right:6px; }
+  .chip { padding:5px 9px; border:1px solid #c9d4de; border-radius:5px; background:#f8fafc; white-space:nowrap; }
+  .chip.active { color:#087468; background:#e8faf7; border-color:#68c9bd; }
+  .chip.disabled { color:#7b8794; background:#f1f4f7; }
+  .body { display:grid; grid-template-columns:220px minmax(420px,1fr) 230px; gap:8px; padding:8px; min-height:290px; }
+  .panel { background:#fff; border:1px solid #d4dee7; border-radius:7px; padding:10px; }
+  .panel h4 { margin:0 0 10px; color:#294256; }
+  .tool { padding:8px; margin-bottom:6px; border-radius:5px; background:#f6f8fa; }
+  .tool.em { color:#087468; background:#e9faf7; border:1px solid #b6e6df; }
+  .chart { position:relative; overflow:hidden; background:#0c1520; color:#a9baca; }
+  .chart:before { content:""; position:absolute; inset:30px 0 0; background:repeating-linear-gradient(0deg,transparent,transparent 42px,#1e2b38 43px),repeating-linear-gradient(90deg,transparent,transparent 92px,#1e2b38 93px); }
+  .chart-line { position:absolute; left:8%; right:6%; top:42%; height:3px; background:linear-gradient(90deg,#31d4ba,#f3b74e,#e65a81); transform:rotate(-5deg); }
+  .orderbox { border-top:1px solid #e2e8ef; padding-top:8px; margin-top:8px; }
+  .row { display:flex; justify-content:space-between; padding:5px 0; }
+  .global-map { display:grid; grid-template-columns:repeat(4,1fr); gap:10px; margin-top:18px; }
+  .map-card { border:1px solid #d8e1e9; border-radius:8px; padding:12px; background:#fff; }
+  .map-card h4 { margin:0 0 8px; color:#20394d; }
+  .map-card ul { margin:0; padding-left:18px; color:#586879; }
+  .rules { margin-top:18px; display:grid; grid-template-columns:1fr 1fr; gap:12px; }
+  .rule { border-left:4px solid #2bb9a6; padding:10px 12px; background:#eefaf8; }
+  .danger { border-left-color:#e7a43b; background:#fff8ec; }
+</style>
+
+<h2>A 方案细化：单窗口交易工作区</h2>
+<p class="subtitle">这一版解决“入口到处都是”的问题：第一行是全局导航与账户上下文，第二行永远只服务当前页面。</p>
+
+<div class="mockup">
+  <div class="mockup-header">默认启动画面：K线工作区</div>
+  <div class="mockup-body">
+    <div class="terminal">
+      <div class="global">
+        <div class="brand">量化交易台</div>
+        <div class="nav">
+          <div class="nav-item active">K线</div>
+          <div class="nav-item">持仓</div>
+          <div class="nav-item">专业套利</div>
+          <div class="nav-item more">交易工具</div>
+          <div class="nav-item more">期权工具</div>
+        </div>
+        <div class="grow"></div>
+        <span class="status">● 行情在线</span>
+        <span class="api">模拟 · moni ▾</span>
+        <span class="tasks">任务 3 ▾</span>
+        <span>⚙</span>
+      </div>
+      <div class="context">
+        <span class="symbol">BTC-USDT-SWAP ▾</span>
+        <span class="chip">1m</span><span class="chip">15m</span><span class="chip active">4H</span><span class="chip">1D</span>
+        <span class="chip active">EMA15</span><span class="chip active">SMA50</span>
+        <span class="chip disabled">形态：关</span>
+        <span class="grow"></span>
+        <span class="chip">双图</span><span class="chip">数量 1200</span><span class="chip">图表设置 ▾</span>
+      </div>
+      <div class="body">
+        <div class="panel"><h4>当前标的工具</h4><div class="tool em">画线与水平线</div><div class="tool">RR 条件单</div><div class="tool">临时条件单</div><div class="tool">形态设置</div><div class="tool">收起左栏</div></div>
+        <div class="panel chart"><b style="position:relative;z-index:2">BTC-USDT-SWAP · 4H · OKX</b><div class="chart-line"></div></div>
+        <div class="panel"><h4>交易抽屉</h4><div class="row"><span>当前 API</span><b>moni</b></div><div class="row"><span>可用余额</span><span>14,562 U</span></div><div class="orderbox">委托 / 持仓 / 任务<br><br>只有用户打开时才占空间</div></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="global-map">
+  <div class="map-card"><h4>一级页面</h4><ul><li>K线（默认）</li><li>持仓</li><li>专业套利</li></ul></div>
+  <div class="map-card"><h4>交易工具 ▾</h4><ul><li>无限下单</li><li>自动通道</li><li>其他临时交易工具</li></ul></div>
+  <div class="map-card"><h4>期权工具 ▾</h4><ul><li>策略计算器</li><li>Deribit 波动率</li><li>展期建议</li></ul></div>
+  <div class="map-card"><h4>设置 ⚙</h4><ul><li>API 配置</li><li>数据目录与日志</li><li>界面设置</li><li>版本信息</li></ul></div>
+</div>
+
+<div class="rules">
+  <div class="rule"><b>默认行为</b><br>启动直接进入 K线；图表显示；EMA15、SMA50 保持开启；形态 1H/4H/1D 全部关闭。</div>
+  <div class="rule danger"><b>任务安全</b><br>顶部 API 只决定当前查看和新操作；已运行任务继续绑定原 API，任务菜单按 API 分组显示。</div>
+</div>
+
+<div class="options" style="margin-top:20px">
+  <div class="option" data-choice="approve-a-detail" onclick="toggleSelect(this)">
+    <div class="letter">✓</div><div class="content"><h3>这个入口结构可以</h3><p>继续细化菜单内容、状态提示和切换行为。</p></div>
+  </div>
+  <div class="option" data-choice="revise-a-detail" onclick="toggleSelect(this)">
+    <div class="letter">改</div><div class="content"><h3>入口还需要调整</h3><p>请回到终端告诉我希望移动、删除或合并哪个入口。</p></div>
+  </div>
+</div>

@@ -3,13 +3,14 @@ from __future__ import annotations
 from collections import Counter
 import json
 import re
+import subprocess
 import sys
 import threading
 import time
 import traceback
 from datetime import datetime, timedelta
 from decimal import Decimal
-from tkinter import Tk
+from pathlib import Path
 from typing import Callable
 
 from PySide6.QtCore import QSignalBlocker, QThread, QTimer, Qt, Signal, Slot
@@ -42,11 +43,10 @@ from PySide6.QtWidgets import (
 
 from roll_terminal_qt.app_icon import apply_qt_window_icon
 from okx_quant.log_utils import append_log_line
+from okx_quant.app_paths import data_root
 from okx_quant.models import Candle, Credentials, EmailNotificationConfig, Instrument, StrategyConfig
 from okx_quant.notifications import EmailNotifier
 from okx_quant.option_roll import is_short_option_position
-from okx_quant.option_roll_ui import OptionRollSuggestionWindow
-from okx_quant.option_strategy_ui import OptionStrategyCalculatorWindow, _build_option_quote
 from okx_quant.okx_client import (
     OkxFillHistoryItem,
     OkxOrderResult,
@@ -155,9 +155,12 @@ from okx_quant.ui_shell import (
 )
 from roll_terminal_qt.account_service import AccountFeedThread
 from roll_terminal_qt.history_service import FillHistoryFeedThread, OrderHistoryFeedThread, PositionHistoryFeedThread
+from roll_terminal_qt.incremental_views import keyed_row_delta
 from roll_terminal_qt.option_strategy_window import CandlestickChartView
 from roll_terminal_qt.order_service import OrderFeedThread, OrderStatusView
+from roll_terminal_qt.perf_metrics import measure_ui_step
 from roll_terminal_qt.profile_access import ensure_profile_unlocked, load_profile_snapshots, profile_requires_password
+from roll_terminal_qt.realtime_account_store import AccountRealtimeSnapshot, RealtimeAccountStore
 from roll_terminal_qt.shared_order_store import SharedOrderSnapshot, get_shared_order_store
 from roll_terminal_qt.runtime import load_runtime, profile_names
 
@@ -390,6 +393,7 @@ POSITION_COLUMNS: tuple[tuple[str, str, int, Qt.AlignmentFlag], ...] = (
     ("avg", "开仓价", 84, Qt.AlignmentFlag.AlignRight),
     ("avg_usdt", "开仓≈USDT", 72, Qt.AlignmentFlag.AlignRight),
     ("open_value_usdt", "开仓价值≈USDT", 116, Qt.AlignmentFlag.AlignRight),
+    ("break_even", "保本价格", 96, Qt.AlignmentFlag.AlignRight),
     ("pos", "持仓量", 170, Qt.AlignmentFlag.AlignRight),
     ("option_side", "买购:卖购 | 买沽:卖沽", 170, Qt.AlignmentFlag.AlignCenter),
     ("upl", "浮盈亏", 168, Qt.AlignmentFlag.AlignRight),
@@ -409,6 +413,72 @@ POSITION_COLUMNS: tuple[tuple[str, str, int, Qt.AlignmentFlag], ...] = (
     ("note", "备注", 200, Qt.AlignmentFlag.AlignLeft),
 )
 
+
+def _position_is_short(position: object) -> bool:
+    pos_side = str(getattr(position, "pos_side", "") or "").strip().lower()
+    if pos_side == "short":
+        return True
+    if pos_side == "long":
+        return False
+    return Decimal(str(getattr(position, "position", "0") or "0")) < 0
+
+
+def _break_even_taker_fee_rate(profile: dict[str, str], *, inst_type: str) -> Decimal:
+    del inst_type
+    raw = str(profile.get("futures_taker_fee_rate") or "0.0360").strip()
+    try:
+        return max(Decimal(raw) / Decimal("100"), Decimal("0"))
+    except Exception:
+        return Decimal("0.00036")
+
+
+def _position_break_even_price(
+    position: object,
+    upl_usdt_prices: dict[str, Decimal],
+    *,
+    fee_rate: Decimal,
+) -> Decimal | None:
+    """Return the underlying/contract break-even price with two taker fees."""
+    inst_type = str(getattr(position, "inst_type", "") or "").strip().upper()
+    avg_price = getattr(position, "avg_price", None)
+    if not isinstance(avg_price, Decimal) or avg_price <= 0:
+        return None
+    two_way_fee_rate = max(fee_rate, Decimal("0")) * Decimal("2")
+    is_short = _position_is_short(position)
+    if inst_type in {"SWAP", "FUTURES"}:
+        multiplier = Decimal("1") - two_way_fee_rate if is_short else Decimal("1") + two_way_fee_rate
+        return avg_price * multiplier
+    if inst_type != "OPTION":
+        return None
+    parts = str(getattr(position, "inst_id", "") or "").strip().upper().split("-")
+    if len(parts) < 5:
+        return None
+    try:
+        strike = Decimal(parts[3])
+    except Exception:
+        return None
+    option_kind = parts[4]
+    asset = parts[0]
+    premium = avg_price
+    margin_ccy = str(getattr(position, "margin_ccy", "") or "").strip().upper()
+    if margin_ccy not in {"USDT", "USD", "USDC"}:
+        underlying_price = upl_usdt_prices.get(asset)
+        if underlying_price is None or underlying_price <= 0:
+            return None
+        premium *= underlying_price
+    premium_with_fee = premium * (Decimal("1") + two_way_fee_rate)
+    if option_kind == "C":
+        return strike + premium_with_fee if not is_short else strike + premium * (Decimal("1") - two_way_fee_rate)
+    if option_kind == "P":
+        return strike - premium_with_fee if not is_short else strike - premium * (Decimal("1") - two_way_fee_rate)
+    return None
+
+
+def _group_row_values_with_break_even(group_type: str, metrics: dict[str, object]) -> tuple[str, ...]:
+    values = list(_build_group_row_values(group_type, metrics))
+    values.insert(15, "--")
+    return tuple(values)
+
 DEFAULT_VISIBLE_COLUMNS: tuple[str, ...] = (
     "inst_type",
     "mgn_mode",
@@ -417,6 +487,7 @@ DEFAULT_VISIBLE_COLUMNS: tuple[str, ...] = (
     "avg",
     "avg_usdt",
     "open_value_usdt",
+    "break_even",
     "pos",
     "option_side",
     "upl",
@@ -453,6 +524,7 @@ DEFAULT_VISIBLE_COLUMNS: tuple[str, ...] = (
     "mgn_ratio",
     "note",
     "open_value_usdt",
+    "break_even",
     "option_side",
     "pos",
     "realized",
@@ -480,6 +552,7 @@ DEFAULT_TREE_COLUMN_WIDTHS: dict[str, int] = {
     "avg": 66,
     "avg_usdt": 72,
     "open_value_usdt": 102,
+    "break_even": 92,
     "pos": 154,
     "option_side": 170,
     "upl": 164,
@@ -928,35 +1001,9 @@ class LegacyOptionToolsHost:
     ) -> None:
         self._parent = parent
         self._runtime_provider = runtime_provider
-        self._client = OkxRestClient()
-        self._root: Tk | None = None
-        self._pump_timer: QTimer | None = None
-        self._option_roll_window: OptionRollSuggestionWindow | None = None
-        self._option_strategy_window: OptionStrategyCalculatorWindow | None = None
 
     def shutdown(self) -> None:
-        if self._pump_timer is not None:
-            self._pump_timer.stop()
-            self._pump_timer.deleteLater()
-            self._pump_timer = None
-        if self._option_roll_window is not None:
-            try:
-                self._option_roll_window.destroy()
-            except Exception:
-                pass
-            self._option_roll_window = None
-        if self._option_strategy_window is not None:
-            try:
-                self._option_strategy_window.destroy()
-            except Exception:
-                pass
-            self._option_strategy_window = None
-        if self._root is not None:
-            try:
-                self._root.destroy()
-            except Exception:
-                pass
-            self._root = None
+        return
 
     def open_option_roll(
         self,
@@ -966,66 +1013,9 @@ class LegacyOptionToolsHost:
         ticker: object,
         api_name: str,
     ) -> None:
-        root = self._ensure_root()
-        if root is None:
-            raise RuntimeError("Tk 桥接窗口初始化失败。")
-        quote = _build_option_quote(instrument, ticker)
-
-        def _send_to_strategy(payload: object) -> None:
-            if self._option_strategy_window is None or not self._option_strategy_window.window.winfo_exists():
-                self._option_strategy_window = OptionStrategyCalculatorWindow(
-                    root,
-                    self._client,
-                    runtime_provider=self._runtime_provider,
-                    logger=None,
-                )
-            self._option_strategy_window.load_roll_transfer_payload(payload)
-
-        if self._option_roll_window is not None and self._option_roll_window.window.winfo_exists():
-            self._option_roll_window.load_position(
-                position=position,
-                instrument=instrument,
-                quote=quote,
-                api_name=api_name,
-                auto_scan=True,
-            )
-            self._option_roll_window.show()
-            return
-
-        self._option_roll_window = OptionRollSuggestionWindow(
-            root,
-            self._client,
-            position=position,
-            instrument=instrument,
-            quote=quote,
-            api_name=api_name,
-            send_to_strategy_callback=_send_to_strategy,
-            logger=None,
-        )
-
-    def _ensure_root(self) -> Tk | None:
-        if self._root is not None:
-            return self._root
-        try:
-            root = Tk()
-            root.withdraw()
-        except Exception:
-            return None
-        self._root = root
-        self._pump_timer = QTimer(self._parent)
-        self._pump_timer.timeout.connect(self._pump_events)
-        self._pump_timer.start(40)
-        return root
-
-    @Slot()
-    def _pump_events(self) -> None:
-        if self._root is None:
-            return
-        try:
-            self._root.update_idletasks()
-            self._root.update()
-        except Exception:
-            self.shutdown()
+        project_root = Path(__file__).resolve().parents[1]
+        command = [sys.executable, str(project_root / "main.py"), "--data-dir", str(data_root())]
+        subprocess.Popen(command, cwd=str(project_root))
 
 
 class PositionProtectionDialog(QDialog):
@@ -1675,7 +1665,7 @@ class AccountPositionsHomeWidget(QWidget):
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        self._runtime = load_runtime("159") or load_runtime()
+        self._runtime = load_runtime("moni") or load_runtime()
         self._profile_snapshots: dict[str, dict[str, str]] = {}
         self._unlocked_profiles: set[str] = set()
         self._last_profile_name = self._runtime.credential_profile_name if self._runtime is not None else ""
@@ -1735,6 +1725,9 @@ class AccountPositionsHomeWidget(QWidget):
         self._current_order_canceling = False
         self._selected_position_manual_flatten_running = False
         self._shared_client = OkxRestClient()
+        self._realtime_store = RealtimeAccountStore(client=self._shared_client, parent=self)
+        self._realtime_store.snapshot_ready.connect(self._apply_realtime_snapshot)
+        self._realtime_store.status_changed.connect(self._set_realtime_status)
         self._protection_manager = PositionProtectionManager(self._shared_client, lambda _message: None)
         self._protection_dialog: PositionProtectionDialog | None = None
         self._legacy_option_tools = LegacyOptionToolsHost(parent=self, runtime_provider=lambda: self._runtime)
@@ -1770,6 +1763,46 @@ class AccountPositionsHomeWidget(QWidget):
                 self._unlocked_profiles.add(self._last_profile_name)
             self._start_private_threads()
         self._profile_change_ready = True
+
+    def workspace_profile_name(self) -> str:
+        return self._last_profile_name
+
+    def connection_snapshot(self) -> dict[str, object]:
+        text = self._account_status.text().strip() if hasattr(self, "_account_status") else ""
+        private_online = any(token in text for token in ("实时更新", "已通过", "WS 在线", "WS在线"))
+        if "未解锁" in text:
+            private_status = "账户未解锁"
+        elif "失败" in text or "断" in text:
+            private_status = "账户连接异常"
+        else:
+            private_status = "账户连接中"
+        return {
+            "public_online": False,
+            "private_online": private_online,
+            "private_status": "私有WS在线" if private_online else private_status,
+        }
+
+    def set_workspace_managed(self, managed: bool) -> None:
+        visible = not bool(managed)
+        self._profile_label.setVisible(visible)
+        self._profile_combo.setVisible(visible)
+
+    def _select_profile_without_signal(self, profile_name: str) -> None:
+        with QSignalBlocker(self._profile_combo):
+            index = self._profile_combo.findText(profile_name)
+            if index >= 0:
+                self._profile_combo.setCurrentIndex(index)
+
+    def apply_workspace_profile(self, profile_name: str) -> None:
+        target = profile_name.strip()
+        if not target or target == self._last_profile_name:
+            return
+        self._unlocked_profiles.add(target)
+        self._select_profile_without_signal(target)
+        self._profile_change_serial += 1
+        serial = self._profile_change_serial
+        self._set_profile_switch_in_progress(True)
+        QTimer.singleShot(0, lambda: self._apply_profile_change(target, serial))
 
     def _retire_thread(self, thread: QThread) -> None:
         try:
@@ -2408,7 +2441,8 @@ class AccountPositionsHomeWidget(QWidget):
         top.addWidget(self._order_status)
         top.addWidget(self._summary_label, 1)
         top.addStretch(1)
-        top.addWidget(QLabel("API配置"))
+        self._profile_label = QLabel("API配置")
+        top.addWidget(self._profile_label)
         self._profile_combo = QComboBox()
         self._profile_combo.currentIndexChanged.connect(self._on_profile_changed)
         self._profile_combo.setMinimumWidth(120)
@@ -2725,6 +2759,9 @@ class AccountPositionsHomeWidget(QWidget):
 
     def _stop_private_threads(self, *, wait_ms: int = 1600) -> None:
         self._private_thread_generation += 1
+        realtime_store = getattr(self, "_realtime_store", None)
+        if realtime_store is not None:
+            realtime_store.stop()
         for thread in (self._account_feed, self._order_feed):
             if thread is None:
                 continue
@@ -3561,7 +3598,8 @@ class AccountPositionsHomeWidget(QWidget):
         else:
             self._current_notes.pop(record_key, None)
         self._save_position_notes()
-        self._render_positions_tree()
+        with measure_ui_step("positions_apply", rows=len(self._raw_positions)):
+            self._render_positions_tree()
 
     def open_positions_column_window(self) -> None:
         dialog = ColumnSettingsDialog(
@@ -3694,7 +3732,7 @@ class AccountPositionsHomeWidget(QWidget):
             asset_item = self._make_tree_item(
                 row_key=asset_id,
                 label=f"{asset_label} 风险单元",
-                values=_build_group_row_values("组合", asset_metrics),
+                values=_group_row_values_with_break_even("组合", asset_metrics),
                 kind="group",
                 payload_item=asset_positions,
                 payload_metrics=asset_metrics,
@@ -3717,7 +3755,7 @@ class AccountPositionsHomeWidget(QWidget):
                 bucket_item = self._make_tree_item(
                     row_key=bucket_id,
                     label=bucket_label,
-                    values=_build_group_row_values("分组", bucket_metrics),
+                    values=_group_row_values_with_break_even("分组", bucket_metrics),
                     kind="group",
                     payload_item=bucket_positions,
                     payload_metrics=bucket_metrics,
@@ -3782,6 +3820,17 @@ class AccountPositionsHomeWidget(QWidget):
             _format_position_avg_price_usdt(position, self._upl_usdt_prices),
             _format_optional_approx_usdt(
                 _position_signed_open_value_approx_usdt(position, self._position_instruments, self._upl_usdt_prices)
+            ),
+            _format_optional_decimal_fixed(
+                _position_break_even_price(
+                    position,
+                    self._upl_usdt_prices,
+                    fee_rate=_break_even_taker_fee_rate(
+                        self._profile_snapshots.get(self._last_profile_name, {}),
+                        inst_type=position.inst_type,
+                    ),
+                ),
+                places=2,
             ),
             _format_position_size(position, self._position_instruments),
             _format_option_trade_side_display(position),
@@ -4427,13 +4476,24 @@ class AccountPositionsHomeWidget(QWidget):
         if not isinstance(payload, dict):
             return
         positions = payload.get("positions")
-        self._raw_positions = list(positions) if isinstance(positions, list) else []
+        next_positions = list(positions) if isinstance(positions, list) else []
         instruments = payload.get("position_instruments")
         tickers = payload.get("position_tickers")
         prices = payload.get("upl_usdt_prices")
-        self._position_instruments = dict(instruments) if isinstance(instruments, dict) else {}
-        self._position_tickers = dict(tickers) if isinstance(tickers, dict) else {}
-        self._upl_usdt_prices = dict(prices) if isinstance(prices, dict) else {}
+        next_instruments = dict(instruments) if isinstance(instruments, dict) else {}
+        next_tickers = dict(tickers) if isinstance(tickers, dict) else {}
+        next_prices = dict(prices) if isinstance(prices, dict) else {}
+        if (
+            next_positions == self._raw_positions
+            and next_instruments == self._position_instruments
+            and next_tickers == self._position_tickers
+            and next_prices == self._upl_usdt_prices
+        ):
+            return
+        self._raw_positions = next_positions
+        self._position_instruments = next_instruments
+        self._position_tickers = next_tickers
+        self._upl_usdt_prices = next_prices
         if self._last_profile_name:
             _reconcile_current_position_note_records(
                 self._current_notes,
@@ -4448,7 +4508,40 @@ class AccountPositionsHomeWidget(QWidget):
     def _apply_orders(self, orders: object) -> None:
         self._orders = list(orders) if isinstance(orders, list) else []
         self._visible_orders = list(self._orders)
-        self._refresh_current_orders_table()
+        with measure_ui_step("orders_apply", rows=len(self._orders)):
+            self._refresh_current_orders_table()
+
+    @Slot(object)
+    def _apply_realtime_snapshot(self, snapshot: object) -> None:
+        if not isinstance(snapshot, AccountRealtimeSnapshot):
+            return
+        runtime = self._runtime
+        if runtime is None:
+            return
+        if snapshot.profile_name != self._last_profile_name:
+            return
+        if snapshot.environment != str(getattr(runtime, "environment", "") or ""):
+            return
+        latest_positions = list(snapshot.positions)
+        if latest_positions != self._raw_positions:
+            instruments = snapshot.position_instruments or self._position_instruments
+            tickers = snapshot.position_tickers or self._position_tickers
+            prices = snapshot.upl_usdt_prices or self._upl_usdt_prices
+            self._apply_positions_payload(
+                {
+                    "positions": latest_positions,
+                    "position_instruments": dict(instruments),
+                    "position_tickers": dict(tickers),
+                    "upl_usdt_prices": dict(prices),
+                }
+            )
+            self._apply_positions_summary(latest_positions)
+        self._apply_orders(list(snapshot.orders))
+
+    @Slot(str)
+    def _set_realtime_status(self, text: str) -> None:
+        self._set_account_status(text)
+        self._set_order_status(text)
 
     @Slot(object)
     def _apply_position_history_payload(self, payload: object) -> None:
@@ -4806,41 +4899,11 @@ class AccountPositionsHomeWidget(QWidget):
             return
         if force_restart:
             self._stop_private_threads()
-        elif self._account_feed is not None and self._account_feed.isRunning():
-            return
         self._private_thread_generation += 1
         generation = self._private_thread_generation
         profile_name = self._last_profile_name or "-"
-        _debug_log(f"[profile_switch] start_private_threads | profile={profile_name} | generation={generation}")
-        self._account_feed = AccountFeedThread(self._runtime)
-        self._order_feed = OrderFeedThread(self._runtime)
-        self._account_feed.positions_ready.connect(
-            lambda payload, generation=generation: self._apply_positions_summary(payload)
-            if generation == self._private_thread_generation
-            else None
-        )
-        self._account_feed.payload_ready.connect(
-            lambda payload, generation=generation: self._apply_positions_payload(payload)
-            if generation == self._private_thread_generation
-            else None
-        )
-        self._account_feed.status_changed.connect(
-            lambda text, generation=generation: self._set_account_status(text)
-            if generation == self._private_thread_generation
-            else None
-        )
-        self._order_feed.orders_ready.connect(
-            lambda orders, generation=generation: self._apply_orders(orders)
-            if generation == self._private_thread_generation
-            else None
-        )
-        self._order_feed.status_changed.connect(
-            lambda text, generation=generation: self._set_order_status(text)
-            if generation == self._private_thread_generation
-            else None
-        )
-        self._account_feed.start()
-        self._order_feed.start()
+        _debug_log(f"[profile_switch] start_realtime_store | profile={profile_name} | generation={generation}")
+        self._realtime_store.start(self._runtime)
         if start_history:
             self._start_order_history_refresh(force_restart=force_restart)
             self._start_fill_history_refresh(force_restart=force_restart)
@@ -4996,7 +5059,7 @@ class AccountPositionsHomeWidget(QWidget):
         if 0 <= row < len(filtered):
             selected_ord_id = filtered[row].ord_id
         self._orders_summary_label.setText(f"当前委托：{len(filtered)} 条")
-        self._orders_table.setRowCount(len(filtered))
+        table_rows: list[tuple[object, tuple[str, ...]]] = []
         for row, order in enumerate(filtered):
             item = _current_order_view_to_trade_order_item(order)
             feed_source = str(order.raw.get("_feed_source") or "").strip().lower()
@@ -5023,7 +5086,20 @@ class AccountPositionsHomeWidget(QWidget):
                 item.order_id or item.algo_id or "-",
                 item.client_order_id or item.algo_client_order_id or "-",
             )
-            self._set_table_row(self._orders_table, row, values, left_align={3, 13})
+            identity = OrderFeedThread._view_identity(order) or ("row", row, order.inst_id, order.update_time)
+            table_rows.append((identity, values))
+        previous_rows = getattr(self, "_current_order_table_rows", ())
+        delta = keyed_row_delta(previous_rows, table_rows)
+        if delta.structure_changed:
+            self._orders_table.setRowCount(len(table_rows))
+            for row, (_identity, values) in enumerate(table_rows):
+                self._set_table_row(self._orders_table, row, values, left_align={3, 13})
+        else:
+            changed_keys = set(delta.changed_keys)
+            for row, (identity, values) in enumerate(table_rows):
+                if identity in changed_keys:
+                    self._update_table_row(self._orders_table, row, values, left_align={3, 13})
+        self._current_order_table_rows = tuple(table_rows)
         self._current_order_rows = filtered
         self._restore_table_selection(self._orders_table, filtered, selected_ord_id, lambda item: item.ord_id or "")
         self._refresh_current_order_detail()
@@ -5631,6 +5707,28 @@ class AccountPositionsHomeWidget(QWidget):
             else:
                 cell.setTextAlignment(int(Qt.AlignmentFlag.AlignCenter | Qt.AlignmentFlag.AlignVCenter))
             table.setItem(row, column, cell)
+
+    def _update_table_row(
+        self,
+        table: QTableWidget,
+        row: int,
+        values: tuple[str, ...],
+        *,
+        left_align: set[int] | None = None,
+    ) -> None:
+        left_align = left_align or set()
+        for column, value in enumerate(values):
+            text = str(value)
+            cell = table.item(row, column)
+            if cell is None:
+                cell = QTableWidgetItem(text)
+                if column in left_align:
+                    cell.setTextAlignment(int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter))
+                else:
+                    cell.setTextAlignment(int(Qt.AlignmentFlag.AlignCenter | Qt.AlignmentFlag.AlignVCenter))
+                table.setItem(row, column, cell)
+            elif cell.text() != text:
+                cell.setText(text)
 
     def _restore_table_selection(
         self,

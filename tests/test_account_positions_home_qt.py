@@ -8,7 +8,10 @@ from unittest.mock import MagicMock, patch
 
 from roll_terminal_qt.account_positions_home import (
     AccountPositionsHomeWidget,
+    LegacyOptionToolsHost,
     PositionProtectionDialog,
+    _position_break_even_price,
+    _break_even_taker_fee_rate,
     _current_order_view_cancel_reference,
     _current_order_view_program_owner_label,
     _current_order_view_to_trade_order_item,
@@ -16,6 +19,7 @@ from roll_terminal_qt.account_positions_home import (
 from okx_quant.okx_client import Instrument, OkxOrderResult
 from okx_quant.position_protection import ProtectionSessionSnapshot
 from roll_terminal_qt.order_service import OrderStatusView
+from roll_terminal_qt.realtime_account_store import AccountRealtimeSnapshot
 from roll_terminal_qt.shared_order_store import SharedOrderSnapshot
 
 
@@ -59,6 +63,36 @@ class _ProfileComboStub:
 
     def setEnabled(self, enabled: bool) -> None:
         self.enabled = enabled
+
+
+class AccountPositionsWorkspaceProfileTest(TestCase):
+    def test_apply_workspace_profile_reuses_async_switch_path_without_unlocking_again(self) -> None:
+        app = SimpleNamespace(
+            _last_profile_name="api1",
+            _profile_change_serial=7,
+            _unlocked_profiles=set(),
+            _select_profile_without_signal=MagicMock(),
+            _set_profile_switch_in_progress=MagicMock(),
+            _apply_profile_change=MagicMock(),
+        )
+        with patch(
+            "roll_terminal_qt.account_positions_home.QTimer.singleShot",
+            side_effect=lambda _delay, callback: callback(),
+        ):
+            AccountPositionsHomeWidget.apply_workspace_profile(app, "api2")
+
+        self.assertIn("api2", app._unlocked_profiles)
+        app._select_profile_without_signal.assert_called_once_with("api2")
+        app._set_profile_switch_in_progress.assert_called_once_with(True)
+        app._apply_profile_change.assert_called_once_with("api2", 8)
+
+    def test_set_workspace_managed_hides_duplicate_profile_controls(self) -> None:
+        app = SimpleNamespace(_profile_label=MagicMock(), _profile_combo=MagicMock())
+
+        AccountPositionsHomeWidget.set_workspace_managed(app, True)
+
+        app._profile_label.setVisible.assert_called_once_with(False)
+        app._profile_combo.setVisible.assert_called_once_with(False)
 
 
 class _ProtectionSessionTableStub:
@@ -109,6 +143,48 @@ class _ColumnConfigTableStub:
 
 
 class AccountPositionsHomeQtHelpersTest(TestCase):
+    def test_option_break_even_uses_strike_premium_and_two_way_fee(self) -> None:
+        call = SimpleNamespace(
+            inst_id="BTC-USD-260731-63000-C",
+            inst_type="OPTION",
+            pos_side="long",
+            position=Decimal("1"),
+            avg_price=Decimal("0.024"),
+            margin_ccy="BTC",
+        )
+
+        value = _position_break_even_price(call, {"BTC": Decimal("64000")}, fee_rate=Decimal("0.0003"))
+
+        self.assertEqual(value, Decimal("64536.9216"))
+
+    def test_swap_break_even_only_adds_two_way_fee_in_position_direction(self) -> None:
+        short_swap = SimpleNamespace(
+            inst_id="BTC-USDT-SWAP",
+            inst_type="SWAP",
+            pos_side="short",
+            position=Decimal("-1"),
+            avg_price=Decimal("64000"),
+            margin_ccy="USDT",
+        )
+
+        value = _position_break_even_price(short_swap, {}, fee_rate=Decimal("0.00036"))
+
+        self.assertEqual(value, Decimal("63953.92000"))
+
+    def test_option_fee_rate_falls_back_to_contract_taker_fee(self) -> None:
+        rate = _break_even_taker_fee_rate(
+            {"futures_taker_fee_rate": "0.0360", "option_taker_fee_rate": ""},
+            inst_type="OPTION",
+        )
+
+        self.assertEqual(rate, Decimal("0.00036"))
+    @patch("roll_terminal_qt.account_positions_home.subprocess.Popen")
+    def test_legacy_option_tools_launch_in_external_process(self, popen: MagicMock) -> None:
+        host = LegacyOptionToolsHost(parent=SimpleNamespace(), runtime_provider=lambda: None)
+
+        host.open_option_roll(position=object(), instrument=object(), ticker=object(), api_name="moni")
+
+        popen.assert_called_once()
     def test_sync_order_watchlist_clears_symbol_restriction_for_current_orders(self) -> None:
         order_feed = MagicMock()
         app = SimpleNamespace(
@@ -119,6 +195,124 @@ class AccountPositionsHomeQtHelpersTest(TestCase):
         AccountPositionsHomeWidget._sync_order_watchlist(app)
 
         order_feed.set_watched_inst_ids.assert_called_once_with(set())
+
+    def test_start_private_threads_uses_realtime_store_not_legacy_order_feed(self) -> None:
+        runtime = SimpleNamespace(environment="demo")
+        realtime_store = MagicMock()
+        app = SimpleNamespace(
+            _runtime=runtime,
+            _private_thread_generation=0,
+            _last_profile_name="moni",
+            _realtime_store=realtime_store,
+            _start_order_history_refresh=MagicMock(),
+            _start_fill_history_refresh=MagicMock(),
+            _start_position_history_refresh=MagicMock(),
+        )
+
+        AccountPositionsHomeWidget._start_private_threads(app)
+
+        realtime_store.start.assert_called_once_with(runtime)
+        app._start_order_history_refresh.assert_called_once_with(force_restart=False)
+        app._start_fill_history_refresh.assert_called_once_with(force_restart=False)
+        app._start_position_history_refresh.assert_called_once_with(force_restart=False)
+
+    def test_unchanged_order_table_cell_is_not_replaced(self) -> None:
+        cell = MagicMock()
+        cell.text.return_value = "same"
+        table = MagicMock()
+        table.item.return_value = cell
+
+        AccountPositionsHomeWidget._update_table_row(
+            SimpleNamespace(),
+            table,
+            0,
+            ("same",),
+        )
+
+        cell.setText.assert_not_called()
+        table.setItem.assert_not_called()
+
+    def test_realtime_order_only_snapshot_does_not_rebuild_positions(self) -> None:
+        app = SimpleNamespace(
+            _runtime=SimpleNamespace(environment="demo"),
+            _last_profile_name="moni",
+            _raw_positions=[],
+            _apply_positions_payload=MagicMock(),
+            _apply_positions_summary=MagicMock(),
+            _apply_orders=MagicMock(),
+        )
+
+        AccountPositionsHomeWidget._apply_realtime_snapshot(
+            app,
+            AccountRealtimeSnapshot(
+                profile_name="moni",
+                environment="demo",
+                positions=(),
+                orders=(),
+                account=None,
+                generation=1,
+                source="ws",
+            ),
+        )
+
+        app._apply_positions_payload.assert_not_called()
+        app._apply_orders.assert_called_once_with([])
+
+    def test_realtime_position_snapshot_preserves_loaded_price_maps(self) -> None:
+        next_position = SimpleNamespace(inst_id="BTC-USD-260731-63000-C")
+        app = SimpleNamespace(
+            _runtime=SimpleNamespace(environment="demo"),
+            _last_profile_name="moni",
+            _raw_positions=[],
+            _position_instruments={"BTC-USD-260731-63000-C": object()},
+            _position_tickers={"BTC-USD-260731-63000-C": object()},
+            _upl_usdt_prices={"BTC": Decimal("64000")},
+            _apply_positions_payload=MagicMock(),
+            _apply_positions_summary=MagicMock(),
+            _apply_orders=MagicMock(),
+        )
+
+        AccountPositionsHomeWidget._apply_realtime_snapshot(
+            app,
+            AccountRealtimeSnapshot(
+                profile_name="moni",
+                environment="demo",
+                positions=(next_position,),
+                orders=(),
+                account=None,
+                generation=1,
+                source="ws",
+                position_instruments={"BTC-USD-260731-63000-C": object()},
+                position_tickers={"BTC-USD-260731-63000-C": object()},
+                upl_usdt_prices={"BTC": Decimal("64000")},
+            ),
+        )
+
+        payload = app._apply_positions_payload.call_args.args[0]
+        self.assertEqual(payload["upl_usdt_prices"], {"BTC": Decimal("64000")})
+
+    def test_unchanged_position_payload_does_not_rebuild_tree(self) -> None:
+        position = SimpleNamespace(inst_id="BTC-USDT-SWAP")
+        app = SimpleNamespace(
+            _raw_positions=[position],
+            _position_instruments={},
+            _position_tickers={},
+            _upl_usdt_prices={},
+            _last_profile_name="",
+            _render_positions_tree=MagicMock(),
+        )
+
+        AccountPositionsHomeWidget._apply_positions_payload(
+            app,
+            {
+                "positions": [position],
+                "position_instruments": {},
+                "position_tickers": {},
+                "upl_usdt_prices": {},
+            },
+        )
+
+        app._render_positions_tree.assert_not_called()
 
     def test_apply_orders_keeps_pending_order_visible_even_without_matching_position(self) -> None:
         order = OrderStatusView(

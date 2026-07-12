@@ -17,6 +17,7 @@ except Exception:  # noqa: BLE001
 
 
 Logger = Callable[[str], None]
+UpdateListener = Callable[[str, int], None]
 
 
 def _position_snapshot_key(item: dict[str, Any]) -> tuple[str, str, str] | None:
@@ -84,6 +85,7 @@ class OkxPrivateWsConnection:
         self._order_by_cl_ord_id: dict[str, OkxPrivateWsRecord] = {}
         self._positions_snapshot: OkxPrivateWsRecord | None = None
         self._account_snapshot: OkxPrivateWsRecord | None = None
+        self._update_listeners: set[UpdateListener] = set()
 
     @property
     def last_error(self) -> str:
@@ -198,6 +200,17 @@ class OkxPrivateWsConnection:
             if record is None:
                 return None
             return record.version, tuple(dict(item) for item in record.payload.get("data", ()))
+
+    def add_update_listener(self, listener: UpdateListener) -> Callable[[], None]:
+        """Register a best-effort callback for cached private-channel updates."""
+        with self._lock:
+            self._update_listeners.add(listener)
+
+        def unsubscribe() -> None:
+            with self._lock:
+                self._update_listeners.discard(listener)
+
+        return unsubscribe
 
     def _resolve_order_record_locked(
         self,
@@ -348,6 +361,7 @@ class OkxPrivateWsConnection:
             self._store_account(data)
 
     def _store_orders(self, items: list[dict[str, Any]]) -> None:
+        update_version: int | None = None
         with self._lock:
             for item in items:
                 if not isinstance(item, dict):
@@ -362,7 +376,10 @@ class OkxPrivateWsConnection:
                     self._order_by_ord_id[ord_id] = record
                 if cl_ord_id:
                     self._order_by_cl_ord_id[cl_ord_id] = record
+                update_version = record.version
             self._lock.notify_all()
+        if update_version is not None:
+            self._notify_update("orders", update_version)
 
     def _store_positions(self, items: list[dict[str, Any]]) -> None:
         with self._lock:
@@ -398,6 +415,8 @@ class OkxPrivateWsConnection:
                 received_at=time.time(),
             )
             self._lock.notify_all()
+            update_version = self._positions_snapshot.version
+        self._notify_update("positions", update_version)
 
     def _store_account(self, items: list[dict[str, Any]]) -> None:
         with self._lock:
@@ -408,6 +427,17 @@ class OkxPrivateWsConnection:
                 received_at=time.time(),
             )
             self._lock.notify_all()
+            update_version = self._account_snapshot.version
+        self._notify_update("account", update_version)
+
+    def _notify_update(self, channel: str, version: int) -> None:
+        with self._lock:
+            listeners = tuple(self._update_listeners)
+        for listener in listeners:
+            try:
+                listener(channel, version)
+            except Exception:  # noqa: BLE001
+                continue
 
     def _set_last_error(self, message: str) -> None:
         with self._lock:

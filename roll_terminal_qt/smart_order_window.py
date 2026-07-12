@@ -43,6 +43,7 @@ from okx_quant.smart_order import (
     resolve_best_quote_price,
 )
 from roll_terminal_qt.profile_access import ensure_profile_unlocked, load_profile_snapshots
+from roll_terminal_qt.workspace_shell import preferred_profile_name
 
 
 INSTRUMENT_TYPE_OPTIONS: tuple[tuple[str, str], ...] = (
@@ -630,7 +631,12 @@ class SmartOrderQtWindow(QMainWindow):
             self._profile_combo.addItem(name, name)
         self._profile_combo.blockSignals(False)
         if self._profile_combo.count() > 0:
-            target = current or self._last_profile_name or selected_profile
+            target = preferred_profile_name(
+                list(self._profile_snapshots),
+                current=current,
+                last=self._last_profile_name,
+                selected=selected_profile,
+            )
             selected_index = self._profile_combo.findData(target)
             if selected_index < 0:
                 selected_index = 0
