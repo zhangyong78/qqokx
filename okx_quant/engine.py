@@ -783,6 +783,14 @@ class StrategyEngine:
             f"{price_label}={format_decimal(entry_reference)}"
         )
 
+    def _log_dynamic_position_closed(self, active_order: ManagedEntryOrder) -> None:
+        self._logger(
+            "仓位关闭已确认"
+            f" | 原开仓ordId={active_order.ord_id or '-'}"
+            f" | clOrdId={active_order.cl_ord_id or '-'}"
+            " | 开仓门禁已释放 | 结算归因中 | 开始评估下一次委托"
+        )
+
     def _append_dynamic_mtf_mode_parts(self, config: StrategyConfig, mode_parts: list[str]) -> None:
         if not strategy_uses_mtf_filter(config.strategy_id):
             return
@@ -935,19 +943,19 @@ class StrategyEngine:
                         newest_ts=newest_ts,
                         dynamic_stop_only=dynamic_stop_only,
                     )
-                    active_order = None
                     # After a round-trip closes on the current confirmed candle,
                     # do not immediately re-place another entry from the same
                     # candle's reference price. Wait for the next confirmed bar.
                     if self._stop_event.is_set():
                         return
+                    self._log_dynamic_position_closed(active_order)
+                    active_order = None
                     idle_signal_candle_ts = self._refresh_dynamic_entry_candle_baseline(
                         config,
                         lookback=lookback,
                         fallback_ts=newest_ts,
                     )
                     last_candle_ts = idle_signal_candle_ts
-                    self._logger("本轮持仓已结束，继续监控下一次信号。")
                     continue
                 if state == "partially_filled":
                     partial_managed = self._handle_partial_dynamic_entry(
@@ -963,16 +971,16 @@ class StrategyEngine:
                         self._stop_event.wait(config.poll_seconds)
                         continue
                     entries_in_current_wave += 1
-                    active_order = None
                     if self._stop_event.is_set():
                         return
+                    self._log_dynamic_position_closed(active_order)
+                    active_order = None
                     idle_signal_candle_ts = self._refresh_dynamic_entry_candle_baseline(
                         config,
                         lookback=lookback,
                         fallback_ts=newest_ts,
                     )
                     last_candle_ts = idle_signal_candle_ts
-                    self._logger("本轮持仓已结束，继续监控下一次信号。")
                     continue
                 if state not in {"live"}:
                     self._logger(
@@ -1004,16 +1012,16 @@ class StrategyEngine:
                         newest_ts=newest_ts,
                         dynamic_stop_only=dynamic_stop_only,
                     )
-                    active_order = None
                     if self._stop_event.is_set():
                         return
+                    self._log_dynamic_position_closed(active_order)
+                    active_order = None
                     idle_signal_candle_ts = self._refresh_dynamic_entry_candle_baseline(
                         config,
                         lookback=lookback,
                         fallback_ts=newest_ts,
                     )
                     last_candle_ts = idle_signal_candle_ts
-                    self._logger("本轮持仓已结束，继续监控下一次信号。")
                     continue
                 if cancel_result.action == "partially_filled":
                     status = cancel_result.status
@@ -1032,16 +1040,16 @@ class StrategyEngine:
                         self._stop_event.wait(config.poll_seconds)
                         continue
                     entries_in_current_wave += 1
-                    active_order = None
                     if self._stop_event.is_set():
                         return
+                    self._log_dynamic_position_closed(active_order)
+                    active_order = None
                     idle_signal_candle_ts = self._refresh_dynamic_entry_candle_baseline(
                         config,
                         lookback=lookback,
                         fallback_ts=newest_ts,
                     )
                     last_candle_ts = idle_signal_candle_ts
-                    self._logger("本轮持仓已结束，继续监控下一次信号。")
                     continue
                 active_order = None
 
@@ -1357,7 +1365,7 @@ class StrategyEngine:
                 )
                 if self._stop_event.is_set():
                     return
-                self._logger("本轮持仓已结束，继续监控下一次信号。")
+                self._log_dynamic_position_closed(active_order)
                 self.resume_automatic_trade_management()
                 return
             if state == "partially_filled":
@@ -1373,7 +1381,7 @@ class StrategyEngine:
                 if partial_managed:
                     if self._stop_event.is_set():
                         return
-                    self._logger("本轮持仓已结束，继续监控下一次信号。")
+                    self._log_dynamic_position_closed(active_order)
                     self.resume_automatic_trade_management()
                     return
                 self._stop_event.wait(config.poll_seconds)
@@ -1438,7 +1446,7 @@ class StrategyEngine:
                     if partial_managed:
                         if self._stop_event.is_set():
                             return
-                        self._logger("本轮持仓已结束，继续监控下一次信号。")
+                        self._log_dynamic_position_closed(active_order)
                         self.resume_automatic_trade_management()
                         return
                     self._stop_event.wait(config.poll_seconds)
