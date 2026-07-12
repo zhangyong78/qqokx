@@ -2538,6 +2538,20 @@ class StrategyEngineTest(TestCase):
         self.assertEqual(waits, [10, 60.0, 10])
         self.assertTrue(any("本波第2次委托" in message for message in messages))
 
+    def test_dynamic_exchange_strategy_logs_confirmed_close_before_reentry(self) -> None:
+        _attempted, _accepted, _evaluate_calls, _waits, messages = self._run_dynamic_exchange_reentry_probe(
+            candle_counts=[80, 80, 82, 82, 83],
+            stop_after_waits=3,
+        )
+
+        close_index = next(index for index, message in enumerate(messages) if "仓位关闭已确认" in message)
+        reentry_index = next(index for index, message in enumerate(messages) if "本波第2次委托" in message)
+        self.assertLess(close_index, reentry_index)
+        self.assertIn("原开仓ordId=ord-1", messages[close_index])
+        self.assertIn("clOrdId=cl-1", messages[close_index])
+        self.assertIn("开仓门禁已释放", messages[close_index])
+        self.assertIn("结算归因中", messages[close_index])
+
     def test_dynamic_exchange_strategy_allows_third_entry_after_another_post_close_candle(self) -> None:
         attempted, accepted, evaluate_calls, waits, messages = self._run_dynamic_exchange_reentry_probe(
             candle_counts=[80, 80, 82, 82, 83, 83, 84, 84, 85],
