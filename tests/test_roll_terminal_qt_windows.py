@@ -5612,6 +5612,75 @@ class RollTerminalQtWindowHelperTests(QtWidgetTestCase):
             finally:
                 self.__class__.dispose_widget(window)
 
+    def test_primary_average_secondary_normal_control_available_for_dual_kline_layouts(self) -> None:
+        with patch("roll_terminal_qt.kline_analysis_window.QTimer.singleShot", return_value=None):
+            window = KlineAnalysisWindow()
+            try:
+                self.assertFalse(window._primary_average_secondary_normal_check.isEnabled())
+                window._secondary_chart_check.setChecked(True)
+                window._secondary_chart_kind_mode = "kline"
+                window._secondary_layout_mode_value = "vertical"
+                window._update_secondary_controls_state()
+                self.assertTrue(window._primary_average_secondary_normal_check.isEnabled())
+
+                window._secondary_layout_mode_value = "horizontal"
+                window._update_secondary_controls_state()
+                self.assertTrue(window._primary_average_secondary_normal_check.isEnabled())
+
+                window._primary_average_secondary_normal_check.setChecked(True)
+                window._secondary_chart_kind_mode = "volatility"
+                window._update_secondary_controls_state()
+                self.assertFalse(window._primary_average_secondary_normal_check.isEnabled())
+                self.assertFalse(window._primary_average_secondary_normal_check.isChecked())
+            finally:
+                self.__class__.dispose_widget(window)
+
+    def test_primary_average_secondary_normal_request_keys_use_primary_average_only(self) -> None:
+        with patch("roll_terminal_qt.kline_analysis_window.QTimer.singleShot", return_value=None):
+            window = KlineAnalysisWindow()
+            try:
+                window._symbol_input.setText("BTC-USDT-SWAP")
+                window._use_native_chart = True
+                window._secondary_chart_check.setChecked(True)
+                window._secondary_chart_kind_mode = "kline"
+                window._secondary_layout_mode_value = "horizontal"
+                window._primary_average_secondary_normal_check.setChecked(True)
+
+                primary_key = window._current_primary_request_key()
+                secondary_key = window._current_secondary_request_key(symbol="BTC-USDT-SWAP")
+
+                self.assertTrue(primary_key[5])
+                self.assertFalse(secondary_key[6])
+
+                window._secondary_layout_mode_value = "vertical"
+                primary_key = window._current_primary_request_key()
+                secondary_key = window._current_secondary_request_key(symbol="BTC-USDT-SWAP")
+
+                self.assertTrue(primary_key[5])
+                self.assertFalse(secondary_key[6])
+            finally:
+                self.__class__.dispose_widget(window)
+
+    def test_primary_average_secondary_normal_is_mutually_exclusive_with_global_average(self) -> None:
+        with patch("roll_terminal_qt.kline_analysis_window.QTimer.singleShot", return_value=None):
+            window = KlineAnalysisWindow()
+            try:
+                window._secondary_chart_check.setChecked(True)
+                window._secondary_chart_kind_mode = "kline"
+                window._secondary_layout_mode_value = "horizontal"
+                window._update_secondary_controls_state()
+
+                window._secondary_average_kline_check.setChecked(True)
+                window._primary_average_secondary_normal_check.setChecked(True)
+                self.assertFalse(window._secondary_average_kline_check.isChecked())
+                self.assertTrue(window._primary_average_secondary_normal_check.isChecked())
+
+                window._secondary_average_kline_check.setChecked(True)
+                self.assertTrue(window._secondary_average_kline_check.isChecked())
+                self.assertFalse(window._primary_average_secondary_normal_check.isChecked())
+            finally:
+                self.__class__.dispose_widget(window)
+
     def test_secondary_sync_period_button_shows_same_period_switch_for_volatility(self) -> None:
         with patch("roll_terminal_qt.kline_analysis_window.QTimer.singleShot", return_value=None):
             window = KlineAnalysisWindow()

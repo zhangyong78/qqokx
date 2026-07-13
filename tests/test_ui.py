@@ -4802,6 +4802,29 @@ class StrategyTradeTrackingTest(TestCase):
         )
         start_custom.assert_called_once()
 
+    def test_recovery_main_loop_config_disables_startup_chase(self) -> None:
+        session = self._make_session()
+        session.config = StrategyConfig(
+            inst_id="ETH-USDT-SWAP",
+            bar="1H",
+            ema_period=21,
+            atr_period=10,
+            atr_stop_multiplier=Decimal("1.5"),
+            atr_take_multiplier=Decimal("1.5"),
+            order_size=Decimal("0"),
+            trade_mode="cross",
+            signal_mode="long_only",
+            position_mode="long_short",
+            environment="demo",
+            tp_sl_trigger_type="mark",
+            startup_chase_current_signal=True,
+        )
+
+        recovery_config = QuantApp._recovery_main_loop_config(session)
+
+        self.assertTrue(session.config.startup_chase_current_signal)
+        self.assertFalse(recovery_config.startup_chase_current_signal)
+
     def test_session_can_auto_migrate_on_close_only_allows_active_trade_for_exchange_mode(self) -> None:
         idle_signal = self._make_session()
         idle_signal.config.run_mode = "signal_only"

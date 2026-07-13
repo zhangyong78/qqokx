@@ -2,6 +2,7 @@
 
 import json
 import time
+from dataclasses import replace
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -8879,6 +8880,14 @@ class UiStrategySessionsMixin:
         }
         return mapping.get(normalized, "恢复中")
 
+    @staticmethod
+    def _recovery_main_loop_config(session):
+        """Recovered sessions never chase the already-confirmed signal."""
+        return replace(
+            session.config,
+            startup_chase_current_signal=False,
+        )
+
     def _restart_recoverable_signal_monitoring(self, session: StrategySession, credentials: Credentials) -> bool:
         previous_trade = session.active_trade
         if (
@@ -8912,7 +8921,7 @@ class UiStrategySessionsMixin:
                     lambda: _mark_recovery_back_to_running("恢复信号监听已完成，继续监控下一次信号。"),
                 )
                 entered_main_loop = True
-                session.engine._run(credentials, session.config)
+                session.engine._run(credentials, self._recovery_main_loop_config(session))
             except Exception as exc:
                 session.engine._notify_error(session.config, str(exc))
                 session.engine._logger(f"策略停止，原因：{exc}")
@@ -9134,7 +9143,7 @@ class UiStrategySessionsMixin:
                                     "恢复挂单接管已完成，已切回主策略循环，继续监控下一次信号。"
                                 ),
                             )
-                            session.engine._run(credentials, session.config)
+                            session.engine._run(credentials, self._recovery_main_loop_config(session))
                     except Exception as exc:
                         session.engine._notify_error(session.config, str(exc))
                         session.engine._logger(f"策略停止，原因：{exc}")
@@ -9458,6 +9467,10 @@ class UiStrategySessionsMixin:
                 session.engine._logger(start_message)
                 _monitor()
                 if not session.engine._stop_event.is_set():
+                    session.engine._logger("恢复持仓接管结束，等待上一轮结算完成后切回主策略循环。")
+                    wait_for_settlement = getattr(session.engine, "_wait_for_trade_settlement", None)
+                    if callable(wait_for_settlement) and not wait_for_settlement():
+                        return
                     continue_main_loop = True
                     self.root.after(
                         0,
@@ -9465,7 +9478,7 @@ class UiStrategySessionsMixin:
                             "恢复持仓接管已完成，已切回主策略循环，继续监控下一次信号。"
                         ),
                     )
-                    session.engine._run(credentials, session.config)
+                    session.engine._run(credentials, self._recovery_main_loop_config(session))
             except Exception as exc:
                 session.engine._notify_error(session.config, str(exc))
                 session.engine._logger(f"策略停止，原因：{exc}")

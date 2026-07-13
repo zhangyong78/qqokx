@@ -900,6 +900,7 @@ class StrategyEngine:
             f"止盈ATR倍数={format_decimal(config.atr_take_multiplier)}",
             f"每波最多开仓次数={config.max_entries_per_trend or 0}",
             f"启动追单窗口={config.startup_chase_window_label()}",
+            f"启动追当前信号={'开启' if config.startup_chase_current_signal else '关闭'}",
         ]
         if config.uses_reentry_confirmation():
             mode_parts.append(config.reentry_confirmation_summary())

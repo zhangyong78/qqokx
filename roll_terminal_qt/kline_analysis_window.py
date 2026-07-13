@@ -5197,8 +5197,18 @@ class KlineAnalysisWindow(QMainWindow):
 
         self._secondary_average_kline_check = QCheckBox("平均K线")
         self._secondary_average_kline_check.setToolTip("开启后，主图和副图都使用平均K线算法显示K线。")
-        self._secondary_average_kline_check.toggled.connect(self._load_data)
+        self._secondary_average_kline_check.toggled.connect(self._on_secondary_average_kline_toggled)
         action_row.addWidget(self._secondary_average_kline_check)
+
+        self._primary_average_secondary_normal_check = QCheckBox("主均副普")
+        self._primary_average_secondary_normal_check.setToolTip(
+            "仅在双图且副图为K线时生效：左右分屏为左图平均、右图正常；上下分屏为上图平均、下图正常。"
+        )
+        self._primary_average_secondary_normal_check.setEnabled(False)
+        self._primary_average_secondary_normal_check.toggled.connect(
+            self._on_primary_average_secondary_normal_toggled
+        )
+        action_row.addWidget(self._primary_average_secondary_normal_check)
 
         self._reverse_kline_check = QCheckBox("K线反转")
         self._reverse_kline_check.setToolTip("开启后，将当前主图及副图K线按价格镜像反转显示；波动率副图不参与反转。")
@@ -5690,7 +5700,7 @@ class KlineAnalysisWindow(QMainWindow):
             return []
         normalized_period = period.strip().upper()
         aggregation_text = "1H直连" if normalized_period == "1H" else f"{normalized_period}本地聚合"
-        average_text = "开" if self._secondary_average_kline_check.isChecked() else "关"
+        average_text = "开" if self._secondary_average_kline_enabled() else "关"
         source_text = str(payload.stats.get("source", "Deribit BTC DVOL") or "Deribit BTC DVOL")
         source_text = source_text.replace("（本地聚合）", "")
         return [f"BTC波动率 | 平均K线 {average_text} | {aggregation_text} | 来源 {source_text}"]
@@ -5768,9 +5778,55 @@ class KlineAnalysisWindow(QMainWindow):
             self._secondary_sync_period_btn.setEnabled(enabled)
         self._secondary_average_kline_check.setEnabled(True)
         self._secondary_average_kline_check.setVisible(True)
+        self._sync_primary_average_secondary_normal_control_state()
         self._refresh_secondary_layout_button()
         self._refresh_secondary_chart_kind_button()
         self._refresh_secondary_sync_period_button()
+
+    def _primary_average_secondary_normal_available(self) -> bool:
+        return bool(
+            self._secondary_chart_check.isChecked()
+            and self._secondary_chart_kind() == "kline"
+        )
+
+    def _primary_average_secondary_normal_enabled(self) -> bool:
+        return bool(
+            self._primary_average_secondary_normal_available()
+            and self._primary_average_secondary_normal_check.isChecked()
+        )
+
+    def _primary_average_kline_enabled(self) -> bool:
+        return bool(
+            self._secondary_average_kline_check.isChecked()
+            or self._primary_average_secondary_normal_enabled()
+        )
+
+    def _secondary_average_kline_enabled(self) -> bool:
+        return bool(self._secondary_average_kline_check.isChecked())
+
+    def _sync_primary_average_secondary_normal_control_state(self) -> None:
+        available = self._primary_average_secondary_normal_available()
+        self._primary_average_secondary_normal_check.setEnabled(available)
+        if not available and self._primary_average_secondary_normal_check.isChecked():
+            self._primary_average_secondary_normal_check.blockSignals(True)
+            self._primary_average_secondary_normal_check.setChecked(False)
+            self._primary_average_secondary_normal_check.blockSignals(False)
+
+    @Slot(bool)
+    def _on_secondary_average_kline_toggled(self, enabled: bool) -> None:
+        if enabled and self._primary_average_secondary_normal_check.isChecked():
+            self._primary_average_secondary_normal_check.blockSignals(True)
+            self._primary_average_secondary_normal_check.setChecked(False)
+            self._primary_average_secondary_normal_check.blockSignals(False)
+        self._load_data()
+
+    @Slot(bool)
+    def _on_primary_average_secondary_normal_toggled(self, enabled: bool) -> None:
+        if enabled and self._secondary_average_kline_check.isChecked():
+            self._secondary_average_kline_check.blockSignals(True)
+            self._secondary_average_kline_check.setChecked(False)
+            self._secondary_average_kline_check.blockSignals(False)
+        self._load_data()
 
     def _refresh_chart_mode_cycle_button(self) -> None:
         if self._chart_mode_cycle_btn is None:
@@ -5791,6 +5847,7 @@ class KlineAnalysisWindow(QMainWindow):
             "horizontal" if self._secondary_layout_mode() == "vertical" else "vertical"
         )
         self._refresh_secondary_layout_button()
+        self._sync_primary_average_secondary_normal_control_state()
         self._apply_secondary_chart_layout()
 
     @Slot()
@@ -5799,6 +5856,7 @@ class KlineAnalysisWindow(QMainWindow):
         self._secondary_chart_kind_mode = ("volatility" if previous_kind == "kline" else "kline")
         self._refresh_secondary_chart_kind_button()
         self._refresh_secondary_sync_period_button()
+        self._sync_primary_average_secondary_normal_control_state()
         if previous_kind == "kline" and self._secondary_chart_kind() == "volatility":
             self._period_combo.blockSignals(True)
             self._secondary_period_combo.blockSignals(True)
@@ -6231,7 +6289,7 @@ class KlineAnalysisWindow(QMainWindow):
             self._period_combo.currentText().strip().upper(),
             max(50, self._limit_spin.value()),
             bool(self._prefer_local_checkbox.isChecked()),
-            bool(self._secondary_average_kline_check.isChecked()),
+            self._primary_average_kline_enabled(),
             bool(getattr(self, "_auto_channel_check", None) and self._auto_channel_check.isChecked()),
             bool(getattr(self, "_auto_box_check", None) and self._auto_box_check.isChecked()),
             bool(getattr(self, "_history_box_check", None) and self._history_box_check.isChecked()),
@@ -6251,7 +6309,7 @@ class KlineAnalysisWindow(QMainWindow):
                 chart_kind,
                 secondary_period,
                 requested_limit,
-                bool(self._secondary_average_kline_check.isChecked()),
+                self._secondary_average_kline_enabled(),
                 False,
             )
         return (
@@ -6261,7 +6319,7 @@ class KlineAnalysisWindow(QMainWindow):
             secondary_period,
             requested_limit,
             bool(self._prefer_local_checkbox.isChecked()),
-            bool(self._secondary_average_kline_check.isChecked()),
+            self._secondary_average_kline_enabled(),
             bool(self._reverse_kline_check.isChecked()),
         )
 
@@ -6341,7 +6399,7 @@ class KlineAnalysisWindow(QMainWindow):
             period=period,
             limit=requested_limit,
             local_only=self._prefer_local_checkbox.isChecked(),
-            average_kline=bool(self._secondary_average_kline_check.isChecked()),
+            average_kline=self._primary_average_kline_enabled(),
             workspace_entry=workspace_entry,
             enable_shape_signals=self.pattern_signals_enabled(),
         )
@@ -6379,7 +6437,7 @@ class KlineAnalysisWindow(QMainWindow):
                 request_id=self._secondary_request_id,
                 period=secondary_period,
                 limit=requested_limit,
-                average_kline=bool(self._secondary_average_kline_check.isChecked()),
+                average_kline=self._secondary_average_kline_enabled(),
             )
             self._secondary_volatility_loader.loaded.connect(self._on_secondary_data_loaded)
             self._secondary_volatility_loader.failed.connect(self._on_secondary_data_failed)
@@ -6392,7 +6450,7 @@ class KlineAnalysisWindow(QMainWindow):
             period=secondary_period,
             limit=requested_limit,
             local_only=self._prefer_local_checkbox.isChecked(),
-            average_kline=bool(self._secondary_average_kline_check.isChecked()),
+            average_kline=self._secondary_average_kline_enabled(),
             workspace_entry={},
             enable_alerts=False,
             enable_shape_signals=False,
@@ -6458,6 +6516,7 @@ class KlineAnalysisWindow(QMainWindow):
 
     @Slot(bool)
     def _on_secondary_chart_toggled(self, enabled: bool) -> None:
+        primary_average_secondary_normal_was_enabled = self._primary_average_secondary_normal_check.isChecked()
         self._apply_secondary_chart_visibility()
         self._apply_chart_mode_period_defaults(dual_enabled=enabled)
         if not enabled:
@@ -6477,6 +6536,8 @@ class KlineAnalysisWindow(QMainWindow):
                 self._secondary_native_chart_view.set_external_hover_time(None)
             if isinstance(self._native_chart_view, InteractiveKlineChartView):
                 self._native_chart_view.set_external_hover_time(None)
+            if primary_average_secondary_normal_was_enabled:
+                self._load_data()
 
     @Slot()
     def _on_secondary_layout_changed(self) -> None:
