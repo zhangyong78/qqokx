@@ -468,7 +468,7 @@ class KlineAnalysisWindowAccountDrawerTests(QtWidgetTestCase):
         try:
             window._account_drawer.show()
             with patch.object(window._account_drawer, "set_context") as set_context, patch.object(window, "_load_data"):
-                window._symbol_input.setText("eth-usdt-swap")
+                window._symbol_combo.setCurrentText("ETH-USDT-SWAP")
                 window._on_symbol_confirmed()
             self.assertEqual(set_context.call_args.kwargs["symbol"], "ETH-USDT-SWAP")
         finally:

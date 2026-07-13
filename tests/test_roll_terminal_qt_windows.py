@@ -58,6 +58,7 @@ from roll_terminal_qt.kline_analysis_window import (
     KlineChartPayload,
     KlineAnalysisWindow,
     KlineDataLoader,
+    KLINE_SYMBOL_OPTIONS,
     RRCardDialog,
     _AUTO_REFRESH_DEFAULT_ENABLED,
     _DEFAULT_DUAL_PRIMARY_PERIOD,
@@ -73,6 +74,7 @@ from roll_terminal_qt.kline_analysis_window import (
     _extend_history_box_end_index,
     _build_display_times_ms,
     _compute_axis_y_padding,
+    _axis_y_label_format,
     _compute_hover_overlay_layout,
     _default_chart_stack_splitter_sizes,
     _default_kline_splitter_sizes,
@@ -99,6 +101,7 @@ from roll_terminal_qt.kline_analysis_window import (
     _to_sma,
     _bar_to_ms,
     _is_local_cache_stale,
+    _volatility_currency_for_symbol,
 )
 import roll_terminal_qt.kline_analysis_window as kline_analysis_module
 from roll_terminal_qt.launcher import LauncherWindow
@@ -691,7 +694,7 @@ class RollTerminalQtWindowHelperTests(QtWidgetTestCase):
         ):
             window = KlineAnalysisWindow(embedded=True)
         try:
-            symbol = window._symbol_input.text()
+            symbol = window._symbol_combo.currentText()
             period = window._period_combo.currentText()
             with (
                 patch(
@@ -704,7 +707,7 @@ class RollTerminalQtWindowHelperTests(QtWidgetTestCase):
 
             self.assertEqual(window.workspace_profile_name(), "api2")
             self.assertIs(window._runtime, runtime_api2)
-            self.assertEqual(window._symbol_input.text(), symbol)
+            self.assertEqual(window._symbol_combo.currentText(), symbol)
             self.assertEqual(window._period_combo.currentText(), period)
             load_data.assert_called_once()
         finally:
@@ -2548,14 +2551,49 @@ class RollTerminalQtWindowHelperTests(QtWidgetTestCase):
         with patch("sys.stdout", None):
             _debug_log("[kline] test")
 
-    def test_kline_symbol_input_uses_bounded_header_width(self) -> None:
+    def test_kline_symbol_combo_uses_bounded_header_width(self) -> None:
         window = KlineAnalysisWindow()
         try:
-            self.assertLessEqual(window._symbol_input.maximumWidth(), 420)
+            self.assertLessEqual(window._symbol_combo.maximumWidth(), 420)
             self.assertEqual(
-                window._symbol_input.sizePolicy().horizontalPolicy(),
+                window._symbol_combo.sizePolicy().horizontalPolicy(),
                 QSizePolicy.Policy.Preferred,
             )
+        finally:
+            self.__class__.dispose_widget(window)
+
+    def test_kline_symbol_options_and_volatility_currency_mapping(self) -> None:
+        self.assertEqual(
+            KLINE_SYMBOL_OPTIONS,
+            ("BTC-USDT-SWAP", "ETH-USDT-SWAP", "SOL-USDT-SWAP", "DOGE-USDT-SWAP", "ETH-BTC"),
+        )
+        self.assertEqual(_volatility_currency_for_symbol("BTC-USDT-SWAP"), "BTC")
+        self.assertEqual(_volatility_currency_for_symbol("ETH-USDT-SWAP"), "ETH")
+        self.assertEqual(_volatility_currency_for_symbol("ETH-BTC"), "ETH")
+        self.assertIsNone(_volatility_currency_for_symbol("SOL-USDT-SWAP"))
+        self.assertIsNone(_volatility_currency_for_symbol("DOGE-USDT-SWAP"))
+
+    def test_kline_symbol_combo_offers_only_configured_symbols(self) -> None:
+        window = KlineAnalysisWindow()
+        try:
+            self.assertEqual(
+                [window._symbol_combo.itemText(index) for index in range(window._symbol_combo.count())],
+                list(KLINE_SYMBOL_OPTIONS),
+            )
+            self.assertFalse(window._symbol_combo.isEditable())
+        finally:
+            self.__class__.dispose_widget(window)
+
+    def test_selecting_symbol_without_volatility_reverts_secondary_chart_to_kline(self) -> None:
+        with patch("roll_terminal_qt.kline_analysis_window.QTimer.singleShot", return_value=None):
+            window = KlineAnalysisWindow()
+        try:
+            window._secondary_chart_check.setChecked(True)
+            window._secondary_chart_kind_mode = "volatility"
+            window._symbol_combo.setCurrentText("SOL-USDT-SWAP")
+
+            self.assertEqual(window._secondary_chart_kind(), "kline")
+            self.assertFalse(window._secondary_chart_kind_btn.isEnabled())
         finally:
             self.__class__.dispose_widget(window)
 
@@ -5599,7 +5637,7 @@ class RollTerminalQtWindowHelperTests(QtWidgetTestCase):
         ):
             window = KlineAnalysisWindow()
             try:
-                window._symbol_input.setText("BTC-USDT-SWAP")
+                window._symbol_combo.setCurrentText("BTC-USDT-SWAP")
                 window._use_native_chart = True
                 window._reverse_kline_check.setChecked(True)
                 window._secondary_chart_check.setChecked(True)
@@ -5639,7 +5677,7 @@ class RollTerminalQtWindowHelperTests(QtWidgetTestCase):
         with patch("roll_terminal_qt.kline_analysis_window.QTimer.singleShot", return_value=None):
             window = KlineAnalysisWindow()
             try:
-                window._symbol_input.setText("BTC-USDT-SWAP")
+                window._symbol_combo.setCurrentText("BTC-USDT-SWAP")
                 window._use_native_chart = True
                 window._secondary_chart_check.setChecked(True)
                 window._secondary_chart_kind_mode = "kline"
@@ -5775,14 +5813,14 @@ class RollTerminalQtWindowHelperTests(QtWidgetTestCase):
                     stats={"returned": 1},
                     alert_snapshot=None,
                 )
-                request_key = window._current_secondary_request_key(symbol=window._symbol_input.text().strip().upper())
+                request_key = window._current_secondary_request_key(symbol=window._symbol_combo.currentText().strip().upper())
                 window._secondary_payload_cache[request_key] = payload
 
                 with (
                     patch.object(window, "_render_secondary_chart") as render_cached,
                     patch("roll_terminal_qt.kline_analysis_window.KlineDataLoader.start") as start_loader,
                 ):
-                    window._load_secondary_data(symbol=window._symbol_input.text().strip().upper())
+                    window._load_secondary_data(symbol=window._symbol_combo.currentText().strip().upper())
 
                 render_cached.assert_called_once_with(payload)
                 start_loader.assert_called_once()
@@ -6080,7 +6118,7 @@ class RollTerminalQtWindowHelperTests(QtWidgetTestCase):
             import tests.test_roll_terminal_qt_windows as target_module
 
             suite = unittest.defaultTestLoader.loadTestsFromName(
-                "RollTerminalQtWindowHelperTests.test_kline_symbol_input_uses_bounded_header_width",
+                "RollTerminalQtWindowHelperTests.test_kline_symbol_combo_uses_bounded_header_width",
                 target_module,
             )
             result = unittest.TextTestRunner(verbosity=2).run(suite)
@@ -6262,6 +6300,16 @@ class RollTerminalQtWindowHelperTests(QtWidgetTestCase):
         min_price_y = ((axis_max - min_price) / span) * plot_height
         volume_band_top = plot_height * (1.0 - volume_reserved_ratio)
         self.assertLess(min_price_y, volume_band_top)
+
+    def test_axis_y_padding_scales_for_doge_price_range(self) -> None:
+        top_padding, bottom_padding = _compute_axis_y_padding(0.14, 0.15)
+        self.assertLess(top_padding, 0.01)
+        self.assertLess(bottom_padding, 0.01)
+
+    def test_axis_y_label_format_preserves_doge_and_eth_btc_precision(self) -> None:
+        self.assertEqual(_axis_y_label_format(0.14, 0.15), "%.5f")
+        self.assertEqual(_axis_y_label_format(0.03, 0.04), "%.6f")
+        self.assertEqual(_axis_y_label_format(64_000.0, 65_000.0), "%.2f")
 
     def test_resolve_candle_time_from_x_value_supports_future_blank_area(self) -> None:
         candles = [

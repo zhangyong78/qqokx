@@ -165,6 +165,18 @@ _BOX_TREND_LABELS = {
     "up": "上涨后整理",
     "down": "下跌后整理",
 }
+KLINE_SYMBOL_OPTIONS = (
+    "BTC-USDT-SWAP",
+    "ETH-USDT-SWAP",
+    "SOL-USDT-SWAP",
+    "DOGE-USDT-SWAP",
+    "ETH-BTC",
+)
+_VOLATILITY_CURRENCY_BY_SYMBOL = {
+    "BTC-USDT-SWAP": "BTC",
+    "ETH-USDT-SWAP": "ETH",
+    "ETH-BTC": "ETH",
+}
 # Keep user-visible labels in plain UTF-8 literals. Do not replace them with
 # mojibake fallbacks or ASCII placeholders.
 _REPLAY_SIGNAL_LABELS = {
@@ -191,6 +203,10 @@ def _debug_log(message: str) -> None:
         stream.flush()
     except Exception:
         return
+
+
+def _volatility_currency_for_symbol(symbol: str) -> str | None:
+    return _VOLATILITY_CURRENCY_BY_SYMBOL.get(symbol.strip().upper())
 
 
 def _load_deribit_volatility_cache_payload() -> dict[str, Any]:
@@ -611,12 +627,24 @@ def _compute_hover_tooltip_x(
 
 def _compute_axis_y_padding(min_price: float, max_price: float) -> tuple[float, float]:
     price_span = max(float(max_price) - float(min_price), 0.0)
-    baseline = max(price_span, abs(float(max_price)) * 0.002, 1.0)
-    top_padding = max(price_span * 0.08, abs(float(max_price)) * 0.002, 1.0)
+    reference_price = max(abs(float(min_price)), abs(float(max_price)))
+    baseline = max(price_span, reference_price * 0.002, 1e-8)
+    top_padding = max(price_span * 0.08, reference_price * 0.002, 1e-8)
     reserved_ratio = min(0.42, max(_VOLUME_OVERLAY_HEIGHT_RATIO + 0.03, 0.12))
     visible_ratio = max(0.18, 1.0 - reserved_ratio)
     bottom_padding = max((price_span + top_padding) * (reserved_ratio / visible_ratio), baseline * 0.12)
     return top_padding, bottom_padding
+
+
+def _axis_y_label_format(min_price: float, max_price: float) -> str:
+    reference_price = max(abs(float(min_price)), abs(float(max_price)))
+    if reference_price < 0.1:
+        return "%.6f"
+    if reference_price < 1.0:
+        return "%.5f"
+    if reference_price < 1_000.0:
+        return "%.4f"
+    return "%.2f"
 
 
 def _full_native_x_range(total_bars: int) -> tuple[float, float]:
@@ -693,9 +721,9 @@ def _next_secondary_layout_button_text(layout_mode: str) -> str:
     return "左右分屏" if normalized == "vertical" else "上下分屏"
 
 
-def _next_secondary_chart_kind_button_text(chart_kind: str) -> str:
+def _next_secondary_chart_kind_button_text(chart_kind: str, volatility_currency: str = "BTC") -> str:
     normalized = str(chart_kind or "").strip().lower()
-    return "BTC波动率" if normalized == "kline" else "副图K线"
+    return f"{volatility_currency}波动率" if normalized == "kline" else "副图K线"
 
 
 def _default_chart_stack_horizontal_sizes(
@@ -4497,12 +4525,14 @@ class SecondaryVolatilityDataLoader(QThread):
         self,
         *,
         request_id: int,
+        currency: str,
         period: str,
         limit: int,
         average_kline: bool,
     ) -> None:
         super().__init__()
         self._request_id = request_id
+        self._currency = currency.strip().upper()
         self._period = period.strip()
         self._limit = limit
         self._average_kline = average_kline
@@ -4547,7 +4577,7 @@ class SecondaryVolatilityDataLoader(QThread):
         cache_synced: bool,
     ) -> KlineChartPayload:
         if not candles:
-            raise ValueError("BTC DVOL 没有可用数据")
+            raise ValueError(f"{self._currency} DVOL 没有可用数据")
 
         chart_candles = [
             {
@@ -4595,10 +4625,10 @@ class SecondaryVolatilityDataLoader(QThread):
 
     def _build_payload(self) -> KlineChartPayload:
         resolution = self._target_resolution()
-        cached_hourly = _load_cached_deribit_hourly_series("BTC")
+        cached_hourly = _load_cached_deribit_hourly_series(self._currency)
         cached_volatility: list[Any] = []
         cached_spot: list[Any] = []
-        spot_inst_id = OKX_SPOT_SYMBOLS["BTC"]
+        spot_inst_id = OKX_SPOT_SYMBOLS[self._currency]
         local_count = 0
         local_preview_emitted = False
 
@@ -4612,7 +4642,7 @@ class SecondaryVolatilityDataLoader(QThread):
                     self._request_id,
                     self._make_payload(
                         candles=cached_candles,
-                        source="Deribit BTC DVOL（本地缓存）",
+                        source=f"Deribit {self._currency} DVOL（本地缓存）",
                         local_count=local_count,
                         remote_added_count=0,
                         cache_synced=False,
@@ -4632,7 +4662,7 @@ class SecondaryVolatilityDataLoader(QThread):
 
         try:
             fetched_volatility = DeribitRestClient().get_volatility_index_candles(
-                "BTC",
+                self._currency,
                 DERIBIT_BASE_HOURLY_RESOLUTION,
                 start_ts=fetch_start_ts,
                 end_ts=now_ms,
@@ -4650,7 +4680,7 @@ class SecondaryVolatilityDataLoader(QThread):
             if local_preview_emitted:
                 return self._make_payload(
                     candles=self._build_resolution_candles(cached_volatility, resolution=resolution),
-                    source="Deribit BTC DVOL（本地缓存）",
+                    source=f"Deribit {self._currency} DVOL（本地缓存）",
                     local_count=local_count,
                     remote_added_count=0,
                     cache_synced=False,
@@ -4669,7 +4699,7 @@ class SecondaryVolatilityDataLoader(QThread):
             remote_added_count = len(hourly_candles)
 
         _save_cached_deribit_hourly_series(
-            "BTC",
+            self._currency,
             spot_inst_id=spot_inst_id,
             volatility_candles=hourly_candles,
             spot_candles=spot_hourly,
@@ -4679,7 +4709,11 @@ class SecondaryVolatilityDataLoader(QThread):
         candles = self._build_resolution_candles(hourly_candles, resolution=resolution)
         return self._make_payload(
             candles=candles,
-            source="Deribit BTC DVOL（本地缓存已刷新）" if cached_hourly is not None else "Deribit BTC DVOL",
+            source=(
+                f"Deribit {self._currency} DVOL（本地缓存已刷新）"
+                if cached_hourly is not None
+                else f"Deribit {self._currency} DVOL"
+            ),
             local_count=local_count,
             remote_added_count=remote_added_count,
             cache_synced=True,
@@ -4987,12 +5021,13 @@ class KlineAnalysisWindow(QMainWindow):
 
         top_row.addSpacing(12)
         top_row.addWidget(QLabel("交易对"))
-        self._symbol_input = QLineEdit("BTC-USDT-SWAP")
-        self._symbol_input.setMinimumWidth(_HEADER_SYMBOL_INPUT_MIN_WIDTH)
-        self._symbol_input.setMaximumWidth(_HEADER_SYMBOL_INPUT_MAX_WIDTH)
-        self._symbol_input.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
-        self._symbol_input.editingFinished.connect(self._on_symbol_confirmed)
-        top_row.addWidget(self._symbol_input, 0)
+        self._symbol_combo = QComboBox()
+        self._symbol_combo.addItems(KLINE_SYMBOL_OPTIONS)
+        self._symbol_combo.setMinimumWidth(_HEADER_SYMBOL_INPUT_MIN_WIDTH)
+        self._symbol_combo.setMaximumWidth(_HEADER_SYMBOL_INPUT_MAX_WIDTH)
+        self._symbol_combo.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
+        self._symbol_combo.currentTextChanged.connect(lambda _symbol: self._on_symbol_confirmed())
+        top_row.addWidget(self._symbol_combo, 0)
 
         top_row.addSpacing(8)
         self._api_profile_label = QLabel("API")
@@ -5655,8 +5690,12 @@ class KlineAnalysisWindow(QMainWindow):
     def _refresh_secondary_chart_kind_button(self) -> None:
         if self._secondary_chart_kind_btn is None:
             return
+        currency = self._current_volatility_currency()
+        if currency is None:
+            self._secondary_chart_kind_btn.setText("暂无波动率")
+            return
         self._secondary_chart_kind_btn.setText(
-            _next_secondary_chart_kind_button_text(self._secondary_chart_kind())
+            _next_secondary_chart_kind_button_text(self._secondary_chart_kind(), currency)
         )
 
     def _refresh_secondary_sync_period_button(self) -> None:
@@ -5689,8 +5728,17 @@ class KlineAnalysisWindow(QMainWindow):
 
     def _secondary_display_symbol(self) -> str:
         if self._secondary_chart_kind() == "volatility":
-            return "BTC DVOL"
-        return self._symbol_input.text().strip().upper()
+            return f"{self._current_volatility_currency() or '-'} DVOL"
+        return self._selected_symbol()
+
+    def _selected_symbol(self) -> str:
+        return self._symbol_combo.currentText().strip().upper()
+
+    def _current_volatility_currency(self) -> str | None:
+        return _volatility_currency_for_symbol(self._selected_symbol())
+
+    def _volatility_available_for_current_symbol(self) -> bool:
+        return self._current_volatility_currency() is not None
 
     def _secondary_chart_venue_label(self) -> str:
         return "DERIBIT" if self._secondary_chart_kind() == "volatility" else "OKX"
@@ -5701,9 +5749,10 @@ class KlineAnalysisWindow(QMainWindow):
         normalized_period = period.strip().upper()
         aggregation_text = "1H直连" if normalized_period == "1H" else f"{normalized_period}本地聚合"
         average_text = "开" if self._secondary_average_kline_enabled() else "关"
-        source_text = str(payload.stats.get("source", "Deribit BTC DVOL") or "Deribit BTC DVOL")
+        currency = self._current_volatility_currency() or "-"
+        source_text = str(payload.stats.get("source", f"Deribit {currency} DVOL") or f"Deribit {currency} DVOL")
         source_text = source_text.replace("（本地聚合）", "")
-        return [f"BTC波动率 | 平均K线 {average_text} | {aggregation_text} | 来源 {source_text}"]
+        return [f"{currency}波动率 | 平均K线 {average_text} | {aggregation_text} | 来源 {source_text}"]
 
     def _sync_chart_range_to_other(self, *, target: str, start_x: float, end_x: float) -> None:
         if self._syncing_chart_range or not self._secondary_chart_check.isChecked() or not self._use_native_chart:
@@ -5773,7 +5822,7 @@ class KlineAnalysisWindow(QMainWindow):
         if self._secondary_layout_cycle_btn is not None:
             self._secondary_layout_cycle_btn.setEnabled(enabled)
         if self._secondary_chart_kind_btn is not None:
-            self._secondary_chart_kind_btn.setEnabled(enabled)
+            self._secondary_chart_kind_btn.setEnabled(enabled and self._volatility_available_for_current_symbol())
         if self._secondary_sync_period_btn is not None:
             self._secondary_sync_period_btn.setEnabled(enabled)
         self._secondary_average_kline_check.setEnabled(True)
@@ -6173,12 +6222,12 @@ class KlineAnalysisWindow(QMainWindow):
             runtime=self._runtime,
             profile_name=self._active_profile_name(),
             environment=self._active_environment(),
-            symbol=self._symbol_input.text().strip().upper(),
+            symbol=self._selected_symbol(),
             refresh_if_visible=refresh_if_visible,
         )
 
     def _instrument_for_symbol(self, symbol: str | None = None) -> object | None:
-        normalized = (symbol or self._symbol_input.text()).strip().upper()
+        normalized = (symbol or self._selected_symbol()).strip().upper()
         if not normalized:
             return None
         if normalized in self._instrument_cache:
@@ -6225,7 +6274,7 @@ class KlineAnalysisWindow(QMainWindow):
         self._load_data()
 
     def _matching_rr_trade_ledger_entries(self, *, symbol: str | None = None) -> list[RRTradeLedgerEntry]:
-        target_symbol = (symbol or self._symbol_input.text()).strip().upper()
+        target_symbol = (symbol or self._selected_symbol()).strip().upper()
         target_profile = self._active_profile_name().strip()
         target_environment = self._active_environment().strip()
         matched: list[RRTradeLedgerEntry] = []
@@ -6277,7 +6326,7 @@ class KlineAnalysisWindow(QMainWindow):
         matched = self._matching_rr_trade_ledger_entries(symbol=symbol)
         profile_name = self._active_profile_name() or "-"
         environment = self._active_environment() or "-"
-        display_symbol = (symbol or self._symbol_input.text()).strip().upper() or "-"
+        display_symbol = (symbol or self._selected_symbol()).strip().upper() or "-"
         self._rr_trade_hint.setText(
             f"RR账本：{profile_name} | {environment} | {display_symbol} | 记录 {len(matched)}"
         )
@@ -6285,7 +6334,7 @@ class KlineAnalysisWindow(QMainWindow):
     def _current_primary_request_key(self) -> tuple[Any, ...]:
         return (
             "primary",
-            self._symbol_input.text().strip().upper(),
+            self._selected_symbol(),
             self._period_combo.currentText().strip().upper(),
             max(50, self._limit_spin.value()),
             bool(self._prefer_local_checkbox.isChecked()),
@@ -6307,6 +6356,7 @@ class KlineAnalysisWindow(QMainWindow):
             return (
                 "secondary",
                 chart_kind,
+                self._current_volatility_currency(),
                 secondary_period,
                 requested_limit,
                 self._secondary_average_kline_enabled(),
@@ -6315,7 +6365,7 @@ class KlineAnalysisWindow(QMainWindow):
         return (
             "secondary",
             chart_kind,
-            (symbol or self._symbol_input.text().strip().upper()),
+            (symbol or self._selected_symbol()),
             secondary_period,
             requested_limit,
             bool(self._prefer_local_checkbox.isChecked()),
@@ -6365,7 +6415,7 @@ class KlineAnalysisWindow(QMainWindow):
 
     @Slot()
     def _load_data(self) -> None:
-        symbol = self._symbol_input.text().strip().upper()
+        symbol = self._selected_symbol()
         period = self._period_combo.currentText()
         _debug_log(f"[kline] _load_data begin | symbol={symbol or '-'} | period={period or '-'}")
         if not symbol:
@@ -6433,8 +6483,15 @@ class KlineAnalysisWindow(QMainWindow):
         self._active_secondary_request_key = self._current_secondary_request_key(symbol=symbol)
         self._preview_cached_secondary_payload(self._active_secondary_request_key)
         if self._secondary_chart_kind() == "volatility":
+            currency = self._current_volatility_currency()
+            if currency is None:
+                self._secondary_chart_kind_mode = "kline"
+                self._update_secondary_controls_state()
+                self._load_secondary_data(symbol=symbol)
+                return
             self._secondary_volatility_loader = SecondaryVolatilityDataLoader(
                 request_id=self._secondary_request_id,
+                currency=currency,
                 period=secondary_period,
                 limit=requested_limit,
                 average_kline=self._secondary_average_kline_enabled(),
@@ -6476,6 +6533,11 @@ class KlineAnalysisWindow(QMainWindow):
 
     @Slot()
     def _on_symbol_confirmed(self) -> None:
+        if not self._volatility_available_for_current_symbol() and self._secondary_chart_kind() == "volatility":
+            self._secondary_chart_kind_mode = "kline"
+            self._secondary_pending_payload = None
+            self._loaded_secondary_request_key = None
+        self._update_secondary_controls_state()
         self._reload_workspace_view()
         self._refresh_rr_trade_hint()
         self._sync_account_drawer_context()
@@ -6668,7 +6730,7 @@ class KlineAnalysisWindow(QMainWindow):
     def _subscribe_realtime_candle(self) -> None:
         if self._pending_payload is None:
             return
-        symbol = self._symbol_input.text().strip().upper()
+        symbol = self._selected_symbol()
         period = self._period_combo.currentText().strip()
         environment = str(getattr(self._runtime, "environment", "demo") or "demo")
         key = CandleStreamKey(symbol, period, environment)
@@ -7341,7 +7403,7 @@ class KlineAnalysisWindow(QMainWindow):
             rr_rules = entry.get("rr", [])
             raw_rr_items = list(rr_rules) if isinstance(rr_rules, list) else []
             workspace_rr_items = [dict(item) for item in raw_rr_items if isinstance(item, dict)]
-            instrument = self._instrument_for_symbol(display_symbol or self._symbol_input.text().strip().upper())
+            instrument = self._instrument_for_symbol(display_symbol or self._selected_symbol())
             price_increment = self._current_rr_price_increment()
             last_candle_time = int(candles[-1]["time"])
             for index, item in enumerate(records):
@@ -7465,7 +7527,7 @@ class KlineAnalysisWindow(QMainWindow):
         axis_y = QValueAxis()
         top_padding, bottom_padding = _compute_axis_y_padding(min_price, max_price)
         axis_y.setRange(min_price - bottom_padding, max_price + top_padding)
-        axis_y.setLabelFormat("%.2f")
+        axis_y.setLabelFormat(_axis_y_label_format(min_price, max_price))
         axis_y.setTickCount(8)
         axis_y.setLabelsColor(QColor(_CHART_AXIS_TEXT_COLOR))
         axis_y.setGridLineColor(QColor(_CHART_GRID_COLOR))
@@ -7477,7 +7539,7 @@ class KlineAnalysisWindow(QMainWindow):
             series.attachAxis(axis_x)
             series.attachAxis(axis_y)
 
-        symbol = (display_symbol or self._symbol_input.text().strip().upper()).strip().upper()
+        symbol = (display_symbol or self._selected_symbol()).strip().upper()
         chart.setTitle("")
         if isinstance(chart_view, InteractiveKlineChartView):
             chart_view.set_chart_context(
@@ -7514,7 +7576,7 @@ class KlineAnalysisWindow(QMainWindow):
             )
 
     def _current_workspace_key(self, *, symbol: str | None = None, period: str | None = None) -> str:
-        resolved_symbol = (symbol or self._symbol_input.text()).strip().upper()
+        resolved_symbol = (symbol or self._selected_symbol()).strip().upper()
         resolved_period = (period or self._period_combo.currentText()).strip()
         return build_workspace_key(resolved_symbol, resolved_period)
 
@@ -7842,7 +7904,7 @@ class KlineAnalysisWindow(QMainWindow):
             parent=self,
             item=item,
             instrument=self._instrument_for_symbol(),
-            symbol=self._symbol_input.text().strip().upper(),
+            symbol=self._selected_symbol(),
             period=self._period_combo.currentText().strip(),
             price_increment=self._current_rr_price_increment(),
         )
@@ -8565,7 +8627,7 @@ class KlineAnalysisWindow(QMainWindow):
             parent=self,
             item=item,
             instrument=instrument,
-            symbol=self._symbol_input.text().strip().upper(),
+            symbol=self._selected_symbol(),
             period=self._period_combo.currentText().strip(),
             price_increment=price_increment,
         )
