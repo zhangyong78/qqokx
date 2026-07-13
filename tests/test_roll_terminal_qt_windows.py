@@ -2565,13 +2565,23 @@ class RollTerminalQtWindowHelperTests(QtWidgetTestCase):
     def test_kline_symbol_options_and_volatility_currency_mapping(self) -> None:
         self.assertEqual(
             KLINE_SYMBOL_OPTIONS,
-            ("BTC-USDT-SWAP", "ETH-USDT-SWAP", "SOL-USDT-SWAP", "DOGE-USDT-SWAP", "ETH-BTC"),
+            (
+                "BTC-USDT-SWAP",
+                "ETH-USDT-SWAP",
+                "SOL-USDT-SWAP",
+                "DOGE-USDT-SWAP",
+                "BNB-USDT-SWAP",
+                "OKB-USDT-SWAP",
+                "ETH-BTC",
+            ),
         )
         self.assertEqual(_volatility_currency_for_symbol("BTC-USDT-SWAP"), "BTC")
         self.assertEqual(_volatility_currency_for_symbol("ETH-USDT-SWAP"), "ETH")
         self.assertEqual(_volatility_currency_for_symbol("ETH-BTC"), "ETH")
         self.assertIsNone(_volatility_currency_for_symbol("SOL-USDT-SWAP"))
         self.assertIsNone(_volatility_currency_for_symbol("DOGE-USDT-SWAP"))
+        self.assertIsNone(_volatility_currency_for_symbol("BNB-USDT-SWAP"))
+        self.assertIsNone(_volatility_currency_for_symbol("OKB-USDT-SWAP"))
 
     def test_kline_symbol_combo_offers_only_configured_symbols(self) -> None:
         window = KlineAnalysisWindow()
