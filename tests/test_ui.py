@@ -9641,6 +9641,28 @@ class StrategyStopCleanupTest(TestCase):
         self.assertTrue(result.needs_manual_review)
         self.assertIn("\u68c0\u6d4b\u5230\u5df2\u6210\u4ea4\u4ed3\u4f4d", result.final_reason)
 
+    def test_perform_stop_session_cleanup_ignores_opposite_direction_position(self) -> None:
+        session = self._make_session()
+        session.config.signal_mode = "long_only"
+        filled_order = self._make_order(session, role="ent", state="filled", filled_size="1")
+        opposite_position = self._make_position()
+        opposite_position.pos_side = "short"
+        initial_snapshot = self._make_snapshot()
+        final_snapshot = self._make_snapshot(order_history=[filled_order], positions=[opposite_position])
+
+        app = SimpleNamespace(
+            _load_strategy_stop_cleanup_snapshot_with_fallback=lambda session_, credentials_: initial_snapshot,
+            _load_strategy_stop_cleanup_snapshot=lambda session_, credentials_, environment: final_snapshot,
+            _cancel_pending_order_request=lambda credentials, *, environment, item: None,
+        )
+
+        result = QuantApp._perform_stop_session_cleanup(app, session, SimpleNamespace())
+
+        self.assertFalse(result.open_position_summaries)
+        self.assertEqual(len(result.ignored_opposite_position_summaries), 1)
+        self.assertFalse(result.needs_manual_review)
+        self.assertEqual(result.final_reason, "用户手动停止")
+
     def test_apply_stop_session_cleanup_result_warns_for_manual_review(self) -> None:
         session = self._make_session()
         log_messages: list[str] = []

@@ -4542,10 +4542,27 @@ class UiStrategySessionsMixin:
             if (item.filled_size or Decimal("0")) > 0 or (item.state or "").strip().lower() in {"filled", "partially_filled"}
         ]
         trade_inst_id = (session.config.trade_inst_id or session.config.inst_id or "").strip().upper()
+        expected_position_sides = _session_expected_position_sides(session)
         open_positions = [
             position
             for position in final_snapshot.positions
-            if position.inst_id.strip().upper() == trade_inst_id and position.position != 0
+            if position.position != 0
+            and _position_matches_session_live_pnl(
+                position,
+                trade_inst_id=trade_inst_id,
+                expected_sides=expected_position_sides,
+            )
+        ]
+        ignored_opposite_positions = [
+            position
+            for position in final_snapshot.positions
+            if position.inst_id.strip().upper() == trade_inst_id
+            and position.position != 0
+            and not _position_matches_session_live_pnl(
+                position,
+                trade_inst_id=trade_inst_id,
+                expected_sides=expected_position_sides,
+            )
         ]
 
         needs_manual_review = bool(cancel_failed_summaries or remaining_cancelable)
@@ -4575,6 +4592,9 @@ class UiStrategySessionsMixin:
             protective_pending_summaries=tuple(_trade_order_cancel_summary(item) for item in protective_pending),
             filled_order_summaries=tuple(_trade_order_fill_summary(item) for item in filled_orders),
             open_position_summaries=tuple(_position_manual_review_summary(item) for item in open_positions),
+            ignored_opposite_position_summaries=tuple(
+                _position_manual_review_summary(item) for item in ignored_opposite_positions
+            ),
             needs_manual_review=needs_manual_review,
             final_reason=final_reason,
         )
@@ -4657,6 +4677,8 @@ class UiStrategySessionsMixin:
             self._log_session_message(session, f"停止清理 | 检测到已成交委托 | {summary}")
         for summary in result.open_position_summaries:
             self._log_session_message(session, f"停止清理 | 检测到仍有仓位 | {summary}")
+        for summary in result.ignored_opposite_position_summaries:
+            self._log_session_message(session, f"停止清理 | 检测到反向仓位，非本策略方向，不处理 | {summary}")
         for summary in result.protective_pending_summaries:
             self._log_session_message(session, f"停止清理 | 检测到保护委托 | {summary}")
         self._log_session_message(session, f"停止流程结束 | 结论={result.final_reason}")

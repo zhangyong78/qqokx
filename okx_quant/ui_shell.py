@@ -1306,6 +1306,7 @@ class StrategyStopCleanupResult:
     protective_pending_summaries: tuple[str, ...] = ()
     filled_order_summaries: tuple[str, ...] = ()
     open_position_summaries: tuple[str, ...] = ()
+    ignored_opposite_position_summaries: tuple[str, ...] = ()
     needs_manual_review: bool = False
     final_reason: str = "用户手动停止"
 
