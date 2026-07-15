@@ -460,6 +460,12 @@ def _to_sma(values: list[float], period: int) -> list[float]:
     return result
 
 
+def _candle_body_pen_width(open_price: float, close_price: float, *, price_span: float) -> int:
+    """Keep near-doji candle bodies visible without changing their OHLC values."""
+    near_doji_threshold = max(abs(float(price_span)) * 0.002, 1e-12)
+    return 2 if abs(float(close_price) - float(open_price)) <= near_doji_threshold else 1
+
+
 def _format_compact_number(value: float) -> str:
     absolute = abs(value)
     if absolute >= 1_000_000_000:
@@ -7462,13 +7468,14 @@ class KlineAnalysisWindow(QMainWindow):
         candle_series.setName("K线")
         candle_series.setIncreasingColor(QColor(_CHART_UP_COLOR))
         candle_series.setDecreasingColor(QColor(_CHART_DOWN_COLOR))
-        candle_series.setBodyOutlineVisible(False)
+        candle_series.setBodyOutlineVisible(True)
         candle_series.setCapsVisible(False)
         if hasattr(candle_series, "setBodyWidth"):
             candle_series.setBodyWidth(0.72)
 
         min_price = min(float(item["low"]) for item in candles)
         max_price = max(float(item["high"]) for item in candles)
+        candle_price_span = max_price - min_price
         overlay_values: list[list[float]] = []
         indicator_series: list[dict[str, Any]] = []
         workspace_lines: list[dict[str, object]] = []
@@ -7485,7 +7492,13 @@ class KlineAnalysisWindow(QMainWindow):
             )
             candle_color = QColor(_CHART_UP_COLOR if float(item["close"]) >= float(item["open"]) else _CHART_DOWN_COLOR)
             candle_pen = QPen(candle_color)
-            candle_pen.setWidth(1)
+            candle_pen.setWidth(
+                _candle_body_pen_width(
+                    float(item["open"]),
+                    float(item["close"]),
+                    price_span=candle_price_span,
+                )
+            )
             candle_set.setPen(candle_pen)
             candle_set.setBrush(candle_color)
             candle_series.append(candle_set)

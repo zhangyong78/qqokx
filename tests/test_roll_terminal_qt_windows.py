@@ -73,6 +73,7 @@ from roll_terminal_qt.kline_analysis_window import (
     _build_rr_overlay_snapshot,
     _extend_history_box_end_index,
     _build_display_times_ms,
+    _candle_body_pen_width,
     _compute_axis_y_padding,
     _axis_y_label_format,
     _compute_hover_overlay_layout,
@@ -110,6 +111,10 @@ from roll_terminal_qt.workspace_shell import LocalTaskCount
 
 
 class RollTerminalQtWindowHelperTests(QtWidgetTestCase):
+
+    def test_near_doji_uses_thicker_body_outline(self) -> None:
+        self.assertEqual(_candle_body_pen_width(64000.0, 64005.0, price_span=3000.0), 2)
+        self.assertEqual(_candle_body_pen_width(64000.0, 64100.0, price_span=3000.0), 1)
 
     def test_disabled_kline_research_layers_are_not_computed_in_loader(self) -> None:
         candles = [
