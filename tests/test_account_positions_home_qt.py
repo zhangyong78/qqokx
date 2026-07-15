@@ -6,6 +6,8 @@ from types import SimpleNamespace
 from unittest import TestCase
 from unittest.mock import MagicMock, patch
 
+from PySide6.QtWidgets import QHeaderView
+
 from roll_terminal_qt.account_positions_home import (
     AccountPositionsHomeWidget,
     LegacyOptionToolsHost,
@@ -15,12 +17,67 @@ from roll_terminal_qt.account_positions_home import (
     _current_order_view_cancel_reference,
     _current_order_view_program_owner_label,
     _current_order_view_to_trade_order_item,
+    _position_display_foreground_colors,
 )
 from okx_quant.okx_client import Instrument, OkxOrderResult
 from okx_quant.position_protection import ProtectionSessionSnapshot
 from roll_terminal_qt.order_service import OrderStatusView
 from roll_terminal_qt.realtime_account_store import AccountRealtimeSnapshot
 from roll_terminal_qt.shared_order_store import SharedOrderSnapshot
+
+
+class PositionDisplayForegroundColorsTest(TestCase):
+    def test_quotes_are_fixed_colors_and_market_value_follows_unrealized_pnl(self) -> None:
+        positive = _position_display_foreground_colors(
+            time_value_text="B 0.0200",
+            intrinsic_value_text="B 0.0100",
+            bid_price_text="B 0.0200",
+            ask_price_text="B 0.0205",
+            mark_price_text="B 0.0202",
+            avg_price_text="B 0.0190",
+            break_even_text="B 0.0192",
+            market_value_text="0.01 BTC",
+            unrealized_pnl=Decimal("0.01"),
+        )
+        negative = _position_display_foreground_colors(
+            time_value_text="B 0.0200",
+            intrinsic_value_text="B 0.0100",
+            bid_price_text="B 0.0200",
+            ask_price_text="B 0.0205",
+            mark_price_text="B 0.0202",
+            avg_price_text="B 0.0190",
+            break_even_text="B 0.0192",
+            market_value_text="-0.01 BTC",
+            unrealized_pnl=Decimal("-0.01"),
+        )
+        zero_or_missing = _position_display_foreground_colors(
+            time_value_text="--",
+            intrinsic_value_text="--",
+            bid_price_text="--",
+            ask_price_text="--",
+            mark_price_text="--",
+            avg_price_text="--",
+            break_even_text="--",
+            market_value_text="--",
+            unrealized_pnl=Decimal("0"),
+        )
+
+        self.assertEqual(positive["time_value"].name(), "#7c3aed")
+        self.assertEqual(positive["intrinsic_value"].name(), "#7c3aed")
+        self.assertEqual(positive["bid_price"].name(), "#d97706")
+        self.assertEqual(positive["ask_price"].name(), "#d97706")
+        self.assertEqual(positive["mark"].name(), "#2563eb")
+        self.assertEqual(positive["avg"].name(), "#2563eb")
+        self.assertEqual(positive["break_even"].name(), "#13803d")
+        self.assertEqual(positive["market_value"].name(), "#13803d")
+        self.assertEqual(negative["break_even"].name(), "#c23b3b")
+        self.assertEqual(negative["market_value"].name(), "#c23b3b")
+        self.assertNotIn("market_value", zero_or_missing)
+        self.assertNotIn("break_even", zero_or_missing)
+        self.assertNotIn("time_value", zero_or_missing)
+        self.assertNotIn("intrinsic_value", zero_or_missing)
+        self.assertNotIn("bid_price", zero_or_missing)
+        self.assertNotIn("ask_price", zero_or_missing)
 
 
 class _ThreadRetireStub:
@@ -426,6 +483,47 @@ class AccountPositionsHomeQtHelpersTest(TestCase):
         )
         app._refresh_order_history_table.assert_called_once_with()
 
+    def test_apply_order_history_payload_skips_identical_cached_data(self) -> None:
+        history_order = SimpleNamespace(inst_id="BTC-USDT-SWAP")
+        shared_order_store = MagicMock()
+        app = SimpleNamespace(
+            _shared_order_store=shared_order_store,
+            _last_profile_name="moni",
+            _runtime=SimpleNamespace(environment="demo"),
+            _order_history_items=[history_order],
+            _order_history_usdt_prices={"USDT": Decimal("1")},
+            _refresh_order_history_table=MagicMock(),
+        )
+
+        AccountPositionsHomeWidget._apply_order_history_payload(
+            app,
+            {
+                "items": [history_order],
+                "usdt_prices": {"USDT": Decimal("1")},
+            },
+        )
+
+        app._refresh_order_history_table.assert_not_called()
+        shared_order_store.publish_history_orders.assert_not_called()
+
+    @patch("roll_terminal_qt.account_positions_home.QTableWidget")
+    def test_build_history_table_uses_interactive_widths_for_non_stretch_columns(
+        self,
+        table_type: MagicMock,
+    ) -> None:
+        table = table_type.return_value
+        header = table.horizontalHeader.return_value
+
+        AccountPositionsHomeWidget._build_history_table(
+            SimpleNamespace(),
+            ("时间", "合约", "订单ID"),
+            stretch_columns={1},
+        )
+
+        header.setSectionResizeMode.assert_any_call(0, QHeaderView.ResizeMode.Interactive)
+        header.setSectionResizeMode.assert_any_call(1, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode.assert_any_call(2, QHeaderView.ResizeMode.Interactive)
+
     def test_apply_shared_order_snapshot_updates_matching_profile_environment(self) -> None:
         current_order = OrderStatusView(
             inst_id="BTC-USDT-SWAP",
@@ -471,6 +569,161 @@ class AccountPositionsHomeQtHelpersTest(TestCase):
         self.assertEqual(app._order_history_usdt_prices, {"USDT": Decimal("1")})
         app._refresh_current_orders_table.assert_called_once_with()
         app._refresh_order_history_table.assert_called_once_with()
+
+    def test_apply_shared_order_snapshot_skips_identical_data(self) -> None:
+        current_order = MagicMock()
+        history_order = MagicMock()
+        app = SimpleNamespace(
+            _last_profile_name="moni",
+            _runtime=SimpleNamespace(environment="demo"),
+            _orders=[current_order],
+            _visible_orders=[current_order],
+            _order_history_items=[history_order],
+            _order_history_usdt_prices={"USDT": Decimal("1")},
+            _refresh_current_orders_table=MagicMock(),
+            _refresh_order_history_table=MagicMock(),
+        )
+
+        AccountPositionsHomeWidget._apply_shared_order_snapshot(
+            app,
+            "moni",
+            "demo",
+            SharedOrderSnapshot(
+                current_order_views=(current_order,),
+                history_orders=(history_order,),
+                history_order_usdt_prices={"USDT": Decimal("1")},
+            ),
+        )
+
+        app._refresh_current_orders_table.assert_not_called()
+        app._refresh_order_history_table.assert_not_called()
+
+    def test_apply_shared_order_snapshot_refreshes_only_changed_history(self) -> None:
+        current_order = MagicMock()
+        old_history_order = MagicMock()
+        new_history_order = MagicMock()
+        app = SimpleNamespace(
+            _last_profile_name="moni",
+            _runtime=SimpleNamespace(environment="demo"),
+            _orders=[current_order],
+            _visible_orders=[current_order],
+            _order_history_items=[old_history_order],
+            _order_history_usdt_prices={},
+            _refresh_current_orders_table=MagicMock(),
+            _refresh_order_history_table=MagicMock(),
+        )
+
+        AccountPositionsHomeWidget._apply_shared_order_snapshot(
+            app,
+            "moni",
+            "demo",
+            SharedOrderSnapshot(
+                current_order_views=(current_order,),
+                history_orders=(new_history_order,),
+            ),
+        )
+
+        app._refresh_current_orders_table.assert_not_called()
+        app._refresh_order_history_table.assert_called_once_with()
+
+    @patch("roll_terminal_qt.account_positions_home._reconcile_current_position_note_records", return_value=True)
+    def test_apply_positions_payload_saves_changed_note_state(self, reconcile_notes: MagicMock) -> None:
+        position = MagicMock()
+        app = SimpleNamespace(
+            _raw_positions=[],
+            _position_instruments={},
+            _position_tickers={},
+            _upl_usdt_prices={},
+            _last_profile_name="moni",
+            _current_notes={},
+            _note_environment=lambda: "demo",
+            _save_position_notes=MagicMock(),
+            _render_positions_tree=MagicMock(),
+        )
+
+        AccountPositionsHomeWidget._apply_positions_payload(
+            app,
+            {
+                "positions": [position],
+                "position_instruments": {},
+                "position_tickers": {},
+                "upl_usdt_prices": {},
+            },
+        )
+
+        reconcile_notes.assert_called_once()
+        app._save_position_notes.assert_called_once_with()
+
+    def test_apply_position_history_payload_inherits_and_saves_notes(self) -> None:
+        history_item = MagicMock()
+        app = SimpleNamespace(
+            _position_history_items=[],
+            _position_history_instruments={},
+            _position_history_usdt_prices={},
+            _last_profile_name="moni",
+            _current_notes={},
+            _history_notes={},
+            _note_environment=lambda: "demo",
+            _save_position_notes=MagicMock(),
+            _render_position_history_table=MagicMock(),
+        )
+        with (
+            patch(
+                "roll_terminal_qt.account_positions_home._inherit_position_history_notes",
+                create=True,
+                return_value=True,
+            ) as inherit_notes,
+            patch(
+                "roll_terminal_qt.account_positions_home._prune_closed_current_position_notes",
+                create=True,
+                return_value=False,
+            ),
+            patch("roll_terminal_qt.account_positions_home.time.strftime", return_value="12:00:00"),
+        ):
+            AccountPositionsHomeWidget._apply_position_history_payload(
+                app,
+                {"items": [history_item], "instruments": {}, "usdt_prices": {}},
+            )
+
+        inherit_notes.assert_called_once()
+        app._save_position_notes.assert_called_once_with()
+
+    @patch("roll_terminal_qt.account_positions_home.OrderHistoryFeedThread")
+    def test_force_order_history_refresh_reuses_running_thread_without_waiting(
+        self,
+        thread_type: MagicMock,
+    ) -> None:
+        running_thread = SimpleNamespace(isRunning=lambda: True)
+        app = SimpleNamespace(
+            _runtime=SimpleNamespace(),
+            _order_history_feed=running_thread,
+            _stop_order_history_thread=MagicMock(),
+            _clear_order_history_thread=MagicMock(),
+            _private_thread_generation=1,
+        )
+
+        AccountPositionsHomeWidget._start_order_history_refresh(app, force_restart=True)
+
+        app._stop_order_history_thread.assert_not_called()
+        thread_type.assert_not_called()
+
+    @patch("roll_terminal_qt.account_positions_home.OrderHistoryFeedThread")
+    def test_start_order_history_refresh_uses_shared_store(self, thread_type: MagicMock) -> None:
+        store = MagicMock()
+        runtime = SimpleNamespace(environment="demo")
+        app = SimpleNamespace(
+            _runtime=runtime,
+            _last_profile_name="moni",
+            _shared_order_store=store,
+            _order_history_feed=None,
+            _private_thread_generation=1,
+            _clear_order_history_thread=MagicMock(),
+        )
+
+        AccountPositionsHomeWidget._start_order_history_refresh(app)
+
+        store.request_refresh.assert_called_once_with(runtime=runtime, profile_name="moni")
+        thread_type.assert_not_called()
 
     @patch("roll_terminal_qt.account_positions_home._validate_protection_live_price_availability")
     def test_start_selected_position_protection_sets_runtime_notifier(self, validate_live_price: MagicMock) -> None:

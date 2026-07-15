@@ -18,10 +18,63 @@ from okx_quant.ui_shell import (
     _collapse_position_history_records,
     _infer_fill_history_pnl_currency,
     _infer_position_history_pnl_currency,
+    _fill_item_from_cache,
     _merge_history_cache_records,
+    _order_item_from_cache,
     _position_history_item_from_cache,
     _serialize_history_item,
 )
+
+
+_ORDER_HISTORY_DEDUP_FIELDS = (
+    "source_kind", "order_id", "algo_id", "client_order_id",
+    "algo_client_order_id", "inst_id", "created_time",
+)
+_FILL_HISTORY_DEDUP_FIELDS = (
+    "trade_id", "order_id", "inst_id", "fill_time", "side", "fill_size", "fill_price",
+)
+
+
+def load_cached_order_history(profile_name: str, environment: str, limit: int) -> list[OkxTradeOrderItem]:
+    records = load_history_cache_records("orders", profile_name, environment)
+    items = [item for record in records if (item := _order_item_from_cache(record)) is not None]
+    items.sort(key=lambda item: item.update_time or item.created_time or 0, reverse=True)
+    return items[:limit]
+
+
+def merge_order_history_cache(
+    *, profile_name: str, environment: str, remote_items: list[OkxTradeOrderItem], limit: int,
+) -> list[OkxTradeOrderItem]:
+    records = _merge_history_cache_records(
+        local_records=load_history_cache_records("orders", profile_name, environment),
+        remote_records=[_serialize_history_item(item) for item in remote_items],
+        dedup_fields=_ORDER_HISTORY_DEDUP_FIELDS,
+    )
+    save_history_cache_records("orders", profile_name, environment, records)
+    items = [item for record in records if (item := _order_item_from_cache(record)) is not None]
+    items.sort(key=lambda item: item.update_time or item.created_time or 0, reverse=True)
+    return items[:limit]
+
+
+def _load_cached_fill_history(profile_name: str, environment: str, limit: int) -> list[OkxFillHistoryItem]:
+    records = load_history_cache_records("fills", profile_name, environment)
+    items = [item for record in records if (item := _fill_item_from_cache(record)) is not None]
+    items.sort(key=lambda item: item.fill_time or 0, reverse=True)
+    return items[:limit]
+
+
+def _merge_fill_history_cache(
+    *, profile_name: str, environment: str, remote_items: list[OkxFillHistoryItem], limit: int,
+) -> list[OkxFillHistoryItem]:
+    records = _merge_history_cache_records(
+        local_records=load_history_cache_records("fills", profile_name, environment),
+        remote_records=[_serialize_history_item(item) for item in remote_items],
+        dedup_fields=_FILL_HISTORY_DEDUP_FIELDS,
+    )
+    save_history_cache_records("fills", profile_name, environment, records)
+    items = [item for record in records if (item := _fill_item_from_cache(record)) is not None]
+    items.sort(key=lambda item: item.fill_time or 0, reverse=True)
+    return items[:limit]
 
 
 class PositionHistoryFeedThread(QThread):
@@ -44,6 +97,10 @@ class PositionHistoryFeedThread(QThread):
             return
         profile_name = str(getattr(self._runtime, "credential_profile_name", "") or "").strip()
         environment = str(getattr(self._runtime, "environment", "") or "").strip()
+        cached_items = self._load_local_position_history(profile_name=profile_name, environment=environment)
+        if cached_items and self._running:
+            self.data_ready.emit({"items": cached_items, "instruments": {}, "usdt_prices": {}})
+            self.status_changed.emit(f"历史仓位 {len(cached_items)} 条 | 本地缓存")
         try:
             remote_items = self._client.get_positions_history(
                 self._runtime.credentials,
@@ -68,20 +125,8 @@ class PositionHistoryFeedThread(QThread):
             )
             self.status_changed.emit(f"历史仓位 {len(items)} 条")
         except Exception as exc:
-            items = self._load_local_position_history(profile_name=profile_name, environment=environment)
-            if items:
-                if not self._running:
-                    return
-                instruments = self._build_instrument_map(items)
-                usdt_prices = self._build_usdt_prices(items)
-                self.data_ready.emit(
-                    {
-                        "items": items,
-                        "instruments": instruments,
-                        "usdt_prices": usdt_prices,
-                    }
-                )
-                self.status_changed.emit(f"历史仓位 {len(items)} 条 | 本地缓存")
+            if cached_items:
+                self.status_changed.emit(f"历史仓位 {len(cached_items)} 条 | 本地缓存（后台同步失败：{exc}）")
                 return
             self.status_changed.emit(f"历史仓位读取异常：{exc}")
 
@@ -160,14 +205,27 @@ class OrderHistoryFeedThread(QThread):
         if self._runtime is None:
             self.status_changed.emit("历史委托不可用")
             return
+        profile_name = str(getattr(self._runtime, "credential_profile_name", "") or "").strip()
+        environment = str(getattr(self._runtime, "environment", "") or "").strip()
+        cached_items = load_cached_order_history(profile_name, environment, self._limit)
+        if cached_items and self._running:
+            self.data_ready.emit({"items": cached_items, "usdt_prices": {}})
+            self.status_changed.emit(f"历史委托 {len(cached_items)} 条 | 本地缓存")
         try:
-            items = self._client.get_order_history(
+            remote_items = self._client.get_order_history(
                 self._runtime.credentials,
-                environment=self._runtime.environment,
+                environment=environment,
                 limit=self._limit,
+                include_algo=True,
             )
             if not self._running:
                 return
+            items = merge_order_history_cache(
+                profile_name=profile_name,
+                environment=environment,
+                remote_items=remote_items,
+                limit=self._limit,
+            )
             self.data_ready.emit(
                 {
                     "items": items,
@@ -176,6 +234,9 @@ class OrderHistoryFeedThread(QThread):
             )
             self.status_changed.emit(f"历史委托 {len(items)} 条")
         except Exception as exc:
+            if cached_items:
+                self.status_changed.emit(f"历史委托 {len(cached_items)} 条 | 本地缓存（后台同步失败：{exc}）")
+                return
             self.status_changed.emit(f"历史委托读取异常：{exc}")
 
     def _build_order_usdt_prices(self, items: list[OkxTradeOrderItem]) -> dict[str, Decimal]:
@@ -205,14 +266,26 @@ class FillHistoryFeedThread(QThread):
         if self._runtime is None:
             self.status_changed.emit("历史成交不可用")
             return
+        profile_name = str(getattr(self._runtime, "credential_profile_name", "") or "").strip()
+        environment = str(getattr(self._runtime, "environment", "") or "").strip()
+        cached_items = _load_cached_fill_history(profile_name, environment, self._limit)
+        if cached_items and self._running:
+            self.data_ready.emit({"items": cached_items, "instruments": {}, "usdt_prices": {}})
+            self.status_changed.emit(f"历史成交 {len(cached_items)} 条 | 本地缓存")
         try:
-            items = self._client.get_fills_history(
+            remote_items = self._client.get_fills_history(
                 self._runtime.credentials,
-                environment=self._runtime.environment,
+                environment=environment,
                 limit=self._limit,
             )
             if not self._running:
                 return
+            items = _merge_fill_history_cache(
+                profile_name=profile_name,
+                environment=environment,
+                remote_items=remote_items,
+                limit=self._limit,
+            )
             self.data_ready.emit(
                 {
                     "items": items,
@@ -222,6 +295,9 @@ class FillHistoryFeedThread(QThread):
             )
             self.status_changed.emit(f"历史成交 {len(items)} 条")
         except Exception as exc:
+            if cached_items:
+                self.status_changed.emit(f"历史成交 {len(cached_items)} 条 | 本地缓存（后台同步失败：{exc}）")
+                return
             self.status_changed.emit(f"历史成交读取异常：{exc}")
 
     def _build_instrument_map(self, items: list[OkxFillHistoryItem]) -> dict[str, Instrument]:

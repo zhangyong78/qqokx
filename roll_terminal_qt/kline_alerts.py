@@ -12,6 +12,7 @@ from roll_terminal_qt.kline_box_rules import AUTO_BOX_MAX_CANDIDATES, is_auto_bo
 _LINE_KINDS = {"horizontal", "trend"}
 _LINE_TRIGGERS = {"cross_above", "cross_below", "touch"}
 _LINE_ACTIONS = {"notify", "long", "short"}
+_LINE_EMAIL_DELIVERY_MODES = {"once", "repeat"}
 _LINE_TRADE_MANAGEMENT_MODES = {"fixed_tp", "trail_after_1r", "trail_after_2r", "trail_after_3r"}
 _LINE_TRADE_ENTRY_MODES = {"limit", "market", "chase_best_quote"}
 _EVENT_LIMIT = 120
@@ -157,6 +158,9 @@ def make_line_rule(
     management_mode: str = "fixed_tp",
     entry_execution_mode: str = "limit",
     fee_offset_enabled: bool = False,
+    email_enabled: bool = False,
+    email_delivery_mode: str = "once",
+    email_sent_once: bool = False,
 ) -> dict[str, object]:
     return _normalize_line_rule(
         {
@@ -178,6 +182,9 @@ def make_line_rule(
             "management_mode": management_mode,
             "entry_execution_mode": entry_execution_mode,
             "fee_offset_enabled": fee_offset_enabled,
+            "email_enabled": email_enabled,
+            "email_delivery_mode": email_delivery_mode,
+            "email_sent_once": email_sent_once,
         }
     )
 
@@ -322,6 +329,13 @@ def _normalize_line_rule(item: object) -> dict[str, object]:
         "management_mode": _safe_choice(raw.get("management_mode"), _LINE_TRADE_MANAGEMENT_MODES, default="fixed_tp"),
         "entry_execution_mode": _safe_choice(raw.get("entry_execution_mode"), _LINE_TRADE_ENTRY_MODES, default="limit"),
         "fee_offset_enabled": _safe_bool(raw.get("fee_offset_enabled"), default=False),
+        "email_enabled": _safe_bool(raw.get("email_enabled"), default=False),
+        "email_delivery_mode": _safe_choice(
+            raw.get("email_delivery_mode"),
+            _LINE_EMAIL_DELIVERY_MODES,
+            default="once",
+        ),
+        "email_sent_once": _safe_bool(raw.get("email_sent_once"), default=False),
         "triggered": _safe_bool(raw.get("triggered"), default=False),
         "last_event_candle_time": _safe_int(raw.get("last_event_candle_time")),
         "color": _safe_text(raw.get("color")) or "#1d4ed8",

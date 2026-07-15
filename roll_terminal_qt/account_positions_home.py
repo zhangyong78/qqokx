@@ -144,6 +144,8 @@ from okx_quant.ui_shell import (
     _position_tree_row_id,
     _position_unrealized_pnl_usdt,
     _reconcile_current_position_note_records,
+    _inherit_position_history_notes,
+    _prune_closed_current_position_notes,
     _format_protection_order_mode_label,
     _format_protection_order_price_detail,
     _format_protection_trigger_price_type,
@@ -412,6 +414,52 @@ POSITION_COLUMNS: tuple[tuple[str, str, int, Qt.AlignmentFlag], ...] = (
     ("theta_usdt", "Theta≈USDT", 108, Qt.AlignmentFlag.AlignRight),
     ("note", "备注", 200, Qt.AlignmentFlag.AlignLeft),
 )
+
+_POSITION_TREE_COLUMN_INDEX = {
+    column_id: index for index, (column_id, _heading, _width, _alignment) in enumerate(POSITION_COLUMNS, start=1)
+}
+_POSITION_POSITIVE_COLOR = "#13803d"
+_POSITION_NEGATIVE_COLOR = "#c23b3b"
+_POSITION_TIME_INTRINSIC_COLOR = "#7c3aed"
+_POSITION_BID_ASK_COLOR = "#d97706"
+_POSITION_MARK_AVG_COLOR = "#2563eb"
+
+
+def _position_display_foreground_colors(
+    *,
+    time_value_text: str,
+    intrinsic_value_text: str,
+    bid_price_text: str,
+    ask_price_text: str,
+    mark_price_text: str,
+    avg_price_text: str,
+    break_even_text: str,
+    market_value_text: str,
+    unrealized_pnl: Decimal | None,
+) -> dict[str, QColor]:
+    colors: dict[str, QColor] = {}
+    for column_id, text, color in (
+        ("time_value", time_value_text, _POSITION_TIME_INTRINSIC_COLOR),
+        ("intrinsic_value", intrinsic_value_text, _POSITION_TIME_INTRINSIC_COLOR),
+        ("bid_price", bid_price_text, _POSITION_BID_ASK_COLOR),
+        ("ask_price", ask_price_text, _POSITION_BID_ASK_COLOR),
+        ("mark", mark_price_text, _POSITION_MARK_AVG_COLOR),
+        ("avg", avg_price_text, _POSITION_MARK_AVG_COLOR),
+    ):
+        if text.strip() not in {"", "-", "--"}:
+            colors[column_id] = QColor(color)
+    if unrealized_pnl is not None:
+        if unrealized_pnl > 0:
+            pnl_color = QColor(_POSITION_POSITIVE_COLOR)
+        elif unrealized_pnl < 0:
+            pnl_color = QColor(_POSITION_NEGATIVE_COLOR)
+        else:
+            pnl_color = None
+        if pnl_color is not None and market_value_text.strip() not in {"", "-", "--"}:
+            colors["market_value"] = pnl_color
+        if pnl_color is not None and break_even_text.strip() not in {"", "-", "--"}:
+            colors["break_even"] = pnl_color
+    return colors
 
 
 def _position_is_short(position: object) -> bool:
@@ -2005,10 +2053,17 @@ class AccountPositionsHomeWidget(QWidget):
     def _start_order_history_refresh(self, *, force_restart: bool = False) -> None:
         if self._runtime is None:
             return
-        if force_restart:
-            self._stop_order_history_thread()
-        elif self._order_history_feed is not None and self._order_history_feed.isRunning():
+        shared_order_store = getattr(self, "_shared_order_store", None)
+        if shared_order_store is not None:
+            shared_order_store.request_refresh(
+                runtime=self._runtime,
+                profile_name=str(getattr(self, "_last_profile_name", "") or "").strip(),
+            )
             return
+        if self._order_history_feed is not None and self._order_history_feed.isRunning():
+            return
+        if self._order_history_feed is not None:
+            self._stop_order_history_thread(wait_ms=0)
         generation = self._private_thread_generation
         self._order_history_feed = OrderHistoryFeedThread(self._runtime, limit=200)
         self._order_history_feed.data_ready.connect(
@@ -2029,10 +2084,10 @@ class AccountPositionsHomeWidget(QWidget):
     def _start_fill_history_refresh(self, *, force_restart: bool = False) -> None:
         if self._runtime is None:
             return
-        if force_restart:
-            self._stop_fill_history_thread()
-        elif self._fill_history_feed is not None and self._fill_history_feed.isRunning():
+        if self._fill_history_feed is not None and self._fill_history_feed.isRunning():
             return
+        if self._fill_history_feed is not None:
+            self._stop_fill_history_thread(wait_ms=0)
         generation = self._private_thread_generation
         self._fill_history_feed = FillHistoryFeedThread(self._runtime, limit=self._fill_history_fetch_limit)
         self._fill_history_feed.data_ready.connect(
@@ -2053,10 +2108,10 @@ class AccountPositionsHomeWidget(QWidget):
     def _start_position_history_refresh(self, *, force_restart: bool = False) -> None:
         if self._runtime is None:
             return
-        if force_restart:
-            self._stop_position_history_thread()
-        elif self._position_history_feed is not None and self._position_history_feed.isRunning():
+        if self._position_history_feed is not None and self._position_history_feed.isRunning():
             return
+        if self._position_history_feed is not None:
+            self._stop_position_history_thread(wait_ms=0)
         generation = self._private_thread_generation
         self._position_history_feed = PositionHistoryFeedThread(self._runtime, limit=self._position_history_fetch_limit)
         self._position_history_feed.data_ready.connect(
@@ -3864,6 +3919,18 @@ class AccountPositionsHomeWidget(QWidget):
         if pnl_color is not None:
             for index in (18, 19, 20, 21):
                 item.setForeground(index, pnl_color)
+        for column_id, color in _position_display_foreground_colors(
+            time_value_text=values[2],
+            intrinsic_value_text=values[4],
+            bid_price_text=values[6],
+            ask_price_text=values[8],
+            mark_price_text=values[10],
+            avg_price_text=values[12],
+            break_even_text=values[15],
+            market_value_text=values[22],
+            unrealized_pnl=position.unrealized_pnl,
+        ).items():
+            item.setForeground(_POSITION_TREE_COLUMN_INDEX[column_id], color)
         if str(position.mgn_mode or "").strip().lower() == "cross":
             for index in range(0, self._position_tree.columnCount()):
                 item.setBackground(index, QColor("#f4f8ff"))
@@ -4483,8 +4550,9 @@ class AccountPositionsHomeWidget(QWidget):
         next_instruments = dict(instruments) if isinstance(instruments, dict) else {}
         next_tickers = dict(tickers) if isinstance(tickers, dict) else {}
         next_prices = dict(prices) if isinstance(prices, dict) else {}
+        positions_changed = next_positions != self._raw_positions
         if (
-            next_positions == self._raw_positions
+            not positions_changed
             and next_instruments == self._position_instruments
             and next_tickers == self._position_tickers
             and next_prices == self._upl_usdt_prices
@@ -4494,14 +4562,16 @@ class AccountPositionsHomeWidget(QWidget):
         self._position_instruments = next_instruments
         self._position_tickers = next_tickers
         self._upl_usdt_prices = next_prices
-        if self._last_profile_name:
-            _reconcile_current_position_note_records(
+        if self._last_profile_name and positions_changed:
+            notes_changed = _reconcile_current_position_note_records(
                 self._current_notes,
                 profile_name=self._last_profile_name,
                 environment=self._note_environment(),
                 positions=self._raw_positions,
                 now_ms=int(time.time() * 1000),
             )
+            if notes_changed:
+                self._save_position_notes()
         self._render_positions_tree()
 
     @Slot(object)
@@ -4890,7 +4960,7 @@ class AccountPositionsHomeWidget(QWidget):
         for index in range(len(headings)):
             header.setSectionResizeMode(
                 index,
-                QHeaderView.ResizeMode.Stretch if index in stretch_columns else QHeaderView.ResizeMode.ResizeToContents,
+                QHeaderView.ResizeMode.Stretch if index in stretch_columns else QHeaderView.ResizeMode.Interactive,
             )
         return table
 
@@ -5673,9 +5743,18 @@ class AccountPositionsHomeWidget(QWidget):
         items = payload.get("items")
         instruments = payload.get("instruments")
         prices = payload.get("usdt_prices")
-        self._fill_history_items = list(items) if isinstance(items, list) else []
-        self._fill_history_instruments = dict(instruments) if isinstance(instruments, dict) else {}
-        self._fill_history_usdt_prices = dict(prices) if isinstance(prices, dict) else {}
+        next_items = list(items) if isinstance(items, list) else []
+        next_instruments = dict(instruments) if isinstance(instruments, dict) else {}
+        next_prices = dict(prices) if isinstance(prices, dict) else {}
+        if (
+            next_items == self._fill_history_items
+            and next_instruments == self._fill_history_instruments
+            and next_prices == self._fill_history_usdt_prices
+        ):
+            return
+        self._fill_history_items = next_items
+        self._fill_history_instruments = next_instruments
+        self._fill_history_usdt_prices = next_prices
         self._refresh_fill_history_table()
 
     @Slot(object)
@@ -5685,9 +5764,38 @@ class AccountPositionsHomeWidget(QWidget):
         items = payload.get("items")
         instruments = payload.get("instruments")
         usdt_prices = payload.get("usdt_prices")
-        self._position_history_items = list(items) if isinstance(items, list) else []
-        self._position_history_instruments = dict(instruments) if isinstance(instruments, dict) else {}
-        self._position_history_usdt_prices = dict(usdt_prices) if isinstance(usdt_prices, dict) else {}
+        next_items = list(items) if isinstance(items, list) else []
+        next_instruments = dict(instruments) if isinstance(instruments, dict) else {}
+        next_prices = dict(usdt_prices) if isinstance(usdt_prices, dict) else {}
+        notes_changed = False
+        if self._last_profile_name:
+            now_ms = int(time.time() * 1000)
+            notes_changed = _inherit_position_history_notes(
+                self._current_notes,
+                self._history_notes,
+                profile_name=self._last_profile_name,
+                environment=self._note_environment(),
+                position_history=next_items,
+                now_ms=now_ms,
+            )
+            notes_changed = _prune_closed_current_position_notes(
+                self._current_notes,
+                self._history_notes,
+                profile_name=self._last_profile_name,
+                environment=self._note_environment(),
+            ) or notes_changed
+            if notes_changed:
+                self._save_position_notes()
+        if (
+            not notes_changed
+            and next_items == self._position_history_items
+            and next_instruments == self._position_history_instruments
+            and next_prices == self._position_history_usdt_prices
+        ):
+            return
+        self._position_history_items = next_items
+        self._position_history_instruments = next_instruments
+        self._position_history_usdt_prices = next_prices
         self._position_history_last_sync_text = time.strftime("%H:%M:%S")
         self._render_position_history_table()
 
@@ -5805,9 +5913,18 @@ _ACCOUNT_POSITIONS_HOME_ORIGINAL_APPLY_ORDER_HISTORY_PAYLOAD = AccountPositionsH
 
 
 def _account_positions_home_shared_init(self: AccountPositionsHomeWidget, parent: QWidget | None = None) -> None:
-    _ACCOUNT_POSITIONS_HOME_ORIGINAL_INIT(self, parent)
     self._shared_order_store = get_shared_order_store()
+    _ACCOUNT_POSITIONS_HOME_ORIGINAL_INIT(self, parent)
     self._shared_order_store.snapshot_changed.connect(self._apply_shared_order_snapshot)
+    runtime = getattr(self, "_runtime", None)
+    profile_name = str(getattr(self, "_last_profile_name", "") or "").strip()
+    environment = str(getattr(runtime, "environment", "") or "").strip()
+    if profile_name:
+        self._apply_shared_order_snapshot(
+            profile_name,
+            environment,
+            self._shared_order_store.snapshot_for(profile_name=profile_name, environment=environment),
+        )
 
 
 def _account_positions_home_apply_orders(self: AccountPositionsHomeWidget, orders: object) -> None:
@@ -5826,6 +5943,17 @@ def _account_positions_home_apply_orders(self: AccountPositionsHomeWidget, order
 
 
 def _account_positions_home_apply_order_history_payload(self: AccountPositionsHomeWidget, payload: object) -> None:
+    if not isinstance(payload, dict):
+        return
+    items = payload.get("items")
+    prices = payload.get("usdt_prices")
+    next_items = list(items) if isinstance(items, list) else []
+    next_prices = dict(prices) if isinstance(prices, dict) else {}
+    if (
+        next_items == list(getattr(self, "_order_history_items", []))
+        and next_prices == dict(getattr(self, "_order_history_usdt_prices", {}))
+    ):
+        return
     _ACCOUNT_POSITIONS_HOME_ORIGINAL_APPLY_ORDER_HISTORY_PAYLOAD(self, payload)
     shared_order_store = getattr(self, "_shared_order_store", None)
     runtime = getattr(self, "_runtime", None)
@@ -5854,20 +5982,25 @@ def _account_positions_home_apply_shared_order_snapshot(
         return
     if not isinstance(snapshot, SharedOrderSnapshot):
         return
-    self._orders = list(snapshot.current_order_views)
-    self._visible_orders = list(self._orders)
-    self._order_history_items = list(snapshot.history_orders)
-    self._order_history_usdt_prices = dict(snapshot.history_order_usdt_prices)
-    self._refresh_current_orders_table()
-    self._refresh_order_history_table()
+    next_orders = list(snapshot.current_order_views)
+    next_history_orders = list(snapshot.history_orders)
+    next_history_prices = dict(snapshot.history_order_usdt_prices)
+    current_changed = next_orders != list(getattr(self, "_orders", []))
+    history_changed = (
+        next_history_orders != list(getattr(self, "_order_history_items", []))
+        or next_history_prices != dict(getattr(self, "_order_history_usdt_prices", {}))
+    )
+    if current_changed:
+        self._orders = next_orders
+        self._visible_orders = list(next_orders)
+        self._refresh_current_orders_table()
+    if history_changed:
+        self._order_history_items = next_history_orders
+        self._order_history_usdt_prices = next_history_prices
+        self._refresh_order_history_table()
 
 
 AccountPositionsHomeWidget.__init__ = _account_positions_home_shared_init
 AccountPositionsHomeWidget._apply_orders = _account_positions_home_apply_orders
 AccountPositionsHomeWidget._apply_order_history_payload = _account_positions_home_apply_order_history_payload
 AccountPositionsHomeWidget._apply_shared_order_snapshot = _account_positions_home_apply_shared_order_snapshot
-
-
-
-
-

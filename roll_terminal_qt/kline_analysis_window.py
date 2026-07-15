@@ -3,6 +3,7 @@
 import json
 import math
 import os
+import re
 import sys
 import time
 from dataclasses import dataclass, field, replace
@@ -61,7 +62,8 @@ from okx_quant.analysis import ChannelDetectionConfig
 from okx_quant.analysis.box_detector import BoxDetectionConfig, detect_boxes
 from okx_quant.strategy_live_chart import build_auto_channel_live_chart_snapshot
 from okx_quant.deribit_client import DeribitRestClient, DeribitVolatilityCandle
-from okx_quant.models import Candle
+from okx_quant.models import Candle, EmailNotificationConfig
+from okx_quant.notifications import EmailNotifier
 from okx_quant.okx_candle_ws import CandleStreamKey
 from okx_quant.deribit_volatility_ui import (
     DERIBIT_BASE_HOURLY_RESOLUTION,
@@ -84,6 +86,7 @@ from okx_quant.persistence import (
     deribit_volatility_cache_file_path,
     load_kline_analysis_workspace_entries,
     load_kline_rr_trade_ledger_snapshot,
+    load_notification_snapshot,
     save_kline_analysis_workspace_entries,
     save_kline_rr_trade_ledger_snapshot,
 )
@@ -148,6 +151,85 @@ _CHART_EMA15_COLOR = "#ff4d6d"
 _CHART_SMA50_COLOR = "#58c66d"
 _CHART_CROSSHAIR_COLOR = "#6b7280"
 _REPLAY_SIGNAL_NEAR_MA_MAX_PCT = 0.006
+
+
+def _build_kline_line_email_notifier() -> EmailNotifier | None:
+    snapshot = load_notification_snapshot()
+    recipients = tuple(
+        item.strip()
+        for item in re.split(r"[,\n;]+", str(snapshot.get("recipient_emails", "")))
+        if item.strip()
+    )
+    notifier = EmailNotifier(
+        EmailNotificationConfig(
+            enabled=bool(snapshot.get("enabled", False)),
+            smtp_host=str(snapshot.get("smtp_host", "")),
+            smtp_port=int(snapshot.get("smtp_port", 465)),
+            smtp_username=str(snapshot.get("smtp_username", "")),
+            smtp_password=str(snapshot.get("smtp_password", "")),
+            sender_email=str(snapshot.get("sender_email", "")),
+            recipient_emails=recipients,
+            use_ssl=bool(snapshot.get("use_ssl", True)),
+            notify_trade_fills=bool(snapshot.get("notify_trade_fills", True)),
+            notify_signals=bool(snapshot.get("notify_signals", True)),
+            notify_errors=bool(snapshot.get("notify_errors", True)),
+        )
+    )
+    return notifier if notifier.signal_notifications_enabled else None
+
+
+def _deliver_line_alert_emails(
+    *,
+    workspace_entry: dict[str, object],
+    events: list[dict[str, object]],
+    symbol: str,
+    period: str,
+    notifier: EmailNotifier | None,
+) -> int:
+    if notifier is None or not notifier.signal_notifications_enabled:
+        return 0
+    lines = workspace_entry.get("lines")
+    if not isinstance(lines, list):
+        return 0
+    lines_by_id = {
+        str(line.get("id", "") or "").strip(): line
+        for line in lines
+        if isinstance(line, dict) and str(line.get("id", "") or "").strip()
+    }
+    sent_count = 0
+    for event in events:
+        if str(event.get("kind", "") or "") != "line_alert":
+            continue
+        if str(event.get("trade_action", "") or "").strip().lower() != "notify":
+            continue
+        line = lines_by_id.get(str(event.get("line_id", "") or "").strip())
+        if not isinstance(line, dict) or not bool(line.get("email_enabled", False)):
+            continue
+        delivery_mode = str(line.get("email_delivery_mode", "once") or "once").strip().lower()
+        if delivery_mode == "once" and bool(line.get("email_sent_once", False)):
+            continue
+        label = str(line.get("label", "画线预警") or "画线预警").strip()
+        trigger = _line_trigger_text(str(line.get("trigger", "") or ""))
+        direction = _line_trigger_text(str(event.get("direction", "") or ""))
+        candle_time = int(event.get("candle_time", 0) or 0)
+        candle_label = _format_bar_time(candle_time) if candle_time > 0 else "-"
+        subject = f"[QQOKX] K线画线提醒 | {symbol} | {period} | {label}"
+        body = "\n".join(
+            (
+                f"交易对：{symbol}",
+                f"周期：{period}",
+                f"线条：{label}",
+                f"预警条件：{trigger}",
+                f"触发方向：{direction}",
+                f"K线时间：{candle_label}",
+                f"事件：{str(event.get('message', '') or '').strip()}",
+            )
+        )
+        notifier.notify_async(subject, body)
+        sent_count += 1
+        if delivery_mode == "once":
+            line["email_sent_once"] = True
+    return sent_count
 _REPLAY_SIGNAL_LONG_COLOR = "#38bdf8"
 _REPLAY_SIGNAL_SHORT_COLOR = "#f97316"
 _PRIMARY_PERIOD_BUTTON_WIDTH = 48
@@ -833,6 +915,15 @@ def _format_rr_table_price(value: object, increment: Decimal | None = None) -> s
     if magnitude >= Decimal("1"):
         return format_decimal(Decimal(format_decimal_fixed(parsed, 4)))
     return format_decimal(Decimal(format_decimal_fixed(parsed, 6)))
+
+
+def _line_price_table_text(line: dict[str, object], increment: Decimal | None = None) -> str:
+    price_a = _format_rr_table_price(line.get("price_a", ""), increment) or "-"
+    kind = str(line.get("kind", "horizontal") or "horizontal").strip().lower()
+    if kind != "trend":
+        return price_a
+    price_b = _format_rr_table_price(line.get("price_b", ""), increment) or "-"
+    return f"{price_a} → {price_b}"
 
 
 def _parse_rr_optional_decimal(value: object) -> Decimal | None:
@@ -5417,6 +5508,20 @@ class KlineAnalysisWindow(QMainWindow):
         self._line_label_edit.setPlaceholderText("线条名称")
         control_layout.addWidget(self._line_label_edit)
 
+        line_price_row = QHBoxLayout()
+        self._line_price_a_label = QLabel("价格")
+        line_price_row.addWidget(self._line_price_a_label)
+        self._line_price_a_edit = QLineEdit()
+        self._line_price_a_edit.setPlaceholderText("价格")
+        line_price_row.addWidget(self._line_price_a_edit, 1)
+        self._line_price_b_label = QLabel("终点价")
+        line_price_row.addWidget(self._line_price_b_label)
+        self._line_price_b_edit = QLineEdit()
+        self._line_price_b_edit.setPlaceholderText("终点价")
+        line_price_row.addWidget(self._line_price_b_edit, 1)
+        control_layout.addLayout(line_price_row)
+        self._refresh_line_price_controls(None)
+
         line_rule_row = QHBoxLayout()
         self._line_trigger_combo = QComboBox()
         self._line_trigger_combo.addItem("上穿", "cross_above")
@@ -5427,8 +5532,21 @@ class KlineAnalysisWindow(QMainWindow):
         self._line_action_combo.addItem("提醒", "notify")
         self._line_action_combo.addItem("做多", "long")
         self._line_action_combo.addItem("做空", "short")
+        self._line_action_combo.currentIndexChanged.connect(lambda _index: self._refresh_line_email_controls())
         line_rule_row.addWidget(self._line_action_combo, 1)
         control_layout.addLayout(line_rule_row)
+
+        line_email_row = QHBoxLayout()
+        self._line_email_enabled_check = QCheckBox("邮件提醒")
+        self._line_email_enabled_check.setToolTip("触发“提醒”时按系统邮箱配置发送邮件。")
+        self._line_email_enabled_check.toggled.connect(lambda _checked: self._refresh_line_email_controls())
+        line_email_row.addWidget(self._line_email_enabled_check)
+        self._line_email_delivery_mode_combo = QComboBox()
+        self._line_email_delivery_mode_combo.addItem("仅一次", "once")
+        self._line_email_delivery_mode_combo.addItem("每次触发", "repeat")
+        self._line_email_delivery_mode_combo.setToolTip("“仅一次”在该线首次触发并提交邮件后不再重复发送。")
+        line_email_row.addWidget(self._line_email_delivery_mode_combo, 1)
+        control_layout.addLayout(line_email_row)
 
         self._line_enabled_check = QCheckBox("启用当前线条")
         control_layout.addWidget(self._line_enabled_check)
@@ -5465,8 +5583,8 @@ class KlineAnalysisWindow(QMainWindow):
         line_manage_row.addWidget(delete_line_btn)
         control_layout.addLayout(line_manage_row)
 
-        self._line_table = QTableWidget(0, 5)
-        self._line_table.setHorizontalHeaderLabels(["标签", "类型", "触发", "操作", "状态"])
+        self._line_table = QTableWidget(0, 6)
+        self._line_table.setHorizontalHeaderLabels(["标签", "类型", "价格", "触发", "操作", "状态"])
         self._line_table.verticalHeader().setVisible(False)
         self._line_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self._line_table.itemSelectionChanged.connect(self._on_line_selected)
@@ -7433,7 +7551,23 @@ class KlineAnalysisWindow(QMainWindow):
                     line_values.append(projected_value)
                     min_price = min(min_price, projected_value)
                     max_price = max(max_price, projected_value)
-                future_line_time = max(int(item.get("time_a", 0) or 0), int(item.get("time_b", 0) or 0))
+                kind = str(item.get("kind", "horizontal") or "horizontal").strip().lower()
+                future_line_time = 0
+                if kind == "horizontal":
+                    right_edge_x = float(display_times_ms[-1]) + _native_right_padding_ms(display_step_ms)
+                    projected_value = self._display_price_from_logical(
+                        logical_payload,
+                        float(line_value_at(item, last_candle_time)),
+                        is_secondary=is_secondary,
+                    )
+                    series.append(right_edge_x, projected_value)
+                    line_values.append(projected_value)
+                    min_price = min(min_price, projected_value)
+                    max_price = max(max_price, projected_value)
+                else:
+                    future_line_time = max(int(item.get("time_a", 0) or 0), int(item.get("time_b", 0) or 0))
+                    if future_line_time <= last_candle_time:
+                        future_line_time = 0
                 if future_line_time > last_candle_time:
                     future_display_x = _display_x_for_candle_time(
                         candles,
@@ -7693,10 +7827,11 @@ class KlineAnalysisWindow(QMainWindow):
         for row, item in enumerate(records):
             label = str(item.get("label", "") or "")
             kind = _line_kind_text(str(item.get("kind", "") or ""))
+            price = _line_price_table_text(item, self._current_rr_price_increment(item))
             trigger = _line_trigger_text(str(item.get("trigger", "") or ""))
             action = _line_action_text(str(item.get("action", "") or ""))
             state = _line_state_text(bool(item.get("enabled", True)))
-            for column, value in enumerate((label, kind, trigger, action, state)):
+            for column, value in enumerate((label, kind, price, trigger, action, state)):
                 self._line_table.setItem(row, column, QTableWidgetItem(value))
         self._line_table.blockSignals(False)
         if target_index >= 0:
@@ -7705,7 +7840,13 @@ class KlineAnalysisWindow(QMainWindow):
             return
         self._selected_line_index = -1
         self._line_table.clearSelection()
+        self._line_price_a_edit.clear()
+        self._line_price_b_edit.clear()
+        self._refresh_line_price_controls(None)
         self._line_enabled_check.setChecked(True)
+        self._line_email_enabled_check.setChecked(False)
+        self._line_email_delivery_mode_combo.setCurrentIndex(0)
+        self._refresh_line_email_controls()
         self._line_trade_enabled_check.setChecked(False)
         self._line_trade_execution_mode_combo.setCurrentIndex(0)
         self._refresh_line_trade_hint(None)
@@ -7817,14 +7958,36 @@ class KlineAnalysisWindow(QMainWindow):
     def _apply_line_record_to_form(self, row: int, item: dict[str, object]) -> None:
         self._selected_line_index = row
         self._line_label_edit.setText(str(item.get("label", "") or ""))
+        price_increment = self._current_rr_price_increment(item)
+        self._line_price_a_edit.setText(_format_rr_table_price(item.get("price_a", ""), price_increment))
+        self._line_price_b_edit.setText(_format_rr_table_price(item.get("price_b", ""), price_increment))
+        self._refresh_line_price_controls(item)
         self._line_trigger_combo.setCurrentIndex(max(0, self._line_trigger_combo.findData(item.get("trigger"))))
         self._line_action_combo.setCurrentIndex(max(0, self._line_action_combo.findData(item.get("action"))))
         self._line_enabled_check.setChecked(bool(item.get("enabled", True)))
+        self._line_email_enabled_check.setChecked(bool(item.get("email_enabled", False)))
+        self._line_email_delivery_mode_combo.setCurrentIndex(
+            max(0, self._line_email_delivery_mode_combo.findData(str(item.get("email_delivery_mode", "once") or "once")))
+        )
+        self._refresh_line_email_controls()
         self._line_trade_enabled_check.setChecked(_rr_fee_offset_enabled(item.get("trade_enabled", False)))
         self._line_trade_execution_mode_combo.setCurrentIndex(
             max(0, self._line_trade_execution_mode_combo.findData(str(item.get("entry_execution_mode", "limit") or "limit")))
         )
         self._refresh_line_trade_hint(item)
+
+    def _refresh_line_price_controls(self, item: dict[str, object] | None) -> None:
+        kind = str(item.get("kind", "horizontal") or "horizontal").strip().lower() if isinstance(item, dict) else "horizontal"
+        is_trend = kind == "trend"
+        self._line_price_a_label.setText("起点价" if is_trend else "价格")
+        self._line_price_a_edit.setPlaceholderText("起点价" if is_trend else "价格")
+        self._line_price_b_label.setVisible(is_trend)
+        self._line_price_b_edit.setVisible(is_trend)
+
+    def _refresh_line_email_controls(self) -> None:
+        is_notify = str(self._line_action_combo.currentData() or "notify") == "notify"
+        self._line_email_enabled_check.setEnabled(is_notify)
+        self._line_email_delivery_mode_combo.setEnabled(is_notify and self._line_email_enabled_check.isChecked())
 
     def _refresh_line_trade_hint(self, item: dict[str, object] | None) -> None:
         if not hasattr(self, "_line_trade_hint"):
@@ -8910,6 +9073,11 @@ class KlineAnalysisWindow(QMainWindow):
                 time_b=candle_time,
                 price_b=price,
                 enabled=self._line_enabled_check.isChecked() if self._selected_line_index >= 0 else True,
+                email_enabled=(
+                    self._line_email_enabled_check.isChecked()
+                    and str(self._line_action_combo.currentData() or "notify") == "notify"
+                ),
+                email_delivery_mode=str(self._line_email_delivery_mode_combo.currentData() or "once"),
             )
             self._append_line_rule(line)
             if isinstance(self._native_chart_view, InteractiveKlineChartView):
@@ -8934,6 +9102,11 @@ class KlineAnalysisWindow(QMainWindow):
             time_b=candle_time,
             price_b=price,
             enabled=self._line_enabled_check.isChecked() if self._selected_line_index >= 0 else True,
+            email_enabled=(
+                self._line_email_enabled_check.isChecked()
+                and str(self._line_action_combo.currentData() or "notify") == "notify"
+            ),
+            email_delivery_mode=str(self._line_email_delivery_mode_combo.currentData() or "once"),
         )
         self._append_line_rule(line)
         self._pending_line_start = None
@@ -9469,9 +9642,35 @@ class KlineAnalysisWindow(QMainWindow):
             return
         item = dict(lines[self._selected_line_index])
         item["label"] = self._line_label_edit.text().strip() or str(item.get("label", "") or "")
+        price_a = _parse_rr_optional_decimal(self._line_price_a_edit.text())
+        kind = str(item.get("kind", "horizontal") or "horizontal").strip().lower()
+        if price_a is None or price_a <= 0:
+            self._set_status("请填写有效的线条价格。")
+            return
+        item["price_a"] = float(price_a)
+        if kind == "trend":
+            price_b = _parse_rr_optional_decimal(self._line_price_b_edit.text())
+            if price_b is None or price_b <= 0:
+                self._set_status("请填写有效的趋势线终点价。")
+                return
+            item["price_b"] = float(price_b)
+        else:
+            item["price_b"] = float(price_a)
         item["trigger"] = str(self._line_trigger_combo.currentData())
         item["action"] = str(self._line_action_combo.currentData())
         item["enabled"] = self._line_enabled_check.isChecked()
+        previous_email_enabled = bool(item.get("email_enabled", False))
+        previous_email_delivery_mode = str(item.get("email_delivery_mode", "once") or "once")
+        item["email_enabled"] = (
+            self._line_email_enabled_check.isChecked() and item["action"] == "notify"
+        )
+        item["email_delivery_mode"] = str(self._line_email_delivery_mode_combo.currentData() or "once")
+        if (
+            not item["email_enabled"]
+            or not previous_email_enabled
+            or previous_email_delivery_mode != item["email_delivery_mode"]
+        ):
+            item["email_sent_once"] = False
         was_trade_enabled = _rr_fee_offset_enabled(item.get("trade_enabled", False))
         trade_enabled = self._line_trade_enabled_check.isChecked()
         item["trade_enabled"] = trade_enabled
@@ -9705,6 +9904,7 @@ class KlineAnalysisWindow(QMainWindow):
         new_events = list(snapshot.new_events)
         structure = dict(snapshot.structure)
         self._workspace_entries[self._current_workspace_key()] = updated_entry
+        email_sent_count = self._dispatch_line_alert_emails(new_events, updated_entry) if new_events else 0
         self._save_workspace_snapshot()
         self._structure_hint.setText(str(structure.get("note", "") or ""))
         self._refresh_event_log()
@@ -9713,7 +9913,21 @@ class KlineAnalysisWindow(QMainWindow):
         if new_events:
             self._enqueue_line_trade_events(new_events)
             latest = str(new_events[0].get("message", "") or "")
-            self._set_status(f"{self._status.text()} | 事件：{latest}")
+            email_status = f" | 邮件提醒已提交 {email_sent_count} 封" if email_sent_count else ""
+            self._set_status(f"{self._status.text()} | 事件：{latest}{email_status}")
+
+    def _dispatch_line_alert_emails(
+        self,
+        events: list[dict[str, object]],
+        workspace_entry: dict[str, object],
+    ) -> int:
+        return _deliver_line_alert_emails(
+            workspace_entry=workspace_entry,
+            events=events,
+            symbol=self._symbol_combo.currentText().strip().upper(),
+            period=self._period_combo.currentText().strip().upper(),
+            notifier=_build_kline_line_email_notifier(),
+        )
 
     def _set_status(self, text: str) -> None:
         self._status.setText(text)

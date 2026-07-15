@@ -3455,6 +3455,46 @@ class RollTerminalQtWindowHelperTests(QtWidgetTestCase):
             finally:
                 self.__class__.dispose_widget(window)
 
+    def test_kline_line_price_table_and_editor_support_horizontal_and_trend_lines(self) -> None:
+        with (
+            patch("roll_terminal_qt.kline_analysis_window.QTimer.singleShot", return_value=None),
+            patch("roll_terminal_qt.kline_analysis_window.load_kline_analysis_workspace_entries", return_value={}),
+        ):
+            window = KlineAnalysisWindow()
+            try:
+                window._workspace_entry()["lines"] = [
+                    {
+                        "id": "horizontal-1", "kind": "horizontal", "label": "H", "trigger": "cross_above",
+                        "action": "notify", "enabled": True, "time_a": 100, "price_a": 60000.0,
+                        "time_b": 100, "price_b": 60000.0,
+                    },
+                    {
+                        "id": "trend-1", "kind": "trend", "label": "T", "trigger": "cross_above",
+                        "action": "notify", "enabled": True, "time_a": 100, "price_a": 60000.0,
+                        "time_b": 200, "price_b": 62000.0,
+                    },
+                ]
+
+                window._populate_line_table(selected_index=0)
+                self.assertEqual(window._line_table.columnCount(), 6)
+                self.assertEqual(window._line_table.item(0, 2).text(), "60000.0")
+                self.assertTrue(window._line_price_b_edit.isHidden())
+                window._line_price_a_edit.setText("61000")
+                window._update_selected_line()
+                self.assertEqual(window._workspace_entry()["lines"][0]["price_a"], 61000.0)
+                self.assertEqual(window._workspace_entry()["lines"][0]["price_b"], 61000.0)
+
+                window._populate_line_table(selected_index=1)
+                self.assertEqual(window._line_table.item(1, 2).text(), "60000.0 → 62000.0")
+                self.assertFalse(window._line_price_b_edit.isHidden())
+                window._line_price_a_edit.setText("60500")
+                window._line_price_b_edit.setText("62500")
+                window._update_selected_line()
+                self.assertEqual(window._workspace_entry()["lines"][1]["price_a"], 60500.0)
+                self.assertEqual(window._workspace_entry()["lines"][1]["price_b"], 62500.0)
+            finally:
+                self.__class__.dispose_widget(window)
+
     def test_kline_line_trade_events_require_global_arming_and_deduplicate_plan(self) -> None:
         instrument = SimpleNamespace(
             inst_id="BTC-USDT-SWAP", inst_type="SWAP", tick_size=Decimal("0.1"), lot_size=Decimal("1"), min_size=Decimal("1"),

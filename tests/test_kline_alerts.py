@@ -12,9 +12,35 @@ from roll_terminal_qt.kline_alerts import (
     make_line_rule,
     normalize_workspace_entry,
 )
+from roll_terminal_qt.kline_analysis_window import _line_price_table_text
 
 
 class KlineAlertTests(unittest.TestCase):
+    def test_line_price_table_text_distinguishes_horizontal_and_trend_prices(self) -> None:
+        horizontal = make_line_rule(
+            kind="horizontal",
+            label="H",
+            trigger="cross_above",
+            action="notify",
+            time_a=100,
+            price_a=10.5,
+            time_b=100,
+            price_b=10.5,
+        )
+        trend = make_line_rule(
+            kind="trend",
+            label="T",
+            trigger="cross_above",
+            action="notify",
+            time_a=100,
+            price_a=10.0,
+            time_b=200,
+            price_b=20.0,
+        )
+
+        self.assertEqual(_line_price_table_text(horizontal), "10.5")
+        self.assertEqual(_line_price_table_text(trend), "10 → 20")
+
     def test_build_workspace_key_normalizes_symbol(self) -> None:
         self.assertEqual(build_workspace_key("btc-usdt-swap", "15m"), "BTC-USDT-SWAP|15m")
 
@@ -36,6 +62,22 @@ class KlineAlertTests(unittest.TestCase):
             price_b=20.0,
         )
         self.assertAlmostEqual(line_value_at(line, 150), 15.0)
+
+    def test_line_email_configuration_defaults_to_disabled_once(self) -> None:
+        line = make_line_rule(
+            kind="horizontal",
+            label="邮件线",
+            trigger="cross_above",
+            action="notify",
+            time_a=100,
+            price_a=10.0,
+            time_b=100,
+            price_b=10.0,
+        )
+
+        self.assertFalse(line.get("email_enabled", True))
+        self.assertEqual(line.get("email_delivery_mode"), "once")
+        self.assertFalse(line.get("email_sent_once", True))
 
     def test_make_line_rule_orders_reversed_trend_endpoints(self) -> None:
         line = make_line_rule(
