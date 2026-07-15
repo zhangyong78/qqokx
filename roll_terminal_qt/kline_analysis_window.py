@@ -6832,7 +6832,10 @@ class KlineAnalysisWindow(QMainWindow):
             candle_series.append(QCandlestickSet(float(candle_values["open"]), float(candle_values["high"]), float(candle_values["low"]), float(candle_values["close"]), timestamp))
         else:
             return
-        latest_points = {"EMA 15": payload.ema_9[-1] if payload.ema_9 else None, "SMA 50": payload.ema_21[-1] if payload.ema_21 else None}
+        latest_points = {
+            "EMA 15": display_payload.ema_9[-1] if display_payload.ema_9 else None,
+            "SMA 50": display_payload.ema_21[-1] if display_payload.ema_21 else None,
+        }
         for series in self._native_chart.series():
             if not isinstance(series, QLineSeries):
                 continue

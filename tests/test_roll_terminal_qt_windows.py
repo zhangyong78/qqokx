@@ -13,7 +13,7 @@ from decimal import Decimal
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-from PySide6.QtCharts import QChart, QLineSeries, QValueAxis
+from PySide6.QtCharts import QCandlestickSeries, QCandlestickSet, QChart, QLineSeries, QValueAxis
 from PySide6.QtCore import QPointF, QThread, Qt
 from PySide6.QtWidgets import QDoubleSpinBox, QLabel, QMessageBox, QPushButton, QSizePolicy, QTabWidget, QWidget
 from okx_quant.analysis import ChannelDetectionConfig
@@ -733,6 +733,43 @@ class RollTerminalQtWindowHelperTests(QtWidgetTestCase):
 
         self.assertEqual(updated.candles[0]["close"], 11.0)
         self.assertEqual(updated.raw_candles[0].volume, Decimal("3"))
+
+    def test_native_realtime_update_uses_reversed_moving_average_values(self) -> None:
+        raw_payload = KlineChartPayload(
+            candles=[{"time": 1, "open": 100.0, "high": 101.0, "low": 99.0, "close": 100.0, "volume": 2.0}],
+            ema_9=[{"time": 1, "value": 100.0}],
+            ema_21=[{"time": 1, "value": 101.0}],
+            ema_55=[], trend_indicator=[], signal_markers=[], box_overlays=[], raw_candles=[], stats={},
+        )
+        reversed_payload = KlineChartPayload(
+            candles=[{"time": 1, "open": 200.0, "high": 201.0, "low": 199.0, "close": 200.0, "volume": 2.0}],
+            ema_9=[{"time": 1, "value": 200.0}],
+            ema_21=[{"time": 1, "value": 201.0}],
+            ema_55=[], trend_indicator=[], signal_markers=[], box_overlays=[], raw_candles=[], stats={},
+        )
+        chart = QChart()
+        candles = QCandlestickSeries()
+        candles.append(QCandlestickSet(200.0, 201.0, 199.0, 200.0, 1_000.0))
+        ema = QLineSeries()
+        ema.setName("EMA 15")
+        ema.append(1_000.0, 200.0)
+        sma = QLineSeries()
+        sma.setName("SMA 50")
+        sma.append(1_000.0, 201.0)
+        chart.addSeries(candles)
+        chart.addSeries(ema)
+        chart.addSeries(sma)
+        app = SimpleNamespace(
+            _native_chart=chart,
+            _native_chart_view=MagicMock(),
+            _period_combo=SimpleNamespace(currentText=lambda: "1H"),
+            _display_payload_for_chart=MagicMock(return_value=reversed_payload),
+        )
+
+        KlineAnalysisWindow._apply_realtime_candle_to_native_chart(app, raw_payload)
+
+        self.assertEqual(ema.at(0).y(), 200.0)
+        self.assertEqual(sma.at(0).y(), 201.0)
 
     def test_window_realtime_candle_does_not_call_history_loader_or_full_renderer(self) -> None:
         payload = KlineChartPayload(
