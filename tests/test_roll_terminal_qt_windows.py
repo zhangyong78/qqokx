@@ -5765,6 +5765,70 @@ class RollTerminalQtWindowHelperTests(QtWidgetTestCase):
             finally:
                 self.__class__.dispose_widget(window)
 
+    def test_secondary_symbol_control_only_available_for_dual_kline(self) -> None:
+        with patch("roll_terminal_qt.kline_analysis_window.QTimer.singleShot", return_value=None):
+            window = KlineAnalysisWindow()
+            try:
+                window._secondary_chart_check.blockSignals(True)
+                window._secondary_chart_check.setChecked(True)
+                window._secondary_chart_check.blockSignals(False)
+                window._secondary_chart_kind_mode = "kline"
+                window._update_secondary_controls_state()
+
+                self.assertFalse(window._secondary_symbol_combo.isHidden())
+                self.assertTrue(window._secondary_symbol_combo.isEnabled())
+
+                window._secondary_chart_kind_mode = "volatility"
+                window._update_secondary_controls_state()
+
+                self.assertTrue(window._secondary_symbol_combo.isHidden())
+                self.assertFalse(window._secondary_symbol_combo.isEnabled())
+            finally:
+                self.__class__.dispose_widget(window)
+
+    def test_secondary_kline_request_key_uses_secondary_symbol(self) -> None:
+        with patch("roll_terminal_qt.kline_analysis_window.QTimer.singleShot", return_value=None):
+            window = KlineAnalysisWindow()
+            try:
+                window._use_native_chart = True
+                window._secondary_chart_check.blockSignals(True)
+                window._secondary_chart_check.setChecked(True)
+                window._secondary_chart_check.blockSignals(False)
+                window._secondary_chart_kind_mode = "kline"
+                window._symbol_combo.setCurrentText("BTC-USDT-SWAP")
+                window._secondary_symbol_combo.blockSignals(True)
+                window._secondary_symbol_combo.setCurrentText("ETH-USDT-SWAP")
+                window._secondary_symbol_combo.blockSignals(False)
+
+                self.assertEqual(window._current_secondary_request_key()[2], "ETH-USDT-SWAP")
+            finally:
+                self.__class__.dispose_widget(window)
+
+    def test_secondary_symbol_change_loads_only_secondary_chart(self) -> None:
+        with patch("roll_terminal_qt.kline_analysis_window.QTimer.singleShot", return_value=None):
+            window = KlineAnalysisWindow()
+            try:
+                window._use_native_chart = True
+                window._secondary_chart_check.blockSignals(True)
+                window._secondary_chart_check.setChecked(True)
+                window._secondary_chart_check.blockSignals(False)
+                window._secondary_chart_kind_mode = "kline"
+                window._secondary_symbol_combo.blockSignals(True)
+                window._secondary_symbol_combo.setCurrentText("ETH-USDT-SWAP")
+                window._secondary_symbol_combo.blockSignals(False)
+
+                with (
+                    patch.object(window, "_has_active_loaders", return_value=False),
+                    patch.object(window, "_load_secondary_data") as load_secondary,
+                    patch.object(window, "_load_data") as load_primary,
+                ):
+                    window._on_secondary_symbol_changed("ETH-USDT-SWAP")
+
+                load_secondary.assert_called_once_with(symbol="ETH-USDT-SWAP")
+                load_primary.assert_not_called()
+            finally:
+                self.__class__.dispose_widget(window)
+
     def test_primary_average_secondary_normal_request_keys_use_primary_average_only(self) -> None:
         with patch("roll_terminal_qt.kline_analysis_window.QTimer.singleShot", return_value=None):
             window = KlineAnalysisWindow()

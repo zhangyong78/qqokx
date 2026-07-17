@@ -5292,6 +5292,19 @@ class KlineAnalysisWindow(QMainWindow):
         self._secondary_chart_check.toggled.connect(self._on_secondary_chart_toggled)
         action_row.addWidget(self._secondary_chart_check)
 
+        self._secondary_symbol_label = QLabel("副图交易对")
+        action_row.addWidget(self._secondary_symbol_label)
+        self._secondary_symbol_combo = QComboBox()
+        self._secondary_symbol_combo.addItems(KLINE_SYMBOL_OPTIONS)
+        self._secondary_symbol_combo.setMinimumWidth(_HEADER_SYMBOL_INPUT_MIN_WIDTH)
+        self._secondary_symbol_combo.setMaximumWidth(_HEADER_SYMBOL_INPUT_MAX_WIDTH)
+        self._secondary_symbol_combo.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
+        self._secondary_symbol_combo.setEnabled(False)
+        self._secondary_symbol_combo.hide()
+        self._secondary_symbol_combo.currentTextChanged.connect(self._on_secondary_symbol_changed)
+        action_row.addWidget(self._secondary_symbol_combo, 0)
+        self._secondary_symbol_label.hide()
+
         self._secondary_period_combo = QComboBox()
         self._secondary_period_combo.addItems([period for _, period in _PRIMARY_PERIOD_OPTIONS])
         self._secondary_period_combo.setCurrentText(_DEFAULT_DUAL_SECONDARY_PERIOD)
@@ -5855,10 +5868,13 @@ class KlineAnalysisWindow(QMainWindow):
     def _secondary_display_symbol(self) -> str:
         if self._secondary_chart_kind() == "volatility":
             return f"{self._current_volatility_currency() or '-'} DVOL"
-        return self._selected_symbol()
+        return self._selected_secondary_symbol()
 
     def _selected_symbol(self) -> str:
         return self._symbol_combo.currentText().strip().upper()
+
+    def _selected_secondary_symbol(self) -> str:
+        return self._secondary_symbol_combo.currentText().strip().upper()
 
     def _current_volatility_currency(self) -> str | None:
         return _volatility_currency_for_symbol(self._selected_symbol())
@@ -5944,6 +5960,10 @@ class KlineAnalysisWindow(QMainWindow):
 
     def _update_secondary_controls_state(self) -> None:
         enabled = bool(self._secondary_chart_check.isChecked())
+        secondary_symbol_available = enabled and self._secondary_chart_kind() == "kline"
+        self._secondary_symbol_label.setVisible(secondary_symbol_available)
+        self._secondary_symbol_combo.setVisible(secondary_symbol_available)
+        self._secondary_symbol_combo.setEnabled(secondary_symbol_available)
         self._secondary_period_combo.setEnabled(enabled)
         if self._secondary_layout_cycle_btn is not None:
             self._secondary_layout_cycle_btn.setEnabled(enabled)
@@ -6031,6 +6051,7 @@ class KlineAnalysisWindow(QMainWindow):
         self._secondary_chart_kind_mode = ("volatility" if previous_kind == "kline" else "kline")
         self._refresh_secondary_chart_kind_button()
         self._refresh_secondary_sync_period_button()
+        self._update_secondary_controls_state()
         self._sync_primary_average_secondary_normal_control_state()
         if previous_kind == "kline" and self._secondary_chart_kind() == "volatility":
             self._period_combo.blockSignals(True)
@@ -6491,7 +6512,7 @@ class KlineAnalysisWindow(QMainWindow):
         return (
             "secondary",
             chart_kind,
-            (symbol or self._selected_symbol()),
+            (symbol or self._selected_secondary_symbol()),
             secondary_period,
             requested_limit,
             bool(self._prefer_local_checkbox.isChecked()),
@@ -6584,7 +6605,7 @@ class KlineAnalysisWindow(QMainWindow):
         self._loader.finished.connect(self._on_loader_finished)
         self._loader.start()
         if self._secondary_chart_check.isChecked() and self._use_native_chart:
-            self._load_secondary_data(symbol=symbol)
+            self._load_secondary_data(symbol=self._selected_secondary_symbol())
         else:
             self._active_secondary_request_key = None
             self._loaded_secondary_request_key = None
@@ -6604,16 +6625,17 @@ class KlineAnalysisWindow(QMainWindow):
     def _load_secondary_data(self, *, symbol: str) -> None:
         secondary_period = self._secondary_period_combo.currentText().strip()
         requested_limit = max(50, self._limit_spin.value())
+        secondary_symbol = symbol.strip().upper() or self._selected_secondary_symbol()
         self._secondary_request_id += 1
         self._active_secondary_request_id = self._secondary_request_id
-        self._active_secondary_request_key = self._current_secondary_request_key(symbol=symbol)
+        self._active_secondary_request_key = self._current_secondary_request_key(symbol=secondary_symbol)
         self._preview_cached_secondary_payload(self._active_secondary_request_key)
         if self._secondary_chart_kind() == "volatility":
             currency = self._current_volatility_currency()
             if currency is None:
                 self._secondary_chart_kind_mode = "kline"
                 self._update_secondary_controls_state()
-                self._load_secondary_data(symbol=symbol)
+                self._load_secondary_data(symbol=secondary_symbol)
                 return
             self._secondary_volatility_loader = SecondaryVolatilityDataLoader(
                 request_id=self._secondary_request_id,
@@ -6629,7 +6651,7 @@ class KlineAnalysisWindow(QMainWindow):
             return
         self._secondary_loader = KlineDataLoader(
             request_id=self._secondary_request_id,
-            symbol=symbol,
+            symbol=secondary_symbol,
             period=secondary_period,
             limit=requested_limit,
             local_only=self._prefer_local_checkbox.isChecked(),
@@ -6668,6 +6690,20 @@ class KlineAnalysisWindow(QMainWindow):
         self._refresh_rr_trade_hint()
         self._sync_account_drawer_context()
         self._load_data()
+
+    @Slot(str)
+    def _on_secondary_symbol_changed(self, _value: str) -> None:
+        if (
+            not self._secondary_chart_check.isChecked()
+            or not self._use_native_chart
+            or self._secondary_chart_kind() != "kline"
+        ):
+            return
+        if self._has_active_loaders():
+            self._pending_reload_after_load = True
+            self._set_status("当前仍在加载，已排队刷新最新副图交易对，请稍候...")
+            return
+        self._load_secondary_data(symbol=self._selected_secondary_symbol())
 
     def _show_account_drawer(self, tab_name: str) -> None:
         if self._account_drawer is None or self._chart_account_splitter is None:
