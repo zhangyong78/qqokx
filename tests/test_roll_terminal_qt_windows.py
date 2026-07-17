@@ -11,11 +11,11 @@ import textwrap
 import unittest
 from decimal import Decimal
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 from PySide6.QtCharts import QCandlestickSeries, QCandlestickSet, QChart, QLineSeries, QValueAxis
 from PySide6.QtCore import QPointF, QThread, Qt
-from PySide6.QtWidgets import QDoubleSpinBox, QLabel, QMessageBox, QPushButton, QSizePolicy, QTabWidget, QWidget
+from PySide6.QtWidgets import QDoubleSpinBox, QLabel, QMessageBox, QPushButton, QSizePolicy, QSplitter, QTabWidget, QWidget
 from okx_quant.analysis import ChannelDetectionConfig
 from okx_quant.models import Candle
 from okx_quant.arbitrage.models import ArbitrageTradeRuntime
@@ -5826,6 +5826,101 @@ class RollTerminalQtWindowHelperTests(QtWidgetTestCase):
 
                 load_secondary.assert_called_once_with(symbol="ETH-USDT-SWAP")
                 load_primary.assert_not_called()
+            finally:
+                self.__class__.dispose_widget(window)
+
+    def test_triple_chart_mode_forces_horizontal_layout(self) -> None:
+        with patch("roll_terminal_qt.kline_analysis_window.QTimer.singleShot", return_value=None):
+            window = KlineAnalysisWindow()
+            try:
+                window._chart_stack_splitter = QSplitter()
+                with patch.object(window, "_load_data"):
+                    window._tertiary_chart_check.setChecked(True)
+
+                self.assertTrue(window._triple_chart_enabled())
+                self.assertEqual(window._chart_stack_splitter.orientation(), Qt.Orientation.Horizontal)
+            finally:
+                self.__class__.dispose_widget(window)
+
+    def test_triple_chart_controls_show_only_when_enabled(self) -> None:
+        with patch("roll_terminal_qt.kline_analysis_window.QTimer.singleShot", return_value=None):
+            window = KlineAnalysisWindow()
+            try:
+                self.assertTrue(window._tertiary_symbol_combo.isHidden())
+                self.assertTrue(window._tertiary_period_combo.isHidden())
+
+                with patch.object(window, "_load_data"):
+                    window._tertiary_chart_check.setChecked(True)
+
+                self.assertFalse(window._secondary_period_combo.isHidden())
+                self.assertFalse(window._tertiary_symbol_combo.isHidden())
+                self.assertFalse(window._tertiary_period_combo.isHidden())
+                self.assertFalse(window._secondary_layout_cycle_btn.isEnabled())
+                self.assertFalse(window._secondary_chart_kind_btn.isEnabled())
+            finally:
+                self.__class__.dispose_widget(window)
+
+    def test_tertiary_request_key_uses_its_own_symbol_and_period(self) -> None:
+        with patch("roll_terminal_qt.kline_analysis_window.QTimer.singleShot", return_value=None):
+            window = KlineAnalysisWindow()
+            try:
+                window._use_native_chart = True
+                window._tertiary_chart_check.blockSignals(True)
+                window._tertiary_chart_check.setChecked(True)
+                window._tertiary_chart_check.blockSignals(False)
+                window._tertiary_symbol_combo.blockSignals(True)
+                window._tertiary_symbol_combo.setCurrentText("SOL-USDT-SWAP")
+                window._tertiary_symbol_combo.blockSignals(False)
+                window._tertiary_period_combo.blockSignals(True)
+                window._tertiary_period_combo.setCurrentText("1H")
+                window._tertiary_period_combo.blockSignals(False)
+
+                self.assertEqual(window._current_tertiary_request_key()[2:4], ("SOL-USDT-SWAP", "1H"))
+            finally:
+                self.__class__.dispose_widget(window)
+
+    def test_tertiary_symbol_change_loads_only_tertiary_chart(self) -> None:
+        with patch("roll_terminal_qt.kline_analysis_window.QTimer.singleShot", return_value=None):
+            window = KlineAnalysisWindow()
+            try:
+                window._use_native_chart = True
+                window._tertiary_chart_check.blockSignals(True)
+                window._tertiary_chart_check.setChecked(True)
+                window._tertiary_chart_check.blockSignals(False)
+                window._tertiary_symbol_combo.blockSignals(True)
+                window._tertiary_symbol_combo.setCurrentText("SOL-USDT-SWAP")
+                window._tertiary_symbol_combo.blockSignals(False)
+
+                with (
+                    patch.object(window, "_has_active_loaders", return_value=False),
+                    patch.object(window, "_load_tertiary_data") as load_tertiary,
+                    patch.object(window, "_load_data") as load_primary,
+                ):
+                    window._on_tertiary_symbol_changed("SOL-USDT-SWAP")
+
+                load_tertiary.assert_called_once_with()
+                load_primary.assert_not_called()
+            finally:
+                self.__class__.dispose_widget(window)
+
+    def test_primary_range_sync_broadcasts_to_both_secondary_charts(self) -> None:
+        with patch("roll_terminal_qt.kline_analysis_window.QTimer.singleShot", return_value=None):
+            window = KlineAnalysisWindow()
+            try:
+                window._tertiary_chart_check.blockSignals(True)
+                window._tertiary_chart_check.setChecked(True)
+                window._tertiary_chart_check.blockSignals(False)
+
+                with patch.object(window, "_sync_chart_range_to_other") as sync_range:
+                    window._on_primary_x_range_changed(100.0, 200.0)
+
+                self.assertEqual(
+                    sync_range.call_args_list,
+                    [
+                        call(target="secondary", start_x=100.0, end_x=200.0),
+                        call(target="tertiary", start_x=100.0, end_x=200.0),
+                    ],
+                )
             finally:
                 self.__class__.dispose_widget(window)
 

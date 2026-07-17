@@ -4857,14 +4857,21 @@ class KlineAnalysisWindow(QMainWindow):
         self._active_secondary_request_key: tuple[Any, ...] | None = None
         self._loaded_secondary_request_key: tuple[Any, ...] | None = None
         self._secondary_loader: KlineDataLoader | None = None
+        self._tertiary_request_id = 0
+        self._active_tertiary_request_id = 0
+        self._active_tertiary_request_key: tuple[Any, ...] | None = None
+        self._loaded_tertiary_request_key: tuple[Any, ...] | None = None
+        self._tertiary_loader: KlineDataLoader | None = None
         self._use_native_chart = bool(
             QChartView is not None and (_prefer_native_chart_backend() or QWebEngineView is None)
         )
         self._page_ready = self._use_native_chart
         self._pending_payload: KlineChartPayload | None = None
         self._secondary_pending_payload: KlineChartPayload | None = None
+        self._tertiary_pending_payload: KlineChartPayload | None = None
         self._primary_payload_cache: dict[tuple[Any, ...], KlineChartPayload] = {}
         self._secondary_payload_cache: dict[tuple[Any, ...], KlineChartPayload] = {}
+        self._tertiary_payload_cache: dict[tuple[Any, ...], KlineChartPayload] = {}
         self._workspace_entries = load_kline_analysis_workspace_entries()
         self._selected_line_index = -1
         self._selected_rr_index = -1
@@ -4883,6 +4890,9 @@ class KlineAnalysisWindow(QMainWindow):
         self._secondary_native_chart = None
         self._secondary_native_chart_view = None
         self._secondary_chart_frame = None
+        self._tertiary_native_chart = None
+        self._tertiary_native_chart_view = None
+        self._tertiary_chart_frame = None
         self._chart_stack_splitter = None
         self._primary_period_buttons: dict[str, QPushButton] = {}
         self._active_chart_target = "primary"
@@ -5039,6 +5049,7 @@ class KlineAnalysisWindow(QMainWindow):
         for loader in (
             getattr(self, "_loader", None),
             getattr(self, "_secondary_loader", None),
+            getattr(self, "_tertiary_loader", None),
             getattr(self, "_secondary_volatility_loader", None),
         ):
             if loader is not None and loader.isRunning():
@@ -5051,6 +5062,7 @@ class KlineAnalysisWindow(QMainWindow):
             for loader in (
                 getattr(self, "_loader", None),
                 getattr(self, "_secondary_loader", None),
+                getattr(self, "_tertiary_loader", None),
                 getattr(self, "_secondary_volatility_loader", None),
             )
         )
@@ -5305,12 +5317,42 @@ class KlineAnalysisWindow(QMainWindow):
         action_row.addWidget(self._secondary_symbol_combo, 0)
         self._secondary_symbol_label.hide()
 
+        self._tertiary_chart_check = QCheckBox("三图联动")
+        self._tertiary_chart_check.toggled.connect(self._on_tertiary_chart_toggled)
+        action_row.addWidget(self._tertiary_chart_check)
+        self._tertiary_symbol_label = QLabel("第三图交易对")
+        action_row.addWidget(self._tertiary_symbol_label)
+        self._tertiary_symbol_combo = QComboBox()
+        self._tertiary_symbol_combo.addItems(KLINE_SYMBOL_OPTIONS)
+        self._tertiary_symbol_combo.setMinimumWidth(_HEADER_SYMBOL_INPUT_MIN_WIDTH)
+        self._tertiary_symbol_combo.setMaximumWidth(_HEADER_SYMBOL_INPUT_MAX_WIDTH)
+        self._tertiary_symbol_combo.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
+        self._tertiary_symbol_combo.setEnabled(False)
+        self._tertiary_symbol_combo.hide()
+        self._tertiary_symbol_combo.currentTextChanged.connect(self._on_tertiary_symbol_changed)
+        action_row.addWidget(self._tertiary_symbol_combo, 0)
+        self._tertiary_symbol_label.hide()
+        self._tertiary_period_label = QLabel("第三图周期")
+        action_row.addWidget(self._tertiary_period_label)
+        self._tertiary_period_combo = QComboBox()
+        self._tertiary_period_combo.addItems([period for _, period in _PRIMARY_PERIOD_OPTIONS])
+        self._tertiary_period_combo.setCurrentText(_DEFAULT_DUAL_SECONDARY_PERIOD)
+        self._tertiary_period_combo.setEnabled(False)
+        self._tertiary_period_combo.hide()
+        self._tertiary_period_combo.currentTextChanged.connect(self._on_tertiary_period_changed)
+        action_row.addWidget(self._tertiary_period_combo, 0)
+        self._tertiary_period_label.hide()
+
+        self._secondary_period_label = QLabel("副图周期")
+        action_row.addWidget(self._secondary_period_label)
         self._secondary_period_combo = QComboBox()
         self._secondary_period_combo.addItems([period for _, period in _PRIMARY_PERIOD_OPTIONS])
         self._secondary_period_combo.setCurrentText(_DEFAULT_DUAL_SECONDARY_PERIOD)
         self._secondary_period_combo.setEnabled(False)
         self._secondary_period_combo.hide()
         self._secondary_period_combo.currentTextChanged.connect(self._on_secondary_period_changed)
+        action_row.addWidget(self._secondary_period_combo, 0)
+        self._secondary_period_label.hide()
 
         self._secondary_layout_cycle_btn = QPushButton("")
         self._secondary_layout_cycle_btn.setEnabled(False)
@@ -5797,10 +5839,14 @@ class KlineAnalysisWindow(QMainWindow):
             and self._page_ready
         ):
             self._render_secondary_chart(self._secondary_pending_payload)
+        if self._triple_chart_enabled() and self._tertiary_pending_payload is not None and self._page_ready:
+            self._render_tertiary_chart(self._tertiary_pending_payload)
         if isinstance(self._native_chart_view, InteractiveKlineChartView):
             self._native_chart_view.update()
         if isinstance(self._secondary_native_chart_view, InteractiveKlineChartView):
             self._secondary_native_chart_view.update()
+        if isinstance(self._tertiary_native_chart_view, InteractiveKlineChartView):
+            self._tertiary_native_chart_view.update()
 
     def _apply_default_splitter_sizes(self) -> None:
         splitter = self._body_splitter
@@ -5814,6 +5860,9 @@ class KlineAnalysisWindow(QMainWindow):
     def _secondary_chart_kind(self) -> str:
         value = str(self._secondary_chart_kind_mode or "kline").strip().lower()
         return value if value in {"kline", "volatility"} else "kline"
+
+    def _triple_chart_enabled(self) -> bool:
+        return bool(self._tertiary_chart_check.isChecked())
 
     def _secondary_layout_mode(self) -> str:
         value = str(self._secondary_layout_mode_value or "vertical").strip().lower()
@@ -5876,6 +5925,9 @@ class KlineAnalysisWindow(QMainWindow):
     def _selected_secondary_symbol(self) -> str:
         return self._secondary_symbol_combo.currentText().strip().upper()
 
+    def _selected_tertiary_symbol(self) -> str:
+        return self._tertiary_symbol_combo.currentText().strip().upper()
+
     def _current_volatility_currency(self) -> str | None:
         return _volatility_currency_for_symbol(self._selected_symbol())
 
@@ -5899,7 +5951,12 @@ class KlineAnalysisWindow(QMainWindow):
     def _sync_chart_range_to_other(self, *, target: str, start_x: float, end_x: float) -> None:
         if self._syncing_chart_range or not self._secondary_chart_check.isChecked() or not self._use_native_chart:
             return
-        target_view = self._secondary_native_chart_view if target == "secondary" else self._native_chart_view
+        target_views = {
+            "primary": self._native_chart_view,
+            "secondary": self._secondary_native_chart_view,
+            "tertiary": self._tertiary_native_chart_view,
+        }
+        target_view = target_views.get(target)
         if not isinstance(target_view, InteractiveKlineChartView):
             return
         self._syncing_chart_range = True
@@ -5908,13 +5965,33 @@ class KlineAnalysisWindow(QMainWindow):
         finally:
             self._syncing_chart_range = False
 
+    def _sync_chart_range_from(self, *, source: str, start_x: float, end_x: float) -> None:
+        targets = ["primary", "secondary"]
+        if self._triple_chart_enabled():
+            targets.append("tertiary")
+        for target in targets:
+            if target != source:
+                self._sync_chart_range_to_other(target=target, start_x=start_x, end_x=end_x)
+
+    def _sync_hover_time_from(self, *, source: str, candle_time: object) -> None:
+        targets: dict[str, object] = {
+            "primary": self._native_chart_view,
+            "secondary": self._secondary_native_chart_view,
+        }
+        if self._triple_chart_enabled():
+            targets["tertiary"] = self._tertiary_native_chart_view
+        value = None if candle_time is None else int(candle_time)
+        for target, view in targets.items():
+            if target != source and isinstance(view, InteractiveKlineChartView):
+                view.set_external_hover_time(value)
+
     def _sync_secondary_chart_range_from_primary(self) -> None:
         if not self._secondary_chart_check.isChecked():
             return
         if not isinstance(self._native_chart_view, InteractiveKlineChartView):
             return
         start_x, end_x = self._native_chart_view.current_x_range()
-        self._sync_chart_range_to_other(target="secondary", start_x=start_x, end_x=end_x)
+        self._sync_chart_range_from(source="primary", start_x=start_x, end_x=end_x)
 
     def _apply_recent_view_range_for_linked_charts(self) -> bool:
         if (
@@ -5923,6 +6000,11 @@ class KlineAnalysisWindow(QMainWindow):
             or not isinstance(self._secondary_native_chart_view, InteractiveKlineChartView)
         ):
             return False
+        if self._triple_chart_enabled():
+            self._native_chart_view.set_recent_view_range()
+            start_x, end_x = self._native_chart_view.current_x_range()
+            self._sync_chart_range_from(source="primary", start_x=start_x, end_x=end_x)
+            return True
         primary_period_ms = _bar_to_ms(self._period_combo.currentText().strip())
         secondary_period_ms = _bar_to_ms(self._secondary_period_combo.currentText().strip())
         if secondary_period_ms < primary_period_ms:
@@ -5964,11 +6046,22 @@ class KlineAnalysisWindow(QMainWindow):
         self._secondary_symbol_label.setVisible(secondary_symbol_available)
         self._secondary_symbol_combo.setVisible(secondary_symbol_available)
         self._secondary_symbol_combo.setEnabled(secondary_symbol_available)
+        tertiary_available = self._triple_chart_enabled()
+        self._tertiary_symbol_label.setVisible(tertiary_available)
+        self._tertiary_symbol_combo.setVisible(tertiary_available)
+        self._tertiary_symbol_combo.setEnabled(tertiary_available)
+        self._tertiary_period_label.setVisible(tertiary_available)
+        self._tertiary_period_combo.setVisible(tertiary_available)
+        self._tertiary_period_combo.setEnabled(tertiary_available)
+        self._secondary_period_label.setVisible(enabled)
+        self._secondary_period_combo.setVisible(enabled)
         self._secondary_period_combo.setEnabled(enabled)
         if self._secondary_layout_cycle_btn is not None:
-            self._secondary_layout_cycle_btn.setEnabled(enabled)
+            self._secondary_layout_cycle_btn.setEnabled(enabled and not tertiary_available)
         if self._secondary_chart_kind_btn is not None:
-            self._secondary_chart_kind_btn.setEnabled(enabled and self._volatility_available_for_current_symbol())
+            self._secondary_chart_kind_btn.setEnabled(
+                enabled and not tertiary_available and self._volatility_available_for_current_symbol()
+            )
         if self._secondary_sync_period_btn is not None:
             self._secondary_sync_period_btn.setEnabled(enabled)
         self._secondary_average_kline_check.setEnabled(True)
@@ -6038,6 +6131,8 @@ class KlineAnalysisWindow(QMainWindow):
 
     @Slot()
     def _on_secondary_layout_cycle_clicked(self) -> None:
+        if self._triple_chart_enabled():
+            return
         self._secondary_layout_mode_value = (
             "horizontal" if self._secondary_layout_mode() == "vertical" else "vertical"
         )
@@ -6047,6 +6142,8 @@ class KlineAnalysisWindow(QMainWindow):
 
     @Slot()
     def _on_secondary_chart_kind_cycle_clicked(self) -> None:
+        if self._triple_chart_enabled():
+            return
         previous_kind = self._secondary_chart_kind()
         self._secondary_chart_kind_mode = ("volatility" if previous_kind == "kline" else "kline")
         self._refresh_secondary_chart_kind_button()
@@ -6107,6 +6204,12 @@ class KlineAnalysisWindow(QMainWindow):
         if splitter is None:
             return
         enabled = bool(self._secondary_chart_check.isChecked())
+        if self._triple_chart_enabled():
+            splitter.setOrientation(Qt.Orientation.Horizontal)
+            available_width = splitter.width() or self.width() or 1800
+            third_width = max(1, available_width // 3)
+            splitter.setSizes([third_width, third_width, third_width])
+            return
         layout_mode = self._secondary_layout_mode()
         splitter.setOrientation(Qt.Orientation.Horizontal if layout_mode == "horizontal" else Qt.Orientation.Vertical)
         if not enabled:
@@ -6122,10 +6225,11 @@ class KlineAnalysisWindow(QMainWindow):
         splitter.setSizes([top_height, bottom_height])
 
     def _apply_secondary_chart_visibility(self) -> None:
-        if self._secondary_chart_frame is None:
-            return
         enabled = bool(self._secondary_chart_check.isChecked())
-        self._secondary_chart_frame.setVisible(enabled)
+        if self._secondary_chart_frame is not None:
+            self._secondary_chart_frame.setVisible(enabled)
+        if self._tertiary_chart_frame is not None:
+            self._tertiary_chart_frame.setVisible(self._triple_chart_enabled())
         self._update_secondary_controls_state()
         self._apply_secondary_chart_layout()
         self._refresh_chart_mode_cycle_button()
@@ -6133,6 +6237,8 @@ class KlineAnalysisWindow(QMainWindow):
     def _active_period_value(self) -> str:
         if self._active_chart_target == "secondary" and self._secondary_chart_check.isChecked():
             return self._secondary_period_combo.currentText().strip()
+        if self._active_chart_target == "tertiary" and self._triple_chart_enabled():
+            return self._tertiary_period_combo.currentText().strip()
         return self._period_combo.currentText().strip()
 
     def _sync_primary_period_buttons(self) -> None:
@@ -6161,9 +6267,18 @@ class KlineAnalysisWindow(QMainWindow):
                     active=self._active_chart_target == "secondary" and self._secondary_chart_check.isChecked()
                 )
             )
+        if self._tertiary_chart_frame is not None:
+            self._tertiary_chart_frame.setStyleSheet(
+                self._chart_frame_style(active=self._active_chart_target == "tertiary" and self._triple_chart_enabled())
+            )
 
     def _set_active_chart_target(self, target: str) -> None:
-        resolved = "secondary" if target == "secondary" and self._secondary_chart_check.isChecked() else "primary"
+        if target == "tertiary" and self._triple_chart_enabled():
+            resolved = "tertiary"
+        elif target == "secondary" and self._secondary_chart_check.isChecked():
+            resolved = "secondary"
+        else:
+            resolved = "primary"
         if self._active_chart_target == resolved:
             self._refresh_chart_selection_visuals()
             self._sync_primary_period_buttons()
@@ -6177,16 +6292,25 @@ class KlineAnalysisWindow(QMainWindow):
         secondary_period = _DEFAULT_DUAL_SECONDARY_PERIOD
         self._period_combo.blockSignals(True)
         self._secondary_period_combo.blockSignals(True)
+        self._tertiary_period_combo.blockSignals(True)
         self._period_combo.setCurrentText(primary_period)
         self._secondary_period_combo.setCurrentText(secondary_period)
+        self._tertiary_period_combo.setCurrentText(secondary_period)
         self._period_combo.blockSignals(False)
         self._secondary_period_combo.blockSignals(False)
+        self._tertiary_period_combo.blockSignals(False)
         self._sync_primary_period_buttons()
         self._refresh_timer.setInterval(self._auto_refresh_interval_ms(primary_period))
         self._reload_workspace_view()
 
     @Slot(str)
     def _on_period_button_clicked(self, period_value: str) -> None:
+        if self._active_chart_target == "tertiary" and self._triple_chart_enabled():
+            if self._tertiary_period_combo.currentText().strip() != period_value:
+                self._tertiary_period_combo.setCurrentText(period_value)
+            else:
+                self._load_tertiary_data()
+            return
         if self._active_chart_target == "secondary" and self._secondary_chart_check.isChecked():
             if self._secondary_chart_kind() == "volatility" and period_value not in {"1H", "4H", "1D"}:
                 period_value = "1H"
@@ -6221,6 +6345,9 @@ class KlineAnalysisWindow(QMainWindow):
         if self._secondary_loader is not None and self._secondary_loader.isRunning():
             self._secondary_loader.requestInterruption()
             self._secondary_loader.wait(1000)
+        if self._tertiary_loader is not None and self._tertiary_loader.isRunning():
+            self._tertiary_loader.requestInterruption()
+            self._tertiary_loader.wait(1000)
         if self._secondary_volatility_loader is not None and self._secondary_volatility_loader.isRunning():
             self._secondary_volatility_loader.requestInterruption()
             self._secondary_volatility_loader.wait(1000)
@@ -6247,6 +6374,7 @@ class KlineAnalysisWindow(QMainWindow):
         return bool(
             (self._loader is not None and self._loader.isRunning())
             or (self._secondary_loader is not None and self._secondary_loader.isRunning())
+            or (self._tertiary_loader is not None and self._tertiary_loader.isRunning())
             or (
                 self._secondary_volatility_loader is not None
                 and self._secondary_volatility_loader.isRunning()
@@ -6520,6 +6648,20 @@ class KlineAnalysisWindow(QMainWindow):
             bool(self._reverse_kline_check.isChecked()),
         )
 
+    def _current_tertiary_request_key(self) -> tuple[Any, ...] | None:
+        if not self._triple_chart_enabled() or not self._use_native_chart:
+            return None
+        return (
+            "tertiary",
+            "kline",
+            self._selected_tertiary_symbol(),
+            self._tertiary_period_combo.currentText().strip().upper(),
+            max(50, self._limit_spin.value()),
+            bool(self._prefer_local_checkbox.isChecked()),
+            self._secondary_average_kline_enabled(),
+            bool(self._reverse_kline_check.isChecked()),
+        )
+
     def _remember_payload_cache(
         self,
         cache: dict[tuple[Any, ...], KlineChartPayload],
@@ -6606,6 +6748,8 @@ class KlineAnalysisWindow(QMainWindow):
         self._loader.start()
         if self._secondary_chart_check.isChecked() and self._use_native_chart:
             self._load_secondary_data(symbol=self._selected_secondary_symbol())
+            if self._triple_chart_enabled():
+                self._load_tertiary_data()
         else:
             self._active_secondary_request_key = None
             self._loaded_secondary_request_key = None
@@ -6614,6 +6758,7 @@ class KlineAnalysisWindow(QMainWindow):
                 self._secondary_native_chart_view.set_external_hover_time(None)
             if self._secondary_native_chart is not None:
                 self._secondary_native_chart.setTitle("副图")
+            self._tertiary_pending_payload = None
 
     @Slot()
     def _on_loader_finished(self) -> None:
@@ -6665,11 +6810,46 @@ class KlineAnalysisWindow(QMainWindow):
         self._secondary_loader.finished.connect(self._on_secondary_loader_finished)
         self._secondary_loader.start()
 
+    def _load_tertiary_data(self) -> None:
+        request_key = self._current_tertiary_request_key()
+        if request_key is None:
+            return
+        self._tertiary_request_id += 1
+        self._active_tertiary_request_id = self._tertiary_request_id
+        self._active_tertiary_request_key = request_key
+        cached_payload = self._tertiary_payload_cache.get(request_key)
+        if cached_payload is not None and self._page_ready:
+            self._tertiary_pending_payload = cached_payload
+            self._loaded_tertiary_request_key = request_key
+            self._render_tertiary_chart(cached_payload)
+        self._tertiary_loader = KlineDataLoader(
+            request_id=self._tertiary_request_id,
+            symbol=self._selected_tertiary_symbol(),
+            period=self._tertiary_period_combo.currentText().strip(),
+            limit=max(50, self._limit_spin.value()),
+            local_only=self._prefer_local_checkbox.isChecked(),
+            average_kline=self._secondary_average_kline_enabled(),
+            workspace_entry={},
+            enable_alerts=False,
+            enable_shape_signals=False,
+        )
+        self._tertiary_loader.loaded.connect(self._on_tertiary_data_loaded)
+        self._tertiary_loader.failed.connect(self._on_tertiary_data_failed)
+        self._tertiary_loader.finished.connect(self._on_tertiary_loader_finished)
+        self._tertiary_loader.start()
+
     @Slot()
     def _on_secondary_loader_finished(self) -> None:
         if self._secondary_loader is not None:
             self._secondary_loader.deleteLater()
             self._secondary_loader = None
+        self._schedule_pending_reload_if_ready()
+
+    @Slot()
+    def _on_tertiary_loader_finished(self) -> None:
+        if self._tertiary_loader is not None:
+            self._tertiary_loader.deleteLater()
+            self._tertiary_loader = None
         self._schedule_pending_reload_if_ready()
 
     @Slot()
@@ -6704,6 +6884,23 @@ class KlineAnalysisWindow(QMainWindow):
             self._set_status("当前仍在加载，已排队刷新最新副图交易对，请稍候...")
             return
         self._load_secondary_data(symbol=self._selected_secondary_symbol())
+
+    @Slot(str)
+    def _on_tertiary_symbol_changed(self, _value: str) -> None:
+        if not self._triple_chart_enabled() or not self._use_native_chart:
+            return
+        if self._has_active_loaders():
+            self._pending_reload_after_load = True
+            self._set_status("当前仍在加载，已排队刷新最新第三图交易对，请稍候...")
+            return
+        self._load_tertiary_data()
+
+    @Slot(str)
+    def _on_tertiary_period_changed(self, _value: str) -> None:
+        if self._active_chart_target == "tertiary":
+            self._sync_primary_period_buttons()
+        if self._triple_chart_enabled():
+            self._on_tertiary_symbol_changed(self._selected_tertiary_symbol())
 
     def _show_account_drawer(self, tab_name: str) -> None:
         if self._account_drawer is None or self._chart_account_splitter is None:
@@ -6740,6 +6937,10 @@ class KlineAnalysisWindow(QMainWindow):
 
     @Slot(bool)
     def _on_secondary_chart_toggled(self, enabled: bool) -> None:
+        if not enabled and self._triple_chart_enabled():
+            self._tertiary_chart_check.blockSignals(True)
+            self._tertiary_chart_check.setChecked(False)
+            self._tertiary_chart_check.blockSignals(False)
         primary_average_secondary_normal_was_enabled = self._primary_average_secondary_normal_check.isChecked()
         self._apply_secondary_chart_visibility()
         self._apply_chart_mode_period_defaults(dual_enabled=enabled)
@@ -6762,6 +6963,22 @@ class KlineAnalysisWindow(QMainWindow):
                 self._native_chart_view.set_external_hover_time(None)
             if primary_average_secondary_normal_was_enabled:
                 self._load_data()
+
+    @Slot(bool)
+    def _on_tertiary_chart_toggled(self, enabled: bool) -> None:
+        if enabled:
+            if self._secondary_chart_kind() != "kline":
+                self._secondary_chart_kind_mode = "kline"
+            if not self._secondary_chart_check.isChecked():
+                self._secondary_chart_check.blockSignals(True)
+                self._secondary_chart_check.setChecked(True)
+                self._secondary_chart_check.blockSignals(False)
+            self._set_active_chart_target("tertiary")
+        elif self._active_chart_target == "tertiary":
+            self._set_active_chart_target("primary")
+        self._apply_secondary_chart_visibility()
+        if enabled:
+            self._load_data()
 
     @Slot()
     def _on_secondary_layout_changed(self) -> None:
@@ -6957,6 +7174,20 @@ class KlineAnalysisWindow(QMainWindow):
         ):
             self._sync_chart_options()
 
+    @Slot(int, KlineChartPayload)
+    def _on_tertiary_data_loaded(self, request_id: int, payload: KlineChartPayload) -> None:
+        if request_id != self._active_tertiary_request_id:
+            return
+        if self._active_tertiary_request_key != self._current_tertiary_request_key():
+            self._set_status("第三图结果已过期，正在刷新最新选择...")
+            return
+        self._tertiary_pending_payload = payload
+        self._loaded_tertiary_request_key = self._active_tertiary_request_key
+        self._remember_payload_cache(self._tertiary_payload_cache, self._loaded_tertiary_request_key, payload)
+        if self._triple_chart_enabled() and self._use_native_chart:
+            self._render_tertiary_chart(payload)
+            self._sync_secondary_chart_range_from_primary()
+
     @Slot(int, str)
     def _on_data_failed(self, request_id: int, message: str) -> None:
         if request_id != self._active_request_id:
@@ -6974,23 +7205,36 @@ class KlineAnalysisWindow(QMainWindow):
         if self._secondary_native_chart is not None:
             self._secondary_native_chart.setTitle(f"副图加载失败：{message}")
 
+    @Slot(int, str)
+    def _on_tertiary_data_failed(self, request_id: int, message: str) -> None:
+        if request_id != self._active_tertiary_request_id:
+            return
+        if self._tertiary_native_chart is not None:
+            self._tertiary_native_chart.setTitle(f"第三图加载失败：{message}")
+
     @Slot(object)
     def _on_primary_hover_time_changed(self, candle_time: object) -> None:
-        if isinstance(self._secondary_native_chart_view, InteractiveKlineChartView):
-            self._secondary_native_chart_view.set_external_hover_time(None if candle_time is None else int(candle_time))
+        self._sync_hover_time_from(source="primary", candle_time=candle_time)
 
     @Slot(object)
     def _on_secondary_hover_time_changed(self, candle_time: object) -> None:
-        if isinstance(self._native_chart_view, InteractiveKlineChartView):
-            self._native_chart_view.set_external_hover_time(None if candle_time is None else int(candle_time))
+        self._sync_hover_time_from(source="secondary", candle_time=candle_time)
+
+    @Slot(object)
+    def _on_tertiary_hover_time_changed(self, candle_time: object) -> None:
+        self._sync_hover_time_from(source="tertiary", candle_time=candle_time)
 
     @Slot(float, float)
     def _on_primary_x_range_changed(self, start_x: float, end_x: float) -> None:
-        self._sync_chart_range_to_other(target="secondary", start_x=start_x, end_x=end_x)
+        self._sync_chart_range_from(source="primary", start_x=start_x, end_x=end_x)
 
     @Slot(float, float)
     def _on_secondary_x_range_changed(self, start_x: float, end_x: float) -> None:
-        self._sync_chart_range_to_other(target="primary", start_x=start_x, end_x=end_x)
+        self._sync_chart_range_from(source="secondary", start_x=start_x, end_x=end_x)
+
+    @Slot(float, float)
+    def _on_tertiary_x_range_changed(self, start_x: float, end_x: float) -> None:
+        self._sync_chart_range_from(source="tertiary", start_x=start_x, end_x=end_x)
 
     @Slot(bool)
     def _toggle_auto_refresh(self, enabled: bool) -> None:
@@ -7068,6 +7312,12 @@ class KlineAnalysisWindow(QMainWindow):
             and self._loaded_secondary_request_key == self._current_secondary_request_key()
         ):
             self._render_secondary_chart(self._secondary_pending_payload)
+        if (
+            self._tertiary_pending_payload is not None
+            and self._triple_chart_enabled()
+            and self._loaded_tertiary_request_key == self._current_tertiary_request_key()
+        ):
+            self._render_tertiary_chart(self._tertiary_pending_payload)
 
     def _reverse_kline_enabled_for_chart(self, *, is_secondary: bool) -> bool:
         if not bool(self._reverse_kline_check.isChecked()):
@@ -7364,8 +7614,20 @@ class KlineAnalysisWindow(QMainWindow):
         secondary_layout.addWidget(self._secondary_native_chart_view, 1)
         self._secondary_chart_frame = secondary_frame
         chart_splitter.addWidget(secondary_frame)
+        tertiary_frame = QFrame()
+        tertiary_frame.setStyleSheet(self._chart_frame_style(active=False))
+        tertiary_layout = QVBoxLayout(tertiary_frame)
+        tertiary_layout.setContentsMargins(0, 0, 0, 0)
+        self._tertiary_native_chart, self._tertiary_native_chart_view = self._create_native_chart_view(
+            title="正在准备第三图...",
+            allow_draw_clicks=False,
+        )
+        tertiary_layout.addWidget(self._tertiary_native_chart_view, 1)
+        self._tertiary_chart_frame = tertiary_frame
+        chart_splitter.addWidget(tertiary_frame)
         chart_splitter.setStretchFactor(0, 5)
         chart_splitter.setStretchFactor(1, 2)
+        chart_splitter.setStretchFactor(2, 2)
 
         if isinstance(self._native_chart_view, InteractiveKlineChartView) and isinstance(self._secondary_native_chart_view, InteractiveKlineChartView):
             self._native_chart_view.hoverTimeChanged.connect(self._on_primary_hover_time_changed)
@@ -7374,6 +7636,10 @@ class KlineAnalysisWindow(QMainWindow):
             self._secondary_native_chart_view.xRangeChanged.connect(self._on_secondary_x_range_changed)
             self._native_chart_view.chartActivated.connect(lambda: self._set_active_chart_target("primary"))
             self._secondary_native_chart_view.chartActivated.connect(lambda: self._set_active_chart_target("secondary"))
+            if isinstance(self._tertiary_native_chart_view, InteractiveKlineChartView):
+                self._tertiary_native_chart_view.hoverTimeChanged.connect(self._on_tertiary_hover_time_changed)
+                self._tertiary_native_chart_view.xRangeChanged.connect(self._on_tertiary_x_range_changed)
+                self._tertiary_native_chart_view.chartActivated.connect(lambda: self._set_active_chart_target("tertiary"))
         elif isinstance(self._native_chart_view, InteractiveKlineChartView):
             self._native_chart_view.chartActivated.connect(lambda: self._set_active_chart_target("primary"))
 
@@ -7458,6 +7724,30 @@ class KlineAnalysisWindow(QMainWindow):
                 display_payload,
                 period=self._secondary_period_combo.currentText().strip(),
             ),
+            source_payload=payload,
+        )
+
+    def _render_tertiary_chart(self, payload: KlineChartPayload) -> None:
+        if (
+            self._tertiary_native_chart is None
+            or self._tertiary_native_chart_view is None
+            or QCandlestickSeries is None
+            or QCandlestickSet is None
+            or QDateTimeAxis is None
+            or QLineSeries is None
+            or QValueAxis is None
+        ):
+            return
+        display_payload = self._display_payload_for_chart(payload, is_secondary=True)
+        self._render_native_chart_target(
+            chart=self._tertiary_native_chart,
+            chart_view=self._tertiary_native_chart_view,
+            payload=display_payload,
+            period=self._tertiary_period_combo.currentText().strip(),
+            title_suffix="第三图",
+            include_workspace_lines=False,
+            is_secondary=True,
+            display_symbol=self._selected_tertiary_symbol(),
             source_payload=payload,
         )
 
