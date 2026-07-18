@@ -8,6 +8,8 @@ from unittest import TestCase
 
 from okx_quant.strategy_status_email import (
     STATUS_EMAIL_TIMES,
+    StrategyStatusEmailRow,
+    build_strategy_status_email,
     claim_status_email_slot,
     latest_due_status_email_slot,
     load_sent_status_email_slots,
@@ -101,3 +103,88 @@ class StrategyStatusEmailScheduleTest(TestCase):
                 strategy_status_email_state_file_path(Path(temp_dir)).name,
                 "strategy_status_email_state.json",
             )
+
+
+def _row(**overrides: str) -> StrategyStatusEmailRow:
+    values = {
+        "session": "S01",
+        "api": "api-b",
+        "account_equity": "2734.05",
+        "strategy": "EMA 动态委托做多",
+        "symbol": "DOGE-USDT-SWAP",
+        "direction": "只做多",
+        "open_qty": "7140 DOGE",
+        "entry_price": "0.0724",
+        "stop_price": "0.07184",
+        "take_profit": "-",
+        "live_pnl": "+0.93",
+        "net_pnl": "-0.67",
+        "last_net_pnl": "-0.67",
+        "status": "持仓监控中",
+        "started": "07-13 17:39:52",
+        "risk_amount": "4",
+    }
+    values.update(overrides)
+    return StrategyStatusEmailRow(**values)
+
+
+class StrategyStatusEmailRenderingTest(TestCase):
+    def test_formal_email_contains_subject_summary_and_all_columns(self) -> None:
+        content = build_strategy_status_email(
+            [_row()],
+            scheduled_for=datetime(2026, 7, 18, 8, 0),
+            generated_at=datetime(2026, 7, 18, 8, 0, 8),
+        )
+        self.assertEqual(
+            content.subject,
+            "[OKXQQ] 策略运行状态 | 2026-07-18 08:00 | 活跃 1",
+        )
+        self.assertIn("涉及 API：1", content.body)
+        self.assertIn("api-b：1", content.body)
+        self.assertIn("7140 DOGE", content.body)
+        self.assertIn("账户总权益", content.html_body)
+        self.assertIn("上次净盈亏", content.html_body)
+        self.assertIn("风险金", content.html_body)
+
+    def test_rows_are_sorted_by_api_then_session(self) -> None:
+        content = build_strategy_status_email(
+            [
+                _row(session="S02", api="api-b"),
+                _row(session="S03", api="api-a"),
+                _row(session="S01", api="api-b"),
+            ],
+            scheduled_for=datetime(2026, 7, 18, 12, 0),
+            generated_at=datetime(2026, 7, 18, 12, 0, 3),
+        )
+        self.assertLess(content.body.index("api-a\tS03"), content.body.index("api-b\tS01"))
+        self.assertLess(content.body.index("api-b\tS01"), content.body.index("api-b\tS02"))
+
+    def test_html_escapes_dynamic_values(self) -> None:
+        content = build_strategy_status_email(
+            [_row(strategy="EMA <script>&")],
+            scheduled_for=datetime(2026, 7, 18, 16, 0),
+            generated_at=datetime(2026, 7, 18, 16, 0),
+        )
+        self.assertIn("EMA &lt;script&gt;&amp;", content.html_body)
+        self.assertNotIn("EMA <script>", content.html_body)
+
+    def test_empty_email_still_reports_healthy_empty_state(self) -> None:
+        content = build_strategy_status_email(
+            [],
+            scheduled_for=datetime(2026, 7, 18, 20, 0),
+            generated_at=datetime(2026, 7, 18, 20, 0, 1),
+        )
+        self.assertIn("活跃 0", content.subject)
+        self.assertIn("当前无活跃策略", content.body)
+        self.assertIn("当前无活跃策略", content.html_body)
+
+    def test_manual_test_email_is_marked_and_explains_no_slot_consumption(self) -> None:
+        content = build_strategy_status_email(
+            [_row()],
+            scheduled_for=datetime(2026, 7, 18, 10, 23),
+            generated_at=datetime(2026, 7, 18, 10, 23),
+            is_test=True,
+        )
+        self.assertIn("策略运行状态测试", content.subject)
+        self.assertIn("手动测试触发，不占用定时发送时段", content.body)
+        self.assertIn("手动测试触发，不占用定时发送时段", content.html_body)
