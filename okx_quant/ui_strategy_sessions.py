@@ -21,7 +21,12 @@ from okx_quant.models import (
 )
 from okx_quant.strategy_parameters import strategy_uses_parameter
 from okx_quant.strategy_symbol_defaults import get_strategy_symbol_parameter_defaults
-from okx_quant.strategy_status_email import StrategyStatusEmailRow, build_strategy_status_email
+from okx_quant.strategy_status_email import (
+    StrategyStatusEmailRow,
+    build_strategy_status_email,
+    claim_status_email_slot,
+    latest_due_status_email_slot,
+)
 
 _SESSION_RUNTIME_HEARTBEAT_PREFIX = "__qqokx_runtime_heartbeat__|"
 _SESSION_RUNTIME_HEARTBEAT_TIMEOUT_POLLS = 6
@@ -6007,6 +6012,45 @@ class UiStrategySessionsMixin:
             messagebox.showinfo("提示", "当前未启用邮件通知。", parent=parent)
             return
         messagebox.showinfo("提示", "策略状态测试邮件已提交，请检查收件箱。", parent=parent)
+
+    def _start_strategy_status_email_scheduler(self) -> None:
+        self._strategy_status_email_last_check_at = datetime.now()
+        self._strategy_status_email_closing = False
+        self._strategy_status_email_job = self.root.after(30_000, self._run_strategy_status_email_tick)
+
+    def _run_strategy_status_email_tick(self, now: datetime | None = None) -> None:
+        current = now or datetime.now()
+        previous = getattr(self, "_strategy_status_email_last_check_at", None)
+        self._strategy_status_email_last_check_at = current
+        try:
+            scheduled_for = latest_due_status_email_slot(previous, current)
+            if scheduled_for is not None and claim_status_email_slot(
+                scheduled_for,
+                now=current,
+                logger=self._enqueue_log,
+            ):
+                self._queue_strategy_status_email(
+                    scheduled_for=scheduled_for,
+                    generated_at=current,
+                    is_test=False,
+                )
+        except Exception as exc:
+            self._enqueue_log(f"策略状态定时邮件触发失败：{exc}")
+        finally:
+            self._strategy_status_email_job = None
+            if not getattr(self, "_strategy_status_email_closing", False):
+                self._strategy_status_email_job = self.root.after(30_000, self._run_strategy_status_email_tick)
+
+    def _stop_strategy_status_email_scheduler(self) -> None:
+        self._strategy_status_email_closing = True
+        job = getattr(self, "_strategy_status_email_job", None)
+        self._strategy_status_email_job = None
+        if job is None:
+            return
+        try:
+            self.root.after_cancel(job)
+        except Exception:
+            pass
 
     def send_test_email(self) -> None:
         try:

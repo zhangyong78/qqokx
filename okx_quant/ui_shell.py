@@ -266,7 +266,12 @@ from okx_quant.strategy_runtime_registry import (
     strategy_uses_mtf_filter,
     strategy_uses_signal_extrema,
 )
-from okx_quant.strategy_status_email import StrategyStatusEmailRow, build_strategy_status_email
+from okx_quant.strategy_status_email import (
+    StrategyStatusEmailRow,
+    build_strategy_status_email,
+    claim_status_email_slot,
+    latest_due_status_email_slot,
+)
 from okx_quant.window_layout import (
     apply_adaptive_window_geometry,
     apply_fill_window_geometry,
@@ -4032,6 +4037,7 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         self.root.after(500, self._refresh_status)
         self.root.after(900, self._attempt_auto_restore_recoverable_sessions)
         self.root.after(1200, self._refresh_positions_periodic)
+        self._start_strategy_status_email_scheduler()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
     def _configure_compact_ui_style(self) -> None:
@@ -14100,6 +14106,7 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
             if not confirmed:
                 return
         self._close_confirmation_required = True
+        self._stop_strategy_status_email_scheduler()
         upgrade_worker_command = self._upgrade_worker_command_on_close
         self._upgrade_worker_command_on_close = None
         restart_command = self._restart_command_on_close

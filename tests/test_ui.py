@@ -9036,6 +9036,90 @@ class CredentialProfileEnvironmentTest(TestCase):
         self.assertIn('text="发送策略状态测试邮件"', source)
         self.assertIn("command=self.send_strategy_status_test_email", source)
 
+    def test_strategy_status_scheduler_claims_due_slot_before_queueing(self) -> None:
+        root = SimpleNamespace(after=MagicMock(return_value="next-job"))
+        app = SimpleNamespace(
+            root=root,
+            _strategy_status_email_closing=False,
+            _strategy_status_email_job=None,
+            _strategy_status_email_last_check_at=datetime(2026, 7, 18, 7, 59, 50),
+            _queue_strategy_status_email=MagicMock(return_value=True),
+            _enqueue_log=MagicMock(),
+        )
+        app._run_strategy_status_email_tick = lambda: QuantApp._run_strategy_status_email_tick(app)
+
+        with patch("okx_quant.ui_shell.claim_status_email_slot", return_value=True) as claim:
+            QuantApp._run_strategy_status_email_tick(app, now=datetime(2026, 7, 18, 8, 0, 10))
+
+        claim.assert_called_once()
+        app._queue_strategy_status_email.assert_called_once_with(
+            scheduled_for=datetime(2026, 7, 18, 8, 0),
+            generated_at=datetime(2026, 7, 18, 8, 0, 10),
+            is_test=False,
+        )
+        root.after.assert_called_once_with(30_000, app._run_strategy_status_email_tick)
+
+    def test_strategy_status_scheduler_skips_already_claimed_slot(self) -> None:
+        root = SimpleNamespace(after=MagicMock(return_value="next-job"))
+        app = SimpleNamespace(
+            root=root,
+            _strategy_status_email_closing=False,
+            _strategy_status_email_job=None,
+            _strategy_status_email_last_check_at=datetime(2026, 7, 18, 7, 59, 50),
+            _queue_strategy_status_email=MagicMock(),
+            _enqueue_log=MagicMock(),
+        )
+        app._run_strategy_status_email_tick = lambda: QuantApp._run_strategy_status_email_tick(app)
+
+        with patch("okx_quant.ui_shell.claim_status_email_slot", return_value=False):
+            QuantApp._run_strategy_status_email_tick(app, now=datetime(2026, 7, 18, 8, 0, 10))
+
+        app._queue_strategy_status_email.assert_not_called()
+
+    def test_strategy_status_scheduler_logs_claim_error_and_reschedules(self) -> None:
+        root = SimpleNamespace(after=MagicMock(return_value="next-job"))
+        app = SimpleNamespace(
+            root=root,
+            _strategy_status_email_closing=False,
+            _strategy_status_email_job=None,
+            _strategy_status_email_last_check_at=datetime(2026, 7, 18, 7, 59, 50),
+            _queue_strategy_status_email=MagicMock(),
+            _enqueue_log=MagicMock(),
+        )
+        app._run_strategy_status_email_tick = lambda: QuantApp._run_strategy_status_email_tick(app)
+
+        with patch("okx_quant.ui_shell.claim_status_email_slot", side_effect=PermissionError("denied")):
+            QuantApp._run_strategy_status_email_tick(app, now=datetime(2026, 7, 18, 8, 0, 10))
+
+        app._enqueue_log.assert_called_once()
+        root.after.assert_called_once_with(30_000, app._run_strategy_status_email_tick)
+
+    def test_strategy_status_scheduler_starts_without_backfilling(self) -> None:
+        root = SimpleNamespace(after=MagicMock(return_value="next-job"))
+        app = SimpleNamespace(root=root, _strategy_status_email_closing=True)
+        app._run_strategy_status_email_tick = MagicMock()
+
+        QuantApp._start_strategy_status_email_scheduler(app)
+
+        self.assertIsInstance(app._strategy_status_email_last_check_at, datetime)
+        self.assertFalse(app._strategy_status_email_closing)
+        self.assertEqual(app._strategy_status_email_job, "next-job")
+        root.after.assert_called_once_with(30_000, app._run_strategy_status_email_tick)
+
+    def test_strategy_status_scheduler_stops_pending_callback(self) -> None:
+        root = SimpleNamespace(after_cancel=MagicMock())
+        app = SimpleNamespace(root=root, _strategy_status_email_job="scheduled-job")
+
+        QuantApp._stop_strategy_status_email_scheduler(app)
+
+        self.assertTrue(app._strategy_status_email_closing)
+        self.assertIsNone(app._strategy_status_email_job)
+        root.after_cancel.assert_called_once_with("scheduled-job")
+
+    def test_app_lifecycle_wires_strategy_status_scheduler(self) -> None:
+        self.assertIn("self._start_strategy_status_email_scheduler()", inspect.getsource(QuantApp.__init__))
+        self.assertIn("self._stop_strategy_status_email_scheduler()", inspect.getsource(QuantApp._on_close))
+
     def test_rename_current_api_profile_moves_sender_override(self) -> None:
         app = SimpleNamespace(
             _credential_profiles={
