@@ -21,6 +21,7 @@ from okx_quant.models import (
 )
 from okx_quant.strategy_parameters import strategy_uses_parameter
 from okx_quant.strategy_symbol_defaults import get_strategy_symbol_parameter_defaults
+from okx_quant.strategy_status_email import StrategyStatusEmailRow
 
 _SESSION_RUNTIME_HEARTBEAT_PREFIX = "__qqokx_runtime_heartbeat__|"
 _SESSION_RUNTIME_HEARTBEAT_TIMEOUT_POLLS = 6
@@ -5909,10 +5910,13 @@ class UiStrategySessionsMixin:
         *,
         validate_if_enabled: bool,
         api_profile_name: str | None = None,
+        use_global_sender: bool = False,
     ) -> EmailNotificationConfig:
         smtp_port = self._parse_optional_port(self.smtp_port.get())
         recipients = tuple(self._split_recipients(self.recipient_emails.get()))
-        sender_email = self._resolved_api_sender_email_override(api_profile_name) or self.sender_email.get().strip()
+        sender_email = self.sender_email.get().strip()
+        if not use_global_sender:
+            sender_email = self._resolved_api_sender_email_override(api_profile_name) or sender_email
         config = EmailNotificationConfig(
             enabled=self.notify_enabled.get(),
             smtp_host=self.smtp_host.get().strip(),
@@ -5955,6 +5959,15 @@ class UiStrategySessionsMixin:
         if not notification_config.enabled:
             return None
         return EmailNotifier(notification_config, logger=self._make_system_logger("邮件 信号监控"))
+
+    def _build_strategy_status_email_notifier(self) -> EmailNotifier | None:
+        notification_config = self._collect_notification_config(
+            validate_if_enabled=True,
+            use_global_sender=True,
+        )
+        if not notification_config.enabled:
+            return None
+        return EmailNotifier(notification_config, logger=self._make_system_logger("邮件 策略运行状态"))
 
     def send_test_email(self) -> None:
         try:
@@ -7195,6 +7208,48 @@ class UiStrategySessionsMixin:
             self.session_tree.insert("", END, iid=session.session_id, values=values, tags=tags)
         if reorder and hasattr(self, "_apply_running_session_tree_sort_order"):
             self._apply_running_session_tree_sort_order()
+
+    def _strategy_status_email_rows(self) -> list[StrategyStatusEmailRow]:
+        rows: list[StrategyStatusEmailRow] = []
+        for session in self.sessions.values():
+            if not QuantApp._session_counts_toward_running_summary(session):
+                continue
+            live_pnl, _refreshed_at = self._session_live_pnl_snapshot(session)
+            risk_amount = UiStrategySessionsMixin._format_optional_positive_entry_decimal(
+                getattr(getattr(session, "config", None), "risk_amount", None)
+            ) or "-"
+            recovery_summary = self._session_recovery_reason_summary(session)
+            status_text = (
+                f"{session.status}:{recovery_summary}"
+                if session.status in {"待恢复", "恢复中"} and recovery_summary
+                else session.display_status
+            )
+            rows.append(
+                StrategyStatusEmailRow(
+                    session=session.session_id or "-",
+                    api=session.api_name or "-",
+                    account_equity=self._session_account_total_equity_text(session),
+                    strategy=session.strategy_name or "-",
+                    symbol=session.symbol or "-",
+                    direction=_normalize_strategy_direction_label(
+                        getattr(session, "strategy_id", getattr(getattr(session, "config", None), "strategy_id", "")),
+                        getattr(session, "config", None),
+                        fallback=session.direction_label,
+                    ),
+                    open_qty=self._session_open_position_amount_text(session),
+                    entry_price=self._session_runtime_entry_price_text(session),
+                    stop_price=self._session_runtime_stop_price_text(session),
+                    take_profit=self._session_runtime_take_profit_text(session),
+                    live_pnl=_format_optional_usdt_precise(live_pnl, places=2),
+                    net_pnl=_format_optional_usdt_precise(session.net_pnl_total, places=2),
+                    last_net_pnl=_format_optional_usdt_precise(session.last_net_pnl, places=2),
+                    status=status_text or "-",
+                    started=self._format_session_started_at(session.started_at),
+                    risk_amount=risk_amount,
+                )
+            )
+        rows.sort(key=lambda row: (row.api.casefold(), row.session))
+        return rows
 
     def _selected_session(self) -> StrategySession | None:
         selected = self.session_tree.selection()

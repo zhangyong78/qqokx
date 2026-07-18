@@ -30,6 +30,7 @@ from okx_quant.upgrade_launch import (
     UpgradeLaunchManager,
 )
 from okx_quant.trader_desk import TraderDraftRecord, TraderRunState, TraderSlotRecord
+from okx_quant.strategy_status_email import StrategyStatusEmailContent
 from okx_quant.ui import (
     ENV_OPTIONS,
     NormalStrategyBookFilters,
@@ -8921,6 +8922,76 @@ class CredentialProfileEnvironmentTest(TestCase):
 
         self.assertEqual(overridden.sender_email, "api2@example.com")
         self.assertEqual(fallback.sender_email, "global@example.com")
+
+    def test_collect_notification_config_can_force_global_sender(self) -> None:
+        app = SimpleNamespace(
+            smtp_port=_Var("465"),
+            recipient_emails=_Var("ops@example.com"),
+            notify_enabled=_Var(True),
+            smtp_host=_Var("smtp.example.com"),
+            smtp_username=_Var("smtp-user"),
+            smtp_password=_Var("secret"),
+            sender_email=_Var("global@example.com"),
+            use_ssl=_Var(True),
+            notify_trade_fills=_Var(True),
+            notify_signals=_Var(True),
+            notify_errors=_Var(True),
+            _api_sender_email_overrides={"api2": "api2@example.com"},
+        )
+        app._parse_optional_port = lambda raw: QuantApp._parse_optional_port(app, raw)
+        app._split_recipients = lambda raw: QuantApp._split_recipients(app, raw)
+        app._normalized_api_sender_email_overrides = lambda: QuantApp._normalized_api_sender_email_overrides(app)
+        app._resolved_api_sender_email_override = lambda profile_name=None: QuantApp._resolved_api_sender_email_override(
+            app, profile_name
+        )
+
+        config = QuantApp._collect_notification_config(
+            app,
+            validate_if_enabled=True,
+            api_profile_name="api2",
+            use_global_sender=True,
+        )
+
+        self.assertEqual(config.sender_email, "global@example.com")
+
+    def test_strategy_status_email_rows_include_all_api_active_sessions_only(self) -> None:
+        def session(session_id: str, api_name: str, status: str, running: bool) -> SimpleNamespace:
+            return SimpleNamespace(
+                session_id=session_id,
+                api_name=api_name,
+                strategy_id=STRATEGY_DYNAMIC_LONG_ID,
+                strategy_name="EMA 动态委托做多",
+                symbol="ETH-USDT-SWAP",
+                direction_label="只做多",
+                display_status="等待信号" if running else status,
+                status=status,
+                engine=SimpleNamespace(is_running=running),
+                stop_cleanup_in_progress=False,
+                config=SimpleNamespace(risk_amount=Decimal("12"), signal_mode="both"),
+                net_pnl_total=Decimal("-1.2"),
+                last_net_pnl=Decimal("0.5"),
+                started_at=datetime(2026, 7, 18, 7, 0),
+            )
+
+        active_a = session("S02", "api-a", "运行中", True)
+        active_b = session("S01", "api-b", "待恢复", False)
+        stopped = session("S03", "api-c", "已停止", False)
+        app = SimpleNamespace(sessions={item.session_id: item for item in (active_a, active_b, stopped)})
+        app._session_live_pnl_snapshot = lambda item: (Decimal("1.25") if item.session_id == "S02" else None, None)
+        app._session_open_position_amount_text = lambda item: "2 ETH" if item.session_id == "S02" else "-"
+        app._session_account_total_equity_text = lambda item: "1000.00" if item.api_name == "api-a" else "500.00"
+        app._session_runtime_entry_price_text = lambda item: "3000" if item.session_id == "S02" else "-"
+        app._session_runtime_stop_price_text = lambda item: "2900" if item.session_id == "S02" else "-"
+        app._session_runtime_take_profit_text = lambda item: "3300" if item.session_id == "S02" else "-"
+        app._session_recovery_reason_summary = lambda item: "等待接管" if item.status == "待恢复" else ""
+        app._format_session_started_at = lambda value: value.strftime("%m-%d %H:%M:%S")
+
+        rows = QuantApp._strategy_status_email_rows(app)
+
+        self.assertEqual([(row.api, row.session) for row in rows], [("api-a", "S02"), ("api-b", "S01")])
+        self.assertEqual(rows[0].account_equity, "1000.00")
+        self.assertEqual(rows[0].open_qty, "2 ETH")
+        self.assertEqual(rows[1].status, "待恢复:等待接管")
 
     def test_rename_current_api_profile_moves_sender_override(self) -> None:
         app = SimpleNamespace(

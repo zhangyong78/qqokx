@@ -266,6 +266,7 @@ from okx_quant.strategy_runtime_registry import (
     strategy_uses_mtf_filter,
     strategy_uses_signal_extrema,
 )
+from okx_quant.strategy_status_email import StrategyStatusEmailRow
 from okx_quant.window_layout import (
     apply_adaptive_window_geometry,
     apply_fill_window_geometry,
