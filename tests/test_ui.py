@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import inspect
 from decimal import Decimal
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -8992,6 +8993,48 @@ class CredentialProfileEnvironmentTest(TestCase):
         self.assertEqual(rows[0].account_equity, "1000.00")
         self.assertEqual(rows[0].open_qty, "2 ETH")
         self.assertEqual(rows[1].status, "待恢复:等待接管")
+
+    def test_queue_strategy_status_email_uses_raw_html_notifier(self) -> None:
+        notifier = SimpleNamespace(notify_async=MagicMock())
+        rows = [MagicMock()]
+        content = StrategyStatusEmailContent("subject", "body", "<b>html</b>")
+        app = SimpleNamespace(
+            _build_strategy_status_email_notifier=lambda: notifier,
+            _strategy_status_email_rows=lambda: rows,
+            _enqueue_log=MagicMock(),
+        )
+        with patch("okx_quant.ui_shell.build_strategy_status_email", return_value=content) as build:
+            queued = QuantApp._queue_strategy_status_email(
+                app,
+                scheduled_for=datetime(2026, 7, 18, 10, 23),
+                generated_at=datetime(2026, 7, 18, 10, 23),
+                is_test=True,
+            )
+
+        self.assertTrue(queued)
+        build.assert_called_once()
+        notifier.notify_async.assert_called_once_with("subject", "body", html_body="<b>html</b>")
+
+    def test_manual_strategy_status_test_email_never_claims_a_schedule_slot(self) -> None:
+        app = SimpleNamespace(
+            _settings_window=None,
+            root=object(),
+            _queue_strategy_status_email=MagicMock(return_value=True),
+        )
+        with patch("okx_quant.strategy_status_email.claim_status_email_slot") as claim, patch(
+            "okx_quant.ui.messagebox.showinfo"
+        ) as showinfo:
+            QuantApp.send_strategy_status_test_email(app)
+
+        claim.assert_not_called()
+        app._queue_strategy_status_email.assert_called_once()
+        self.assertTrue(app._queue_strategy_status_email.call_args.kwargs["is_test"])
+        showinfo.assert_called_once()
+
+    def test_settings_window_wires_strategy_status_test_button(self) -> None:
+        source = inspect.getsource(QuantApp.open_settings_window)
+        self.assertIn('text="发送策略状态测试邮件"', source)
+        self.assertIn("command=self.send_strategy_status_test_email", source)
 
     def test_rename_current_api_profile_moves_sender_override(self) -> None:
         app = SimpleNamespace(

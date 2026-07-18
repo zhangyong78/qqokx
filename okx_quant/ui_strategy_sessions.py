@@ -21,7 +21,7 @@ from okx_quant.models import (
 )
 from okx_quant.strategy_parameters import strategy_uses_parameter
 from okx_quant.strategy_symbol_defaults import get_strategy_symbol_parameter_defaults
-from okx_quant.strategy_status_email import StrategyStatusEmailRow
+from okx_quant.strategy_status_email import StrategyStatusEmailRow, build_strategy_status_email
 
 _SESSION_RUNTIME_HEARTBEAT_PREFIX = "__qqokx_runtime_heartbeat__|"
 _SESSION_RUNTIME_HEARTBEAT_TIMEOUT_POLLS = 6
@@ -5968,6 +5968,45 @@ class UiStrategySessionsMixin:
         if not notification_config.enabled:
             return None
         return EmailNotifier(notification_config, logger=self._make_system_logger("邮件 策略运行状态"))
+
+    def _queue_strategy_status_email(
+        self,
+        *,
+        scheduled_for: datetime,
+        generated_at: datetime,
+        is_test: bool,
+    ) -> bool:
+        notifier = self._build_strategy_status_email_notifier()
+        if notifier is None:
+            self._enqueue_log("策略状态邮件已跳过：当前未启用邮件通知。")
+            return False
+        content = build_strategy_status_email(
+            self._strategy_status_email_rows(),
+            scheduled_for=scheduled_for,
+            generated_at=generated_at,
+            is_test=is_test,
+        )
+        notifier.notify_async(content.subject, content.body, html_body=content.html_body)
+        kind = "测试" if is_test else "定时"
+        self._enqueue_log(f"已提交策略状态{kind}邮件发送请求：{content.subject}")
+        return True
+
+    def send_strategy_status_test_email(self) -> None:
+        now = datetime.now()
+        parent = self._settings_window or self.root
+        try:
+            queued = self._queue_strategy_status_email(
+                scheduled_for=now,
+                generated_at=now,
+                is_test=True,
+            )
+        except Exception as exc:
+            messagebox.showerror("策略状态测试邮件失败", str(exc), parent=parent)
+            return
+        if not queued:
+            messagebox.showinfo("提示", "当前未启用邮件通知。", parent=parent)
+            return
+        messagebox.showinfo("提示", "策略状态测试邮件已提交，请检查收件箱。", parent=parent)
 
     def send_test_email(self) -> None:
         try:

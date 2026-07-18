@@ -266,7 +266,7 @@ from okx_quant.strategy_runtime_registry import (
     strategy_uses_mtf_filter,
     strategy_uses_signal_extrema,
 )
-from okx_quant.strategy_status_email import StrategyStatusEmailRow
+from okx_quant.strategy_status_email import StrategyStatusEmailRow, build_strategy_status_email
 from okx_quant.window_layout import (
     apply_adaptive_window_geometry,
     apply_fill_window_geometry,
@@ -7466,7 +7466,12 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         footer = ttk.Frame(container)
         footer.grid(row=2, column=0, sticky="e", pady=(16, 0))
         ttk.Button(footer, text="发送测试邮件", command=self.send_test_email).grid(row=0, column=0, padx=(0, 8))
-        ttk.Button(footer, text="关闭", command=self._close_settings_window).grid(row=0, column=1)
+        ttk.Button(
+            footer,
+            text="发送策略状态测试邮件",
+            command=self.send_strategy_status_test_email,
+        ).grid(row=0, column=1, padx=(0, 8))
+        ttk.Button(footer, text="关闭", command=self._close_settings_window).grid(row=0, column=2)
 
 
 
