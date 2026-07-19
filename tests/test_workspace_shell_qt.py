@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from PySide6.QtWidgets import QToolButton
+
 from tests.qt_test_case import QtWidgetTestCase
 import roll_terminal_qt.workspace_shell as workspace_shell
 
@@ -67,6 +69,21 @@ class WorkspaceShellQtTests(QtWidgetTestCase):
                 "settings:version",
             },
         )
+
+    def test_workspace_header_marks_trading_tools_active_for_smart_order(self) -> None:
+        header = WorkspaceHeader()
+        trading_tools_button = next(
+            button for button in header.findChildren(QToolButton) if button.text() == "交易工具"
+        )
+        self.assertEqual(trading_tools_button.objectName(), "WorkspacePageButton")
+
+        header.set_active_page("roll")
+        self.assertTrue(header._page_buttons["roll"].isChecked())
+
+        header.set_active_page("smart-order")
+
+        self.assertTrue(trading_tools_button.isChecked())
+        self.assertFalse(header._page_buttons["roll"].isChecked())
 
     def test_preferred_profile_uses_moni_before_saved_selection(self) -> None:
         self.assertEqual(

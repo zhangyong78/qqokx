@@ -111,7 +111,12 @@ class WorkspaceHeader(QFrame):
             self._page_buttons[page_key] = button
             layout.addWidget(button)
 
-        layout.addWidget(self._menu_button("交易工具", self._ROUTES[3:4]))
+        trading_tools_button = self._menu_button("交易工具", self._ROUTES[3:4])
+        trading_tools_button.setCheckable(True)
+        trading_tools_button.setAutoExclusive(True)
+        trading_tools_button.setObjectName("WorkspacePageButton")
+        self._page_buttons["smart-order"] = trading_tools_button
+        layout.addWidget(trading_tools_button)
         layout.addWidget(self._menu_button("期权工具", self._ROUTES[4:6]))
         layout.addStretch(1)
 
