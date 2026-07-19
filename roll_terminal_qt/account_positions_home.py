@@ -969,7 +969,11 @@ class InstrumentKlineDialog(QDialog):
         if not isinstance(candles, list):
             return
         source_label = "标记价格" if source == "mark" else "成交价格"
-        self._chart.set_candles(title=f"{inst_id} {source_label}K线 | {bar}", candles=candles)
+        self._chart.set_candles(
+            title=f"{inst_id} {source_label}K线 | {bar}",
+            candles=candles,
+            show_moving_averages=True,
+        )
         latest = candles[-1] if candles else None
         latest_text = ""
         latest_time_text = ""

@@ -586,6 +586,8 @@ def _apply_drag_to_line_rule(
 
 def _bar_to_ms(period: str) -> int:
     normalized = period.strip().upper()
+    if normalized.endswith("UTC"):
+        normalized = normalized[:-3]
     if not normalized:
         return 0
     if len(normalized) < 2:
@@ -5347,6 +5349,7 @@ class KlineAnalysisWindow(QMainWindow):
         action_row.addWidget(self._secondary_period_label)
         self._secondary_period_combo = QComboBox()
         self._secondary_period_combo.addItems([period for _, period in _PRIMARY_PERIOD_OPTIONS])
+        self._secondary_period_combo.addItem("1Dutc")
         self._secondary_period_combo.setCurrentText(_DEFAULT_DUAL_SECONDARY_PERIOD)
         self._secondary_period_combo.setEnabled(False)
         self._secondary_period_combo.hide()
@@ -5369,6 +5372,11 @@ class KlineAnalysisWindow(QMainWindow):
         self._secondary_sync_period_btn.setToolTip("副图为K线时：主图1D、副图4H并切换到最近视图")
         self._secondary_sync_period_btn.clicked.connect(self._on_secondary_sync_period_clicked)
         action_row.addWidget(self._secondary_sync_period_btn)
+
+        self._daily_timezone_compare_btn = QPushButton("UTC+8/UTC日线")
+        self._daily_timezone_compare_btn.setToolTip("同一交易对左右比较：左图 UTC+8 日线，右图 UTC 日线")
+        self._daily_timezone_compare_btn.clicked.connect(self._on_daily_timezone_compare_clicked)
+        action_row.addWidget(self._daily_timezone_compare_btn)
 
         action_row.addSpacing(12)
         action_row.addWidget(QLabel("数量"))
@@ -5934,8 +5942,19 @@ class KlineAnalysisWindow(QMainWindow):
     def _volatility_available_for_current_symbol(self) -> bool:
         return self._current_volatility_currency() is not None
 
+    @staticmethod
+    def _kline_venue_label(period: str) -> str:
+        normalized = str(period or "").strip().upper()
+        if normalized == "1D":
+            return "OKX UTC+8"
+        if normalized == "1DUTC":
+            return "OKX UTC"
+        return "OKX"
+
     def _secondary_chart_venue_label(self) -> str:
-        return "DERIBIT" if self._secondary_chart_kind() == "volatility" else "OKX"
+        if self._secondary_chart_kind() == "volatility":
+            return "DERIBIT"
+        return self._kline_venue_label(self._secondary_period_combo.currentText())
 
     def _secondary_chart_note_lines(self, payload: KlineChartPayload, *, period: str) -> list[str]:
         if self._secondary_chart_kind() != "volatility":
@@ -6197,6 +6216,40 @@ class KlineAnalysisWindow(QMainWindow):
         self._set_chart_view_range_mode("recent")
         self._apply_chart_view_range()
         self._refresh_timer.setInterval(self._auto_refresh_interval_ms(primary_next))
+        self._load_data()
+
+    @Slot()
+    def _on_daily_timezone_compare_clicked(self) -> None:
+        symbol = self._selected_symbol()
+        if not symbol:
+            self._set_status("请先选择交易对")
+            return
+        self._secondary_chart_kind_mode = "kline"
+        self._secondary_layout_mode_value = "horizontal"
+        controls = (
+            self._period_combo,
+            self._secondary_period_combo,
+            self._secondary_symbol_combo,
+            self._secondary_chart_check,
+            self._tertiary_chart_check,
+        )
+        for control in controls:
+            control.blockSignals(True)
+        try:
+            self._period_combo.setCurrentText("1D")
+            self._secondary_period_combo.setCurrentText("1Dutc")
+            self._secondary_symbol_combo.setCurrentText(symbol)
+            self._tertiary_chart_check.setChecked(False)
+            self._secondary_chart_check.setChecked(True)
+        finally:
+            for control in controls:
+                control.blockSignals(False)
+        self._apply_secondary_chart_visibility()
+        self._set_active_chart_target("primary")
+        self._sync_primary_period_buttons()
+        self._set_chart_view_range_mode("recent")
+        self._apply_chart_view_range()
+        self._refresh_timer.setInterval(self._auto_refresh_interval_ms("1D"))
         self._load_data()
 
     def _apply_secondary_chart_layout(self) -> None:
@@ -7695,6 +7748,7 @@ class KlineAnalysisWindow(QMainWindow):
             title_suffix="主图",
             include_workspace_lines=True,
             is_secondary=False,
+            venue_label=self._kline_venue_label(self._period_combo.currentText()),
             source_payload=payload,
         )
 

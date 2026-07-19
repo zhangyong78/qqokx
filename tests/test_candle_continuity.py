@@ -20,6 +20,9 @@ class CandleContinuityTest(TestCase):
     def test_bar_step_ms(self) -> None:
         self.assertEqual(bar_step_ms("15m"), 900_000)
 
+    def test_bar_step_ms_supports_utc_daily_bar(self) -> None:
+        self.assertEqual(bar_step_ms("1Dutc"), 86_400_000)
+
     def test_count_bar_opens(self) -> None:
         self.assertEqual(count_bar_opens_in_half_open_range(0, 900_000, 900_000), 1)
         self.assertEqual(count_bar_opens_in_half_open_range(0, 2_700_000, 900_000), 3)

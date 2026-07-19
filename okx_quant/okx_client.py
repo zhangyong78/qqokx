@@ -54,6 +54,8 @@ USD_LIKE_CURRENCIES = {"USD", "USDT", "USDC"}
 
 def _candle_bar_ms(bar: str) -> int:
     normalized = str(bar or "").strip().upper()
+    if normalized.endswith("UTC"):
+        normalized = normalized[:-3]
     if len(normalized) < 2:
         return 0
     unit = normalized[-1]

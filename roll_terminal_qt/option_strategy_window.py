@@ -924,6 +924,26 @@ class PayoffChartView(QWidget):
             text_top += line_height
 
 
+def _build_moving_average_series(candles: list[Candle]) -> tuple[list[Decimal], list[Decimal | None]]:
+    if not candles:
+        return [], []
+    closes = [candle.close for candle in candles]
+    ema_period = 15
+    sma_period = 50
+    ema_multiplier = Decimal("2") / Decimal(ema_period + 1)
+    ema15_values: list[Decimal] = []
+    sma50_values: list[Decimal | None] = []
+    rolling_sum = Decimal("0")
+
+    for index, close in enumerate(closes):
+        ema15_values.append(close if index == 0 else ((close - ema15_values[-1]) * ema_multiplier) + ema15_values[-1])
+        rolling_sum += close
+        if index >= sma_period:
+            rolling_sum -= closes[index - sma_period]
+        sma50_values.append(rolling_sum / Decimal(sma_period) if index + 1 >= sma_period else None)
+    return ema15_values, sma50_values
+
+
 class CandlestickChartView(QChartView):
     hover_changed = Signal(int, float)
     hover_cleared = Signal()
@@ -937,6 +957,7 @@ class CandlestickChartView(QChartView):
         self.setMouseTracking(True)
         self.viewport().setMouseTracking(True)
         self._candles: list[Candle] = []
+        self._moving_average_values: list[tuple[int, float]] = []
         self._hover_pos: QPointF | None = None
         self._value_min = 0.0
         self._value_max = 1.0
@@ -969,6 +990,7 @@ class CandlestickChartView(QChartView):
         self._axis_x = None
         self._axis_y = None
         self._candles = []
+        self._moving_average_values = []
         self._hover_pos = None
         self._pan_anchor_x = None
         self._linked_hover_index = None
@@ -976,7 +998,14 @@ class CandlestickChartView(QChartView):
         self._hide_hover_overlays()
         self.viewport().update()
 
-    def set_candles(self, *, title: str, candles: list[Candle], hide_wicks: bool = False) -> None:
+    def set_candles(
+        self,
+        *,
+        title: str,
+        candles: list[Candle],
+        hide_wicks: bool = False,
+        show_moving_averages: bool = False,
+    ) -> None:
         if not candles:
             self.show_message(title)
             return
@@ -1043,6 +1072,26 @@ class CandlestickChartView(QChartView):
         up_series.attachAxis(axis_y)
         down_series.attachAxis(axis_x)
         down_series.attachAxis(axis_y)
+        ema15_values: list[Decimal] = []
+        sma50_values: list[Decimal | None] = []
+        if show_moving_averages:
+            ema15_values, sma50_values = _build_moving_average_series(candles)
+            for label, values, color, width in (
+                ("EMA 15", ema15_values, "#ff4d6d", 2),
+                ("SMA 50", sma50_values, "#58c66d", 2),
+            ):
+                series = QLineSeries()
+                series.setName(label)
+                series.setPen(QPen(QColor(color), width))
+                for candle, value in zip(candles, values):
+                    if value is None:
+                        continue
+                    numeric_value = float(value)
+                    series.append(float(candle.ts), numeric_value)
+                    self._moving_average_values.append((candle.ts, numeric_value))
+                chart.addSeries(series)
+                series.attachAxis(axis_x)
+                series.attachAxis(axis_y)
         self._axis_x = axis_x
         self._axis_y = axis_y
         self._candles = list(candles)
@@ -1053,11 +1102,16 @@ class CandlestickChartView(QChartView):
         self._fit_y_axis_to_visible_range()
         latest = candles[-1]
         suffix = "%" if self._percent_axis else ""
+        moving_average_title = ""
+        if ema15_values:
+            moving_average_title += f" | EMA 15 {_format_compact_number(ema15_values[-1])}{suffix}"
+        if sma50_values and sma50_values[-1] is not None:
+            moving_average_title += f" | SMA 50 {_format_compact_number(sma50_values[-1])}{suffix}"
         chart.setTitle(
             f"{title} | 最新 O {_format_compact_number(latest.open)}{suffix} "
             f"H {_format_compact_number(latest.high)}{suffix} "
             f"L {_format_compact_number(latest.low)}{suffix} "
-            f"C {_format_compact_number(latest.close)}{suffix}"
+            f"C {_format_compact_number(latest.close)}{suffix}{moving_average_title}"
         )
 
     def wheelEvent(self, event) -> None:  # type: ignore[override]
@@ -1271,6 +1325,13 @@ class CandlestickChartView(QChartView):
             visible = list(self._candles)
         lows = [float(min(item.open, item.close) if self._hide_wicks else item.low) for item in visible]
         highs = [float(max(item.open, item.close) if self._hide_wicks else item.high) for item in visible]
+        visible_moving_averages = [
+            value
+            for ts, value in self._moving_average_values
+            if start_ts <= float(ts) <= end_ts
+        ]
+        lows.extend(visible_moving_averages)
+        highs.extend(visible_moving_averages)
         min_price = min(lows)
         max_price = max(highs)
         if min_price == max_price:

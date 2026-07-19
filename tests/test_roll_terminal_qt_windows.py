@@ -20,6 +20,7 @@ from okx_quant.analysis import ChannelDetectionConfig
 from okx_quant.models import Candle
 from okx_quant.arbitrage.models import ArbitrageTradeRuntime
 from okx_quant.kline_rr_trade import RRTradeLedgerEntry, RRTradeOrderLink, build_rr_trade_plan
+from okx_quant.okx_client import _candle_bar_ms
 from okx_quant.persistence import (
     build_profile_switch_password_snapshot,
     load_kline_analysis_workspace_entries,
@@ -6280,6 +6281,37 @@ class RollTerminalQtWindowHelperTests(QtWidgetTestCase):
         finally:
             self.__class__.dispose_widget(view)
 
+    def test_option_candlestick_chart_only_adds_moving_averages_when_enabled(self) -> None:
+        view = CandlestickChartView()
+        try:
+            candles = [
+                Candle(
+                    ts=1_700_000_000_000 + (index * 3_600_000),
+                    open=Decimal(index + 1),
+                    high=Decimal(index + 2),
+                    low=Decimal(index),
+                    close=Decimal(index + 1),
+                    volume=Decimal("1"),
+                    confirmed=True,
+                )
+                for index in range(60)
+            ]
+
+            view.set_candles(title="test", candles=candles)
+            self.assertEqual(len(view.chart().series()), 2)
+
+            view.set_candles(title="test", candles=candles, show_moving_averages=True)
+
+            moving_averages = [series for series in view.chart().series() if isinstance(series, QLineSeries)]
+            self.assertEqual([series.name() for series in moving_averages], ["EMA 15", "SMA 50"])
+            self.assertEqual(moving_averages[0].count(), 60)
+            self.assertEqual(moving_averages[1].count(), 11)
+            self.assertEqual(moving_averages[1].at(0).y(), 25.5)
+            self.assertIn("EMA 15", view.chart().title())
+            self.assertIn("SMA 50", view.chart().title())
+        finally:
+            self.__class__.dispose_widget(view)
+
     def test_deribit_overlay_moving_average_series_keeps_length_and_ma50_warmup(self) -> None:
         closes = [Decimal(str(value)) for value in range(1, 61)]
 
@@ -6420,6 +6452,34 @@ class RollTerminalQtWindowHelperTests(QtWidgetTestCase):
     def test_default_dual_chart_periods_are_day_and_4h(self) -> None:
         self.assertEqual(_DEFAULT_DUAL_PRIMARY_PERIOD, "1D")
         self.assertEqual(_DEFAULT_DUAL_SECONDARY_PERIOD, "4H")
+
+    def test_daily_timezone_compare_preset_uses_same_symbol_and_two_daily_boundaries(self) -> None:
+        with patch("roll_terminal_qt.kline_analysis_window.QTimer.singleShot", return_value=None):
+            window = KlineAnalysisWindow()
+            try:
+                window._symbol_combo.setCurrentText("ETH-USDT-SWAP")
+                window._secondary_symbol_combo.setCurrentText("BTC-USDT-SWAP")
+                window._tertiary_chart_check.blockSignals(True)
+                window._tertiary_chart_check.setChecked(True)
+                window._tertiary_chart_check.blockSignals(False)
+
+                with patch.object(window, "_load_data") as load_data:
+                    window._on_daily_timezone_compare_clicked()
+
+                self.assertTrue(window._secondary_chart_check.isChecked())
+                self.assertFalse(window._tertiary_chart_check.isChecked())
+                self.assertEqual(window._secondary_chart_kind(), "kline")
+                self.assertEqual(window._secondary_layout_mode(), "horizontal")
+                self.assertEqual(window._period_combo.currentText(), "1D")
+                self.assertEqual(window._secondary_period_combo.currentText(), "1Dutc")
+                self.assertEqual(window._selected_secondary_symbol(), "ETH-USDT-SWAP")
+                self.assertEqual(_bar_to_ms("1Dutc"), 86_400_000)
+                self.assertEqual(_candle_bar_ms("1Dutc"), 86_400_000)
+                self.assertEqual(window._kline_venue_label("1D"), "OKX UTC+8")
+                self.assertEqual(window._secondary_chart_venue_label(), "OKX UTC")
+                load_data.assert_called_once_with()
+            finally:
+                self.__class__.dispose_widget(window)
 
     def test_line_drag_helpers_order_and_shift_trend_endpoints(self) -> None:
         self.assertEqual(
