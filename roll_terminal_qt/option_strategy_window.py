@@ -958,6 +958,9 @@ class CandlestickChartView(QChartView):
         self.viewport().setMouseTracking(True)
         self._candles: list[Candle] = []
         self._moving_average_values: list[tuple[int, float]] = []
+        self._tooltip_close_usdt_rate: Decimal | None = None
+        self._tooltip_close_usdt_basis = ""
+        self._tooltip_entry_price: Decimal | None = None
         self._hover_pos: QPointF | None = None
         self._value_min = 0.0
         self._value_max = 1.0
@@ -991,6 +994,9 @@ class CandlestickChartView(QChartView):
         self._axis_y = None
         self._candles = []
         self._moving_average_values = []
+        self._tooltip_close_usdt_rate = None
+        self._tooltip_close_usdt_basis = ""
+        self._tooltip_entry_price = None
         self._hover_pos = None
         self._pan_anchor_x = None
         self._linked_hover_index = None
@@ -1005,6 +1011,9 @@ class CandlestickChartView(QChartView):
         candles: list[Candle],
         hide_wicks: bool = False,
         show_moving_averages: bool = False,
+        tooltip_close_usdt_rate: Decimal | None = None,
+        tooltip_close_usdt_basis: str = "",
+        tooltip_entry_price: Decimal | None = None,
     ) -> None:
         if not candles:
             self.show_message(title)
@@ -1012,6 +1021,11 @@ class CandlestickChartView(QChartView):
         self._hide_wicks = hide_wicks
         self._chart_title = title
         self._clear_chart_context()
+        if tooltip_close_usdt_rate is not None and tooltip_close_usdt_rate > 0:
+            self._tooltip_close_usdt_rate = tooltip_close_usdt_rate
+            self._tooltip_close_usdt_basis = tooltip_close_usdt_basis.strip()
+            if tooltip_entry_price is not None and tooltip_entry_price > 0:
+                self._tooltip_entry_price = tooltip_entry_price
         chart = self.chart()
         chart.removeAllSeries()
         for axis in chart.axes():
@@ -1237,12 +1251,31 @@ class CandlestickChartView(QChartView):
             painter.drawEllipse(QPointF(snapped_x, marker_y), 4.0, 4.0)
             hover_value_decimal = Decimal(str(hover_value))
             hover_value_text = _format_compact_number(hover_value_decimal)
-            tooltip_lines = (
-                QDateTime.fromMSecsSinceEpoch(int(candle.ts)).toString("yyyy-MM-dd HH:mm"),
-                f"O {_format_compact_number(candle.open)}  H {_format_compact_number(candle.high)}",
-                f"L {_format_compact_number(candle.low)}  C {_format_compact_number(candle.close)}",
-                f"游标 {hover_value_text}{suffix}",
-            )
+            candle_time_text = QDateTime.fromMSecsSinceEpoch(int(candle.ts)).toString("yyyy-MM-dd HH:mm")
+            if self._tooltip_close_usdt_rate is not None:
+                def _price_with_usdt(label: str, value: Decimal) -> str:
+                    usdt_value = value * self._tooltip_close_usdt_rate
+                    return f"{label} {_format_compact_number(value)} ≈ {_format_compact_number(usdt_value)} USDT"
+
+                tooltip_lines = [
+                    candle_time_text,
+                    _price_with_usdt("O", candle.open),
+                    _price_with_usdt("H", candle.high),
+                    _price_with_usdt("L", candle.low),
+                    _price_with_usdt("C", candle.close),
+                    _price_with_usdt("游标", hover_value_decimal),
+                ]
+                if self._tooltip_entry_price is not None:
+                    tooltip_lines.append(_price_with_usdt("开仓价", self._tooltip_entry_price))
+                if self._tooltip_close_usdt_basis:
+                    tooltip_lines.append(f"固定基准 {self._tooltip_close_usdt_basis}")
+            else:
+                tooltip_lines = [
+                    candle_time_text,
+                    f"O {_format_compact_number(candle.open)}  H {_format_compact_number(candle.high)}",
+                    f"L {_format_compact_number(candle.low)}  C {_format_compact_number(candle.close)}",
+                    f"游标 {hover_value_text}{suffix}",
+                ]
             painter.end()
             self._update_hover_overlays(
                 bounds=plot_area,
@@ -1250,7 +1283,7 @@ class CandlestickChartView(QChartView):
                 candle_color=candle_color,
                 price_text=f"{hover_value_text}{suffix}",
                 time_text=QDateTime.fromMSecsSinceEpoch(int(candle.ts)).toString("MM-dd HH:mm"),
-                tooltip_lines=tooltip_lines,
+                tooltip_lines=tuple(tooltip_lines),
             )
         except Exception:
             traceback.print_exc()

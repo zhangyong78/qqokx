@@ -858,6 +858,9 @@ class InstrumentKlineDialog(QDialog):
 
         self._inst_id = ""
         self._inst_type = ""
+        self._underlying_usdt_price: Decimal | None = None
+        self._underlying_usdt_basis = ""
+        self._option_entry_price: Decimal | None = None
         self._current_bar = initial_bar if initial_bar in {bar for _text, bar in POSITION_KLINE_BAR_OPTIONS} else "1H"
         self._load_thread: InstrumentKlineLoadThread | None = None
         self._bar_buttons: dict[str, QPushButton] = {}
@@ -894,9 +897,20 @@ class InstrumentKlineDialog(QDialog):
         layout.addWidget(self._chart, 1)
         self._sync_bar_buttons()
 
-    def show_instrument(self, *, inst_id: str, inst_type: str) -> None:
+    def show_instrument(
+        self,
+        *,
+        inst_id: str,
+        inst_type: str,
+        underlying_usdt_price: Decimal | None = None,
+        underlying_usdt_basis: str = "",
+        option_entry_price: Decimal | None = None,
+    ) -> None:
         self._inst_id = inst_id.strip().upper()
         self._inst_type = inst_type.strip().upper()
+        self._underlying_usdt_price = underlying_usdt_price if underlying_usdt_price is not None and underlying_usdt_price > 0 else None
+        self._underlying_usdt_basis = underlying_usdt_basis.strip() if self._underlying_usdt_price is not None else ""
+        self._option_entry_price = option_entry_price if option_entry_price is not None and option_entry_price > 0 else None
         self._update_title()
         self._load_current_bar()
         self.show()
@@ -973,6 +987,9 @@ class InstrumentKlineDialog(QDialog):
             title=f"{inst_id} {source_label}K线 | {bar}",
             candles=candles,
             show_moving_averages=True,
+            tooltip_close_usdt_rate=self._underlying_usdt_price if inst_type == "OPTION" else None,
+            tooltip_close_usdt_basis=self._underlying_usdt_basis if inst_type == "OPTION" else "",
+            tooltip_entry_price=self._option_entry_price if inst_type == "OPTION" else None,
         )
         latest = candles[-1] if candles else None
         latest_text = ""
@@ -4516,7 +4533,34 @@ class AccountPositionsHomeWidget(QWidget):
                 prefs_changed=self._on_position_kline_prefs_changed,
                 parent=self,
             )
-        self._instrument_kline_dialog.show_instrument(inst_id=position.inst_id, inst_type=position.inst_type)
+        underlying_usdt_price: Decimal | None = None
+        underlying_usdt_basis = ""
+        option_entry_price: Decimal | None = None
+        if position.inst_type == "OPTION":
+            underlying = position.inst_id.split("-", 1)[0].strip().upper()
+            candidate = self._upl_usdt_prices.get(underlying)
+            if not isinstance(candidate, Decimal) or candidate <= 0:
+                raw = position.raw if isinstance(position.raw, dict) else {}
+                for key in ("idxPx", "indexPx", "underlyingPx", "ulyPx"):
+                    try:
+                        fallback = Decimal(str(raw.get(key, "")).strip())
+                    except Exception:
+                        continue
+                    if fallback > 0:
+                        candidate = fallback
+                        break
+            if isinstance(candidate, Decimal) and candidate > 0:
+                underlying_usdt_price = candidate
+                underlying_usdt_basis = f"{underlying}-USDT {candidate}（打开图时）"
+            if isinstance(position.avg_price, Decimal) and position.avg_price > 0:
+                option_entry_price = position.avg_price
+        self._instrument_kline_dialog.show_instrument(
+            inst_id=position.inst_id,
+            inst_type=position.inst_type,
+            underlying_usdt_price=underlying_usdt_price,
+            underlying_usdt_basis=underlying_usdt_basis,
+            option_entry_price=option_entry_price,
+        )
 
     def _on_position_kline_prefs_changed(self, bar: str, width: int, height: int) -> None:
         self._position_kline_last_bar = bar if bar in {item_bar for _text, item_bar in POSITION_KLINE_BAR_OPTIONS} else "1H"
