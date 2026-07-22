@@ -6141,7 +6141,15 @@ class UiStrategySessionsMixin:
                     self._enqueue_log(f"{owner_prefix}独立日志写入失败：{exc}")
         self.log_queue.put(line)
 
+    @staticmethod
+    def _with_session_fill_time(message: str, *, observed_at: datetime) -> str:
+        text = str(message or "").strip()
+        if not text or "成交时间=" in text or "成交" not in text or "未成交" in text:
+            return text
+        return f"{text} | 成交时间={observed_at.strftime('%Y-%m-%d %H:%M:%S')}"
+
     def _log_session_message(self, session: StrategySession, message: str) -> None:
+        message = self._with_session_fill_time(message, observed_at=datetime.now())
         self._record_session_runtime_message(session.session_id, message)
         self._append_logged_message(
             f"{session.log_prefix} {message}",
@@ -6160,6 +6168,7 @@ class UiStrategySessionsMixin:
         prefix = f"[{api_name}] [{session_id} {strategy_name} {symbol}]" if api_name else f"[{session_id} {strategy_name} {symbol}]"
 
         def _logger(message: str) -> None:
+            message = self._with_session_fill_time(message, observed_at=datetime.now())
             self._record_session_runtime_message(session_id, message)
             if self._parse_runtime_heartbeat_control_message(message) is not None:
                 return

@@ -3681,6 +3681,28 @@ class StrategyTradeTrackingTest(TestCase):
         app._clear_session_manual_management_state = lambda _session: None
         return app
 
+    def test_with_session_fill_time_adds_time_only_to_fill_messages(self) -> None:
+        observed_at = datetime(2026, 7, 16, 15, 36, 9)
+
+        entry = QuantApp._with_session_fill_time(
+            "本地下单成交 | ordId=1001 | 成交均价=64937",
+            observed_at=observed_at,
+        )
+        close = QuantApp._with_session_fill_time(
+            "本地止损平仓已成交 | ordId=2001 | 成交均价=63771",
+            observed_at=observed_at,
+        )
+        duplicate = QuantApp._with_session_fill_time(
+            "挂单已成交 | 成交时间=2026-07-16 15:35:00",
+            observed_at=observed_at,
+        )
+        ordinary = QuantApp._with_session_fill_time("正在读取K线", observed_at=observed_at)
+
+        self.assertTrue(entry.endswith("成交时间=2026-07-16 15:36:09"))
+        self.assertTrue(close.endswith("成交时间=2026-07-16 15:36:09"))
+        self.assertEqual(duplicate, "挂单已成交 | 成交时间=2026-07-16 15:35:00")
+        self.assertEqual(ordinary, "正在读取K线")
+
     def test_track_session_trade_runtime_captures_entry_stop_and_close_trigger(self) -> None:
         session = self._make_session()
         app = self._make_app_for_tracking()
