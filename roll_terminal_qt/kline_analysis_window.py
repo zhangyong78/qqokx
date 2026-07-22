@@ -9028,6 +9028,14 @@ class KlineAnalysisWindow(QMainWindow):
         if self._pending_payload is not None:
             self._render_to_chart(self._pending_payload)
 
+    def _delete_rr_visual_keep_protection(self, entry: RRTradeLedgerEntry) -> None:
+        index = self._find_rr_item_index_for_entry(entry)
+        if index < 0:
+            index = self._selected_rr_index
+        if index >= 0:
+            self._delete_rr_item_at_index(index)
+        self._set_status("已删除本地 RR 图形；已成交仓位和交易所止损/止盈保护继续保留。")
+
     def _purge_placeholder_rr_entry(self, payload: dict[str, object], *, delete_item: bool) -> bool:
         ledger_entry = self._rr_ledger_entry_for_item(payload)
         if not _rr_entry_looks_local_placeholder(ledger_entry):
@@ -9057,10 +9065,13 @@ class KlineAnalysisWindow(QMainWindow):
 
     def _handle_rr_cancel_result(self, entry: RRTradeLedgerEntry, *, runtime, delete_after_cancel: bool) -> None:
         if entry.status == "cancel_confirmation_required":
+            confirmation_text = "该 RR 已有成交。确认后只撤销未成交部分，已成交仓位及止损/止盈保护会保留。是否继续？"
+            if delete_after_cancel:
+                confirmation_text += "\n\n同时会删除本地 RR 图形和列表记录；不会平仓，也不会撤销交易所保护单。"
             confirmed = QMessageBox.question(
                 self,
                 "确认取消已成交 RR",
-                "该 RR 已有成交。确认后只撤销未成交部分，已成交仓位及止损/止盈保护会保留。是否继续？",
+                confirmation_text,
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 QMessageBox.StandardButton.No,
             )
@@ -9080,6 +9091,14 @@ class KlineAnalysisWindow(QMainWindow):
                 if index >= 0:
                     self._delete_rr_item_at_index(index)
                 self._set_status("RR 挂单已撤销，图形已删除。")
+                return
+            if entry.status in {
+                "protected",
+                "protected_break_even",
+                "protected_trailing",
+                "protected_cancelled_remainder",
+            }:
+                self._delete_rr_visual_keep_protection(entry)
                 return
             self._set_status(f"RR 取消结果：{entry.status}，已有成交或保护单，保留图形。")
             return
@@ -10275,7 +10294,18 @@ class KlineAnalysisWindow(QMainWindow):
             }
             status = str(ledger_entry.status or "").strip().lower()
             if status in protected_statuses:
-                self._set_status("该 RR 已有关联仓位或保护单，不能直接删除。请先处理持仓。")
+                confirmed = QMessageBox.question(
+                    self,
+                    "删除已成交 RR 图形",
+                    "该 RR 已有关联仓位或止损/止盈保护。\n\n"
+                    "确认后只删除本地 RR 图形和列表记录；不会平仓，也不会撤销交易所保护单。是否继续？",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.No,
+                )
+                if confirmed == QMessageBox.StandardButton.Yes:
+                    self._delete_rr_visual_keep_protection(ledger_entry)
+                else:
+                    self._set_status("已取消删除 RR 图形，仓位和保护保持不变。")
                 return
             if status in active_statuses:
                 runtime = self._runtime
