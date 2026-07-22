@@ -2163,6 +2163,9 @@ class UiStrategySessionsMixin:
             label = f"{action} {at.strftime('%m-%d %H:%M')}"
             return f"{label} | 价格={format_decimal(price)}" if price is not None else label
 
+        def format_net_pnl(value: Decimal) -> str:
+            return f"{'+' if value > 0 else ''}{format_decimal(value)}"
+
         for ledger in ledger_records:
             open_anchor, close_anchor = self._strategy_live_chart_event_anchors(ledger.direction_label)
             if ledger.opened_at is not None:
@@ -2178,10 +2181,13 @@ class UiStrategySessionsMixin:
                     )
                 )
             if ledger.opened_at and ledger.closed_at and ledger.closed_at >= ledger.opened_at:
+                close_label = label_with_price("平仓", ledger.closed_at, ledger.exit_price)
+                if ledger.net_pnl is not None:
+                    close_label = f"{close_label}\n本次盈亏={format_net_pnl(ledger.net_pnl)} USDT"
                 markers.append(
                     StrategyLiveChartTimeMarker(
                         key=f"close:{ledger.record_id}",
-                        label=label_with_price("平仓", ledger.closed_at, ledger.exit_price),
+                        label=close_label,
                         at=ledger.closed_at,
                         color="#cf222e",
                         dash=(6, 3),

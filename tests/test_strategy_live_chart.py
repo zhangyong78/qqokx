@@ -429,6 +429,34 @@ class StrategyLiveChartHelpersTest(TestCase):
         self.assertGreaterEqual(len(y_positions), 2)
         self.assertGreaterEqual(min(y_positions), 34.0)
 
+    def test_time_marker_layout_sizes_box_for_two_line_chinese_label(self) -> None:
+        bounds = _ChartBounds(left=76.0, top=40.0, right=476.0, bottom=544.0)
+        candle = Candle(
+            ts=1714330800000,
+            open=Decimal("100"),
+            high=Decimal("101"),
+            low=Decimal("99"),
+            close=Decimal("100"),
+            volume=Decimal("1"),
+            confirmed=True,
+        )
+        marker = StrategyLiveChartTimeMarker(
+            key="close",
+            label="平仓 04-29 10:00 | 价格=64336\n本次盈亏=+12.34 USDT",
+            at=datetime.fromtimestamp(candle.ts / 1000),
+            color="#cf222e",
+        )
+
+        placement = _layout_time_marker_label_positions(
+            (marker,),
+            StrategyLiveChartSnapshot(session_id="S01", candles=(candle,)),
+            bounds,
+            candle_step=80.0,
+        )[0]
+
+        self.assertGreaterEqual(placement[3] - placement[2], 190.0)
+        self.assertGreaterEqual(placement[5] - placement[4], 40.0)
+
     def test_time_marker_labels_share_row_when_x_positions_are_far_enough_apart(self) -> None:
         bounds = _ChartBounds(left=76.0, top=40.0, right=676.0, bottom=544.0)
         candles = tuple(

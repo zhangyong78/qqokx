@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
 from tkinter import Canvas
+from unicodedata import east_asian_width
 
 from okx_quant.analysis import (
     BoxDetectionConfig,
@@ -57,6 +58,10 @@ _MARKER_LABEL_MIN_GAP = 24.0
 _MARKER_LABEL_CANVAS_MARGIN = 6.0
 _TIME_MARKER_LABEL_MIN_GAP = 8.0
 _TIME_MARKER_LABEL_ROW_HEIGHT = 22.0
+_TIME_MARKER_LABEL_LINE_HEIGHT = 16.0
+_TIME_MARKER_LABEL_HORIZONTAL_PADDING = 16.0
+_TIME_MARKER_LABEL_VERTICAL_PADDING = 8.0
+_TIME_MARKER_LABEL_ROW_GAP = 6.0
 _LEGEND_BASELINE_Y = 18.0
 _LEGEND_LABEL_HALF_HEIGHT = 8.0
 
@@ -755,7 +760,7 @@ def render_strategy_live_chart(
         canvas.create_rectangle(x1, y1, x2, y2, outline=time_marker.color, fill=_PRICE_LABEL_BG)
         canvas.create_text(
             x1 + 6,
-            y1 + 9,
+            (y1 + y2) / 2,
             text=time_marker.label,
             fill=time_marker.color,
             anchor="w",
@@ -1105,6 +1110,21 @@ def _layout_marker_label_positions(
     return [(item[0], float(item[1]), float(item[2])) for item in placements]
 
 
+def _time_marker_label_size(label: str) -> tuple[float, float]:
+    lines = str(label or "").splitlines() or [""]
+    text_width = max(
+        sum(14.0 if east_asian_width(char) in {"F", "W"} else 7.0 for char in line)
+        for line in lines
+    )
+    return (
+        max(text_width + _TIME_MARKER_LABEL_HORIZONTAL_PADDING, 88.0),
+        max(
+            len(lines) * _TIME_MARKER_LABEL_LINE_HEIGHT + _TIME_MARKER_LABEL_VERTICAL_PADDING,
+            22.0,
+        ),
+    )
+
+
 def _layout_time_marker_label_positions(
     time_markers: tuple[StrategyLiveChartTimeMarker, ...],
     snapshot: StrategyLiveChartSnapshot,
@@ -1119,10 +1139,8 @@ def _layout_time_marker_label_positions(
         _LEGEND_BASELINE_Y + _LEGEND_LABEL_HALF_HEIGHT + 8.0,
         bounds.top - 6.0,
     )
-    bottom_base_y1 = min(bounds.bottom + 6.0, max(bounds.top, bounds.bottom - 18.0))
     for marker in time_markers:
-        label_text = marker.label
-        text_width = max(len(label_text) * 7 + 14, 88)
+        text_width, text_height = _time_marker_label_size(marker.label)
         x = _time_marker_x(marker.at, snapshot, bounds, candle_step)
         max_left = max(bounds.left, bounds.right - text_width)
         x1 = min(max(bounds.left, x - text_width / 2), max_left)
@@ -1131,33 +1149,49 @@ def _layout_time_marker_label_positions(
             "x": x,
             "x1": x1,
             "x2": x1 + text_width,
+            "height": text_height,
         }
         if str(marker.vertical_anchor or "").strip().lower() == "below":
             bottom_placements.append(item)
         else:
             top_placements.append(item)
 
-    def _assign_rows(items: list[dict[str, object]], *, base_y1: float, direction: int) -> None:
+    def _assign_rows(items: list[dict[str, object]], *, base_y: float, direction: int) -> None:
         items.sort(key=lambda item: (float(item["x1"]), float(item["x"])))
-        row_right_edges: list[float] = []
+        rows: list[dict[str, float]] = []
         for item in items:
             x1 = float(item["x1"])
             x2 = float(item["x2"])
+            height = float(item["height"])
             assigned_row = None
-            for row_index, row_right in enumerate(row_right_edges):
-                if x1 >= row_right + _TIME_MARKER_LABEL_MIN_GAP:
+            for row_index, row in enumerate(rows):
+                if x1 >= row["right"] + _TIME_MARKER_LABEL_MIN_GAP:
                     assigned_row = row_index
-                    row_right_edges[row_index] = x2
+                    row["right"] = x2
+                    row["height"] = max(row["height"], height)
                     break
             if assigned_row is None:
-                assigned_row = len(row_right_edges)
-                row_right_edges.append(x2)
-            y1 = base_y1 + direction * assigned_row * _TIME_MARKER_LABEL_ROW_HEIGHT
-            item["y1"] = y1
-            item["y2"] = y1 + 18.0
+                assigned_row = len(rows)
+                rows.append({"right": x2, "height": height})
+            item["row"] = assigned_row
+        offsets: list[float] = []
+        offset = 0.0
+        for row in rows:
+            offsets.append(offset)
+            offset += row["height"] + _TIME_MARKER_LABEL_ROW_GAP
+        for item in items:
+            row = rows[int(item["row"])]
+            if direction > 0:
+                y1 = base_y + offsets[int(item["row"])]
+                item["y1"] = y1
+                item["y2"] = y1 + row["height"]
+            else:
+                y2 = base_y - offsets[int(item["row"])]
+                item["y1"] = y2 - row["height"]
+                item["y2"] = y2
 
-    _assign_rows(top_placements, base_y1=top_base_y1, direction=1)
-    _assign_rows(bottom_placements, base_y1=bottom_base_y1, direction=-1)
+    _assign_rows(top_placements, base_y=top_base_y1, direction=1)
+    _assign_rows(bottom_placements, base_y=bounds.bottom, direction=-1)
     placements = sorted(
         (*top_placements, *bottom_placements),
         key=lambda item: (float(item["x1"]), float(item["x"]), str(item["marker"].key)),
