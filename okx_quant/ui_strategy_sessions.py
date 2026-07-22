@@ -19,6 +19,7 @@ from okx_quant.models import (
     dynamic_protection_rules_to_payload,
     normalize_dynamic_protection_rules,
 )
+from okx_quant.pricing import format_decimal
 from okx_quant.strategy_parameters import strategy_uses_parameter
 from okx_quant.strategy_symbol_defaults import get_strategy_symbol_parameter_defaults
 from okx_quant.strategy_status_email import (
@@ -2157,13 +2158,18 @@ class UiStrategySessionsMixin:
         trade = session.active_trade
         ledger_records = self._strategy_live_chart_ledger_records(session)
         latest_ledger = self._latest_strategy_trade_ledger_record(session)
+
+        def label_with_price(action: str, at: datetime, price: Decimal | None) -> str:
+            label = f"{action} {at.strftime('%m-%d %H:%M')}"
+            return f"{label} | 价格={format_decimal(price)}" if price is not None else label
+
         for ledger in ledger_records:
             open_anchor, close_anchor = self._strategy_live_chart_event_anchors(ledger.direction_label)
             if ledger.opened_at is not None:
                 markers.append(
                     StrategyLiveChartTimeMarker(
                         key=f"open:{ledger.record_id}",
-                        label=f"开仓 {ledger.opened_at.strftime('%m-%d %H:%M')}",
+                        label=label_with_price("开仓", ledger.opened_at, ledger.entry_price),
                         at=ledger.opened_at,
                         color="#6f42c1",
                         dash=(4, 3),
@@ -2175,7 +2181,7 @@ class UiStrategySessionsMixin:
                 markers.append(
                     StrategyLiveChartTimeMarker(
                         key=f"close:{ledger.record_id}",
-                        label=f"平仓 {ledger.closed_at.strftime('%m-%d %H:%M')}",
+                        label=label_with_price("平仓", ledger.closed_at, ledger.exit_price),
                         at=ledger.closed_at,
                         color="#cf222e",
                         dash=(6, 3),

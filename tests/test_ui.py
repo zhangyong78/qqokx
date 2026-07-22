@@ -2027,6 +2027,44 @@ HTTP 502: <!DOCTYPE html>
         self.assertEqual([(marker.key, marker.vertical_anchor) for marker in short_markers], [("open:short", "above"), ("close:short", "below")])
         self.assertEqual([(marker.key, marker.vertical_anchor) for marker in long_markers], [("open:long", "below"), ("close:long", "above")])
 
+    def test_strategy_live_chart_event_time_markers_include_fill_prices(self) -> None:
+        opened_at = datetime(2026, 7, 16, 15, 36)
+        closed_at = datetime(2026, 7, 17, 7, 20)
+        app = QuantApp.__new__(QuantApp)
+        app._strategy_trade_ledger_records = [
+            StrategyTradeLedgerRecord(
+                record_id="L01",
+                history_record_id="H01",
+                session_id="S01",
+                api_name="moni",
+                strategy_id="ema55_slope_short",
+                strategy_name="EMA55",
+                symbol="BTC-USDT-SWAP",
+                direction_label="SHORT_ONLY",
+                run_mode_label="TRADE",
+                environment="demo",
+                opened_at=opened_at,
+                closed_at=closed_at,
+                entry_price=Decimal("64937.00"),
+                exit_price=Decimal("63771.00"),
+            )
+        ]
+        app._credentials_for_profile_or_none = lambda _profile_name: None
+
+        markers = QuantApp._strategy_live_chart_event_time_markers(
+            app,
+            SimpleNamespace(session_id="S01", history_record_id="H01", api_name="moni", active_trade=None),
+            "BTC-USDT-SWAP",
+        )
+
+        self.assertEqual(
+            [(marker.key, marker.label) for marker in markers],
+            [
+                ("open:L01", "开仓 07-16 15:36 | 价格=64937"),
+                ("close:L01", "平仓 07-17 07:20 | 价格=63771"),
+            ],
+        )
+
     def test_strategy_live_chart_event_time_markers_ignore_unrelated_fills_after_closed_round(self) -> None:
         opened_at = datetime(2026, 4, 28, 9, 0)
         closed_at = datetime(2026, 4, 28, 10, 15)
