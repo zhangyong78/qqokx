@@ -2047,7 +2047,7 @@ HTTP 502: <!DOCTYPE html>
                 closed_at=closed_at,
                 entry_price=Decimal("64937.00"),
                 exit_price=Decimal("63771.00"),
-                net_pnl=Decimal("12.34"),
+                net_pnl=Decimal("-13.879740197042042"),
             )
         ]
         app._credentials_for_profile_or_none = lambda _profile_name: None
@@ -2062,7 +2062,7 @@ HTTP 502: <!DOCTYPE html>
             [(marker.key, marker.label) for marker in markers],
             [
                 ("open:L01", "开仓 07-16 15:36 | 价格=64937"),
-                ("close:L01", "平仓 07-17 07:20 | 价格=63771\n本次盈亏=+12.34 USDT"),
+                ("close:L01", "平仓 07-17 07:20 | 价格=63771\n本次盈亏=-13.88 USDT"),
             ],
         )
 

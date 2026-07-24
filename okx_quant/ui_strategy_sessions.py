@@ -4,7 +4,7 @@ import json
 import time
 from dataclasses import replace
 from datetime import datetime
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
 import threading
 
@@ -2164,7 +2164,8 @@ class UiStrategySessionsMixin:
             return f"{label} | 价格={format_decimal(price)}" if price is not None else label
 
         def format_net_pnl(value: Decimal) -> str:
-            return f"{'+' if value > 0 else ''}{format_decimal(value)}"
+            rounded_value = value.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+            return f"{'+' if rounded_value > 0 else ''}{rounded_value:.2f}"
 
         for ledger in ledger_records:
             open_anchor, close_anchor = self._strategy_live_chart_event_anchors(ledger.direction_label)
