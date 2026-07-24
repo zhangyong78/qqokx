@@ -8,13 +8,21 @@ from unittest import TestCase
 from okx_quant.btc_market_analyzer import BtcMarketAnalysis, PatternFocusEvent, ResonanceAnalysis, TimeframeAnalysis
 from okx_quant.models import Candle
 from okx_quant.multi_coin_market_digest import (
+    BtcVolatilitySupplement,
+    BtcVolatilityTimeframeAnalysis,
+    DigestLeader,
+    MultiCoinMarketDigest,
     archive_multi_coin_market_email,
+    build_chart_data_status,
     build_multi_coin_market_email_body,
     build_multi_coin_market_email_html,
     build_multi_coin_chart_image_map,
+    _build_single_chart_cell,
     _btc_ema15_ma50_timeframe_summary,
     _btc_volatility_timeframe_summary,
     _load_btc_volatility_timeframe_candles,
+    _recent_validation_time_lines,
+    _refresh_recent_validation_summary_if_needed,
     multi_coin_market_digest_payload,
     analyze_multi_coin_market,
     release_due_pending_multi_coin_market_emails,
@@ -92,6 +100,78 @@ def _price_candle(index: int, close_price: str) -> Candle:
 
 
 class MultiCoinMarketDigestTest(TestCase):
+    def test_chart_data_status_formats_beijing_time_and_marks_stale_data(self) -> None:
+        status = build_chart_data_status(
+            "1H",
+            candle_ts=int(datetime(2026, 7, 23, 4, 0, tzinfo=timezone.utc).timestamp() * 1000),
+            confirmed=True,
+            source="OKX",
+            generated_at="2026-07-24T01:22:31Z",
+        )
+
+        self.assertEqual(status.display_time, "2026-07-23 12:00")
+        self.assertTrue(status.is_stale)
+        self.assertIn("数据已过期", status.status_text)
+        self.assertIn("OKX", status.status_text)
+        self.assertIn("已收盘", status.status_text)
+
+    def test_chart_data_status_marks_current_open_candle_without_stale_warning(self) -> None:
+        status = build_chart_data_status(
+            "1H",
+            candle_ts=int(datetime(2026, 7, 24, 1, 0, tzinfo=timezone.utc).timestamp() * 1000),
+            confirmed=False,
+            source="Deribit 波动率指数",
+            generated_at="2026-07-24T01:22:31Z",
+        )
+
+        self.assertEqual(status.display_time, "2026-07-24 09:00")
+        self.assertFalse(status.is_stale)
+        self.assertIn("进行中", status.status_text)
+        self.assertNotIn("数据已过期", status.status_text)
+
+    def test_chart_cell_displays_data_time_and_red_stale_warning(self) -> None:
+        status = build_chart_data_status(
+            "4H",
+            candle_ts=int(datetime(2026, 7, 23, 4, 0, tzinfo=timezone.utc).timestamp() * 1000),
+            confirmed=True,
+            source="OKX",
+            generated_at="2026-07-24T01:22:31Z",
+        )
+
+        html = _build_single_chart_cell(asset="BTC", timeframe="4H", encoded="ZmFrZQ==", data_status=status)
+
+        self.assertIn("数据更新至 2026-07-23 12:00", html)
+        self.assertIn("数据已过期", html)
+        self.assertIn("#b42318", html)
+
+    def test_email_html_displays_top_warning_and_each_chart_data_time(self) -> None:
+        analysis = _analysis("BTC-USDT-SWAP", "short", -6, "short", "short")
+        digest = MultiCoinMarketDigest(
+            generated_at="2026-07-24T01:22:31Z",
+            symbols=(analysis.symbol,),
+            analyses=(analysis,),
+            strongest_long=DigestLeader(analysis.symbol, "BTC", "test", 0, False),
+            weakest_short=DigestLeader(analysis.symbol, "BTC", "test", -1, True),
+            best_trade_candidate=DigestLeader(analysis.symbol, "BTC", "test", 1, True),
+        )
+        stale = build_chart_data_status(
+            "1H",
+            candle_ts=int(datetime(2026, 7, 23, 4, 0, tzinfo=timezone.utc).timestamp() * 1000),
+            confirmed=True,
+            source="OKX",
+            generated_at=digest.generated_at,
+        )
+
+        html = build_multi_coin_market_email_html(
+            digest,
+            chart_image_map={analysis.symbol: {"1H": "ZmFrZQ=="}},
+            chart_data_status_map={analysis.symbol: {"1H": stale}},
+        )
+
+        self.assertIn("本邮件含过期数据", html)
+        self.assertIn("数据更新至 2026-07-23 12:00", html)
+        self.assertIn("数据已过期", html)
+
     def test_btc_volatility_timeframe_summary_uses_risk_language(self) -> None:
         summary = _btc_volatility_timeframe_summary(
             "4H",
@@ -132,8 +212,31 @@ class MultiCoinMarketDigestTest(TestCase):
                 limit=24,
             )
 
-        self.assertEqual(source, "程序历史波动率")
+        self.assertEqual(source, "降级：程序历史波动率")
         self.assertGreater(len(candles), 0)
+
+    def test_stale_validation_payload_is_refreshed(self) -> None:
+        stale_payload = {"generated_at": "2026-06-17T05:28:29Z", "details": [{"symbol": "BTC-USDT-SWAP"}]}
+
+        with patch("okx_quant.multi_coin_market_digest.load_latest_email_validation_payload", return_value=stale_payload):
+            with patch("okx_quant.multi_coin_market_digest.refresh_email_validation_report") as refresh:
+                _refresh_recent_validation_summary_if_needed(now=datetime(2026, 7, 24, 2, 0, tzinfo=timezone.utc))
+
+        refresh.assert_called_once_with(archive_limit=60)
+
+    def test_recent_validation_time_lines_show_cutoff_and_stale_warning(self) -> None:
+        lines = _recent_validation_time_lines(
+            {
+                "generated_at": "2026-06-17T05:28:29Z",
+                "sample_cutoff_at": "2026-06-16T12:00:00Z",
+            },
+            now=datetime(2026, 7, 24, 2, 0, tzinfo=timezone.utc),
+        )
+
+        text = "\n".join(lines)
+        self.assertIn("复盘报告生成时间：2026-06-17 13:28 UTC+8", text)
+        self.assertIn("复盘样本截止时间：2026-06-16 20:00 UTC+8", text)
+        self.assertIn("复盘数据已过期", text)
 
     def test_btc_ema15_ma50_timeframe_summary_only_adds_shape_for_4h_and_1d(self) -> None:
         four_hour_summary = _btc_ema15_ma50_timeframe_summary(
@@ -485,7 +588,7 @@ class MultiCoinMarketDigestTest(TestCase):
             self.assertEqual(same_day_meta["delivery_status"], "released")
             self.assertEqual(next_day_meta["delivery_status"], "released")
 
-    def test_build_chart_image_map_reuses_cached_intraday_data_and_fetches_weekly_directly(self) -> None:
+    def test_build_chart_image_map_refreshes_every_timeframe_instead_of_trusting_cache_size(self) -> None:
         from okx_quant.multi_coin_market_digest import MultiCoinMarketDigest, _pick_best_trade_candidate, _pick_strongest_long, _pick_weakest_short
         from okx_quant.models import Candle
 
@@ -529,13 +632,8 @@ class MultiCoinMarketDigestTest(TestCase):
 
             def get_candles_history(self, symbol: str, timeframe: str, limit: int = 0):  # noqa: ANN202
                 self.calls.append((symbol, timeframe, limit))
-                raise AssertionError("intraday/daily charts should reuse local cache")
-
-            def get_candles(self, symbol: str, timeframe: str, limit: int = 0):  # noqa: ANN202
-                self.calls.append((symbol, timeframe, limit))
-                if timeframe != "1W":
-                    raise AssertionError(f"unexpected direct fetch timeframe: {timeframe}")
-                return weekly_candles[-limit:]
+                rows = weekly_candles if timeframe == "1W" else cached_map[timeframe]
+                return rows[-limit:]
 
         client = StubChartClient()
 
@@ -558,4 +656,58 @@ class MultiCoinMarketDigestTest(TestCase):
                 }
             },
         )
-        self.assertEqual(client.calls, [("BTC-USDT-SWAP", "1W", 127)])
+        self.assertEqual(
+            client.calls,
+            [
+                ("BTC-USDT-SWAP", "1H", 127),
+                ("BTC-USDT-SWAP", "4H", 127),
+                ("BTC-USDT-SWAP", "1D", 127),
+                ("BTC-USDT-SWAP", "1W", 127),
+            ],
+        )
+
+    def test_prepare_email_reuses_volatility_series_from_analysis(self) -> None:
+        analysis = _analysis("BTC-USDT-SWAP", "neutral", 0, "neutral", "neutral")
+        series = tuple(_price_candle(index, str(30 + index)) for index in range(60))
+        item = BtcVolatilityTimeframeAnalysis(
+            timeframe="1H",
+            candle_ts=series[-1].ts,
+            last_close=series[-1].close,
+            ema15=Decimal("80"),
+            ma50=Decimal("70"),
+            direction="long",
+            structure="多头排列",
+            source="Deribit 波动率指数",
+            summary="test",
+        )
+        supplement = BtcVolatilitySupplement(
+            symbol=analysis.symbol,
+            generated_at="2026-07-24T01:22:31Z",
+            direction="long",
+            summary="test",
+            timeframes=(item,),
+            candle_series=(("1H", series),),
+        )
+        digest = MultiCoinMarketDigest(
+            generated_at=supplement.generated_at,
+            symbols=(analysis.symbol,),
+            analyses=(analysis,),
+            strongest_long=DigestLeader(analysis.symbol, "BTC", "test", 0, False),
+            weakest_short=DigestLeader(analysis.symbol, "BTC", "test", 0, False),
+            best_trade_candidate=DigestLeader(analysis.symbol, "BTC", "test", 0, False),
+            btc_volatility_ema15_ma50=supplement,
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with patch("okx_quant.multi_coin_market_digest.analysis_report_dir_path", return_value=Path(temp_dir)):
+                with patch("okx_quant.multi_coin_market_digest._load_recent_validation_summary", return_value=None):
+                    with patch(
+                        "okx_quant.multi_coin_market_digest._collect_btc_volatility_candle_series",
+                        side_effect=AssertionError("must reuse analysis snapshot"),
+                    ):
+                        with patch("okx_quant.multi_coin_market_digest.render_candles_png_base64", return_value="fake-chart"):
+                            from okx_quant.multi_coin_market_digest import prepare_multi_coin_market_email
+
+                            prepared = prepare_multi_coin_market_email(digest, delivery_status="preview")
+
+        self.assertIn("data:image/png;base64,fake-chart", str(prepared["html_body"]))

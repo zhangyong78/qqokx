@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import math
 from html import escape
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -47,6 +47,14 @@ DEFAULT_DIGEST_SYMBOLS: tuple[str, ...] = (
 DEFAULT_DEFERRED_RELEASE_SLOT = "08:00"
 BTC_EMA15_MA50_TIMEFRAMES: tuple[str, ...] = ("1H", "4H", "1D", "1W")
 BTC_VOLATILITY_EMA15_MA50_TIMEFRAMES: tuple[str, ...] = ("1H", "4H", "1D", "1W")
+BEIJING_TIMEZONE = timezone(timedelta(hours=8))
+CHART_STALE_AFTER = {
+    "1H": timedelta(hours=2),
+    "4H": timedelta(hours=6),
+    "1D": timedelta(hours=36),
+    "1W": timedelta(days=8),
+}
+VALIDATION_STALE_AFTER = timedelta(hours=24)
 
 
 @dataclass(frozen=True)
@@ -59,6 +67,73 @@ class DigestLeader:
 
 
 @dataclass(frozen=True)
+class ChartDataStatus:
+    timeframe: str
+    candle_ts: int | None
+    confirmed: bool | None
+    source: str
+    display_time: str
+    age: timedelta | None
+    is_stale: bool
+    status_text: str
+
+
+def build_chart_data_status(
+    timeframe: str,
+    *,
+    candle_ts: int | None,
+    confirmed: bool | None,
+    source: str,
+    generated_at: str | datetime,
+) -> ChartDataStatus:
+    generated_dt = generated_at if isinstance(generated_at, datetime) else _parse_iso_datetime(generated_at)
+    if generated_dt is None:
+        generated_dt = datetime.now(timezone.utc)
+    if generated_dt.tzinfo is None:
+        generated_dt = generated_dt.replace(tzinfo=timezone.utc)
+    source_text = str(source or "").strip() or "来源未知"
+    if candle_ts is None:
+        return ChartDataStatus(
+            timeframe=timeframe,
+            candle_ts=None,
+            confirmed=confirmed,
+            source=source_text,
+            display_time="-",
+            age=None,
+            is_stale=True,
+            status_text=f"数据更新时间未知 | {source_text} | 数据已过期",
+        )
+    candle_dt = datetime.fromtimestamp(int(candle_ts) / 1000.0, tz=timezone.utc)
+    age = max(generated_dt.astimezone(timezone.utc) - candle_dt, timedelta(0))
+    threshold = CHART_STALE_AFTER.get(str(timeframe).strip().upper(), timedelta(hours=2))
+    is_stale = age > threshold
+    display_time = candle_dt.astimezone(BEIJING_TIMEZONE).strftime("%Y-%m-%d %H:%M")
+    close_state = "已收盘" if confirmed is True else "进行中" if confirmed is False else "收盘状态未知"
+    freshness = f"数据已过期（滞后 {_format_age(age)}）" if is_stale else "数据正常"
+    return ChartDataStatus(
+        timeframe=timeframe,
+        candle_ts=int(candle_ts),
+        confirmed=confirmed,
+        source=source_text,
+        display_time=display_time,
+        age=age,
+        is_stale=is_stale,
+        status_text=f"数据更新至 {display_time} UTC+8 | {close_state} | {source_text} | {freshness}",
+    )
+
+
+def _format_age(value: timedelta) -> str:
+    total_minutes = max(0, int(value.total_seconds() // 60))
+    days, remaining_minutes = divmod(total_minutes, 24 * 60)
+    hours, minutes = divmod(remaining_minutes, 60)
+    if days:
+        return f"{days}天{hours}小时"
+    if hours:
+        return f"{hours}小时{minutes}分"
+    return f"{minutes}分"
+
+
+@dataclass(frozen=True)
 class BtcEma15Ma50TimeframeAnalysis:
     timeframe: str
     candle_ts: int | None
@@ -68,6 +143,7 @@ class BtcEma15Ma50TimeframeAnalysis:
     direction: str
     structure: str
     summary: str
+    candle_confirmed: bool | None = None
 
 
 @dataclass(frozen=True)
@@ -77,6 +153,7 @@ class BtcEma15Ma50Supplement:
     direction: str
     summary: str
     timeframes: tuple[BtcEma15Ma50TimeframeAnalysis, ...]
+    candle_series: tuple[tuple[str, tuple[Candle, ...]], ...] = field(default_factory=tuple, repr=False, compare=False)
 
 
 @dataclass(frozen=True)
@@ -90,6 +167,7 @@ class BtcVolatilityTimeframeAnalysis:
     structure: str
     source: str
     summary: str
+    candle_confirmed: bool | None = None
 
 
 @dataclass(frozen=True)
@@ -99,6 +177,7 @@ class BtcVolatilitySupplement:
     direction: str
     summary: str
     timeframes: tuple[BtcVolatilityTimeframeAnalysis, ...]
+    candle_series: tuple[tuple[str, tuple[Candle, ...]], ...] = field(default_factory=tuple, repr=False, compare=False)
 
 
 @dataclass(frozen=True)
@@ -236,19 +315,25 @@ def build_multi_coin_market_email_html(
     digest: MultiCoinMarketDigest,
     *,
     chart_image_map: dict[str, dict[str, str]] | None = None,
+    chart_data_status_map: dict[str, dict[str, ChartDataStatus]] | None = None,
     overlay_legend_map: dict[str, dict[str, str]] | None = None,
     btc_ema15_ma50_chart_image_map: dict[str, dict[str, str]] | None = None,
+    btc_ema15_ma50_chart_data_status_map: dict[str, dict[str, ChartDataStatus]] | None = None,
     btc_ema15_ma50_overlay_legend_map: dict[str, dict[str, str]] | None = None,
     btc_volatility_chart_image_map: dict[str, dict[str, str]] | None = None,
+    btc_volatility_chart_data_status_map: dict[str, dict[str, ChartDataStatus]] | None = None,
     btc_volatility_overlay_legend_map: dict[str, dict[str, str]] | None = None,
 ) -> str:
     return _build_multi_coin_market_email_html(
         digest,
         chart_image_map=chart_image_map,
+        chart_data_status_map=chart_data_status_map,
         overlay_legend_map=overlay_legend_map,
         btc_ema15_ma50_chart_image_map=btc_ema15_ma50_chart_image_map,
+        btc_ema15_ma50_chart_data_status_map=btc_ema15_ma50_chart_data_status_map,
         btc_ema15_ma50_overlay_legend_map=btc_ema15_ma50_overlay_legend_map,
         btc_volatility_chart_image_map=btc_volatility_chart_image_map,
+        btc_volatility_chart_data_status_map=btc_volatility_chart_data_status_map,
         btc_volatility_overlay_legend_map=btc_volatility_overlay_legend_map,
         validation_summary=None,
     )
@@ -258,10 +343,13 @@ def _build_multi_coin_market_email_html(
     digest: MultiCoinMarketDigest,
     *,
     chart_image_map: dict[str, dict[str, str]] | None = None,
+    chart_data_status_map: dict[str, dict[str, ChartDataStatus]] | None = None,
     overlay_legend_map: dict[str, dict[str, str]] | None = None,
     btc_ema15_ma50_chart_image_map: dict[str, dict[str, str]] | None = None,
+    btc_ema15_ma50_chart_data_status_map: dict[str, dict[str, ChartDataStatus]] | None = None,
     btc_ema15_ma50_overlay_legend_map: dict[str, dict[str, str]] | None = None,
     btc_volatility_chart_image_map: dict[str, dict[str, str]] | None = None,
+    btc_volatility_chart_data_status_map: dict[str, dict[str, ChartDataStatus]] | None = None,
     btc_volatility_overlay_legend_map: dict[str, dict[str, str]] | None = None,
     validation_summary: dict[str, object] | None,
 ) -> str:
@@ -304,18 +392,26 @@ def _build_multi_coin_market_email_html(
             strongest_long_asset=strongest_long_asset,
             weakest_short_asset=weakest_short_asset,
             chart_image_map=chart_image_map or {},
+            chart_data_status_map=chart_data_status_map or {},
             overlay_legend_map=overlay_legend_map or {},
             btc_ema15_ma50=digest.btc_ema15_ma50,
             btc_ema15_ma50_chart_image_map=btc_ema15_ma50_chart_image_map or {},
+            btc_ema15_ma50_chart_data_status_map=btc_ema15_ma50_chart_data_status_map or {},
             btc_ema15_ma50_overlay_legend_map=btc_ema15_ma50_overlay_legend_map or {},
             btc_volatility_ema15_ma50=digest.btc_volatility_ema15_ma50,
             btc_volatility_chart_image_map=btc_volatility_chart_image_map or {},
+            btc_volatility_chart_data_status_map=btc_volatility_chart_data_status_map or {},
             btc_volatility_overlay_legend_map=btc_volatility_overlay_legend_map or {},
         )
         for analysis in digest.analyses
     )
     headline = build_multi_coin_market_email_subject(digest)
     generated_at = _format_generated_at_display(digest.generated_at)
+    freshness_warning_html = _build_freshness_warning_html(
+        chart_data_status_map or {},
+        btc_ema15_ma50_chart_data_status_map or {},
+        btc_volatility_chart_data_status_map or {},
+    )
     return f"""<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -334,6 +430,7 @@ def _build_multi_coin_market_email_html(
                             <p style="margin: 8px 0 0 0; color: #bdc3c7; font-size: 14px;">生成时间：{escape(generated_at)}</p>
                         </td>
                     </tr>
+                    {freshness_warning_html}
                     <tr>
                         <td style="padding: 20px 24px; background-color: #e8f4fd;">
                             <h2 style="margin: 0 0 12px 0; color: #2980b9; font-size: 16px; font-weight: 600;">简明结论</h2>
@@ -413,22 +510,32 @@ def prepare_multi_coin_market_email(
     scheduled_release_slot: str = "",
     analysis_slot: str = "",
 ) -> dict[str, object]:
-    validation_summary = _load_recent_validation_summary()
+    validation_summary = _load_recent_validation_summary(refresh_if_needed=True)
     subject = build_multi_coin_market_email_subject(digest)
     body = _build_multi_coin_market_email_body(digest, validation_summary=validation_summary)
     overlay_map = build_multi_coin_overlay_map(digest)
-    chart_image_map = build_multi_coin_chart_image_map(digest, overlay_map=overlay_map)
+    chart_image_map, chart_data_status_map = _build_multi_coin_chart_assets(digest, overlay_map=overlay_map)
     btc_ema15_ma50_chart_image_map: dict[str, dict[str, str]] = {}
+    btc_ema15_ma50_chart_data_status_map: dict[str, dict[str, ChartDataStatus]] = {}
     btc_ema15_ma50_overlay_legend_map: dict[str, dict[str, str]] = {}
     btc_volatility_chart_image_map: dict[str, dict[str, str]] = {}
+    btc_volatility_chart_data_status_map: dict[str, dict[str, ChartDataStatus]] = {}
     btc_volatility_overlay_legend_map: dict[str, dict[str, str]] = {}
     if digest.btc_ema15_ma50 is not None:
         btc_symbol = digest.btc_ema15_ma50.symbol
         btc_ema15_ma50_overlays = _build_btc_ema15_ma50_overlay_map(btc_symbol)
-        btc_ema15_ma50_chart_image_map = build_multi_coin_chart_image_map(
-            digest,
-            overlay_map=btc_ema15_ma50_overlays,
-            symbols=(btc_symbol,),
+        price_series_by_timeframe = _supplement_candle_series_map(digest.btc_ema15_ma50.candle_series)
+        btc_ema15_ma50_chart_image_map = _build_chart_image_map_from_candle_series(
+            btc_symbol,
+            candles_by_timeframe=price_series_by_timeframe,
+            overlays_by_timeframe=btc_ema15_ma50_overlays[btc_symbol],
+            visible_limit=72,
+        )
+        btc_ema15_ma50_chart_data_status_map = _build_chart_data_status_map_from_candle_series(
+            btc_symbol,
+            candles_by_timeframe=price_series_by_timeframe,
+            generated_at=digest.generated_at,
+            source_by_timeframe={timeframe: "OKX" for timeframe in price_series_by_timeframe},
         )
         btc_ema15_ma50_overlay_legend_map = {
             btc_symbol: {
@@ -439,17 +546,21 @@ def prepare_multi_coin_market_email(
     if digest.btc_volatility_ema15_ma50 is not None:
         btc_symbol = digest.btc_volatility_ema15_ma50.symbol
         btc_volatility_overlays = _build_btc_ema15_ma50_overlay_map(btc_symbol)
-        volatility_series_by_timeframe, _ = _collect_btc_volatility_candle_series(
-            btc_symbol,
-            client=OkxRestClient(),
-            timeframes=BTC_VOLATILITY_EMA15_MA50_TIMEFRAMES,
-            limit=127,
-        )
+        volatility_series_by_timeframe = _supplement_candle_series_map(digest.btc_volatility_ema15_ma50.candle_series)
         btc_volatility_chart_image_map = _build_chart_image_map_from_candle_series(
             btc_symbol,
             candles_by_timeframe=volatility_series_by_timeframe,
             overlays_by_timeframe=btc_volatility_overlays[btc_symbol],
             visible_limit=72,
+        )
+        btc_volatility_chart_data_status_map = _build_chart_data_status_map_from_candle_series(
+            btc_symbol,
+            candles_by_timeframe=volatility_series_by_timeframe,
+            generated_at=digest.generated_at,
+            source_by_timeframe={
+                item.timeframe: item.source
+                for item in digest.btc_volatility_ema15_ma50.timeframes
+            },
         )
         btc_volatility_overlay_legend_map = {
             btc_symbol: {
@@ -469,10 +580,13 @@ def prepare_multi_coin_market_email(
     html_body = _build_multi_coin_market_email_html(
         digest,
         chart_image_map=chart_image_map,
+        chart_data_status_map=chart_data_status_map,
         overlay_legend_map=overlay_legend_map,
         btc_ema15_ma50_chart_image_map=btc_ema15_ma50_chart_image_map,
+        btc_ema15_ma50_chart_data_status_map=btc_ema15_ma50_chart_data_status_map,
         btc_ema15_ma50_overlay_legend_map=btc_ema15_ma50_overlay_legend_map,
         btc_volatility_chart_image_map=btc_volatility_chart_image_map,
+        btc_volatility_chart_data_status_map=btc_volatility_chart_data_status_map,
         btc_volatility_overlay_legend_map=btc_volatility_overlay_legend_map,
         validation_summary=validation_summary,
     )
@@ -612,17 +726,22 @@ def build_multi_coin_market_viewpoints(digest: MultiCoinMarketDigest) -> list[di
     return viewpoints
 
 
-def _load_recent_validation_summary() -> dict[str, object] | None:
-    _refresh_recent_validation_summary_if_needed()
+def _load_recent_validation_summary(*, refresh_if_needed: bool = False) -> dict[str, object] | None:
+    if refresh_if_needed:
+        _refresh_recent_validation_summary_if_needed()
     payload = load_latest_email_validation_payload()
     if not payload:
         return None
     return build_recent_email_validation_summary(payload, recent_email_limit=20)
 
 
-def _refresh_recent_validation_summary_if_needed() -> None:
+def _refresh_recent_validation_summary_if_needed(*, now: datetime | None = None) -> None:
     payload = load_latest_email_validation_payload()
-    if payload is not None:
+    generated_at = _parse_iso_datetime(payload.get("generated_at")) if payload is not None else None
+    resolved_now = now or datetime.now(timezone.utc)
+    if resolved_now.tzinfo is None:
+        resolved_now = resolved_now.replace(tzinfo=timezone.utc)
+    if generated_at is not None and resolved_now.astimezone(timezone.utc) - generated_at.astimezone(timezone.utc) <= VALIDATION_STALE_AFTER:
         return
     try:
         refresh_email_validation_report(archive_limit=60)
@@ -644,7 +763,6 @@ def _build_recent_validation_text_lines(
     email_count = int(summary.get("email_count", 0) or 0)
     sample_count = int(summary.get("sample_count", 0) or 0)
     actionable_count = int(summary.get("actionable_sample_count", 0) or 0)
-    generated_at = str(summary.get("generated_at", "") or "").strip()
     lines = [
         (
             f"- 基于最近一次本地复盘汇总，覆盖最近 {email_count} 封已发送邮件，"
@@ -668,7 +786,7 @@ def _build_recent_validation_text_lines(
             text = str(detail_line or "").strip()
             if text:
                 lines.append(f"  {text}")
-    lines.append(f"- 最近复盘汇总生成时间：{generated_at or '-'}")
+    lines.extend(f"- {item}" for item in _recent_validation_time_lines(summary))
     if by_symbol:
         lines.append("- 各币种最近命中率简表：")
         for symbol, item in by_symbol.items():
@@ -681,6 +799,63 @@ def _build_recent_validation_text_lines(
                 f"24H 平均回报 {_summary_avg_return_text(item, 'avg_return_24h_pct')}"
             )
     return lines
+
+
+def _recent_validation_time_lines(
+    summary: dict[str, object],
+    *,
+    now: datetime | None = None,
+) -> list[str]:
+    generated_at = _parse_iso_datetime(summary.get("generated_at"))
+    sample_cutoff_at = _parse_iso_datetime(summary.get("sample_cutoff_at"))
+    generated_text = _format_beijing_datetime(generated_at)
+    cutoff_text = _format_beijing_datetime(sample_cutoff_at)
+    lines = [
+        f"复盘报告生成时间：{generated_text}",
+        f"复盘样本截止时间：{cutoff_text}",
+    ]
+    resolved_now = now or datetime.now(timezone.utc)
+    if resolved_now.tzinfo is None:
+        resolved_now = resolved_now.replace(tzinfo=timezone.utc)
+    is_stale = (
+        generated_at is None
+        or resolved_now.astimezone(timezone.utc) - generated_at.astimezone(timezone.utc) > VALIDATION_STALE_AFTER
+    )
+    if is_stale:
+        lines.append("复盘数据已过期：邮件继续发送，但请勿把旧样本统计当作当前表现。")
+    return lines
+
+
+def _format_beijing_datetime(value: datetime | None) -> str:
+    if value is None:
+        return "-"
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.astimezone(BEIJING_TIMEZONE).strftime("%Y-%m-%d %H:%M UTC+8")
+
+
+def _build_freshness_warning_html(
+    *status_maps: dict[str, dict[str, ChartDataStatus]],
+) -> str:
+    stale_items = [
+        f"{symbol.split('-')[0]} {status.timeframe}（{status.display_time}）"
+        for status_map in status_maps
+        for symbol, timeframe_map in status_map.items()
+        for status in timeframe_map.values()
+        if status.is_stale
+    ]
+    if not stale_items:
+        return ""
+    preview = "、".join(stale_items[:8])
+    if len(stale_items) > 8:
+        preview = f"{preview} 等 {len(stale_items)} 项"
+    return f"""
+                    <tr>
+                        <td style="padding: 12px 24px; color: #b42318; background-color: #fff1f0; border-bottom: 1px solid #fecdca; font-size: 13px; line-height: 1.7; font-weight: 700;">
+                            本邮件含过期数据：{escape(preview)}。邮件仍按计划发送，请先核对各图更新时间再使用结论。
+                        </td>
+                    </tr>
+    """
 
 
 def _build_recent_validation_html(
@@ -703,7 +878,6 @@ def _build_recent_validation_html(
     email_count = int(summary.get("email_count", 0) or 0)
     sample_count = int(summary.get("sample_count", 0) or 0)
     actionable_count = int(summary.get("actionable_sample_count", 0) or 0)
-    generated_at = str(summary.get("generated_at", "") or "").strip() or "-"
     rows = [
         f"基于最近一次本地复盘汇总，覆盖最近 {email_count} 封已发送邮件，共 {sample_count} 个样本。",
         (
@@ -724,11 +898,11 @@ def _build_recent_validation_html(
             text = str(detail_line or "").strip()
             if text:
                 rows.append(text)
-    rows.append(f"最近复盘汇总生成时间：{generated_at}")
+    rows.extend(_recent_validation_time_lines(summary))
     summary_html = "".join(
         f"""
         <tr>
-            <td style="padding: 6px 0; color: #7c5f10; font-size: 14px; line-height: 1.7;">
+            <td style="padding: 6px 0; color: {'#b42318' if row.startswith('复盘数据已过期') else '#7c5f10'}; font-size: 14px; line-height: 1.7; font-weight: {'700' if row.startswith('复盘数据已过期') else '400'};">
                 - {escape(row)}
             </td>
         </tr>
@@ -1057,8 +1231,8 @@ def _build_coin_section(analysis: BtcMarketAnalysis, *, last_sent_at: datetime |
     tf1h = _find_timeframe(analysis, "1H")
     lines = [
         f"- {asset} | 综合={_direction_label(analysis.direction)} | 分数={analysis.score} | 置信度={_pct(analysis.confidence)}",
-        f"  4H：{_timeframe_line(tf4h)}",
-        f"  1H：{_timeframe_line(tf1h)}",
+        f"  4H：{_timeframe_line(tf4h)} | {_timeframe_status_text(tf4h, generated_at=analysis.generated_at, source='OKX')}",
+        f"  1H：{_timeframe_line(tf1h)} | {_timeframe_status_text(tf1h, generated_at=analysis.generated_at, source='OKX')}",
         f"  跟踪：{_coin_tracking_summary(analysis, tf4h, tf1h)}",
     ]
     recent_events = _collect_recent_events((tf4h, tf1h), last_sent_at=last_sent_at)
@@ -1070,17 +1244,61 @@ def _build_coin_section(analysis: BtcMarketAnalysis, *, last_sent_at: datetime |
 
 
 def _build_btc_ema15_ma50_text_section(supplement: BtcEma15Ma50Supplement) -> list[str]:
-    lines = [f"  EMA15/MA50 鍥涘懆鏈熻ˉ鍏咃細{supplement.summary}"]
+    lines = [f"  EMA15/MA50 四周期补充：{supplement.summary}"]
     for item in supplement.timeframes:
-        lines.append(f"    {item.timeframe}锛歿{item.summary}")
+        lines.append(
+            f"    {item.timeframe}：{item.summary} | "
+            f"{_supplement_status_text(item, generated_at=supplement.generated_at, source='OKX')}"
+        )
     return lines
 
 
 def _build_btc_volatility_text_section(supplement: BtcVolatilitySupplement) -> list[str]:
     lines = [f"  波动率 EMA15/MA50 补充：{supplement.summary}"]
     for item in supplement.timeframes:
-        lines.append(f"    {item.timeframe}：{item.summary}")
+        lines.append(
+            f"    {item.timeframe}：{item.summary} | "
+            f"{_supplement_status_text(item, generated_at=supplement.generated_at, source=item.source)}"
+        )
     return lines
+
+
+def _timeframe_status_text(
+    item: TimeframeAnalysis | None,
+    *,
+    generated_at: str,
+    source: str,
+) -> str:
+    if item is None:
+        return build_chart_data_status(
+            "",
+            candle_ts=None,
+            confirmed=None,
+            source=source,
+            generated_at=generated_at,
+        ).status_text
+    return build_chart_data_status(
+        item.timeframe,
+        candle_ts=item.candle_ts,
+        confirmed=item.candle_confirmed,
+        source=source,
+        generated_at=generated_at,
+    ).status_text
+
+
+def _supplement_status_text(
+    item: BtcEma15Ma50TimeframeAnalysis | BtcVolatilityTimeframeAnalysis,
+    *,
+    generated_at: str,
+    source: str,
+) -> str:
+    return build_chart_data_status(
+        item.timeframe,
+        candle_ts=item.candle_ts,
+        confirmed=item.candle_confirmed,
+        source=source,
+        generated_at=generated_at,
+    ).status_text
 
 
 def _coin_tracking_summary(
@@ -1286,12 +1504,15 @@ def _build_coin_card_html(
     strongest_long_asset: str,
     weakest_short_asset: str,
     chart_image_map: dict[str, dict[str, str]],
+    chart_data_status_map: dict[str, dict[str, ChartDataStatus]],
     overlay_legend_map: dict[str, dict[str, str]],
     btc_ema15_ma50: BtcEma15Ma50Supplement | None,
     btc_ema15_ma50_chart_image_map: dict[str, dict[str, str]],
+    btc_ema15_ma50_chart_data_status_map: dict[str, dict[str, ChartDataStatus]],
     btc_ema15_ma50_overlay_legend_map: dict[str, dict[str, str]],
     btc_volatility_ema15_ma50: BtcVolatilitySupplement | None,
     btc_volatility_chart_image_map: dict[str, dict[str, str]],
+    btc_volatility_chart_data_status_map: dict[str, dict[str, ChartDataStatus]],
     btc_volatility_overlay_legend_map: dict[str, dict[str, str]],
 ) -> str:
     asset = _asset_name(analysis.symbol)
@@ -1309,6 +1530,7 @@ def _build_coin_card_html(
         asset=asset,
         symbol=analysis.symbol,
         chart_image_map=chart_image_map,
+        data_statuses=chart_data_status_map.get(analysis.symbol, {}),
         overlay_legends=overlay_legend_map.get(analysis.symbol, {}),
     )
     btc_extra_html = ""
@@ -1319,6 +1541,7 @@ def _build_coin_card_html(
         btc_extra_html = _build_btc_ema15_ma50_html_block(
             btc_ema15_ma50,
             chart_image_map=btc_ema15_ma50_chart_image_map,
+            data_statuses=btc_ema15_ma50_chart_data_status_map.get(analysis.symbol, {}),
             overlay_legends=btc_ema15_ma50_overlay_legend_map.get(analysis.symbol, {}),
         )
     btc_volatility_extra_html = ""
@@ -1329,6 +1552,7 @@ def _build_coin_card_html(
         btc_volatility_extra_html = _build_btc_volatility_html_block(
             btc_volatility_ema15_ma50,
             chart_image_map=btc_volatility_chart_image_map,
+            data_statuses=btc_volatility_chart_data_status_map.get(analysis.symbol, {}),
             overlay_legends=btc_volatility_overlay_legend_map.get(analysis.symbol, {}),
         )
     return f"""
@@ -1348,10 +1572,10 @@ def _build_coin_card_html(
                 {chart_html}
                 <table width="100%" border="0" cellspacing="0" cellpadding="0" style="font-size: 13px; color: #34495e; line-height: 1.7;">
                     <tr>
-                        <td style="padding: 4px 0;"><strong>4H 周期：</strong>{escape(_timeframe_line(tf4h))}</td>
+                        <td style="padding: 4px 0;"><strong>4H 周期：</strong>{escape(_timeframe_line(tf4h))}<br><span style="font-size: 11px; color: #667085;">{escape(_timeframe_status_text(tf4h, generated_at=analysis.generated_at, source='OKX'))}</span></td>
                     </tr>
                     <tr>
-                        <td style="padding: 4px 0;"><strong>1H 周期：</strong>{escape(_timeframe_line(tf1h))}</td>
+                        <td style="padding: 4px 0;"><strong>1H 周期：</strong>{escape(_timeframe_line(tf1h))}<br><span style="font-size: 11px; color: #667085;">{escape(_timeframe_status_text(tf1h, generated_at=analysis.generated_at, source='OKX'))}</span></td>
                     </tr>
                     <tr>
                         <td style="padding: 4px 0;"><strong>跟踪提示：</strong>{escape(_coin_tracking_summary(analysis, tf4h, tf1h))}</td>
@@ -1503,28 +1727,61 @@ def build_multi_coin_chart_image_map(
     timeframes: tuple[str, ...] = ("1H", "4H", "1D", "1W"),
     visible_limit: int = 72,
 ) -> dict[str, dict[str, str]]:
+    images, _ = _build_multi_coin_chart_assets(
+        digest,
+        client=client,
+        overlay_map=overlay_map,
+        symbols=symbols,
+        timeframes=timeframes,
+        visible_limit=visible_limit,
+    )
+    return images
+
+
+def _build_multi_coin_chart_assets(
+    digest: MultiCoinMarketDigest,
+    *,
+    client: OkxRestClient | None = None,
+    overlay_map: dict[str, dict[str, tuple[MiniChartOverlay, ...]]] | None = None,
+    symbols: Iterable[str] | None = None,
+    timeframes: tuple[str, ...] = ("1H", "4H", "1D", "1W"),
+    visible_limit: int = 72,
+) -> tuple[dict[str, dict[str, str]], dict[str, dict[str, ChartDataStatus]]]:
     resolved_client = client or OkxRestClient()
     resolved_overlay_map = overlay_map or {}
     symbol_filter = {str(item).strip().upper() for item in (symbols or ()) if str(item).strip()}
     images: dict[str, dict[str, str]] = {}
+    statuses: dict[str, dict[str, ChartDataStatus]] = {}
     for analysis in digest.analyses:
         if symbol_filter and analysis.symbol.strip().upper() not in symbol_filter:
             continue
         symbol_images: dict[str, str] = {}
+        symbol_statuses: dict[str, ChartDataStatus] = {}
+        snapshot_map = {timeframe: list(candles) for timeframe, candles in analysis.chart_candles}
         for timeframe in timeframes:
             symbol_overlays = _resolve_chart_overlays_for_timeframe(
                 resolved_overlay_map.get(analysis.symbol, {}),
                 timeframe,
             )
             preload_limit = visible_limit + max((item.period for item in symbol_overlays), default=55)
-            candles = _load_chart_candles(
-                analysis.symbol,
-                timeframe,
-                limit=preload_limit,
-                client=resolved_client,
-            )
+            candles = snapshot_map.get(timeframe, [])
+            if not candles:
+                candles = _load_chart_candles(
+                    analysis.symbol,
+                    timeframe,
+                    limit=preload_limit,
+                    client=resolved_client,
+                )
             if not candles:
                 continue
+            latest = candles[-1]
+            symbol_statuses[timeframe] = build_chart_data_status(
+                timeframe,
+                candle_ts=int(latest.ts),
+                confirmed=bool(latest.confirmed),
+                source="OKX",
+                generated_at=digest.generated_at,
+            )
             try:
                 symbol_images[timeframe] = render_candles_png_base64(
                     candles,
@@ -1537,7 +1794,9 @@ def build_multi_coin_chart_image_map(
                 continue
         if symbol_images:
             images[analysis.symbol] = symbol_images
-    return images
+        if symbol_statuses:
+            statuses[analysis.symbol] = symbol_statuses
+    return images, statuses
 
 
 def _build_chart_image_map_from_candle_series(
@@ -1564,6 +1823,34 @@ def _build_chart_image_map_from_candle_series(
     return {symbol: symbol_images} if symbol_images else {}
 
 
+def _supplement_candle_series_map(
+    candle_series: tuple[tuple[str, tuple[Candle, ...]], ...],
+) -> dict[str, list[Candle]]:
+    return {timeframe: list(candles) for timeframe, candles in candle_series}
+
+
+def _build_chart_data_status_map_from_candle_series(
+    symbol: str,
+    *,
+    candles_by_timeframe: dict[str, list],
+    generated_at: str,
+    source_by_timeframe: dict[str, str],
+) -> dict[str, dict[str, ChartDataStatus]]:
+    statuses: dict[str, ChartDataStatus] = {}
+    for timeframe, candles in candles_by_timeframe.items():
+        if not candles:
+            continue
+        latest = candles[-1]
+        statuses[timeframe] = build_chart_data_status(
+            timeframe,
+            candle_ts=int(latest.ts),
+            confirmed=bool(latest.confirmed),
+            source=source_by_timeframe.get(timeframe, ""),
+            generated_at=generated_at,
+        )
+    return {symbol: statuses} if statuses else {}
+
+
 def _load_chart_candles(
     symbol: str,
     timeframe: str,
@@ -1571,20 +1858,11 @@ def _load_chart_candles(
     limit: int,
     client: OkxRestClient,
 ) -> list:
-    if timeframe == "1W":
-        try:
-            return client.get_candles(symbol, timeframe, limit=limit)
-        except Exception:
-            return []
-
     cached: list = []
     try:
         cached = load_candle_cache(symbol, timeframe, limit=limit)
     except Exception:
         cached = []
-    if len(cached) >= limit:
-        return cached[-limit:]
-
     try:
         fetched = client.get_candles_history(symbol, timeframe, limit=limit)
     except Exception:
@@ -1597,6 +1875,7 @@ def _build_coin_chart_html(
     asset: str,
     symbol: str,
     chart_image_map: dict[str, dict[str, str]],
+    data_statuses: dict[str, ChartDataStatus],
     overlay_legends: dict[str, str],
     headline: str | None = None,
 ) -> str:
@@ -1615,19 +1894,27 @@ def _build_coin_chart_html(
             </tr>
         </table>
         """
-    image_1h_html = _build_single_chart_cell(asset=asset, timeframe="1H", encoded=encoded_1h)
-    image_4h_html = _build_single_chart_cell(asset=asset, timeframe="4H", encoded=encoded_4h)
-    image_1d_html = _build_single_chart_cell(asset=asset, timeframe="1D", encoded=encoded_1d)
-    image_1w_html = _build_single_chart_cell(asset=asset, timeframe="1W", encoded=encoded_1w)
+    image_1h_html = _build_single_chart_cell(
+        asset=asset, timeframe="1H", encoded=encoded_1h, data_status=data_statuses.get("1H")
+    )
+    image_4h_html = _build_single_chart_cell(
+        asset=asset, timeframe="4H", encoded=encoded_4h, data_status=data_statuses.get("4H")
+    )
+    image_1d_html = _build_single_chart_cell(
+        asset=asset, timeframe="1D", encoded=encoded_1d, data_status=data_statuses.get("1D")
+    )
+    image_1w_html = _build_single_chart_cell(
+        asset=asset, timeframe="1W", encoded=encoded_1w, data_status=data_statuses.get("1W")
+    )
     overlay_1h = overlay_legends.get("1H", build_overlay_legend_html(default_symbol_overlays()))
     overlay_4h = overlay_legends.get("4H", build_overlay_legend_html(default_4h_overlays()))
     overlay_1d = overlay_legends.get("1D", build_overlay_legend_html(default_4h_overlays()))
     overlay_1w = overlay_legends.get("1W", build_overlay_legend_html(default_4h_overlays()))
-    title = headline or f"{asset} 鏈€杩?72 鏍?1H / 4H / 1D / 1W K 绾?"
+    title = headline or f"{asset} 最近 72 根 1H / 4H / 1D / 1W K 线"
     return f"""
     <table width="100%" border="0" cellspacing="0" cellpadding="0" style="margin-bottom: 12px;">
         <tr>
-            <td style="font-size: 12px; color: #7f8c8d; padding: 0 0 6px 0;">{escape(asset)} 最近 72 根 1H / 4H / 1D / 1W K 线</td>
+            <td style="font-size: 12px; color: #7f8c8d; padding: 0 0 6px 0;">{escape(title)}</td>
         </tr>
         <tr>
             <td>
@@ -1652,6 +1939,7 @@ def _build_coin_chart_html_with_headline(
     asset: str,
     symbol: str,
     chart_image_map: dict[str, dict[str, str]],
+    data_statuses: dict[str, ChartDataStatus],
     overlay_legends: dict[str, str],
     headline: str,
 ) -> str:
@@ -1670,10 +1958,18 @@ def _build_coin_chart_html_with_headline(
             </tr>
         </table>
         """
-    image_1h_html = _build_single_chart_cell(asset=asset, timeframe="1H", encoded=encoded_1h)
-    image_4h_html = _build_single_chart_cell(asset=asset, timeframe="4H", encoded=encoded_4h)
-    image_1d_html = _build_single_chart_cell(asset=asset, timeframe="1D", encoded=encoded_1d)
-    image_1w_html = _build_single_chart_cell(asset=asset, timeframe="1W", encoded=encoded_1w)
+    image_1h_html = _build_single_chart_cell(
+        asset=asset, timeframe="1H", encoded=encoded_1h, data_status=data_statuses.get("1H")
+    )
+    image_4h_html = _build_single_chart_cell(
+        asset=asset, timeframe="4H", encoded=encoded_4h, data_status=data_statuses.get("4H")
+    )
+    image_1d_html = _build_single_chart_cell(
+        asset=asset, timeframe="1D", encoded=encoded_1d, data_status=data_statuses.get("1D")
+    )
+    image_1w_html = _build_single_chart_cell(
+        asset=asset, timeframe="1W", encoded=encoded_1w, data_status=data_statuses.get("1W")
+    )
     overlay_1h = overlay_legends.get("1H", build_overlay_legend_html(default_symbol_overlays()))
     overlay_4h = overlay_legends.get("4H", build_overlay_legend_html(default_4h_overlays()))
     overlay_1d = overlay_legends.get("1D", build_overlay_legend_html(default_4h_overlays()))
@@ -1705,19 +2001,21 @@ def _build_btc_ema15_ma50_html_block(
     supplement: BtcEma15Ma50Supplement,
     *,
     chart_image_map: dict[str, dict[str, str]],
+    data_statuses: dict[str, ChartDataStatus],
     overlay_legends: dict[str, str],
 ) -> str:
     chart_html = _build_coin_chart_html_with_headline(
         asset="BTC",
         symbol=supplement.symbol,
         chart_image_map=chart_image_map,
+        data_statuses=data_statuses,
         overlay_legends=overlay_legends,
         headline="BTC EMA15 + MA50 最近 72 根 1H / 4H / 1D / 1W K 线",
     )
     rows_html = "".join(
         f"""
         <tr>
-            <td style="padding: 4px 0;"><strong>{escape(item.timeframe)}：</strong>{escape(item.summary)}</td>
+            <td style="padding: 4px 0;"><strong>{escape(item.timeframe)}：</strong>{escape(item.summary)}<br><span style="font-size: 11px; color: {'#b42318' if data_statuses.get(item.timeframe) and data_statuses[item.timeframe].is_stale else '#667085'};">{escape(_supplement_status_text(item, generated_at=supplement.generated_at, source='OKX'))}</span></td>
         </tr>
         """
         for item in supplement.timeframes
@@ -1750,19 +2048,21 @@ def _build_btc_volatility_html_block(
     supplement: BtcVolatilitySupplement,
     *,
     chart_image_map: dict[str, dict[str, str]],
+    data_statuses: dict[str, ChartDataStatus],
     overlay_legends: dict[str, str],
 ) -> str:
     chart_html = _build_coin_chart_html_with_headline(
         asset="BTC波动率",
         symbol=supplement.symbol,
         chart_image_map=chart_image_map,
+        data_statuses=data_statuses,
         overlay_legends=overlay_legends,
         headline="BTC 波动率 EMA15 + MA50 最近 72 根 1H / 4H / 1D / 1W K 线",
     )
     rows_html = "".join(
         f"""
         <tr>
-            <td style="padding: 4px 0;"><strong>{escape(item.timeframe)}：</strong>{escape(item.summary)}</td>
+            <td style="padding: 4px 0;"><strong>{escape(item.timeframe)}：</strong>{escape(item.summary)}<br><span style="font-size: 11px; color: {'#b42318' if data_statuses.get(item.timeframe) and data_statuses[item.timeframe].is_stale else '#667085'};">{escape(_supplement_status_text(item, generated_at=supplement.generated_at, source=item.source))}</span></td>
         </tr>
         """
         for item in supplement.timeframes
@@ -1798,8 +2098,11 @@ def _build_btc_ema15_ma50_supplement(
     generated_at: str,
 ) -> BtcEma15Ma50Supplement | None:
     timeframes: list[BtcEma15Ma50TimeframeAnalysis] = []
+    candle_series: list[tuple[str, tuple[Candle, ...]]] = []
     for timeframe in BTC_EMA15_MA50_TIMEFRAMES:
         candles = _load_chart_candles(symbol, timeframe, limit=120, client=client)
+        if candles:
+            candle_series.append((timeframe, tuple(candles[-320:])))
         item = _build_btc_ema15_ma50_timeframe_analysis(timeframe, candles)
         if item is not None:
             timeframes.append(item)
@@ -1812,6 +2115,7 @@ def _build_btc_ema15_ma50_supplement(
         direction=direction,
         summary=summary,
         timeframes=tuple(timeframes),
+        candle_series=tuple(candle_series),
     )
 
 
@@ -1843,6 +2147,11 @@ def _build_btc_volatility_ema15_ma50_supplement(
         direction=direction,
         summary=summary,
         timeframes=tuple(timeframes),
+        candle_series=tuple(
+            (timeframe, tuple(candles[-320:]))
+            for timeframe, candles in volatility_series_by_timeframe.items()
+            if candles
+        ),
     )
 
 
@@ -1889,7 +2198,7 @@ def _load_btc_volatility_timeframe_candles(
         return deribit_candles, "Deribit 波动率指数"
     realized = _build_realized_volatility_from_reference_for_digest(price_candles, bar=timeframe, lookback=20)
     if realized:
-        return realized[-limit:], "程序历史波动率"
+        return realized[-limit:], "降级：程序历史波动率"
     return [], ""
 
 
@@ -2058,6 +2367,7 @@ def _build_btc_volatility_timeframe_analysis(
     return BtcVolatilityTimeframeAnalysis(
         timeframe=timeframe,
         candle_ts=int(candles[-1].ts),
+        candle_confirmed=bool(candles[-1].confirmed),
         last_close=latest_close,
         ema15=latest_ema15,
         ma50=latest_ma50,
@@ -2178,6 +2488,7 @@ def _build_btc_ema15_ma50_timeframe_analysis(
     return BtcEma15Ma50TimeframeAnalysis(
         timeframe=timeframe,
         candle_ts=int(candles[-1].ts),
+        candle_confirmed=bool(candles[-1].confirmed),
         last_close=latest_close,
         ema15=latest_ema15,
         ma50=latest_ma50,
@@ -2427,6 +2738,7 @@ def _btc_ema15_ma50_payload(supplement: BtcEma15Ma50Supplement) -> dict[str, obj
             {
                 "timeframe": item.timeframe,
                 "candle_ts": item.candle_ts,
+                "candle_confirmed": item.candle_confirmed,
                 "last_close": str(item.last_close) if item.last_close is not None else None,
                 "ema15": str(item.ema15) if item.ema15 is not None else None,
                 "ma50": str(item.ma50) if item.ma50 is not None else None,
@@ -2449,6 +2761,7 @@ def _btc_volatility_ema15_ma50_payload(supplement: BtcVolatilitySupplement) -> d
             {
                 "timeframe": item.timeframe,
                 "candle_ts": item.candle_ts,
+                "candle_confirmed": item.candle_confirmed,
                 "last_close": str(item.last_close) if item.last_close is not None else None,
                 "ema15": str(item.ema15) if item.ema15 is not None else None,
                 "ma50": str(item.ma50) if item.ma50 is not None else None,
@@ -2489,7 +2802,23 @@ def _fmt_decimal(value: Decimal | None) -> str:
     return format(value.quantize(Decimal("0.01")), "f")
 
 
-def _build_single_chart_cell(*, asset: str, timeframe: str, encoded: str) -> str:
+def _build_single_chart_cell(
+    *,
+    asset: str,
+    timeframe: str,
+    encoded: str,
+    data_status: ChartDataStatus | None = None,
+) -> str:
+    status_html = ""
+    if data_status is not None:
+        status_color = "#b42318" if data_status.is_stale else "#667085"
+        status_html = f"""
+            <tr>
+                <td style="font-size: 11px; color: {status_color}; padding: 0 0 6px 0; font-weight: {'700' if data_status.is_stale else '400'};">
+                    {escape(data_status.status_text)}
+                </td>
+            </tr>
+        """
     if not encoded.strip():
         return f"""
         <table width="100%" border="0" cellspacing="0" cellpadding="0">
@@ -2499,6 +2828,7 @@ def _build_single_chart_cell(*, asset: str, timeframe: str, encoded: str) -> str
             <tr>
                 <td style="font-size: 11px; color: #94a3b8; padding: 0 0 6px 0;">__OVERLAY_LEGEND__</td>
             </tr>
+            {status_html}
             <tr>
                 <td style="padding: 10px 12px; border: 1px dashed #d8e1ea; border-radius: 6px; background-color: #fbfcfe; font-size: 12px; color: #94a3b8; text-align: center;">
                     {escape(timeframe)} 图暂不可用
@@ -2514,6 +2844,7 @@ def _build_single_chart_cell(*, asset: str, timeframe: str, encoded: str) -> str
         <tr>
             <td style="font-size: 11px; color: #94a3b8; padding: 0 0 6px 0;">__OVERLAY_LEGEND__</td>
         </tr>
+        {status_html}
         <tr>
             <td>
                 <img

@@ -193,6 +193,35 @@ class AnalysisEmailValidationTest(TestCase):
         self.assertIn("ETH-USDT-SWAP", recent_summary["by_symbol"])
         self.assertIn("highlights", recent_summary)
 
+    def test_load_email_analysis_records_deduplicates_repeated_delivery_of_same_report(self) -> None:
+        temp_dir = self._workspace_temp_dir()
+        analysis_dir = temp_dir / "reports" / "analysis"
+        archive_dir = analysis_dir / "email_archives"
+        archive_dir.mkdir(parents=True, exist_ok=True)
+        report_path = analysis_dir / "multi_coin_market_digest_20260724T010000Z.json"
+        digest_payload = {
+            "generated_at": "2026-07-24T01:00:00Z",
+            "symbols": ["BTC-USDT-SWAP"],
+            "analyses": [_analysis_payload("BTC-USDT-SWAP", "short", -6, "0.50", 1_000, "65000")],
+        }
+        report_path.write_text(json.dumps(digest_payload, ensure_ascii=False), encoding="utf-8")
+        for index in range(2):
+            metadata = {
+                "subject": f"[QQOKX] repeated {index}",
+                "generated_at": "2026-07-24T01:00:00Z",
+                "delivery_status": "sent",
+                "report_path": str(report_path),
+            }
+            (archive_dir / f"multi_coin_market_digest_email_20260724T01000{index}Z.json").write_text(
+                json.dumps(metadata, ensure_ascii=False),
+                encoding="utf-8",
+            )
+
+        records = load_email_analysis_records(base_dir=temp_dir)
+
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0].symbol, "BTC-USDT-SWAP")
+
     def test_recent_summary_builds_symbol_highlights(self) -> None:
         payload = {
             "generated_at": "2026-06-16T12:00:00Z",
@@ -223,6 +252,7 @@ class AnalysisEmailValidationTest(TestCase):
         self.assertEqual(highlights["worst_symbol"]["symbol"], "ETH-USDT-SWAP")
         self.assertTrue(str(highlights["notable_change"]).strip())
         self.assertIn("BTC", str(highlights["notable_change"]) + str(summary))
+        self.assertEqual(summary["sample_cutoff_at"], "2026-06-16T12:00:00Z")
 
     def test_refresh_email_validation_report_builds_latest_payload(self) -> None:
         temp_dir = self._workspace_temp_dir()

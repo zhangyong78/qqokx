@@ -8,6 +8,7 @@ from uuid import uuid4
 from zoneinfo import ZoneInfo
 
 from okx_quant.btc_market_analyzer import (
+    BtcMarketAnalyzerConfig,
     analyze_btc_market_at_time,
     analyze_btc_market_from_candle_map,
     btc_market_analysis_payload,
@@ -60,6 +61,18 @@ class BtcMarketAnalyzerTest(TestCase):
         temp_dir.mkdir(parents=True, exist_ok=True)
         self.addCleanup(lambda: shutil.rmtree(temp_dir, ignore_errors=True))
         return temp_dir
+
+    def test_analysis_keeps_recent_candles_for_email_chart_snapshot(self) -> None:
+        candles = _candles_from_closes([Decimal(100 + index) for index in range(400)])
+
+        analysis = analyze_btc_market_from_candle_map(
+            {"1H": candles},
+            config=BtcMarketAnalyzerConfig(timeframes=("1H",)),
+        )
+
+        chart_map = dict(analysis.chart_candles)
+        self.assertEqual(len(chart_map["1H"]), 320)
+        self.assertEqual(chart_map["1H"][-1].ts, candles[-1].ts)
 
     def test_multi_timeframe_analysis_produces_long_resonance(self) -> None:
         candles = _bullish_trend_candles()

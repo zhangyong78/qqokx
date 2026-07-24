@@ -100,6 +100,7 @@ class TimeframeAnalysis:
     indicators: dict[str, object]
     pattern: dict[str, object]
     focus_events: tuple[PatternFocusEvent, ...] = ()
+    candle_confirmed: bool | None = None
 
 
 @dataclass(frozen=True)
@@ -128,6 +129,7 @@ class BtcMarketAnalysis:
     analysis_point_utc: str | None = None
     data_cutoff_rule: str | None = None
     validation: ReplayValidation | None = None
+    chart_candles: tuple[tuple[str, tuple[Candle, ...]], ...] = field(default_factory=tuple, repr=False, compare=False)
 
 
 @dataclass(frozen=True)
@@ -301,6 +303,14 @@ def analyze_btc_market_from_candle_map(
         analysis_point_utc=analysis_point_utc,
         data_cutoff_rule=data_cutoff_rule,
         validation=validation,
+        chart_candles=tuple(
+            (
+                timeframe,
+                tuple(sorted(candle_map.get(timeframe, []), key=lambda item: item.ts)[-320:]),
+            )
+            for timeframe in config.timeframes
+            if candle_map.get(timeframe)
+        ),
     )
 
 
@@ -341,6 +351,7 @@ def btc_market_analysis_payload(analysis: BtcMarketAnalysis) -> dict[str, object
                 "indicators": item.indicators,
                 "pattern": item.pattern,
                 "focus_events": [_focus_event_payload(event) for event in item.focus_events],
+                "candle_confirmed": item.candle_confirmed,
             }
             for item in analysis.timeframes
         ],
@@ -757,6 +768,7 @@ def _analyze_timeframe(
             indicators={},
             pattern={},
             focus_events=(),
+            candle_confirmed=None,
         )
 
     indicator_snapshot, indicator_signals, indicator_trend_context = _build_indicator_snapshot(
@@ -800,6 +812,7 @@ def _analyze_timeframe(
         indicators=indicator_snapshot,
         pattern=pattern_snapshot,
         focus_events=focus_events,
+        candle_confirmed=bool(ordered[-1].confirmed),
     )
 
 

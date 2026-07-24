@@ -136,7 +136,8 @@ class WorkspaceHeader(QFrame):
 
         self.task_button = QToolButton(self)
         self.task_button.setText("无本地任务")
-        self.task_button.setToolTip("按 API 显示 RR、条件单和套利任务")
+        self.task_button.setToolTip("按 API 显示 RR、条件单和套利任务；点击查看 RR 监控")
+        self.task_button.clicked.connect(lambda: self.tool_requested.emit("rr-monitor"))
         layout.addWidget(self.task_button)
 
         layout.addWidget(self._menu_button("⚙", self._ROUTES[6:]))

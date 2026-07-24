@@ -34,7 +34,16 @@ class EmailScheduleManagerHelpersTest(TestCase):
 
     def test_format_event_id_prefers_known_labels(self) -> None:
         self.assertEqual(format_event_id(102), "102 已完成")
+        self.assertEqual(format_event_id(114), "114 错过后补跑")
         self.assertEqual(format_event_id(999), "999")
+
+    def test_schedule_registration_only_enables_catchup_for_8am(self) -> None:
+        script_path = Path(__file__).resolve().parents[1] / "scripts" / "register_btc_market_analysis_schedule.ps1"
+        script = script_path.read_text(encoding="utf-8-sig")
+
+        self.assertIn('StartWhenAvailable = $true', script)
+        self.assertIn('StartWhenAvailable = $false', script)
+        self.assertIn('if ([bool]$config.StartWhenAvailable)', script)
 
     def test_summarize_event_message_compacts_whitespace(self) -> None:
         message = "Task   started\r\nwith   multiple\tspaces"

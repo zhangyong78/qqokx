@@ -5670,6 +5670,9 @@ class KlineAnalysisWindow(QMainWindow):
         remove_rr_btn = QPushButton("删除 RR")
         remove_rr_btn.clicked.connect(self._remove_rr_item)
         rr_manage_row.addWidget(remove_rr_btn)
+        monitor_rr_btn = QPushButton("RR 监控")
+        monitor_rr_btn.clicked.connect(self.open_rr_monitor_dialog)
+        rr_manage_row.addWidget(monitor_rr_btn)
         control_layout.addLayout(rr_manage_row)
 
         self._rr_table = QTableWidget(0, 8)
@@ -6648,6 +6651,108 @@ class KlineAnalysisWindow(QMainWindow):
         index = self._rr_monitor_cursor % len(entries)
         self._rr_monitor_cursor = (index + 1) % len(entries)
         return entries[index]
+
+    def open_rr_monitor_dialog(self) -> None:
+        entries = self._monitorable_rr_trade_ledger_entries()
+        dialog = QDialog(self)
+        dialog.setWindowTitle("RR 监控")
+        dialog.setMinimumWidth(880)
+
+        layout = QVBoxLayout(dialog)
+        hint = QLabel(
+            "这里列出本程序仍在轮询的 RR 账本记录。清空仅停止本程序监控，"
+            "不会平仓，也不会撤销 OKX 的止盈止损单。",
+            dialog,
+        )
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+
+        table = QTableWidget(len(entries), 9, dialog)
+        table.setHorizontalHeaderLabels(
+            ["账户", "环境", "合约", "方向", "状态", "已成交", "剩余", "止损/止盈", "最后更新"]
+        )
+        table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
+        table.verticalHeader().setVisible(False)
+        header = table.horizontalHeader()
+        for column in range(9):
+            header.setSectionResizeMode(column, QHeaderView.ResizeMode.ResizeToContents)
+        header.setStretchLastSection(True)
+        for row, entry in enumerate(entries):
+            plan = entry.plan
+            protection_text = (
+                f"止损 {getattr(entry.stop_loss_order, 'state', '-') or '-'} / "
+                f"止盈 {getattr(entry.take_profit_order, 'state', '-') or '-'}"
+            )
+            values = (
+                plan.profile_name or "-",
+                plan.environment or "-",
+                plan.inst_id or "-",
+                "多" if plan.direction == "long" else "空",
+                entry.status or "-",
+                format_decimal(entry.filled_size),
+                format_decimal(entry.remaining_size),
+                protection_text,
+                entry.updated_at or entry.created_at or "-",
+            )
+            for column, value in enumerate(values):
+                table.setItem(row, column, QTableWidgetItem(str(value)))
+        layout.addWidget(table)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close, parent=dialog)
+        clear_button = buttons.addButton("清空本地监控", QDialogButtonBox.ButtonRole.DestructiveRole)
+        buttons.rejected.connect(dialog.reject)
+        buttons.accepted.connect(dialog.accept)
+        layout.addWidget(buttons)
+
+        def _clear_monitoring() -> None:
+            if not entries:
+                return
+            confirmed = QMessageBox.question(
+                dialog,
+                "清空本地 RR 监控",
+                f"将删除 {len(entries)} 条本地 RR 监控账本记录，顶部 RR 计数会归零。\n\n"
+                "不会平仓，也不会撤销 OKX 的止盈止损单；清空后本程序不再跟踪这些记录。是否继续？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if confirmed != QMessageBox.StandardButton.Yes:
+                return
+            removed = self._clear_rr_monitor_entries(entries)
+            self._set_status(f"已清空 {removed} 条本地 RR 监控；未对 OKX 仓位或保护单执行操作。")
+            dialog.accept()
+
+        clear_button.clicked.connect(_clear_monitoring)
+        dialog.exec()
+
+    def _clear_rr_monitor_entries(self, entries: list[RRTradeLedgerEntry]) -> int:
+        plan_ids = {str(entry.plan.plan_id or "").strip() for entry in entries}
+        plan_ids.discard("")
+        if not plan_ids:
+            return 0
+        snapshot = self._rr_trade_ledger_snapshot if isinstance(self._rr_trade_ledger_snapshot, dict) else {}
+        raw_entries = list(snapshot.get("entries", [])) if isinstance(snapshot.get("entries"), list) else []
+        retained_entries: list[dict[str, object]] = []
+        removed = 0
+        for raw in raw_entries:
+            if not isinstance(raw, dict):
+                continue
+            try:
+                ledger_entry = RRTradeLedgerEntry.from_dict(raw)
+            except Exception:
+                retained_entries.append(raw)
+                continue
+            if str(ledger_entry.plan.plan_id or "").strip() in plan_ids:
+                removed += 1
+                continue
+            retained_entries.append(raw)
+        if removed:
+            self._rr_trade_ledger_snapshot = {"entries": retained_entries}
+            self._rr_monitor_cursor = 0
+            save_kline_rr_trade_ledger_snapshot(retained_entries)
+            self._refresh_rr_trade_hint()
+        return removed
 
     def _refresh_rr_trade_hint(self, *, symbol: str | None = None) -> None:
         if not hasattr(self, "_rr_trade_hint"):

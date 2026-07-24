@@ -3,18 +3,13 @@ $ErrorActionPreference = "Stop"
 $runnerPath = Join-Path $PSScriptRoot "send_btc_market_analysis_email.ps1"
 $powershellPath = Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe"
 $taskPrefix = "QQOKX BTC Analysis Email"
-$taskSettings = New-ScheduledTaskSettingsSet `
-    -AllowStartIfOnBatteries `
-    -DontStopIfGoingOnBatteries `
-    -StartWhenAvailable `
-    -MultipleInstances IgnoreNew
 $taskConfigs = @(
-    @{ Time = "00:00"; DeliveryMode = "archive_only"; ScheduledReleaseSlot = "08:00"; AnalysisSlot = "00:00" },
-    @{ Time = "04:00"; DeliveryMode = "archive_only"; ScheduledReleaseSlot = "08:00"; AnalysisSlot = "04:00" },
-    @{ Time = "08:00"; DeliveryMode = "release_pending_and_send"; ScheduledReleaseSlot = "08:00"; AnalysisSlot = "08:00" },
-    @{ Time = "12:00"; DeliveryMode = "immediate"; ScheduledReleaseSlot = "08:00"; AnalysisSlot = "12:00" },
-    @{ Time = "16:00"; DeliveryMode = "immediate"; ScheduledReleaseSlot = "08:00"; AnalysisSlot = "16:00" },
-    @{ Time = "20:00"; DeliveryMode = "immediate"; ScheduledReleaseSlot = "08:00"; AnalysisSlot = "20:00" }
+    @{ Time = "00:00"; DeliveryMode = "archive_only"; ScheduledReleaseSlot = "08:00"; AnalysisSlot = "00:00"; StartWhenAvailable = $false },
+    @{ Time = "04:00"; DeliveryMode = "archive_only"; ScheduledReleaseSlot = "08:00"; AnalysisSlot = "04:00"; StartWhenAvailable = $false },
+    @{ Time = "08:00"; DeliveryMode = "release_pending_and_send"; ScheduledReleaseSlot = "08:00"; AnalysisSlot = "08:00"; StartWhenAvailable = $true },
+    @{ Time = "12:00"; DeliveryMode = "immediate"; ScheduledReleaseSlot = "08:00"; AnalysisSlot = "12:00"; StartWhenAvailable = $false },
+    @{ Time = "16:00"; DeliveryMode = "immediate"; ScheduledReleaseSlot = "08:00"; AnalysisSlot = "16:00"; StartWhenAvailable = $false },
+    @{ Time = "20:00"; DeliveryMode = "immediate"; ScheduledReleaseSlot = "08:00"; AnalysisSlot = "20:00"; StartWhenAvailable = $false }
 )
 
 foreach ($config in $taskConfigs) {
@@ -28,6 +23,18 @@ foreach ($config in $taskConfigs) {
         "-AnalysisSlot `"$($config.AnalysisSlot)`""
     )
     schtasks /Create /TN $taskName /SC DAILY /ST $time /TR $taskCommand /F | Out-Null
+    if ([bool]$config.StartWhenAvailable) {
+        $taskSettings = New-ScheduledTaskSettingsSet `
+            -AllowStartIfOnBatteries `
+            -DontStopIfGoingOnBatteries `
+            -StartWhenAvailable `
+            -MultipleInstances IgnoreNew
+    } else {
+        $taskSettings = New-ScheduledTaskSettingsSet `
+            -AllowStartIfOnBatteries `
+            -DontStopIfGoingOnBatteries `
+            -MultipleInstances IgnoreNew
+    }
     Set-ScheduledTask -TaskName $taskName -Settings $taskSettings | Out-Null
     Write-Output "registered $taskName at $time [$($config.DeliveryMode)]"
 }

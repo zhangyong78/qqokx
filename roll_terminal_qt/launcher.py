@@ -569,6 +569,14 @@ class LauncherWindow(QMainWindow):
     @Slot(str)
     def _handle_workspace_tool(self, tool_key: str) -> None:
         normalized = tool_key.strip().lower()
+        if normalized == "rr-monitor":
+            self.show_page("kline")
+            page = self._pages.get("kline")
+            opener = getattr(page, "open_rr_monitor_dialog", None)
+            if callable(opener):
+                opener()
+            self._refresh_local_task_status()
+            return
         if normalized == "smart-order":
             self.show_page(normalized)
             return

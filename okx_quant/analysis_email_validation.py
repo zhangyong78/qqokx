@@ -62,6 +62,7 @@ def load_email_analysis_records(
     if limit > 0:
         meta_paths = meta_paths[-limit:]
     records: list[EmailAnalysisRecord] = []
+    seen_record_keys: set[tuple[str, str]] = set()
     for meta_path in meta_paths:
         metadata = _load_json_dict(meta_path)
         if not metadata:
@@ -89,6 +90,11 @@ def load_email_analysis_records(
             if primary is None:
                 continue
             viewpoint = viewpoints.get(symbol) or _derive_viewpoint_from_payload(analysis_payload)
+            report_key = str(report_path.resolve()).casefold() if report_path is not None else generated_at
+            record_key = (report_key, symbol)
+            if record_key in seen_record_keys:
+                continue
+            seen_record_keys.add(record_key)
             records.append(
                 EmailAnalysisRecord(
                     archive_meta_path=meta_path,
@@ -265,6 +271,7 @@ def build_recent_email_validation_summary(
     }
     summary = {
         "generated_at": str(payload.get("generated_at", "") or "").strip(),
+        "sample_cutoff_at": _latest_detail_generated_at(recent_rows),
         "recent_email_limit": recent_email_limit,
         "email_count": _unique_archive_count(recent_rows),
         "sample_count": len(recent_rows),
@@ -275,6 +282,15 @@ def build_recent_email_validation_summary(
     }
     summary["highlights"] = _build_recent_summary_highlights(summary)
     return summary
+
+
+def _latest_detail_generated_at(details: list[dict[str, object]]) -> str:
+    candidates = [
+        str(item.get("generated_at", "") or "").strip()
+        for item in details
+        if str(item.get("generated_at", "") or "").strip()
+    ]
+    return max(candidates, default="")
 
 
 def _archive_metadata_is_delivered(metadata: dict[str, object]) -> bool:
