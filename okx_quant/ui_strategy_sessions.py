@@ -39,6 +39,7 @@ from okx_quant.strategy_ui_schema import (
     strategy_forces_local_trade,
     strategy_parameter_default_for_scope,
     strategy_ui_extra_defaults,
+    strategy_ui_fixed_extra_value,
 )
 from okx_quant.strategy_status_email import (
     StrategyStatusEmailRow,
@@ -76,8 +77,14 @@ class UiStrategySessionsMixin:
             for key in iter_strategy_parameter_keys(definition.strategy_id)
         }
         defaults.update(strategy_ui_extra_defaults(definition.strategy_id, "launcher"))
+        defaults.setdefault("risk_amount", "10")
+        defaults.setdefault("order_size", "1")
         for key in iter_strategy_parameter_keys(definition.strategy_id):
             fixed_value = strategy_fixed_value(definition.strategy_id, key)
+            if fixed_value is not None:
+                defaults[key] = fixed_value
+        for key in ("risk_amount", "order_size"):
+            fixed_value = strategy_ui_fixed_extra_value(definition.strategy_id, key, "launcher")
             if fixed_value is not None:
                 defaults[key] = fixed_value
         defaults.setdefault("symbol", "")
@@ -158,6 +165,10 @@ class UiStrategySessionsMixin:
             fixed_value = strategy_fixed_value(definition.strategy_id, key)
             if fixed_value is not None:
                 snapshot[key] = fixed_value
+        for key in ("risk_amount", "order_size"):
+            fixed_value = strategy_ui_fixed_extra_value(definition.strategy_id, key, "launcher")
+            if fixed_value is not None:
+                snapshot[key] = fixed_value
         if strategy_forces_local_trade(definition.strategy_id):
             snapshot["tp_sl_mode"] = "local_trade"
             snapshot["local_tp_sl_inst_id"] = symbol
@@ -166,13 +177,20 @@ class UiStrategySessionsMixin:
         config = _deserialize_strategy_config_snapshot(snapshot)
         if config is None:
             raise ValueError("策略参数无效，无法创建半自动任务。")
-        return replace(
+        normalized_config = replace(
             config,
             inst_id=symbol,
             trade_inst_id=symbol,
             strategy_id=definition.strategy_id,
             run_mode="trade",
         )
+        if normalized_config.risk_amount is not None and normalized_config.risk_amount <= 0:
+            raise ValueError("风险金必须大于 0。")
+        if normalized_config.order_size < 0:
+            raise ValueError("固定数量不能小于 0。")
+        if normalized_config.risk_amount is None and normalized_config.order_size <= 0:
+            raise ValueError("交易并下单模式下，风险金和固定数量至少填写一个。")
+        return normalized_config
 
     def _load_semi_auto_desk_snapshot(self) -> None:
         try:

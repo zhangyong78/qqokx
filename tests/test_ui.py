@@ -144,6 +144,31 @@ class UiHelpersTest(TestCase):
                 "real",
             )
 
+    def test_semi_auto_templates_supply_a_live_order_size_for_every_library_strategy(self) -> None:
+        for definition in STRATEGY_DEFINITIONS:
+            with self.subTest(strategy_id=definition.strategy_id):
+                record = QuantApp.build_semi_auto_strategy_template(
+                    SimpleNamespace(),
+                    definition.strategy_id,
+                    {"symbol": "ETH-USDT-SWAP"},
+                    "real",
+                )
+                self.assertTrue(
+                    (record.config.risk_amount is not None and record.config.risk_amount > 0)
+                    or record.config.order_size > 0
+                )
+
+    def test_semi_auto_template_reapplies_ema5_8_fixed_extra_values(self) -> None:
+        record = QuantApp.build_semi_auto_strategy_template(
+            SimpleNamespace(),
+            STRATEGY_EMA5_EMA8_ID,
+            {"symbol": "ETH-USDT-SWAP", "risk_amount": "999", "order_size": "7"},
+            "real",
+        )
+
+        self.assertEqual(record.config.risk_amount, Decimal("10"))
+        self.assertEqual(record.config.order_size, Decimal("0"))
+
     def test_semi_auto_snapshot_provider_works_after_shell_global_rebinding(self) -> None:
         pool = SemiAutoPoolRecord("P001", "主操盘", "real", Decimal("1000"))
         task = SemiAutoTaskRecord(task_id="P001-1", pool_id="P001", template_payload={})
