@@ -3,10 +3,11 @@
 import json
 import time
 from dataclasses import replace
-from datetime import datetime
+from datetime import datetime, timedelta
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
 import threading
+from tkinter import Canvas, StringVar, Toplevel, ttk
 
 from okx_quant.strategy_runtime_registry import (
     get_strategy_runtime_profile,
@@ -34,6 +35,12 @@ from okx_quant.semi_auto_desk import (
     SemiAutoTaskRecord,
     load_semi_auto_desk_snapshot,
     save_semi_auto_desk_snapshot,
+)
+from okx_quant.semi_auto_desk_ui import build_semi_auto_pool_replay_time_markers
+from okx_quant.strategy_live_chart import (
+    DEFAULT_STRATEGY_LIVE_CHART_CANDLE_LIMIT,
+    build_strategy_live_chart_snapshot,
+    render_strategy_live_chart,
 )
 
 _SESSION_RUNTIME_HEARTBEAT_PREFIX = "__qqokx_runtime_heartbeat__|"
@@ -156,6 +163,15 @@ class UiStrategySessionsMixin:
             raise ValueError(f"未找到 API：{pool.api_name}")
         definition = self._resolve_strategy_template_definition(record)
         config = replace(record.config, run_mode="trade")
+        conflicting_task = QuantApp._semi_auto_net_position_conflict_task(
+            self._semi_auto_desk_tasks,
+            task,
+            position_mode=config.position_mode,
+        )
+        if conflicting_task is not None:
+            raise ValueError(
+                "净持仓 net 不允许同币种多空任务同时运行；请等待相反方向任务结束，或把两个策略都设为双向持仓 long_short。"
+            )
         notifier = self._build_notifier(config, pool.api_name)
         session_id = self._start_strategy_session(
             definition=definition,
@@ -198,6 +214,88 @@ class UiStrategySessionsMixin:
                 show_dialog=False,
             )
         QuantApp._finish_semi_auto_task(self, task, status="cancelled", reason="人工取消")
+
+    def open_semi_auto_pool_replay(self, pool_id: str, symbol: str, bar: str) -> None:
+        normalized_pool_id = str(pool_id or "").strip()
+        normalized_symbol = str(symbol or "").strip().upper()
+        normalized_bar = str(bar or "").strip() or "1H"
+        if self._semi_auto_pool_by_id(normalized_pool_id) is None:
+            raise ValueError("未找到操盘组合。")
+        records = [
+            record
+            for record in self._strategy_trade_ledger_records
+            if str(getattr(record, "semi_auto_pool_id", "") or "").strip() == normalized_pool_id
+            and str(getattr(record, "symbol", "") or "").strip().upper() == normalized_symbol
+        ]
+        markers = build_semi_auto_pool_replay_time_markers(normalized_pool_id, normalized_symbol, records)
+        if not markers:
+            raise ValueError("该组合在此币种上尚无已结算交易记录，无法复盘。")
+        event_times = [marker.at for marker in markers]
+        start_at = min(event_times) - timedelta(days=1)
+        end_at = max(event_times) + timedelta(days=1)
+
+        window = Toplevel(self.root)
+        window.title(f"半自动复盘 - {normalized_symbol} [{normalized_bar}]")
+        window.geometry("1280x760")
+        window.minsize(980, 620)
+        container = ttk.Frame(window, padding=12)
+        container.pack(fill="both", expand=True)
+        container.columnconfigure(0, weight=1)
+        container.rowconfigure(1, weight=1)
+        ttk.Label(
+            container,
+            text=f"组合 {normalized_pool_id} | {normalized_symbol} | 叠加 {len(markers) // 2} 笔已结算交易（所有策略、多空合并）",
+        ).grid(row=0, column=0, sticky="w", pady=(0, 8))
+        canvas = Canvas(container, background="#ffffff", highlightthickness=0, width=1120, height=620)
+        canvas.grid(row=1, column=0, sticky="nsew")
+        status_var = StringVar(value="正在加载复盘 K 线…")
+        ttk.Label(container, textvariable=status_var, justify="left").grid(row=2, column=0, sticky="w", pady=(8, 0))
+        snapshot_box: dict[str, object] = {}
+
+        def render_current() -> None:
+            snapshot = snapshot_box.get("snapshot")
+            if snapshot is not None:
+                render_strategy_live_chart(canvas, snapshot)
+
+        canvas.bind("<Configure>", lambda _event: render_current())
+
+        def apply_snapshot(snapshot, status: str) -> None:
+            if not window.winfo_exists():
+                return
+            snapshot_box["snapshot"] = snapshot
+            status_var.set(status)
+            render_current()
+
+        def load_replay() -> None:
+            try:
+                candles = self.client.get_candles_history_range(
+                    normalized_symbol,
+                    normalized_bar,
+                    start_ts=int(start_at.timestamp() * 1000),
+                    end_ts=int(end_at.timestamp() * 1000),
+                    limit=0,
+                    preload_count=min(DEFAULT_STRATEGY_LIVE_CHART_CANDLE_LIMIT, 120),
+                )
+                snapshot = build_strategy_live_chart_snapshot(
+                    session_id=f"semi-auto:{normalized_pool_id}:{normalized_symbol}",
+                    candles=candles,
+                    time_markers=markers,
+                    latest_price=candles[-1].close if candles else None,
+                    note="半自动组合复盘：同币种全部策略、多空交易记录。",
+                )
+                self.root.after(0, lambda: apply_snapshot(snapshot, f"已加载 {len(candles)} 根 K 线。"))
+            except Exception as exc:
+                self.root.after(0, lambda message=str(exc): apply_snapshot(
+                    build_strategy_live_chart_snapshot(
+                        session_id=f"semi-auto:{normalized_pool_id}:{normalized_symbol}",
+                        candles=(),
+                        time_markers=markers,
+                        note=f"K 线读取失败：{message}",
+                    ),
+                    f"复盘 K 线读取失败：{message}",
+                ))
+
+        threading.Thread(target=load_replay, daemon=True).start()
     @staticmethod
     def _entry_reference_ema_caption(strategy_id: str) -> str:
         return strategy_entry_reference_period_caption(strategy_id)
@@ -6618,6 +6716,45 @@ class UiStrategySessionsMixin:
         return None
 
     @staticmethod
+    def _semi_auto_task_direction(task) -> str:
+        direction_label = str(getattr(task, "direction_label", "") or "").strip().lower()
+        if "做多" in direction_label or "long" in direction_label:
+            return "long"
+        if "做空" in direction_label or "short" in direction_label:
+            return "short"
+        payload = getattr(task, "template_payload", None)
+        if isinstance(payload, dict):
+            config_snapshot = payload.get("config_snapshot")
+            if isinstance(config_snapshot, dict):
+                signal_mode = str(config_snapshot.get("signal_mode", "") or "").strip().lower()
+                if signal_mode == "long_only":
+                    return "long"
+                if signal_mode == "short_only":
+                    return "short"
+        return ""
+
+    @staticmethod
+    def _semi_auto_net_position_conflict_task(tasks, task, *, position_mode: str):
+        if str(position_mode or "").strip().lower() == "long_short":
+            return None
+        requested_direction = QuantApp._semi_auto_task_direction(task)
+        if requested_direction not in {"long", "short"}:
+            return None
+        opposite_direction = {"long": "short", "short": "long"}[requested_direction]
+        pool_id = str(getattr(task, "pool_id", "") or "").strip()
+        symbol = str(getattr(task, "symbol", "") or "").strip().upper()
+        for other in tasks:
+            if other is task or str(getattr(other, "status", "") or "").strip() not in {"queued", "running", "opened", "settling"}:
+                continue
+            if str(getattr(other, "pool_id", "") or "").strip() != pool_id:
+                continue
+            if str(getattr(other, "symbol", "") or "").strip().upper() != symbol:
+                continue
+            if QuantApp._semi_auto_task_direction(other) == opposite_direction:
+                return other
+        return None
+
+    @staticmethod
     def _save_semi_auto_desk_if_available(self) -> None:
         saver = getattr(self, "_save_semi_auto_desk_snapshot", None)
         if callable(saver):
@@ -6645,7 +6782,7 @@ class UiStrategySessionsMixin:
             return
         if str(getattr(task, "status", "") or "").strip() not in {"queued", "running"}:
             return
-        if "当前无法生成挂单" not in str(message or ""):
+        if not any(token in str(message or "") for token in ("当前无法生成挂单", "当前无信号")):
             return
         QuantApp._finish_semi_auto_task(self, task, status="completed_no_signal", reason="本次无信号")
         requester = getattr(self, "_request_stop_strategy_session", None)

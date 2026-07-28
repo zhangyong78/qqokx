@@ -8659,6 +8659,7 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
             task_adder=self.add_semi_auto_task,
             task_starter=self.start_semi_auto_task,
             task_canceller=self.cancel_semi_auto_task,
+            replay_opener=self.open_semi_auto_pool_replay,
             ledger_provider=lambda: list(self._strategy_trade_ledger_records),
             summary_provider=lambda pool: build_semi_auto_pool_summary(
                 pool,

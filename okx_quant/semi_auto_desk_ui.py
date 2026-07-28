@@ -5,6 +5,7 @@ from decimal import Decimal, ROUND_HALF_UP
 from tkinter import END, StringVar, Text, Toplevel, messagebox, ttk
 
 from okx_quant.semi_auto_desk import SemiAutoTaskRecord, semi_auto_pool_ledger_records
+from okx_quant.strategy_live_chart import StrategyLiveChartTimeMarker
 
 
 def _format_optional_datetime(value: object) -> str:
@@ -24,6 +25,17 @@ def _task_strategy_name(task: SemiAutoTaskRecord) -> str:
 
 def build_semi_auto_task_rows(tasks: list[SemiAutoTaskRecord]) -> list[tuple[str, tuple[object, ...]]]:
     mode_label = {"evaluate_once": "单次判断", "wait_one": "等待一单"}
+    status_label = {
+        "queued": "待启动",
+        "running": "等待信号",
+        "opened": "已开仓",
+        "settling": "结算中",
+        "completed_no_signal": "已结束（无信号）",
+        "completed_closed": "已结束（已平仓）",
+        "blocked_conflict": "未执行（仓位冲突）",
+        "cancelled": "已取消",
+        "failed": "失败",
+    }
     rows: list[tuple[str, tuple[object, ...]]] = []
     for task in sorted(tasks, key=lambda item: (item.created_at, item.task_id), reverse=True):
         rows.append(
@@ -35,7 +47,7 @@ def build_semi_auto_task_rows(tasks: list[SemiAutoTaskRecord]) -> list[tuple[str
                     task.symbol or "-",
                     task.direction_label or "-",
                     mode_label.get(task.mode, task.mode or "-"),
-                    task.status or "-",
+                    status_label.get(task.status, task.status or "-"),
                     task.bar or "-",
                     task.session_id or "-",
                     task.ended_reason or "-",
@@ -67,6 +79,99 @@ def build_semi_auto_pool_ledger_rows(pool_id: str, ledger_records: list[object])
     return rows
 
 
+def build_semi_auto_pool_replay_time_markers(
+    pool_id: str,
+    symbol: str,
+    ledger_records: list[object],
+) -> tuple[StrategyLiveChartTimeMarker, ...]:
+    normalized_symbol = str(symbol or "").strip().upper()
+    markers: list[StrategyLiveChartTimeMarker] = []
+    for record in semi_auto_pool_ledger_records(pool_id, ledger_records):
+        if str(getattr(record, "symbol", "") or "").strip().upper() != normalized_symbol:
+            continue
+        record_id = str(getattr(record, "record_id", "") or "").strip()
+        if not record_id:
+            continue
+        strategy_name = str(getattr(record, "strategy_name", "") or "未命名策略").strip() or "未命名策略"
+        direction = str(getattr(record, "direction_label", "") or "").strip()
+        suffix = f" {direction}" if direction else ""
+        opened_at = getattr(record, "opened_at", None)
+        if isinstance(opened_at, datetime):
+            markers.append(
+                StrategyLiveChartTimeMarker(
+                    key=f"open:{record_id}",
+                    label=(
+                        f"开仓 {strategy_name}{suffix}\n"
+                        f"{opened_at.strftime('%m-%d %H:%M')} | 价格={_format_optional_decimal(getattr(record, 'entry_price', None))}"
+                    ),
+                    at=opened_at,
+                    color="#6f42c1",
+                    dash=(4, 3),
+                    width=2,
+                    vertical_anchor="below",
+                )
+            )
+        closed_at = getattr(record, "closed_at", None)
+        if isinstance(closed_at, datetime):
+            markers.append(
+                StrategyLiveChartTimeMarker(
+                    key=f"close:{record_id}",
+                    label=(
+                        f"平仓 {strategy_name}{suffix}\n"
+                        f"{closed_at.strftime('%m-%d %H:%M')} | 价格={_format_optional_decimal(getattr(record, 'exit_price', None))}\n"
+                        f"本次盈亏={_format_optional_decimal(getattr(record, 'net_pnl', None), signed=True)} USDT"
+                    ),
+                    at=closed_at,
+                    color="#cf222e",
+                    dash=(4, 3),
+                    width=2,
+                    vertical_anchor="above",
+                )
+            )
+    return tuple(markers)
+
+
+def build_semi_auto_pool_performance_rows(pool_id: str, ledger_records: list[object]) -> list[tuple[str, tuple[str, ...]]]:
+    groups: dict[tuple[str, str, str], list[Decimal]] = {}
+    for record in semi_auto_pool_ledger_records(pool_id, ledger_records):
+        raw_pnl = getattr(record, "net_pnl", None)
+        if raw_pnl is None:
+            continue
+        try:
+            pnl = Decimal(str(raw_pnl))
+        except Exception:
+            continue
+        strategy = str(getattr(record, "strategy_name", "") or "未命名策略").strip() or "未命名策略"
+        symbol = str(getattr(record, "symbol", "") or "-").strip() or "-"
+        direction = str(getattr(record, "direction_label", "") or "-").strip() or "-"
+        groups.setdefault((strategy, symbol, direction), []).append(pnl)
+
+    rows: list[tuple[str, tuple[str, ...]]] = []
+    for index, ((strategy, symbol, direction), pnls) in enumerate(sorted(groups.items()), start=1):
+        wins = [item for item in pnls if item > 0]
+        losses = [item for item in pnls if item < 0]
+        net_pnl = sum(pnls, Decimal("0"))
+        win_rate = Decimal(len(wins)) * Decimal("100") / Decimal(len(pnls)) if pnls else Decimal("0")
+        average_win = sum(wins, Decimal("0")) / Decimal(len(wins)) if wins else None
+        average_loss = sum(losses, Decimal("0")) / Decimal(len(losses)) if losses else None
+        ratio = average_win / abs(average_loss) if average_win is not None and average_loss not in {None, Decimal("0")} else None
+        rows.append(
+            (
+                f"performance:{index}",
+                (
+                    strategy,
+                    symbol,
+                    direction,
+                    str(len(pnls)),
+                    f"{win_rate:.2f}%",
+                    _format_optional_decimal(net_pnl, signed=True),
+                    "-" if ratio is None else f"{ratio:.2f}",
+                ),
+            )
+        )
+    return rows
+
+
 class SemiAutoDeskWindow:
     def __init__(
         self,
@@ -79,6 +184,7 @@ class SemiAutoDeskWindow:
         task_adder,
         task_starter,
         task_canceller,
+        replay_opener,
         ledger_provider,
         summary_provider,
         default_api_name: str = "",
@@ -90,6 +196,7 @@ class SemiAutoDeskWindow:
         self._task_adder = task_adder
         self._task_starter = task_starter
         self._task_canceller = task_canceller
+        self._replay_opener = replay_opener
         self._ledger_provider = ledger_provider
         self._summary_provider = summary_provider
         self._snapshot = None
@@ -97,7 +204,7 @@ class SemiAutoDeskWindow:
         self.pool_name_var = StringVar(value="半自动主操盘")
         self.api_name_var = StringVar(value=default_api_name)
         self.initial_capital_var = StringVar(value="1000")
-        self.mode_var = StringVar(value="wait_one")
+        self.mode_var = StringVar(value="等待一单")
         self.summary_var = StringVar(value="")
 
         self.window = Toplevel(parent)
@@ -130,13 +237,14 @@ class SemiAutoDeskWindow:
         ttk.Combobox(
             action_row,
             textvariable=self.mode_var,
-            values=("wait_one", "evaluate_once"),
+            values=("等待一单", "单次判断"),
             state="readonly",
             width=14,
         ).pack(side="left", padx=(4, 10))
         ttk.Button(action_row, text="加入当前策略", command=self._add_current_strategy).pack(side="left")
         ttk.Button(action_row, text="启动选中任务", command=self._start_selected_task).pack(side="left", padx=(8, 0))
         ttk.Button(action_row, text="取消选中任务", command=self._cancel_selected_task).pack(side="left", padx=(8, 0))
+        ttk.Button(action_row, text="复盘选中任务币种", command=self._open_replay).pack(side="left", padx=(8, 0))
         ttk.Button(action_row, text="打开组合总账本", command=self._open_book).pack(side="left", padx=(8, 0))
 
         pool_frame = ttk.LabelFrame(root, text="操盘组合", padding=6)
@@ -196,7 +304,8 @@ class SemiAutoDeskWindow:
             return
         try:
             payload = self._template_serializer(self._current_template_factory())
-            self._task_adder(self._selected_pool_id, payload, self.mode_var.get())
+            mode = {"等待一单": "wait_one", "单次判断": "evaluate_once"}.get(self.mode_var.get(), self.mode_var.get())
+            self._task_adder(self._selected_pool_id, payload, mode)
         except Exception as exc:
             messagebox.showerror("加入策略失败", str(exc), parent=self.window)
             return
@@ -225,6 +334,17 @@ class SemiAutoDeskWindow:
             messagebox.showerror("取消失败", str(exc), parent=self.window)
             return
         self.refresh()
+
+    def _open_replay(self) -> None:
+        task_id = self._selected_task_id()
+        task = next((item for item in self._snapshot.tasks if item.task_id == task_id), None) if self._snapshot else None
+        if task is None:
+            messagebox.showinfo("提示", "请先选择一个任务，以确定复盘币种和周期。", parent=self.window)
+            return
+        try:
+            self._replay_opener(task.pool_id, task.symbol, task.bar)
+        except Exception as exc:
+            messagebox.showerror("打开复盘失败", str(exc), parent=self.window)
 
     def _on_pool_select(self, _event=None) -> None:
         selected = self.pool_tree.selection()
@@ -262,15 +382,33 @@ class SemiAutoDeskWindow:
             return
         window = Toplevel(self.window)
         window.title("半自动操盘组合总账本")
-        window.geometry("1280x620")
+        window.geometry("1280x760")
         frame = ttk.Frame(window, padding=12)
         frame.pack(fill="both", expand=True)
+        frame.columnconfigure(0, weight=1)
+        frame.rowconfigure(1, weight=1)
+        performance_frame = ttk.LabelFrame(frame, text="按策略 / 币种 / 方向统计", padding=6)
+        performance_frame.grid(row=0, column=0, sticky="ew", pady=(0, 10))
+        performance_columns = ("strategy", "symbol", "direction", "count", "win_rate", "pnl", "ratio")
+        performance_tree = ttk.Treeview(performance_frame, columns=performance_columns, show="headings", height=5)
+        performance_labels = ("策略", "币种", "方向", "已结算", "胜率", "净盈亏", "盈亏比")
+        for key, label in zip(performance_columns, performance_labels, strict=True):
+            performance_tree.heading(key, text=label)
+            performance_tree.column(key, width=140 if key == "strategy" else 105, anchor="center")
+        performance_tree.pack(fill="x", expand=True)
+        for row_id, values in build_semi_auto_pool_performance_rows(self._selected_pool_id, self._ledger_provider()):
+            performance_tree.insert("", END, iid=row_id, values=values)
+
+        ledger_frame = ttk.LabelFrame(frame, text="连续交易总账本", padding=6)
+        ledger_frame.grid(row=1, column=0, sticky="nsew")
+        ledger_frame.columnconfigure(0, weight=1)
+        ledger_frame.rowconfigure(0, weight=1)
         columns = ("closed", "strategy", "symbol", "direction", "opened", "entry", "exit", "pnl", "reason")
-        tree = ttk.Treeview(frame, columns=columns, show="headings")
+        tree = ttk.Treeview(ledger_frame, columns=columns, show="headings")
         labels = ("平仓时间", "策略", "币种", "方向", "开仓时间", "开仓价", "平仓价", "净盈亏", "平仓原因")
         for key, label in zip(columns, labels, strict=True):
             tree.heading(key, text=label)
             tree.column(key, width=125, anchor="center")
-        tree.pack(fill="both", expand=True)
+        tree.grid(row=0, column=0, sticky="nsew")
         for row_id, values in build_semi_auto_pool_ledger_rows(self._selected_pool_id, self._ledger_provider()):
             tree.insert("", END, iid=row_id, values=values)

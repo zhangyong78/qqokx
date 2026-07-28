@@ -149,6 +149,35 @@ class UiHelpersTest(TestCase):
             show_dialog=False,
         )
 
+    def test_single_check_task_stops_when_standard_engine_reports_no_signal(self) -> None:
+        task = self._semi_auto_task("P001-1", session_id="S01", mode="evaluate_once")
+        request_stop = MagicMock(return_value=True)
+        app = SimpleNamespace(
+            _semi_auto_desk_tasks=[task],
+            _save_semi_auto_desk_snapshot=MagicMock(),
+            _request_stop_strategy_session=request_stop,
+        )
+        session = SimpleNamespace(session_id="S01", semi_auto_task_id=task.task_id)
+
+        QuantApp._apply_semi_auto_runtime_message(app, session, "当前无信号 | EMA55 斜率条件未满足")
+
+        self.assertEqual(task.status, "completed_no_signal")
+        request_stop.assert_called_once()
+
+    def test_semi_auto_task_direction_identifies_opposite_direction_pair(self) -> None:
+        long_task = self._semi_auto_task("P001-1", direction_label="只做多")
+        short_task = self._semi_auto_task("P001-2", direction_label="只做空")
+
+        self.assertEqual(QuantApp._semi_auto_task_direction(long_task), "long")
+        self.assertEqual(QuantApp._semi_auto_task_direction(short_task), "short")
+        self.assertIs(
+            QuantApp._semi_auto_net_position_conflict_task([long_task, short_task], long_task, position_mode="net"),
+            short_task,
+        )
+        self.assertIsNone(
+            QuantApp._semi_auto_net_position_conflict_task([long_task, short_task], long_task, position_mode="long_short")
+        )
+
     def test_first_opened_task_blocks_unfilled_same_symbol_direction_task(self) -> None:
         entered = self._semi_auto_task("P001-1", session_id="S01")
         waiting = self._semi_auto_task("P001-2", session_id="S02")
