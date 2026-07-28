@@ -14,15 +14,32 @@ from okx_quant.strategy_runtime_registry import (
     strategy_entry_reference_period_caption,
     strategy_preferred_direction,
 )
-from okx_quant.strategy_catalog import is_ema55_slope_short_strategy, supports_startup_chase_current_signal
+from okx_quant.strategy_catalog import (
+    STRATEGY_DEFINITIONS,
+    StrategyDefinition,
+    get_strategy_definition,
+    is_ema55_slope_short_strategy,
+    supports_startup_chase_current_signal,
+)
 from okx_quant.models import (
+    StrategyConfig,
     describe_dynamic_protection_rules,
     dynamic_protection_rules_to_payload,
     normalize_dynamic_protection_rules,
 )
 from okx_quant.pricing import format_decimal
-from okx_quant.strategy_parameters import strategy_uses_parameter
+from okx_quant.strategy_parameters import (
+    iter_strategy_parameter_keys,
+    strategy_fixed_value,
+    strategy_uses_parameter,
+)
 from okx_quant.strategy_symbol_defaults import get_strategy_symbol_parameter_defaults
+from okx_quant.strategy_ui_schema import (
+    strategy_forces_follow_signal,
+    strategy_forces_local_trade,
+    strategy_parameter_default_for_scope,
+    strategy_ui_extra_defaults,
+)
 from okx_quant.strategy_status_email import (
     StrategyStatusEmailRow,
     build_strategy_status_email,
@@ -49,6 +66,114 @@ _SESSION_RUNTIME_HEARTBEAT_TIMEOUT_MIN_SECONDS = 180.0
 
 
 class UiStrategySessionsMixin:
+    def semi_auto_strategy_definitions(self) -> tuple[StrategyDefinition, ...]:
+        return STRATEGY_DEFINITIONS
+
+    def semi_auto_strategy_parameter_defaults(self, strategy_id: str) -> dict[str, object]:
+        definition = QuantApp._semi_auto_strategy_definition(self, strategy_id)
+        defaults = {
+            key: strategy_parameter_default_for_scope(definition.strategy_id, key, "launcher")
+            for key in iter_strategy_parameter_keys(definition.strategy_id)
+        }
+        defaults.update(strategy_ui_extra_defaults(definition.strategy_id, "launcher"))
+        for key in iter_strategy_parameter_keys(definition.strategy_id):
+            fixed_value = strategy_fixed_value(definition.strategy_id, key)
+            if fixed_value is not None:
+                defaults[key] = fixed_value
+        defaults.setdefault("symbol", "")
+        return defaults
+
+    def build_semi_auto_strategy_template(
+        self,
+        strategy_id: str,
+        parameter_values: dict[str, object],
+        api_name: str,
+    ) -> StrategyTemplateRecord:
+        definition = QuantApp._semi_auto_strategy_definition(self, strategy_id)
+        config = QuantApp._build_strategy_config_from_isolated_values(self, definition, parameter_values)
+        return StrategyTemplateRecord(
+            strategy_id=definition.strategy_id,
+            strategy_name=definition.name,
+            api_name=str(api_name or "").strip(),
+            direction_label=_strategy_template_direction_label(
+                definition.strategy_id,
+                config,
+                fallback=definition.default_signal_label,
+            ),
+            run_mode_label="交易并下单",
+            symbol=(config.trade_inst_id or config.inst_id).strip().upper(),
+            config=config,
+        )
+
+    def _semi_auto_strategy_definition(self, strategy_id: str) -> StrategyDefinition:
+        try:
+            definition = get_strategy_definition(str(strategy_id or "").strip())
+        except KeyError as exc:
+            raise ValueError(f"未知策略：{strategy_id}") from exc
+        if definition not in STRATEGY_DEFINITIONS:
+            raise ValueError(f"{definition.name} 暂不支持半自动实盘任务。")
+        return definition
+
+    def _build_strategy_config_from_isolated_values(
+        self,
+        definition: StrategyDefinition,
+        parameter_values: dict[str, object],
+    ) -> StrategyConfig:
+        if not isinstance(parameter_values, dict):
+            raise ValueError("策略参数必须是有效对象。")
+        values = QuantApp.semi_auto_strategy_parameter_defaults(self, definition.strategy_id)
+        values.update(parameter_values)
+        symbol = str(values.get("symbol") or "").strip().upper()
+        if not symbol:
+            raise ValueError("请选择交易标的。")
+        base_config = StrategyConfig(
+            inst_id=symbol,
+            bar="1H",
+            ema_period=21,
+            atr_period=10,
+            atr_stop_multiplier=Decimal("2"),
+            atr_take_multiplier=Decimal("4"),
+            order_size=Decimal("0"),
+            trade_mode="cross",
+            signal_mode="both",
+            position_mode="net",
+            environment="demo",
+            tp_sl_trigger_type="mark",
+            strategy_id=definition.strategy_id,
+            trade_inst_id=symbol,
+            run_mode="trade",
+        )
+        snapshot = _serialize_strategy_config_snapshot(base_config)
+        config_field_names = {item.name for item in dataclass_fields(StrategyConfig)}
+        snapshot.update({key: value for key, value in values.items() if key in config_field_names})
+        snapshot.update(
+            {
+                "inst_id": symbol,
+                "trade_inst_id": symbol,
+                "strategy_id": definition.strategy_id,
+                "run_mode": "trade",
+            }
+        )
+        for key in iter_strategy_parameter_keys(definition.strategy_id):
+            fixed_value = strategy_fixed_value(definition.strategy_id, key)
+            if fixed_value is not None:
+                snapshot[key] = fixed_value
+        if strategy_forces_local_trade(definition.strategy_id):
+            snapshot["tp_sl_mode"] = "local_trade"
+            snapshot["local_tp_sl_inst_id"] = symbol
+        if strategy_forces_follow_signal(definition.strategy_id):
+            snapshot["entry_side_mode"] = "follow_signal"
+        config = _deserialize_strategy_config_snapshot(snapshot)
+        if config is None:
+            raise ValueError("策略参数无效，无法创建半自动任务。")
+        return replace(
+            config,
+            inst_id=symbol,
+            trade_inst_id=symbol,
+            strategy_id=definition.strategy_id,
+            run_mode="trade",
+        )
+
     def _load_semi_auto_desk_snapshot(self) -> None:
         try:
             snapshot = load_semi_auto_desk_snapshot()

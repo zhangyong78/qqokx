@@ -16,6 +16,7 @@ from okx_quant.okx_client import Instrument, OkxOrderResult, OkxOrderStatus, Okx
 from okx_quant.persistence import build_profile_switch_password_snapshot
 from okx_quant.persistence import load_notification_snapshot, save_notification_snapshot
 from okx_quant.strategy_catalog import (
+    STRATEGY_DEFINITIONS,
     STRATEGY_BTC_EMA55_SLOPE_SHORT_ID,
     STRATEGY_DYNAMIC_LONG_ID,
     STRATEGY_DYNAMIC_MTF_LONG_ID,
@@ -106,6 +107,43 @@ from okx_quant.ui import (
 
 
 class UiHelpersTest(TestCase):
+    def test_semi_auto_strategy_definitions_return_all_launchable_builtin_strategies(self) -> None:
+        entries = QuantApp.semi_auto_strategy_definitions(SimpleNamespace())
+
+        self.assertEqual(entries, STRATEGY_DEFINITIONS)
+        self.assertIn(STRATEGY_DYNAMIC_LONG_ID, [item.strategy_id for item in entries])
+        self.assertIn(STRATEGY_DYNAMIC_MTF_LONG_ID, [item.strategy_id for item in entries])
+
+    def test_semi_auto_template_uses_selected_library_strategy_not_launcher_variables(self) -> None:
+        app = SimpleNamespace(
+            strategy_name="EMA55 slope short",
+            symbol="BTC-USDT-SWAP",
+            bar="4H",
+        )
+
+        record = QuantApp.build_semi_auto_strategy_template(
+            app,
+            STRATEGY_DYNAMIC_LONG_ID,
+            {"symbol": "ETH-USDT-SWAP", "bar": "1H", "signal_mode": "long_only"},
+            "real",
+        )
+
+        self.assertEqual(record.strategy_id, STRATEGY_DYNAMIC_LONG_ID)
+        self.assertEqual(record.api_name, "real")
+        self.assertEqual(record.symbol, "ETH-USDT-SWAP")
+        self.assertEqual(record.direction_label, "只做多")
+        self.assertEqual(record.config.bar, "1H")
+        self.assertEqual(record.config.run_mode, "trade")
+
+    def test_semi_auto_template_rejects_unknown_strategy(self) -> None:
+        with self.assertRaises(ValueError):
+            QuantApp.build_semi_auto_strategy_template(
+                SimpleNamespace(),
+                "not-a-strategy",
+                {"symbol": "ETH-USDT-SWAP"},
+                "real",
+            )
+
     def test_semi_auto_snapshot_provider_works_after_shell_global_rebinding(self) -> None:
         pool = SemiAutoPoolRecord("P001", "主操盘", "real", Decimal("1000"))
         task = SemiAutoTaskRecord(task_id="P001-1", pool_id="P001", template_payload={})
