@@ -57,6 +57,9 @@ class UiStrategySessionsMixin:
             return
         self._semi_auto_desk_pools = list(snapshot.pools)
         self._semi_auto_desk_tasks = list(snapshot.tasks)
+        if QuantApp._normalize_interrupted_semi_auto_tasks(self._semi_auto_desk_tasks, now=datetime.now()):
+            self._save_semi_auto_desk_snapshot()
+            self._enqueue_log("[半自动操盘台] 已处理程序重启前的未完成任务：等待信号任务需人工重新启动，持仓任务需人工核对。")
 
     def _semi_auto_desk_snapshot_for_ui(self) -> SemiAutoDeskSnapshot:
         return SemiAutoDeskSnapshot(
@@ -6753,6 +6756,25 @@ class UiStrategySessionsMixin:
             if QuantApp._semi_auto_task_direction(other) == opposite_direction:
                 return other
         return None
+
+    @staticmethod
+    def _normalize_interrupted_semi_auto_tasks(tasks, *, now: datetime) -> bool:
+        changed = False
+        for task in tasks:
+            status = str(getattr(task, "status", "") or "").strip()
+            if status == "running":
+                task.status = "queued"
+                task.session_id = ""
+                task.ended_reason = "程序重启，需人工重新启动"
+                task.updated_at = now
+                changed = True
+            elif status in {"opened", "settling"}:
+                task.status = "failed"
+                task.ended_reason = "程序重启，需人工核对实际仓位"
+                task.ended_at = now
+                task.updated_at = now
+                changed = True
+        return changed
 
     @staticmethod
     def _save_semi_auto_desk_if_available(self) -> None:

@@ -178,6 +178,19 @@ class UiHelpersTest(TestCase):
             QuantApp._semi_auto_net_position_conflict_task([long_task, short_task], long_task, position_mode="long_short")
         )
 
+    def test_interrupted_semi_auto_tasks_are_made_safe_after_restart(self) -> None:
+        waiting = self._semi_auto_task("P001-1", session_id="S01", status="running")
+        opened = self._semi_auto_task("P001-2", session_id="S02", status="opened")
+
+        changed = QuantApp._normalize_interrupted_semi_auto_tasks([waiting, opened], now=datetime(2026, 7, 28, 12, 0))
+
+        self.assertTrue(changed)
+        self.assertEqual(waiting.status, "queued")
+        self.assertEqual(waiting.session_id, "")
+        self.assertEqual(waiting.ended_reason, "程序重启，需人工重新启动")
+        self.assertEqual(opened.status, "failed")
+        self.assertEqual(opened.ended_reason, "程序重启，需人工核对实际仓位")
+
     def test_first_opened_task_blocks_unfilled_same_symbol_direction_task(self) -> None:
         entered = self._semi_auto_task("P001-1", session_id="S01")
         waiting = self._semi_auto_task("P001-2", session_id="S02")
