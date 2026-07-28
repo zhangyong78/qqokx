@@ -1067,6 +1067,8 @@ class StrategyTradeLedgerRecord:
     reason_confidence: str = "low"
     summary_note: str = ""
     updated_at: datetime | None = None
+    semi_auto_pool_id: str = ""
+    semi_auto_task_id: str = ""
 
 
 @dataclass
@@ -1128,6 +1130,9 @@ class StrategySession:
     last_close_reason: str = ""
     trader_id: str = ""
     trader_slot_id: str = ""
+    semi_auto_pool_id: str = ""
+    semi_auto_task_id: str = ""
+    semi_auto_mode: str = ""
     email_notifications_enabled: bool = True
 
     @property

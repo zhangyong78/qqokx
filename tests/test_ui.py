@@ -105,6 +105,30 @@ from okx_quant.ui import (
 
 
 class UiHelpersTest(TestCase):
+    def test_trade_ledger_payload_round_trip_keeps_semi_auto_task_identity(self) -> None:
+        record = StrategyTradeLedgerRecord(
+            record_id="L01",
+            history_record_id="H01",
+            session_id="S01",
+            api_name="real",
+            strategy_id="ema_dynamic_long",
+            strategy_name="EMA 动态委托做多",
+            symbol="ETH-USDT-SWAP",
+            direction_label="只做多",
+            run_mode_label="交易并下单",
+            environment="live",
+            closed_at=datetime(2026, 7, 28, 10, 0),
+            net_pnl=Decimal("12.34"),
+            semi_auto_pool_id="P001",
+            semi_auto_task_id="P001-1",
+        )
+
+        payload = QuantApp._trade_ledger_payload(record)
+        restored = QuantApp._trade_ledger_record_from_payload(QuantApp.__new__(QuantApp), payload)
+
+        self.assertEqual(restored.semi_auto_pool_id, "P001")
+        self.assertEqual(restored.semi_auto_task_id, "P001-1")
+
     def test_decorate_position_history_records_marks_partial_close_and_increment(self) -> None:
         first_partial = OkxPositionHistoryItem(
             update_time=1775023544581,

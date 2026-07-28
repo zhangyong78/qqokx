@@ -4018,6 +4018,9 @@ class UiStrategySessionsMixin:
         allow_duplicate_launch: bool = False,
         trader_id: str = "",
         trader_slot_id: str = "",
+        semi_auto_pool_id: str = "",
+        semi_auto_task_id: str = "",
+        semi_auto_mode: str = "",
     ) -> str:
         self._validate_strategy_session_environment(api_name=api_name, config=config)
         if not allow_duplicate_launch:
@@ -4068,6 +4071,9 @@ class UiStrategySessionsMixin:
             recovery_supported=self._strategy_session_supports_recovery(config),
             trader_id=trader_id.strip(),
             trader_slot_id=trader_slot_id.strip(),
+            semi_auto_pool_id=semi_auto_pool_id.strip(),
+            semi_auto_task_id=semi_auto_task_id.strip(),
+            semi_auto_mode=semi_auto_mode.strip(),
         )
 
         self.sessions[session_id] = session
@@ -7083,6 +7089,8 @@ class UiStrategySessionsMixin:
             reason_confidence=reason_confidence,
             summary_note=snapshot.environment_note or "",
             updated_at=datetime.now(),
+            semi_auto_pool_id=str(getattr(session, "semi_auto_pool_id", "") or "").strip(),
+            semi_auto_task_id=str(getattr(session, "semi_auto_task_id", "") or "").strip(),
         )
 
         projected_trade_count = session.trade_count + 1
@@ -10199,6 +10207,8 @@ class UiStrategySessionsMixin:
             reason_confidence=str(payload.get("reason_confidence", "")).strip() or "low",
             summary_note=str(payload.get("summary_note", "")).strip(),
             updated_at=_parse_datetime_snapshot(payload.get("updated_at")),
+            semi_auto_pool_id=str(payload.get("semi_auto_pool_id", "")).strip(),
+            semi_auto_task_id=str(payload.get("semi_auto_task_id", "")).strip(),
         )
 
     @staticmethod
@@ -10235,6 +10245,8 @@ class UiStrategySessionsMixin:
             "reason_confidence": record.reason_confidence,
             "summary_note": record.summary_note,
             "updated_at": record.updated_at.isoformat(timespec="seconds") if record.updated_at is not None else None,
+            "semi_auto_pool_id": record.semi_auto_pool_id,
+            "semi_auto_task_id": record.semi_auto_task_id,
         }
 
     def _sort_strategy_trade_ledger_records(self) -> None:
