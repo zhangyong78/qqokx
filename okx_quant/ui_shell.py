@@ -17750,15 +17750,12 @@ def _format_position_history_filter_stats(
     filtered_items: list[tuple[int, OkxPositionHistoryItem]],
     usdt_prices: dict[str, Decimal],
 ) -> str:
-    pnl_totals: dict[str, Decimal] = {}
     realized_totals: dict[str, Decimal] = {}
     realized_usdt_total = Decimal("0")
     realized_usdt_count = 0
 
     for _, item in filtered_items:
         currency = _infer_position_history_pnl_currency(item)
-        if item.pnl is not None:
-            pnl_totals[currency] = pnl_totals.get(currency, Decimal("0")) + item.pnl
         if item.realized_pnl is not None:
             realized_totals[currency] = realized_totals.get(currency, Decimal("0")) + item.realized_pnl
         realized_usdt = _position_history_realized_pnl_usdt(item, usdt_prices)
@@ -17772,8 +17769,7 @@ def _format_position_history_filter_stats(
         else "-"
     )
     return (
-        f"\u76c8\u4e8f\u5408\u8ba1 { _format_position_history_currency_totals(pnl_totals) } | "
-        f"\u5df2\u5b9e\u73b0\u5408\u8ba1 { _format_position_history_currency_totals(realized_totals) } | "
+        f"\u5df2\u5b9e\u73b0\u6536\u76ca\u5408\u8ba1 { _format_position_history_currency_totals(realized_totals) } | "
         f"\u6298\u5408USDT\u5408\u8ba1 {realized_usdt_text}"
     )
 
@@ -18194,8 +18190,7 @@ def _build_position_history_detail_text(
         f"平仓数量：{_format_position_history_size(item, instruments)}\n"
         f"{incremental_close_line}"
         f"手续费：{_format_position_history_fee_cell(item, upl_usdt_prices)}\n"
-        f"盈亏：{_format_position_history_pnl(item.pnl, item, usdt_prices=upl_usdt_prices)}\n"
-        f"已实现盈亏：{_format_position_history_pnl(item.realized_pnl, item, with_sign=True, usdt_prices=upl_usdt_prices)}\n"
+        f"\u5df2\u5b9e\u73b0\u6536\u76ca?{_format_position_history_pnl(item.realized_pnl, item, with_sign=True, usdt_prices=upl_usdt_prices)}\n"
         f"结算盈亏：{_format_optional_decimal(item.settle_pnl)}"
     )
 
@@ -18231,8 +18226,7 @@ def _build_position_history_detail_text(
         f"平仓数量：{_format_position_history_size(item, instruments)}\n"
         f"{incremental_close_line}"
         f"手续费：{_format_position_history_fee_cell(item, upl_usdt_prices)}\n"
-        f"盈亏：{_format_position_history_pnl(item.pnl, item, usdt_prices=upl_usdt_prices)}\n"
-        f"已实现盈亏：{_format_position_history_pnl(item.realized_pnl, item, with_sign=True, usdt_prices=upl_usdt_prices)}\n"
+        f"\u5df2\u5b9e\u73b0\u6536\u76ca?{_format_position_history_pnl(item.realized_pnl, item, with_sign=True, usdt_prices=upl_usdt_prices)}\n"
         f"结算盈亏：{_format_optional_decimal(item.settle_pnl)}"
     )
 

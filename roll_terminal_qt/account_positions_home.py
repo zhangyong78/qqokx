@@ -2339,6 +2339,7 @@ class AccountPositionsHomeWidget(QWidget):
     def _render_position_history_table(self) -> None:
         if not hasattr(self, "_position_history_table"):
             return
+        self._position_history_table.setHorizontalHeaderItem(10, QTableWidgetItem("\u5df2\u5b9e\u73b0\u6536\u76ca"))
         filtered = self._filtered_position_history_items()
         selected_key = ""
         row = self._position_history_table.currentRow()
@@ -2376,7 +2377,12 @@ class AccountPositionsHomeWidget(QWidget):
                 _format_position_history_price(item.close_avg_price, item.inst_id, item.inst_type),
                 _format_position_history_size(item, self._position_history_instruments),
                 _format_position_history_fee_cell(item, self._position_history_usdt_prices),
-                _format_position_history_pnl(item.pnl, item, usdt_prices=self._position_history_usdt_prices),
+                _format_position_history_pnl(
+                    item.realized_pnl,
+                    item,
+                    with_sign=True,
+                    usdt_prices=self._position_history_usdt_prices,
+                ),
                 _position_history_note_summary_text(item, self._position_history_note_text(item)),
             )
             self._set_table_row(self._position_history_table, row, values, left_align={2, 11})
@@ -3548,6 +3554,7 @@ class AccountPositionsHomeWidget(QWidget):
     def _render_position_history_table(self) -> None:
         if not hasattr(self, "_position_history_table"):
             return
+        self._position_history_table.setHorizontalHeaderItem(10, QTableWidgetItem("\u5df2\u5b9e\u73b0\u6536\u76ca"))
         selected_row = self._position_history_table.currentRow()
         selected_key = None
         if 0 <= selected_row < len(self._position_history_items):
@@ -3566,7 +3573,12 @@ class AccountPositionsHomeWidget(QWidget):
                 _format_position_history_price(item.close_avg_price, item.inst_id, item.inst_type),
                 _format_position_history_size(item, self._position_history_instruments),
                 _format_position_history_fee_cell(item, self._position_history_usdt_prices),
-                _format_position_history_pnl(item.pnl, item, usdt_prices=self._position_history_usdt_prices),
+                _format_position_history_pnl(
+                    item.realized_pnl,
+                    item,
+                    with_sign=True,
+                    usdt_prices=self._position_history_usdt_prices,
+                ),
                 _position_history_note_summary_text(item, self._position_history_note_text(item)),
             )
             for column, value in enumerate(values):
@@ -4992,6 +5004,9 @@ class AccountPositionsHomeWidget(QWidget):
             ("时间", "类型", "合约", "保证金模式", "持仓模式", "交易方向", "开仓均价", "平仓均价", "平仓数量", "手续费", "盈亏", "备注"),
             stretch_columns={2, 11},
         )
+        self._position_history_table.setColumnWidth(0, 170)
+        self._position_history_table.setColumnWidth(9, 220)
+        self._position_history_table.setColumnWidth(10, 240)
         layout.addWidget(self._position_history_table, 1)
         self._position_history_summary_label.setMinimumHeight(34)
         return tab
@@ -5662,6 +5677,7 @@ class AccountPositionsHomeWidget(QWidget):
     def _render_position_history_table(self) -> None:
         if not hasattr(self, "_position_history_table"):
             return
+        self._position_history_table.setHorizontalHeaderItem(10, QTableWidgetItem("\u5df2\u5b9e\u73b0\u6536\u76ca"))
         filtered = self._filtered_position_history_items()
         selected_key = ""
         row = self._position_history_table.currentRow()
@@ -5693,7 +5709,12 @@ class AccountPositionsHomeWidget(QWidget):
                 _format_position_history_price(item.close_avg_price, item.inst_id, item.inst_type),
                 _format_position_history_size(item, self._position_history_instruments),
                 _format_position_history_fee_cell(item, self._position_history_usdt_prices),
-                _format_position_history_pnl(item.pnl, item, usdt_prices=self._position_history_usdt_prices),
+                _format_position_history_pnl(
+                    item.realized_pnl,
+                    item,
+                    with_sign=True,
+                    usdt_prices=self._position_history_usdt_prices,
+                ),
                 _position_history_note_summary_text(item, self._position_history_note_text(item)),
             )
             self._set_table_row(self._position_history_table, row, values, left_align={2, 11})

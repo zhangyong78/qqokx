@@ -128,8 +128,8 @@ _SMA50_LINE_WIDTH = 3
 _SECONDARY_CHART_TOP_RATIO = 0.31
 _SECONDARY_CHART_SIDE_RATIO = 0.56
 _SECONDARY_CHART_SPLITTER_HANDLE_WIDTH = 10
-_HEADER_SYMBOL_INPUT_MIN_WIDTH = 220
-_HEADER_SYMBOL_INPUT_MAX_WIDTH = 360
+_HEADER_SYMBOL_INPUT_MIN_WIDTH = 160
+_HEADER_SYMBOL_INPUT_MAX_WIDTH = 190
 _RR_BOX_WIDTH_BARS = 6
 _RR_MULTIPLE_STEP = Decimal("0.1")
 _RR_DRAG_ACTIVATION_DISTANCE_PX = 6.0
@@ -4916,6 +4916,7 @@ class KlineAnalysisWindow(QMainWindow):
         self._body_splitter: QSplitter | None = None
         self._chart_account_splitter: QSplitter | None = None
         self._chart_host: QWidget | None = None
+        self._chart_frame: QFrame | None = None
         self._control_panel: QFrame | None = None
         self._control_scroll: QScrollArea | None = None
         self._account_drawer: KlineAccountDrawer | None = None
@@ -5779,6 +5780,7 @@ class KlineAnalysisWindow(QMainWindow):
         chart_layout.setSpacing(0)
 
         chart_frame = QFrame()
+        self._chart_frame = chart_frame
         chart_frame_layout = QVBoxLayout(chart_frame)
         chart_frame_layout.setContentsMargins(0, 0, 0, 0)
         chart_frame_layout.setSpacing(0)
@@ -6058,9 +6060,20 @@ class KlineAnalysisWindow(QMainWindow):
 
     @Slot(bool)
     def _toggle_chart_visibility(self, hidden: bool) -> None:
-        chart_host = self._chart_host
-        if chart_host is not None:
-            chart_host.setVisible(not hidden)
+        chart_frame = self._chart_frame
+        if chart_frame is not None:
+            chart_frame.setVisible(not hidden)
+        splitter = self._chart_account_splitter
+        drawer = self._account_drawer
+        if hidden and splitter is not None and drawer is not None:
+            drawer.show()
+            self._sync_account_drawer_context(refresh_if_visible=False)
+            drawer.refresh_data()
+            splitter.setSizes([0, max(splitter.size().height(), 1)])
+        elif not hidden and splitter is not None and drawer is not None and not drawer.isHidden():
+            total_height = max(splitter.size().height(), 1)
+            drawer_height = max(int(total_height * 0.28), 180)
+            splitter.setSizes([max(total_height - drawer_height, 240), drawer_height])
         self._hide_chart_btn.setText("显示图表" if hidden else "隐藏图表")
 
     def _update_secondary_controls_state(self) -> None:

@@ -966,6 +966,7 @@ class CandlestickChartView(QChartView):
         self._value_max = 1.0
         self._hide_wicks = False
         self._chart_title = ""
+        self._show_moving_averages = False
         self._axis_x: QDateTimeAxis | None = None
         self._axis_y: QValueAxis | None = None
         self._full_x_min_ms = 0.0
@@ -1010,7 +1011,7 @@ class CandlestickChartView(QChartView):
         title: str,
         candles: list[Candle],
         hide_wicks: bool = False,
-        show_moving_averages: bool = False,
+        show_moving_averages: bool | None = None,
         tooltip_close_usdt_rate: Decimal | None = None,
         tooltip_close_usdt_basis: str = "",
         tooltip_entry_price: Decimal | None = None,
@@ -1018,6 +1019,10 @@ class CandlestickChartView(QChartView):
         if not candles:
             self.show_message(title)
             return
+        if show_moving_averages is None:
+            show_moving_averages = self._show_moving_averages
+        else:
+            self._show_moving_averages = show_moving_averages
         self._hide_wicks = hide_wicks
         self._chart_title = title
         self._clear_chart_context()
@@ -1126,6 +1131,20 @@ class CandlestickChartView(QChartView):
             f"H {_format_compact_number(latest.high)}{suffix} "
             f"L {_format_compact_number(latest.low)}{suffix} "
             f"C {_format_compact_number(latest.close)}{suffix}{moving_average_title}"
+        )
+
+    @Slot(bool)
+    def set_moving_averages_visible(self, visible: bool) -> None:
+        self._show_moving_averages = visible
+        if not self._candles:
+            return
+        self.set_candles(
+            title=self._chart_title,
+            candles=list(self._candles),
+            hide_wicks=self._hide_wicks,
+            tooltip_close_usdt_rate=self._tooltip_close_usdt_rate,
+            tooltip_close_usdt_basis=self._tooltip_close_usdt_basis,
+            tooltip_entry_price=self._tooltip_entry_price,
         )
 
     def wheelEvent(self, event) -> None:  # type: ignore[override]
@@ -1618,6 +1637,14 @@ class OptionStrategyBigChartDialog(QDialog):
         combo_page = QWidget()
         combo_layout = QVBoxLayout(combo_page)
         combo_layout.addWidget(self._combo_note)
+        combo_toolbar = QHBoxLayout()
+        combo_toolbar.addStretch(1)
+        self._combo_moving_average_check = QCheckBox("\u663e\u793a\u5747\u7ebf (EMA15 / SMA50)")
+        self._combo_moving_average_check.setChecked(True)
+        self._combo_chart.set_moving_averages_visible(True)
+        self._combo_moving_average_check.toggled.connect(self._combo_chart.set_moving_averages_visible)
+        combo_toolbar.addWidget(self._combo_moving_average_check)
+        combo_layout.addLayout(combo_toolbar)
         combo_layout.addWidget(self._combo_chart, 1)
         self._tabs.addTab(combo_page, "组合K线")
 
@@ -1627,6 +1654,14 @@ class OptionStrategyBigChartDialog(QDialog):
         vol_page = QWidget()
         vol_layout = QVBoxLayout(vol_page)
         vol_layout.addWidget(self._vol_note)
+        vol_toolbar = QHBoxLayout()
+        vol_toolbar.addStretch(1)
+        self._vol_moving_average_check = QCheckBox("\u663e\u793a\u5747\u7ebf (EMA15 / SMA50)")
+        self._vol_moving_average_check.setChecked(True)
+        self._vol_chart.set_moving_averages_visible(True)
+        self._vol_moving_average_check.toggled.connect(self._vol_chart.set_moving_averages_visible)
+        vol_toolbar.addWidget(self._vol_moving_average_check)
+        vol_layout.addLayout(vol_toolbar)
         vol_layout.addWidget(self._vol_chart, 1)
         self._tabs.addTab(vol_page, "波动率K线")
 
@@ -1640,6 +1675,10 @@ class OptionStrategyBigChartDialog(QDialog):
         self._overlay_period_combo.addItem("日线", "1D")
         toolbar.addWidget(self._overlay_period_combo)
         toolbar.addStretch(1)
+        self._overlay_moving_average_check = QCheckBox("\u663e\u793a\u5747\u7ebf (EMA15 / SMA50)")
+        self._overlay_moving_average_check.setChecked(True)
+        self._overlay_moving_average_check.toggled.connect(self._set_overlay_moving_averages_visible)
+        toolbar.addWidget(self._overlay_moving_average_check)
         self._overlay_refresh_button = QPushButton("刷新叠加对比")
         toolbar.addWidget(self._overlay_refresh_button)
         overlay_layout.addLayout(toolbar)
@@ -1653,6 +1692,13 @@ class OptionStrategyBigChartDialog(QDialog):
         overlay_layout.addWidget(self._overlay_vol_chart, 1)
         overlay_layout.addWidget(self._overlay_spot_chart, 1)
         self._tabs.addTab(overlay_page, "叠加对比")
+
+        self._set_overlay_moving_averages_visible(True)
+
+    @Slot(bool)
+    def _set_overlay_moving_averages_visible(self, visible: bool) -> None:
+        for chart in (self._overlay_combo_chart, self._overlay_vol_chart, self._overlay_spot_chart):
+            chart.set_moving_averages_visible(visible)
 
     @property
     def overlay_period(self) -> str:
