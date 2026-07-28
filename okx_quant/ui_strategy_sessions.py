@@ -6316,6 +6316,7 @@ class UiStrategySessionsMixin:
         if visible_heartbeat_label is not None:
             self._touch_session_runtime_heartbeat(session, visible_heartbeat_label, observed_at=observed_at)
         self._track_session_trade_runtime(session, text)
+        QuantApp._apply_semi_auto_runtime_message(self, session, text)
         pending_updates = getattr(self, "_pending_runtime_session_updates", None)
         if not isinstance(pending_updates, set):
             pending_updates = set()
@@ -6387,6 +6388,7 @@ class UiStrategySessionsMixin:
             if size is not None:
                 trade.size = size
             QuantApp._trader_desk_sync_open_trade_state(self, session)
+            QuantApp._apply_semi_auto_task_opened(self, session)
             return
         if "交易员虚拟止损监控启动" in message:
             trade = session.active_trade
@@ -6439,7 +6441,128 @@ class UiStrategySessionsMixin:
             if trade is None or trade.reconciliation_started:
                 return
             trade.reconciliation_started = True
+            QuantApp._mark_semi_auto_task_settling(self, session)
             self._start_session_trade_reconciliation(session, trade)
+
+    @staticmethod
+    def _semi_auto_task_for_session(self, session: StrategySession):
+        task_id = str(getattr(session, "semi_auto_task_id", "") or "").strip()
+        if not task_id:
+            return None
+        for task in getattr(self, "_semi_auto_desk_tasks", []):
+            if str(getattr(task, "task_id", "") or "").strip() == task_id:
+                return task
+        return None
+
+    @staticmethod
+    def _save_semi_auto_desk_if_available(self) -> None:
+        saver = getattr(self, "_save_semi_auto_desk_snapshot", None)
+        if callable(saver):
+            saver()
+
+    @staticmethod
+    def _finish_semi_auto_task(
+        self,
+        task,
+        *,
+        status: str,
+        reason: str,
+    ) -> None:
+        now = datetime.now()
+        task.status = status
+        task.ended_reason = reason
+        task.ended_at = now
+        task.updated_at = now
+        QuantApp._save_semi_auto_desk_if_available(self)
+
+    @staticmethod
+    def _apply_semi_auto_runtime_message(self, session: StrategySession, message: str) -> None:
+        task = QuantApp._semi_auto_task_for_session(self, session)
+        if task is None or str(getattr(task, "mode", "") or "").strip() != "evaluate_once":
+            return
+        if str(getattr(task, "status", "") or "").strip() not in {"queued", "running"}:
+            return
+        if "当前无法生成挂单" not in str(message or ""):
+            return
+        QuantApp._finish_semi_auto_task(self, task, status="completed_no_signal", reason="本次无信号")
+        requester = getattr(self, "_request_stop_strategy_session", None)
+        if callable(requester):
+            requester(
+                session.session_id,
+                ended_reason="半自动单次判断无信号",
+                source_label="半自动操盘台",
+                show_dialog=False,
+            )
+
+    @staticmethod
+    def _apply_semi_auto_task_opened(self, session: StrategySession) -> None:
+        task = QuantApp._semi_auto_task_for_session(self, session)
+        if task is None:
+            return
+        terminal_statuses = {"completed_no_signal", "completed_closed", "blocked_conflict", "cancelled", "failed"}
+        if str(getattr(task, "status", "") or "").strip() in terminal_statuses:
+            return
+        now = datetime.now()
+        task.status = "opened"
+        task.updated_at = now
+        pool_id = str(getattr(task, "pool_id", "") or "").strip()
+        symbol = str(getattr(task, "symbol", "") or "").strip().upper()
+        direction = str(getattr(task, "direction_label", "") or "").strip()
+        requester = getattr(self, "_request_stop_strategy_session", None)
+        for other in getattr(self, "_semi_auto_desk_tasks", []):
+            if other is task:
+                continue
+            if str(getattr(other, "pool_id", "") or "").strip() != pool_id:
+                continue
+            if str(getattr(other, "symbol", "") or "").strip().upper() != symbol:
+                continue
+            if str(getattr(other, "direction_label", "") or "").strip() != direction:
+                continue
+            if str(getattr(other, "status", "") or "").strip() not in {"queued", "running"}:
+                continue
+            QuantApp._finish_semi_auto_task(self, other, status="blocked_conflict", reason="仓位冲突未执行")
+            other_session_id = str(getattr(other, "session_id", "") or "").strip()
+            if other_session_id and callable(requester):
+                requester(
+                    other_session_id,
+                    ended_reason="仓位冲突未执行",
+                    source_label="半自动操盘台仓位冲突",
+                    show_dialog=False,
+                )
+        QuantApp._save_semi_auto_desk_if_available(self)
+
+    @staticmethod
+    def _mark_semi_auto_task_settling(self, session: StrategySession) -> None:
+        task = QuantApp._semi_auto_task_for_session(self, session)
+        if task is None or str(getattr(task, "status", "") or "").strip() != "opened":
+            return
+        task.status = "settling"
+        task.updated_at = datetime.now()
+        QuantApp._save_semi_auto_desk_if_available(self)
+
+    @staticmethod
+    def _apply_semi_auto_task_settlement(
+        self,
+        session: StrategySession,
+        ledger_record: StrategyTradeLedgerRecord,
+    ) -> None:
+        task = QuantApp._semi_auto_task_for_session(self, session)
+        if task is None:
+            return
+        ledger_task_id = str(getattr(ledger_record, "semi_auto_task_id", "") or "").strip()
+        if ledger_task_id and ledger_task_id != str(getattr(task, "task_id", "") or "").strip():
+            return
+        task.ledger_record_id = str(getattr(ledger_record, "record_id", "") or "").strip()
+        close_reason = str(getattr(ledger_record, "close_reason", "") or "").strip() or "本次交易已结算"
+        QuantApp._finish_semi_auto_task(self, task, status="completed_closed", reason=close_reason)
+        requester = getattr(self, "_request_stop_strategy_session", None)
+        if callable(requester):
+            requester(
+                session.session_id,
+                ended_reason="半自动本次交易已结算",
+                source_label="半自动操盘台",
+                show_dialog=False,
+            )
 
     def _trader_desk_sync_open_trade_state(self, session: StrategySession) -> None:
         trader_id = getattr(session, "trader_id", "").strip()
@@ -7190,6 +7313,7 @@ class UiStrategySessionsMixin:
         self._log_session_message(session, result.cumulative_summary)
         try:
             self._apply_trader_desk_reconciliation(session, result.ledger_record)
+            self._apply_semi_auto_task_settlement(session, result.ledger_record)
         finally:
             if matching_trade:
                 self._clear_session_manual_management_state(session)

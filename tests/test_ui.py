@@ -31,6 +31,7 @@ from okx_quant.upgrade_launch import (
     UpgradeLaunchManager,
 )
 from okx_quant.trader_desk import TraderDraftRecord, TraderRunState, TraderSlotRecord
+from okx_quant.semi_auto_desk import SemiAutoPoolRecord, SemiAutoTaskRecord
 from okx_quant.strategy_status_email import StrategyStatusEmailContent
 from okx_quant.ui import (
     ENV_OPTIONS,
@@ -105,6 +106,98 @@ from okx_quant.ui import (
 
 
 class UiHelpersTest(TestCase):
+    @staticmethod
+    def _semi_auto_task(
+        task_id: str,
+        *,
+        pool_id: str = "P001",
+        session_id: str = "",
+        symbol: str = "ETH-USDT-SWAP",
+        direction_label: str = "只做多",
+        status: str = "running",
+        mode: str = "wait_one",
+    ) -> SemiAutoTaskRecord:
+        return SemiAutoTaskRecord(
+            task_id=task_id,
+            pool_id=pool_id,
+            template_payload={},
+            session_id=session_id,
+            symbol=symbol,
+            direction_label=direction_label,
+            status=status,
+            mode=mode,
+        )
+
+    def test_single_check_task_stops_when_first_evaluation_reports_no_entry(self) -> None:
+        task = self._semi_auto_task("P001-1", session_id="S01", mode="evaluate_once")
+        request_stop = MagicMock(return_value=True)
+        app = SimpleNamespace(
+            _semi_auto_desk_tasks=[task],
+            _save_semi_auto_desk_snapshot=MagicMock(),
+            _request_stop_strategy_session=request_stop,
+        )
+        session = SimpleNamespace(session_id="S01", semi_auto_task_id=task.task_id)
+
+        QuantApp._apply_semi_auto_runtime_message(app, session, "当前无法生成挂单 | 条件未满足")
+
+        self.assertEqual(task.status, "completed_no_signal")
+        self.assertEqual(task.ended_reason, "本次无信号")
+        request_stop.assert_called_once_with(
+            "S01",
+            ended_reason="半自动单次判断无信号",
+            source_label="半自动操盘台",
+            show_dialog=False,
+        )
+
+    def test_first_opened_task_blocks_unfilled_same_symbol_direction_task(self) -> None:
+        entered = self._semi_auto_task("P001-1", session_id="S01")
+        waiting = self._semi_auto_task("P001-2", session_id="S02")
+        request_stop = MagicMock(return_value=True)
+        app = SimpleNamespace(
+            _semi_auto_desk_pools=[
+                SemiAutoPoolRecord("P001", "主操盘", "real", Decimal("1000")),
+            ],
+            _semi_auto_desk_tasks=[entered, waiting],
+            _save_semi_auto_desk_snapshot=MagicMock(),
+            _request_stop_strategy_session=request_stop,
+        )
+        session = SimpleNamespace(session_id="S01", semi_auto_task_id=entered.task_id)
+
+        QuantApp._apply_semi_auto_task_opened(app, session)
+
+        self.assertEqual(entered.status, "opened")
+        self.assertEqual(waiting.status, "blocked_conflict")
+        self.assertEqual(waiting.ended_reason, "仓位冲突未执行")
+        request_stop.assert_called_once_with(
+            "S02",
+            ended_reason="仓位冲突未执行",
+            source_label="半自动操盘台仓位冲突",
+            show_dialog=False,
+        )
+
+    def test_settlement_marks_wait_one_task_completed_then_stops_session(self) -> None:
+        task = self._semi_auto_task("P001-1", session_id="S01", status="settling")
+        request_stop = MagicMock(return_value=True)
+        app = SimpleNamespace(
+            _semi_auto_desk_tasks=[task],
+            _save_semi_auto_desk_snapshot=MagicMock(),
+            _request_stop_strategy_session=request_stop,
+        )
+        session = SimpleNamespace(session_id="S01", semi_auto_task_id=task.task_id)
+        ledger = SimpleNamespace(record_id="L01", semi_auto_task_id=task.task_id, close_reason="止盈")
+
+        QuantApp._apply_semi_auto_task_settlement(app, session, ledger)
+
+        self.assertEqual(task.status, "completed_closed")
+        self.assertEqual(task.ended_reason, "止盈")
+        self.assertEqual(task.ledger_record_id, "L01")
+        request_stop.assert_called_once_with(
+            "S01",
+            ended_reason="半自动本次交易已结算",
+            source_label="半自动操盘台",
+            show_dialog=False,
+        )
+
     def test_trade_ledger_payload_round_trip_keeps_semi_auto_task_identity(self) -> None:
         record = StrategyTradeLedgerRecord(
             record_id="L01",
