@@ -35,6 +35,7 @@ OPTION_STRATEGIES_FILE_NAME = "option_strategies.json"
 SIGNAL_OBSERVER_TEMPLATES_FILE_NAME = "signal_observer_templates.json"
 SIGNAL_OBSERVER_PRESETS_FILE_NAME = "signal_observer_presets.json"
 TRADER_DESK_FILE_NAME = "trader_desk.json"
+SEMI_AUTO_DESK_FILE_NAME = "semi_auto_desk.json"
 POSITION_NOTES_FILE_NAME = "position_notes.json"
 STRATEGY_PARAMETER_GLOBAL_DEFAULTS_FILE_NAME = "strategy_parameter_global_defaults.json"
 STRATEGY_PARAMETER_DRAFTS_FILE_NAME = "strategy_parameter_drafts.json"
@@ -125,6 +126,10 @@ def strategy_trade_ledger_file_path(base_dir: Path | None = None) -> Path:
     if base_dir is not None:
         return Path(base_dir) / STRATEGY_TRADE_LEDGER_FILE_NAME
     return state_dir_path() / STRATEGY_TRADE_LEDGER_FILE_NAME
+
+
+def semi_auto_desk_file_path(base_dir: Path | None = None) -> Path:
+    return Path(base_dir) / SEMI_AUTO_DESK_FILE_NAME if base_dir is not None else state_dir_path() / SEMI_AUTO_DESK_FILE_NAME
 
 
 def recoverable_strategy_sessions_file_path(base_dir: Path | None = None) -> Path:
