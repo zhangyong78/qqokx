@@ -28,6 +28,13 @@ from okx_quant.strategy_status_email import (
     claim_status_email_slot,
     latest_due_status_email_slot,
 )
+from okx_quant.semi_auto_desk import (
+    SemiAutoDeskSnapshot,
+    SemiAutoPoolRecord,
+    SemiAutoTaskRecord,
+    load_semi_auto_desk_snapshot,
+    save_semi_auto_desk_snapshot,
+)
 
 _SESSION_RUNTIME_HEARTBEAT_PREFIX = "__qqokx_runtime_heartbeat__|"
 _SESSION_RUNTIME_HEARTBEAT_TIMEOUT_POLLS = 6
@@ -35,6 +42,162 @@ _SESSION_RUNTIME_HEARTBEAT_TIMEOUT_MIN_SECONDS = 180.0
 
 
 class UiStrategySessionsMixin:
+    def _load_semi_auto_desk_snapshot(self) -> None:
+        try:
+            snapshot = load_semi_auto_desk_snapshot()
+        except Exception as exc:
+            self._enqueue_log(f"读取半自动操盘台数据失败：{exc}")
+            return
+        self._semi_auto_desk_pools = list(snapshot.pools)
+        self._semi_auto_desk_tasks = list(snapshot.tasks)
+
+    def _semi_auto_desk_snapshot_for_ui(self) -> SemiAutoDeskSnapshot:
+        return SemiAutoDeskSnapshot(
+            pools=list(getattr(self, "_semi_auto_desk_pools", [])),
+            tasks=list(getattr(self, "_semi_auto_desk_tasks", [])),
+        )
+
+    def _save_semi_auto_desk_snapshot(self) -> None:
+        try:
+            save_semi_auto_desk_snapshot(self._semi_auto_desk_snapshot_for_ui())
+        except Exception as exc:
+            self._enqueue_log(f"保存半自动操盘台数据失败：{exc}")
+
+    def _semi_auto_pool_by_id(self, pool_id: str):
+        normalized = str(pool_id or "").strip()
+        return next((pool for pool in getattr(self, "_semi_auto_desk_pools", []) if pool.pool_id == normalized), None)
+
+    def _semi_auto_task_by_id(self, task_id: str):
+        normalized = str(task_id or "").strip()
+        return next((task for task in getattr(self, "_semi_auto_desk_tasks", []) if task.task_id == normalized), None)
+
+    def _next_semi_auto_pool_id(self) -> str:
+        known = {pool.pool_id for pool in getattr(self, "_semi_auto_desk_pools", [])}
+        index = 1
+        while f"P{index:03d}" in known:
+            index += 1
+        return f"P{index:03d}"
+
+    def _next_semi_auto_task_id(self, pool_id: str) -> str:
+        prefix = f"{pool_id}-"
+        known = {task.task_id for task in getattr(self, "_semi_auto_desk_tasks", [])}
+        index = 1
+        while f"{prefix}{index}" in known:
+            index += 1
+        return f"{prefix}{index}"
+
+    def create_semi_auto_pool(self, name: str, api_name: str, initial_capital: Decimal) -> SemiAutoPoolRecord:
+        normalized_name = str(name or "").strip()
+        normalized_api = str(api_name or "").strip()
+        if not normalized_name:
+            raise ValueError("请填写操盘组合名称。")
+        if not normalized_api:
+            raise ValueError("请先选择 API 配置。")
+        if initial_capital <= 0:
+            raise ValueError("初始虚拟资金必须大于 0。")
+        now = datetime.now()
+        pool = SemiAutoPoolRecord(
+            pool_id=self._next_semi_auto_pool_id(),
+            name=normalized_name,
+            api_name=normalized_api,
+            initial_capital=initial_capital,
+            created_at=now,
+            updated_at=now,
+        )
+        self._semi_auto_desk_pools.append(pool)
+        self._save_semi_auto_desk_snapshot()
+        self._enqueue_log(f"[半自动操盘台] 已创建组合 {pool.pool_id} | {pool.name} | API={pool.api_name}")
+        return pool
+
+    def add_semi_auto_task(self, pool_id: str, template_payload: dict[str, object], mode: str) -> SemiAutoTaskRecord:
+        pool = self._semi_auto_pool_by_id(pool_id)
+        if pool is None:
+            raise ValueError("请先选择操盘组合。")
+        record = _strategy_template_record_from_payload(template_payload)
+        if record is None:
+            raise ValueError("当前策略配置无效，无法加入半自动操盘台。")
+        normalized_mode = str(mode or "").strip()
+        if normalized_mode not in {"evaluate_once", "wait_one"}:
+            raise ValueError("一次性执行模式无效。")
+        now = datetime.now()
+        task = SemiAutoTaskRecord(
+            task_id=self._next_semi_auto_task_id(pool.pool_id),
+            pool_id=pool.pool_id,
+            template_payload=dict(template_payload),
+            mode=normalized_mode,
+            symbol=record.symbol,
+            direction_label=record.direction_label,
+            bar=str(record.config.bar or "").strip(),
+            created_at=now,
+            updated_at=now,
+        )
+        self._semi_auto_desk_tasks.append(task)
+        self._save_semi_auto_desk_snapshot()
+        self._enqueue_log(f"[半自动操盘台] 已加入任务 {task.task_id} | {record.strategy_name} | {task.symbol}")
+        return task
+
+    def start_semi_auto_task(self, task_id: str) -> None:
+        task = self._semi_auto_task_by_id(task_id)
+        if task is None:
+            raise ValueError("未找到半自动任务。")
+        if task.status != "queued":
+            raise ValueError("只有待启动任务可以启动。")
+        pool = self._semi_auto_pool_by_id(task.pool_id)
+        record = _strategy_template_record_from_payload(task.template_payload)
+        if pool is None or record is None:
+            task.status = "failed"
+            task.ended_reason = "组合或策略配置缺失"
+            task.ended_at = datetime.now()
+            task.updated_at = task.ended_at
+            self._save_semi_auto_desk_snapshot()
+            raise ValueError(task.ended_reason)
+        credentials = self._credentials_for_profile_or_none(pool.api_name)
+        if credentials is None:
+            raise ValueError(f"未找到 API：{pool.api_name}")
+        definition = self._resolve_strategy_template_definition(record)
+        config = replace(record.config, run_mode="trade")
+        notifier = self._build_notifier(config, pool.api_name)
+        session_id = self._start_strategy_session(
+            definition=definition,
+            credentials=credentials,
+            config=config,
+            notifier=notifier,
+            api_name=pool.api_name,
+            direction_label=record.direction_label or definition.default_signal_label,
+            run_mode_label="交易并下单",
+            source_label=f"半自动组合 {pool.name}",
+            select_session=False,
+            allow_duplicate_launch=True,
+            semi_auto_pool_id=pool.pool_id,
+            semi_auto_task_id=task.task_id,
+            semi_auto_mode=task.mode,
+        )
+        now = datetime.now()
+        task.status = "running"
+        task.session_id = session_id
+        task.started_at = now
+        task.updated_at = now
+        pool.status = "running"
+        pool.updated_at = now
+        self._save_semi_auto_desk_snapshot()
+        self._enqueue_log(f"[半自动操盘台] 已启动任务 {task.task_id} | 会话={session_id}")
+
+    def cancel_semi_auto_task(self, task_id: str) -> None:
+        task = self._semi_auto_task_by_id(task_id)
+        if task is None:
+            raise ValueError("未找到半自动任务。")
+        if task.status == "opened" or task.status == "settling":
+            raise ValueError("任务已有持仓或正在结算，请先使用策略会话的人工平仓功能。")
+        if task.status not in {"queued", "running"}:
+            raise ValueError("当前任务不能取消。")
+        if task.status == "running" and task.session_id:
+            self._request_stop_strategy_session(
+                task.session_id,
+                ended_reason="半自动任务已取消",
+                source_label="半自动操盘台",
+                show_dialog=False,
+            )
+        QuantApp._finish_semi_auto_task(self, task, status="cancelled", reason="人工取消")
     @staticmethod
     def _entry_reference_ema_caption(strategy_id: str) -> str:
         return strategy_entry_reference_period_caption(strategy_id)

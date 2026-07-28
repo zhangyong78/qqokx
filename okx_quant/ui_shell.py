@@ -185,6 +185,11 @@ from okx_quant.trader_desk import (
     trader_used_quota_steps,
 )
 from okx_quant.trader_desk_ui import TraderDeskWindow
+from okx_quant.semi_auto_desk import (
+    SemiAutoPoolRecord,
+    build_semi_auto_pool_summary,
+)
+from okx_quant.semi_auto_desk_ui import SemiAutoDeskWindow
 from okx_quant.arbitrage.models import ArbitrageTradeRuntime
 from okx_quant.arbitrage_ui import ArbitrageWindow
 from okx_quant.smart_order import SmartOrderRuntimeConfig
@@ -3414,6 +3419,9 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         self._trader_desk_runs: list[TraderRunState] = []
         self._trader_desk_slots: list[TraderSlotRecord] = []
         self._trader_desk_events: list[TraderEventRecord] = []
+        self._semi_auto_desk_pools: list[SemiAutoPoolRecord] = []
+        self._semi_auto_desk_tasks: list = []
+        self._semi_auto_desk_window: SemiAutoDeskWindow | None = None
         self._trader_gate_price_cache: dict[str, tuple[datetime, OkxTicker]] = {}
         self._strategy_log_write_failures: set[str] = set()
         self._session_counter = 0
@@ -4024,6 +4032,7 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         self._load_recoverable_strategy_sessions_registry()
         self._load_strategy_history()
         self._load_strategy_trade_ledger()
+        self._load_semi_auto_desk_snapshot()
         self._strategy_parameter_drafts = load_strategy_parameter_drafts()
         self._strategy_parameter_scope = "launcher"
         self._last_strategy_parameter_strategy_id: str | None = None
@@ -4293,6 +4302,7 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         tools_menu.add_command(label="打开行情日记", command=self.open_journal_window)
         tools_menu.add_command(label="打开信号观察台", command=self.open_signal_monitor_window)
         tools_menu.add_command(label="打开交易员管理台", command=self.open_trader_desk_window)
+        tools_menu.add_command(label="打开半自动操盘台", command=self.open_semi_auto_desk_window)
         menu_bar.add_cascade(label="工具", menu=tools_menu)
 
         history_menu = Menu(menu_bar, tearoff=False)
@@ -8634,6 +8644,29 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
             window._focus_trader_row(normalized)
         except Exception:
             pass
+
+    def open_semi_auto_desk_window(self) -> None:
+        if self._semi_auto_desk_window is not None and self._semi_auto_desk_window.window.winfo_exists():
+            self._semi_auto_desk_window.show()
+            return
+
+        self._semi_auto_desk_window = SemiAutoDeskWindow(
+            self.root,
+            snapshot_provider=self._semi_auto_desk_snapshot_for_ui,
+            current_template_factory=self._template_record_from_launcher,
+            template_serializer=_build_strategy_template_payload_from_record,
+            pool_creator=self.create_semi_auto_pool,
+            task_adder=self.add_semi_auto_task,
+            task_starter=self.start_semi_auto_task,
+            task_canceller=self.cancel_semi_auto_task,
+            ledger_provider=lambda: list(self._strategy_trade_ledger_records),
+            summary_provider=lambda pool: build_semi_auto_pool_summary(
+                pool,
+                [task for task in self._semi_auto_desk_tasks if task.pool_id == pool.pool_id],
+                self._strategy_trade_ledger_records,
+            ),
+            default_api_name=self._current_credential_profile(),
+        )
 
     def open_deribit_volatility_monitor_window(self) -> None:
         if (
