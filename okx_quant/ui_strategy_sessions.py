@@ -67,6 +67,35 @@ _SESSION_RUNTIME_HEARTBEAT_TIMEOUT_MIN_SECONDS = 180.0
 
 
 class UiStrategySessionsMixin:
+    def open_semi_auto_strategy_library(self, pool_id: str, mode: str) -> None:
+        pool = QuantApp._semi_auto_pool_by_id(self, pool_id)
+        if pool is None:
+            messagebox.showerror("打开策略库失败", "请先选择有效的操盘组合。", parent=self.root)
+            return
+        normalized_mode = str(mode or "").strip()
+        if normalized_mode not in {"wait_one", "evaluate_once"}:
+            raise ValueError("半自动任务模式无效。")
+
+        def _on_confirm(record: StrategyTemplateRecord) -> None:
+            payload = _build_strategy_template_payload_from_record(record)
+            task = self.add_semi_auto_task(pool.pool_id, payload, normalized_mode)
+            window = getattr(self, "_semi_auto_desk_window", None)
+            if window is not None:
+                window.refresh()
+            self._enqueue_log(
+                f"[半自动操盘台] 已从策略库加入一次性任务 {getattr(task, 'task_id', '')} | "
+                f"{record.strategy_name} | {record.symbol}"
+            )
+
+        SemiAutoStrategyLibraryDialog(
+            self.root,
+            definitions=self.semi_auto_strategy_definitions(),
+            initial_api_name=pool.api_name,
+            parameter_defaults_provider=self.semi_auto_strategy_parameter_defaults,
+            template_builder=self.build_semi_auto_strategy_template,
+            on_confirm=_on_confirm,
+        )
+
     def semi_auto_strategy_definitions(self) -> tuple[StrategyDefinition, ...]:
         return STRATEGY_DEFINITIONS
 

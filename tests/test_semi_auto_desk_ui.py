@@ -2,9 +2,11 @@ from datetime import datetime
 from decimal import Decimal
 from types import SimpleNamespace
 from unittest import TestCase
+from unittest.mock import MagicMock
 
 from okx_quant.semi_auto_desk import SemiAutoTaskRecord
 from okx_quant.semi_auto_desk_ui import (
+    SemiAutoDeskWindow,
     build_semi_auto_pool_performance_rows,
     build_semi_auto_pool_replay_time_markers,
     build_semi_auto_pool_ledger_rows,
@@ -13,6 +15,18 @@ from okx_quant.semi_auto_desk_ui import (
 
 
 class SemiAutoDeskUiTest(TestCase):
+    def test_strategy_library_action_passes_selected_pool_and_one_shot_mode(self) -> None:
+        opener = MagicMock()
+        window = SemiAutoDeskWindow.__new__(SemiAutoDeskWindow)
+        window._selected_pool_id = "P001"
+        window.mode_var = SimpleNamespace(get=lambda: "等待一单")
+        window._strategy_library_opener = opener
+
+        window._open_strategy_library()
+
+        opener.assert_called_once_with("P001", "wait_one")
+        self.assertFalse(hasattr(window, "_add_current_strategy"))
+
     def test_pool_ledger_rows_mix_strategies_but_keep_one_pool_only(self) -> None:
         records = [
             SimpleNamespace(

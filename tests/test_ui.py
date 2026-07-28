@@ -181,6 +181,45 @@ class UiHelpersTest(TestCase):
         self.assertEqual(snapshot.pools, [pool])
         self.assertEqual(snapshot.tasks, [task])
 
+    @patch("okx_quant.ui_shell._build_strategy_template_payload_from_record")
+    @patch("okx_quant.ui_shell.SemiAutoStrategyLibraryDialog")
+    def test_open_semi_auto_strategy_library_uses_pool_api_and_adds_confirmed_task(
+        self,
+        dialog_class: MagicMock,
+        serializer: MagicMock,
+    ) -> None:
+        pool = SemiAutoPoolRecord("P001", "主操盘", "real", Decimal("1000"))
+        desk_window = SimpleNamespace(refresh=MagicMock())
+        record = SimpleNamespace(
+            strategy_id=STRATEGY_DYNAMIC_LONG_ID,
+            strategy_name="EMA 动态委托做多",
+            symbol="ETH-USDT-SWAP",
+        )
+        payload = {"strategy_id": STRATEGY_DYNAMIC_LONG_ID, "symbol": "ETH-USDT-SWAP"}
+        serializer.return_value = payload
+        add_task = MagicMock()
+        app = SimpleNamespace(
+            root=object(),
+            _semi_auto_desk_pools=[pool],
+            _semi_auto_desk_window=desk_window,
+            semi_auto_strategy_definitions=lambda: STRATEGY_DEFINITIONS,
+            semi_auto_strategy_parameter_defaults=MagicMock(),
+            build_semi_auto_strategy_template=MagicMock(),
+            add_semi_auto_task=add_task,
+            _enqueue_log=MagicMock(),
+        )
+
+        QuantApp.open_semi_auto_strategy_library(app, "P001", "wait_one")
+
+        dialog_class.assert_called_once()
+        kwargs = dialog_class.call_args.kwargs
+        self.assertEqual(kwargs["definitions"], STRATEGY_DEFINITIONS)
+        self.assertEqual(kwargs["initial_api_name"], "real")
+        kwargs["on_confirm"](record)
+        serializer.assert_called_once_with(record)
+        add_task.assert_called_once_with("P001", payload, "wait_one")
+        desk_window.refresh.assert_called_once_with()
+
     @patch("okx_quant.ui_shell.load_semi_auto_desk_snapshot")
     def test_semi_auto_snapshot_load_works_after_shell_global_rebinding(self, load_snapshot: MagicMock) -> None:
         pool = SemiAutoPoolRecord("P001", "主操盘", "real", Decimal("1000"))

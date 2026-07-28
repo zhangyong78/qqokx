@@ -178,8 +178,7 @@ class SemiAutoDeskWindow:
         parent,
         *,
         snapshot_provider,
-        current_template_factory,
-        template_serializer,
+        strategy_library_opener,
         pool_creator,
         task_adder,
         task_starter,
@@ -190,8 +189,7 @@ class SemiAutoDeskWindow:
         default_api_name: str = "",
     ) -> None:
         self._snapshot_provider = snapshot_provider
-        self._current_template_factory = current_template_factory
-        self._template_serializer = template_serializer
+        self._strategy_library_opener = strategy_library_opener
         self._pool_creator = pool_creator
         self._task_adder = task_adder
         self._task_starter = task_starter
@@ -241,7 +239,7 @@ class SemiAutoDeskWindow:
             state="readonly",
             width=14,
         ).pack(side="left", padx=(4, 10))
-        ttk.Button(action_row, text="加入当前策略", command=self._add_current_strategy).pack(side="left")
+        ttk.Button(action_row, text="从策略库添加", command=self._open_strategy_library).pack(side="left")
         ttk.Button(action_row, text="启动选中任务", command=self._start_selected_task).pack(side="left", padx=(8, 0))
         ttk.Button(action_row, text="取消选中任务", command=self._cancel_selected_task).pack(side="left", padx=(8, 0))
         ttk.Button(action_row, text="复盘选中任务币种", command=self._open_replay).pack(side="left", padx=(8, 0))
@@ -298,18 +296,12 @@ class SemiAutoDeskWindow:
         self._selected_pool_id = pool.pool_id
         self.refresh()
 
-    def _add_current_strategy(self) -> None:
+    def _open_strategy_library(self) -> None:
         if not self._selected_pool_id:
             messagebox.showinfo("提示", "请先选择操盘组合。", parent=self.window)
             return
-        try:
-            payload = self._template_serializer(self._current_template_factory())
-            mode = {"等待一单": "wait_one", "单次判断": "evaluate_once"}.get(self.mode_var.get(), self.mode_var.get())
-            self._task_adder(self._selected_pool_id, payload, mode)
-        except Exception as exc:
-            messagebox.showerror("加入策略失败", str(exc), parent=self.window)
-            return
-        self.refresh()
+        mode = {"等待一单": "wait_one", "单次判断": "evaluate_once"}[self.mode_var.get()]
+        self._strategy_library_opener(self._selected_pool_id, mode)
 
     def _start_selected_task(self) -> None:
         task_id = self._selected_task_id()

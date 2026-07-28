@@ -194,6 +194,7 @@ from okx_quant.semi_auto_desk import (
     save_semi_auto_desk_snapshot,
 )
 from okx_quant.semi_auto_desk_ui import SemiAutoDeskWindow, build_semi_auto_pool_replay_time_markers
+from okx_quant.semi_auto_strategy_library_ui import SemiAutoStrategyLibraryDialog
 from okx_quant.arbitrage.models import ArbitrageTradeRuntime
 from okx_quant.arbitrage_ui import ArbitrageWindow
 from okx_quant.smart_order import SmartOrderRuntimeConfig
@@ -8657,8 +8658,7 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         self._semi_auto_desk_window = SemiAutoDeskWindow(
             self.root,
             snapshot_provider=self._semi_auto_desk_snapshot_for_ui,
-            current_template_factory=self._template_record_from_launcher,
-            template_serializer=_build_strategy_template_payload_from_record,
+            strategy_library_opener=self.open_semi_auto_strategy_library,
             pool_creator=self.create_semi_auto_pool,
             task_adder=self.add_semi_auto_task,
             task_starter=self.start_semi_auto_task,
