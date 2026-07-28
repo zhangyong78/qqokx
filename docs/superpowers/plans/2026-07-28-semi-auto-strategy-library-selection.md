@@ -259,4 +259,3 @@ Expected: 不暂存现有 `roll_terminal_qt` 修改。
 git add docs/superpowers/specs/2026-07-28-semi-auto-strategy-library-selection-design.md
 git commit -m "docs: finalize semi-auto library strategy selection"
 ```
-
