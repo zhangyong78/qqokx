@@ -46,8 +46,9 @@
 def test_semi_auto_strategy_definitions_only_return_launchable_builtin_strategies(self) -> None:
     entries = QuantApp.semi_auto_strategy_definitions(SimpleNamespace())
     self.assertTrue(entries)
-    self.assertTrue(all(item.supports_trader_desk for item in entries))
+    self.assertEqual(entries, STRATEGY_DEFINITIONS)
     self.assertIn("EMA 动态委托做多", [item.name for item in entries])
+    self.assertIn("EMA 动态委托-多周期多头", [item.name for item in entries])
 
 
 def test_library_template_ignores_current_launcher_selection(self) -> None:
@@ -73,7 +74,7 @@ Expected: FAIL because the three library interfaces do not exist.
 
 ```python
 def semi_auto_strategy_definitions(self) -> tuple[StrategyDefinition, ...]:
-    return tuple(item for item in STRATEGY_DEFINITIONS if item.supports_trader_desk)
+    return STRATEGY_DEFINITIONS
 
 
 def build_semi_auto_strategy_template(self, strategy_id, parameter_values, api_name):
@@ -145,7 +146,7 @@ Expected: FAIL because the module does not exist.
 def build_semi_auto_strategy_library_rows(definitions):
     return [
         (item.strategy_id, (item.name, item.default_signal_label, item.summary))
-        for item in definitions if item.supports_trader_desk
+        for item in definitions
     ]
 
 
