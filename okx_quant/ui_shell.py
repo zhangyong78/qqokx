@@ -186,10 +186,14 @@ from okx_quant.trader_desk import (
 )
 from okx_quant.trader_desk_ui import TraderDeskWindow
 from okx_quant.semi_auto_desk import (
+    SemiAutoDeskSnapshot,
     SemiAutoPoolRecord,
+    SemiAutoTaskRecord,
     build_semi_auto_pool_summary,
+    load_semi_auto_desk_snapshot,
+    save_semi_auto_desk_snapshot,
 )
-from okx_quant.semi_auto_desk_ui import SemiAutoDeskWindow
+from okx_quant.semi_auto_desk_ui import SemiAutoDeskWindow, build_semi_auto_pool_replay_time_markers
 from okx_quant.arbitrage.models import ArbitrageTradeRuntime
 from okx_quant.arbitrage_ui import ArbitrageWindow
 from okx_quant.smart_order import SmartOrderRuntimeConfig

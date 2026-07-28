@@ -31,7 +31,7 @@ from okx_quant.upgrade_launch import (
     UpgradeLaunchManager,
 )
 from okx_quant.trader_desk import TraderDraftRecord, TraderRunState, TraderSlotRecord
-from okx_quant.semi_auto_desk import SemiAutoPoolRecord, SemiAutoTaskRecord
+from okx_quant.semi_auto_desk import SemiAutoDeskSnapshot, SemiAutoPoolRecord, SemiAutoTaskRecord
 from okx_quant.strategy_status_email import StrategyStatusEmailContent
 from okx_quant.ui import (
     ENV_OPTIONS,
@@ -106,6 +106,35 @@ from okx_quant.ui import (
 
 
 class UiHelpersTest(TestCase):
+    def test_semi_auto_snapshot_provider_works_after_shell_global_rebinding(self) -> None:
+        pool = SemiAutoPoolRecord("P001", "主操盘", "real", Decimal("1000"))
+        task = SemiAutoTaskRecord(task_id="P001-1", pool_id="P001", template_payload={})
+
+        snapshot = QuantApp._semi_auto_desk_snapshot_for_ui(
+            SimpleNamespace(_semi_auto_desk_pools=[pool], _semi_auto_desk_tasks=[task])
+        )
+
+        self.assertIsInstance(snapshot, SemiAutoDeskSnapshot)
+        self.assertEqual(snapshot.pools, [pool])
+        self.assertEqual(snapshot.tasks, [task])
+
+    @patch("okx_quant.ui_shell.load_semi_auto_desk_snapshot")
+    def test_semi_auto_snapshot_load_works_after_shell_global_rebinding(self, load_snapshot: MagicMock) -> None:
+        pool = SemiAutoPoolRecord("P001", "主操盘", "real", Decimal("1000"))
+        load_snapshot.return_value = SemiAutoDeskSnapshot(pools=[pool], tasks=[])
+        app = SimpleNamespace(
+            _semi_auto_desk_pools=[],
+            _semi_auto_desk_tasks=[],
+            _enqueue_log=MagicMock(),
+            _save_semi_auto_desk_snapshot=MagicMock(),
+        )
+
+        QuantApp._load_semi_auto_desk_snapshot(app)
+
+        self.assertEqual(app._semi_auto_desk_pools, [pool])
+        self.assertEqual(app._semi_auto_desk_tasks, [])
+        app._enqueue_log.assert_not_called()
+
     @staticmethod
     def _semi_auto_task(
         task_id: str,
