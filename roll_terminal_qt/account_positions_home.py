@@ -11,6 +11,7 @@ import traceback
 from datetime import datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Callable
 
 from PySide6.QtCore import QSignalBlocker, QThread, QTimer, Qt, Signal, Slot
@@ -42,6 +43,7 @@ from PySide6.QtWidgets import (
 )
 
 from roll_terminal_qt.app_icon import apply_qt_window_icon
+from roll_terminal_qt.option_roll_window import OptionRollQtDialog
 from okx_quant.log_utils import append_log_line
 from okx_quant.app_paths import data_root
 from okx_quant.models import Candle, Credentials, EmailNotificationConfig, Instrument, StrategyConfig
@@ -113,6 +115,8 @@ from okx_quant.ui_shell import (
     _option_search_shortcuts,
     _format_trade_order_price,
     _format_trade_order_size,
+    _format_trade_order_coin_size,
+    _format_trade_order_coin_filled_size,
     _format_trade_order_state,
     _format_trade_order_fee_cell,
     _format_trade_order_tp_sl,
@@ -706,6 +710,65 @@ POSITION_KLINE_BAR_OPTIONS: tuple[tuple[str, str], ...] = (
 )
 
 
+def _format_trade_order_size_with_coin(item: object, instruments: dict[str, object], *, filled: bool) -> str:
+    size_text = _format_trade_order_size(getattr(item, "filled_size" if filled else "size", None))
+    coin_text = (
+        _format_trade_order_coin_filled_size(item, instruments)
+        if filled
+        else _format_trade_order_coin_size(item, instruments)
+    )
+    return size_text if coin_text in {"-", size_text} else f"{size_text} ({coin_text})"
+POSITION_KLINE_BAR_MS = {
+    "15m": 15 * 60 * 1000,
+    "1H": 60 * 60 * 1000,
+    "4H": 4 * 60 * 60 * 1000,
+    "1D": 24 * 60 * 60 * 1000,
+}
+
+
+def _position_history_kline_time_markers(item: OkxPositionHistoryItem) -> tuple[tuple[str, int], ...]:
+    raw = item.raw if isinstance(item.raw, dict) else {}
+
+    def _timestamp(*values: object) -> int | None:
+        for value in values:
+            try:
+                timestamp = int(str(value or "").strip())
+            except (TypeError, ValueError):
+                continue
+            if timestamp <= 0:
+                continue
+            return timestamp * 1000 if timestamp < 100_000_000_000 else timestamp
+        return None
+
+    opened_at = _timestamp(raw.get("openTime"), raw.get("openTs"), raw.get("cTime"), raw.get("createdTime"))
+    closed_at = _timestamp(raw.get("closeTime"), raw.get("closeTs"), raw.get("uTime"), raw.get("updateTime"), item.update_time)
+    markers: list[tuple[str, int]] = []
+    if opened_at is not None:
+        markers.append(("开仓", opened_at))
+    if closed_at is not None:
+        markers.append(("平仓", closed_at))
+    return tuple(markers)
+
+
+def _position_kline_candle_limit(
+    bar: str,
+    time_markers: tuple[tuple[str, int], ...],
+    *,
+    now_ms: int | None = None,
+) -> int:
+    base_limit = 240
+    bar_ms = POSITION_KLINE_BAR_MS.get(bar)
+    timestamps = [timestamp for _label, timestamp in time_markers if timestamp > 0]
+    if bar_ms is None or not timestamps:
+        return base_limit
+    current_ms = now_ms if now_ms is not None else int(time.time() * 1000)
+    oldest_timestamp = min(timestamps)
+    if oldest_timestamp >= current_ms:
+        return base_limit
+    required_bars = ((current_ms - oldest_timestamp) + bar_ms - 1) // bar_ms
+    return min(max(base_limit, required_bars + 32), 2000)
+
+
 class NoteEditorDialog(QDialog):
     def __init__(self, *, title: str, prompt: str, initial_value: str, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -861,6 +924,7 @@ class InstrumentKlineDialog(QDialog):
         self._underlying_usdt_price: Decimal | None = None
         self._underlying_usdt_basis = ""
         self._option_entry_price: Decimal | None = None
+        self._time_markers: tuple[tuple[str, int], ...] = ()
         self._current_bar = initial_bar if initial_bar in {bar for _text, bar in POSITION_KLINE_BAR_OPTIONS} else "1H"
         self._load_thread: InstrumentKlineLoadThread | None = None
         self._bar_buttons: dict[str, QPushButton] = {}
@@ -905,12 +969,14 @@ class InstrumentKlineDialog(QDialog):
         underlying_usdt_price: Decimal | None = None,
         underlying_usdt_basis: str = "",
         option_entry_price: Decimal | None = None,
+        time_markers: tuple[tuple[str, int], ...] = (),
     ) -> None:
         self._inst_id = inst_id.strip().upper()
         self._inst_type = inst_type.strip().upper()
         self._underlying_usdt_price = underlying_usdt_price if underlying_usdt_price is not None and underlying_usdt_price > 0 else None
         self._underlying_usdt_basis = underlying_usdt_basis.strip() if self._underlying_usdt_price is not None else ""
         self._option_entry_price = option_entry_price if option_entry_price is not None and option_entry_price > 0 else None
+        self._time_markers = tuple(time_markers)
         self._update_title()
         self._load_current_bar()
         self.show()
@@ -963,6 +1029,7 @@ class InstrumentKlineDialog(QDialog):
             inst_id=self._inst_id,
             inst_type=self._inst_type,
             bar=self._current_bar,
+            limit=_position_kline_candle_limit(self._current_bar, self._time_markers),
         )
         self._load_thread.loaded.connect(self._apply_loaded_candles)
         self._load_thread.failed.connect(self._apply_load_error)
@@ -990,6 +1057,7 @@ class InstrumentKlineDialog(QDialog):
             tooltip_close_usdt_rate=self._underlying_usdt_price if inst_type == "OPTION" else None,
             tooltip_close_usdt_basis=self._underlying_usdt_basis if inst_type == "OPTION" else "",
             tooltip_entry_price=self._option_entry_price if inst_type == "OPTION" else None,
+            time_markers=self._time_markers,
         )
         latest = candles[-1] if candles else None
         latest_text = ""
@@ -1083,7 +1151,20 @@ class LegacyOptionToolsHost:
         api_name: str,
     ) -> None:
         project_root = Path(__file__).resolve().parents[1]
-        command = [sys.executable, str(project_root / "main.py"), "--data-dir", str(data_root())]
+        command = [
+            sys.executable,
+            str(project_root / "main.py"),
+            "--data-dir",
+            str(data_root()),
+            "--option-roll-inst-id",
+            position.inst_id,
+            "--option-roll-pos-side",
+            position.pos_side,
+            "--option-roll-size",
+            str(position.position),
+            "--option-roll-profile",
+            api_name,
+        ]
         subprocess.Popen(command, cwd=str(project_root))
 
 
@@ -2151,6 +2232,7 @@ class AccountPositionsHomeWidget(QWidget):
 
     @Slot()
     def _refresh_position_history(self) -> None:
+        self._position_history_range_end_edit.setText(datetime.now().strftime("%Y%m%d"))
         if not self._ensure_runtime_ready(force_unlock=True):
             return
         self._start_position_history_refresh(force_restart=True)
@@ -3628,35 +3710,54 @@ class AccountPositionsHomeWidget(QWidget):
     def _open_option_roll_window(self) -> None:
         position = self._selected_option_for_shortcut()
         if position is None:
-            QMessageBox.information(self, "展期建议", "请先在当前持仓中选中一条期权持仓。")
+            QMessageBox.information(self, "\u5c55\u671f\u5efa\u8bae", "\u8bf7\u5148\u5728\u5f53\u524d\u6301\u4ed3\u4e2d\u9009\u4e2d\u4e00\u6761\u671f\u6743\u6301\u4ed3\u3002")
             return
         if not is_short_option_position(position):
-            QMessageBox.information(self, "展期建议", "展期建议第一版只支持期权卖出方向持仓。")
+            QMessageBox.information(self, "\u5c55\u671f\u5efa\u8bae", "\u5c55\u671f\u5efa\u8bae\u76ee\u524d\u4ec5\u652f\u6301\u671f\u6743\u5356\u51fa\u65b9\u5411\u6301\u4ed3\u3002")
             return
         instrument = self._position_instruments.get(position.inst_id)
         if instrument is None:
             try:
                 instrument = self._shared_client.get_instrument(position.inst_id)
             except Exception as exc:
-                QMessageBox.critical(self, "展期建议", f"读取合约信息失败：{exc}")
+                QMessageBox.critical(self, "\u5c55\u671f\u5efa\u8bae", f"\u8bfb\u53d6\u5408\u7ea6\u4fe1\u606f\u5931\u8d25\uff1a{exc}")
                 return
         ticker = self._position_tickers.get(position.inst_id)
         if ticker is None:
             try:
                 ticker = self._shared_client.get_ticker(position.inst_id)
             except Exception as exc:
-                QMessageBox.critical(self, "展期建议", f"读取行情失败：{exc}")
+                QMessageBox.critical(self, "\u5c55\u671f\u5efa\u8bae", f"\u8bfb\u53d6\u884c\u60c5\u5931\u8d25\uff1a{exc}")
                 return
-        try:
-            self._legacy_option_tools.open_option_roll(
-                position=position,
-                instrument=instrument,
-                ticker=ticker,
-                api_name=self._last_profile_name or "",
-            )
-        except Exception as exc:
-            QMessageBox.critical(self, "展期建议", f"打开展期建议失败：{exc}")
+        dialog = getattr(self, "_option_roll_dialog", None)
+        if dialog is not None:
+            dialog.close()
+        self._option_roll_dialog = OptionRollQtDialog(
+            client=self._shared_client,
+            position=position,
+            instrument=instrument,
+            ticker=ticker,
+            api_name=self._last_profile_name or "",
+            send_to_strategy=self._send_option_roll_to_strategy,
+            parent=self,
+        )
+        self._option_roll_dialog.destroyed.connect(lambda *_args: setattr(self, "_option_roll_dialog", None))
+        self._option_roll_dialog.show()
+        self._option_roll_dialog.raise_()
+        self._option_roll_dialog.activateWindow()
 
+    def _send_option_roll_to_strategy(self, payload: object) -> None:
+        from roll_terminal_qt.option_strategy_window import OptionStrategyQtWindow
+
+        window = getattr(self, "_option_strategy_window", None)
+        if window is None:
+            window = OptionStrategyQtWindow()
+            window.destroyed.connect(lambda *_args: setattr(self, "_option_strategy_window", None))
+            self._option_strategy_window = window
+        window.load_roll_transfer_payload(payload)
+        window.show()
+        window.raise_()
+        window.activateWindow()
     def edit_selected_position_note(self) -> None:
         position = self._selected_position()
         if position is None:
@@ -4536,7 +4637,7 @@ class AccountPositionsHomeWidget(QWidget):
             return
         self._open_position_kline(position)
 
-    def _open_position_kline(self, position: OkxPosition) -> None:
+    def _open_position_kline(self, position: OkxPosition, *, time_markers: tuple[tuple[str, int], ...] = ()) -> None:
         if self._instrument_kline_dialog is None:
             self._instrument_kline_dialog = InstrumentKlineDialog(
                 initial_bar=self._position_kline_last_bar,
@@ -4572,6 +4673,27 @@ class AccountPositionsHomeWidget(QWidget):
             underlying_usdt_price=underlying_usdt_price,
             underlying_usdt_basis=underlying_usdt_basis,
             option_entry_price=option_entry_price,
+            time_markers=time_markers,
+        )
+
+    @Slot(int, int)
+    def _on_position_history_table_clicked(self, row: int, column: int) -> None:
+        if column != 2 or row < 0 or row >= len(self._visible_position_history_items):
+            return
+        item = self._visible_position_history_items[row]
+        if not item.inst_id or not item.inst_type:
+            return
+        self._open_position_history_kline(item)
+
+    def _open_position_history_kline(self, item: OkxPositionHistoryItem) -> None:
+        self._open_position_kline(
+            SimpleNamespace(
+                inst_id=item.inst_id,
+                inst_type=item.inst_type,
+                avg_price=item.open_avg_price,
+                raw=item.raw,
+            ),
+            time_markers=_position_history_kline_time_markers(item),
         )
 
     def _on_position_kline_prefs_changed(self, bar: str, width: int, height: int) -> None:
@@ -4778,6 +4900,8 @@ class AccountPositionsHomeWidget(QWidget):
             ("时间", "来源", "类型", "合约", "状态", "方向", "委托类型", "委托价", "委托量", "已成交", "手续费", "TP/SL", "订单ID", "clOrdId"),
             stretch_columns={3, 11, 13},
         )
+        self._orders_table.setColumnWidth(8, 180)
+        self._orders_table.setColumnWidth(9, 180)
         layout.addWidget(self._orders_table, 1)
         return tab
 
@@ -5004,6 +5128,7 @@ class AccountPositionsHomeWidget(QWidget):
             ("时间", "类型", "合约", "保证金模式", "持仓模式", "交易方向", "开仓均价", "平仓均价", "平仓数量", "手续费", "盈亏", "备注"),
             stretch_columns={2, 11},
         )
+        self._position_history_table.cellDoubleClicked.connect(self._on_position_history_table_clicked)
         self._position_history_table.setColumnWidth(0, 170)
         self._position_history_table.setColumnWidth(9, 220)
         self._position_history_table.setColumnWidth(10, 240)
@@ -5025,6 +5150,7 @@ class AccountPositionsHomeWidget(QWidget):
                 index,
                 QHeaderView.ResizeMode.Stretch if index in stretch_columns else QHeaderView.ResizeMode.Interactive,
             )
+        table.setColumnWidth(0, 180)
         return table
 
     def _start_private_threads(self, *, force_restart: bool = False, start_history: bool = True) -> None:
@@ -5183,6 +5309,24 @@ class AccountPositionsHomeWidget(QWidget):
             result.append(item)
         return result
 
+    def _format_current_order_size_with_coin(self, order: object, *, filled: bool) -> str:
+        instruments = dict(self._position_instruments)
+        inst_id = str(getattr(order, "inst_id", "") or "").strip()
+        inst_type = str(getattr(order, "inst_type", "") or "").upper()
+        if inst_id and inst_type in {"SWAP", "FUTURES", "OPTION"} and inst_id not in instruments:
+            cache = getattr(self, "_current_order_instruments", {})
+            instrument = cache.get(inst_id)
+            if instrument is None:
+                try:
+                    instrument = self._shared_client.get_instrument(inst_id)
+                except Exception:
+                    instrument = None
+                if instrument is not None:
+                    cache[inst_id] = instrument
+                    self._current_order_instruments = cache
+            if instrument is not None:
+                instruments[inst_id] = instrument
+        return _format_trade_order_size_with_coin(order, instruments, filled=filled)
     def _refresh_current_orders_table(self) -> None:
         if not hasattr(self, "_orders_table"):
             return
@@ -5212,8 +5356,8 @@ class AccountPositionsHomeWidget(QWidget):
                 _format_history_side(order.side or "-", order.pos_side or ""),
                 order.ord_type or "-",
                 _format_trade_order_price(order.price, order.inst_id, order.inst_type or ""),
-                _format_trade_order_size(order.size),
-                _format_trade_order_size(order.filled_size),
+                self._format_current_order_size_with_coin(order, filled=False),
+                self._format_current_order_size_with_coin(order, filled=True),
                 _format_trade_order_fee_cell(item),
                 _format_trade_order_tp_sl(item),
                 item.order_id or item.algo_id or "-",

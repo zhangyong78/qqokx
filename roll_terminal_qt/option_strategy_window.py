@@ -75,6 +75,7 @@ from okx_quant.option_strategy import (
     resolve_strategy_leg,
 )
 from okx_quant.persistence import load_option_strategies_snapshot, save_option_strategies_snapshot
+from okx_quant.option_roll import OptionRollTransferPayload
 from okx_quant.pricing import format_decimal, format_decimal_fixed
 from okx_quant.option_strategy_ui import (
     BAR_OPTIONS,
@@ -961,6 +962,7 @@ class CandlestickChartView(QChartView):
         self._tooltip_close_usdt_rate: Decimal | None = None
         self._tooltip_close_usdt_basis = ""
         self._tooltip_entry_price: Decimal | None = None
+        self._time_markers: tuple[tuple[str, int], ...] = ()
         self._hover_pos: QPointF | None = None
         self._value_min = 0.0
         self._value_max = 1.0
@@ -998,6 +1000,7 @@ class CandlestickChartView(QChartView):
         self._tooltip_close_usdt_rate = None
         self._tooltip_close_usdt_basis = ""
         self._tooltip_entry_price = None
+        self._time_markers = ()
         self._hover_pos = None
         self._pan_anchor_x = None
         self._linked_hover_index = None
@@ -1015,6 +1018,7 @@ class CandlestickChartView(QChartView):
         tooltip_close_usdt_rate: Decimal | None = None,
         tooltip_close_usdt_basis: str = "",
         tooltip_entry_price: Decimal | None = None,
+        time_markers: tuple[tuple[str, int], ...] = (),
     ) -> None:
         if not candles:
             self.show_message(title)
@@ -1026,6 +1030,11 @@ class CandlestickChartView(QChartView):
         self._hide_wicks = hide_wicks
         self._chart_title = title
         self._clear_chart_context()
+        self._time_markers = tuple(
+            (str(label).strip(), int(timestamp))
+            for label, timestamp in time_markers
+            if str(label).strip() and int(timestamp) > 0
+        )
         if tooltip_close_usdt_rate is not None and tooltip_close_usdt_rate > 0:
             self._tooltip_close_usdt_rate = tooltip_close_usdt_rate
             self._tooltip_close_usdt_basis = tooltip_close_usdt_basis.strip()
@@ -1145,6 +1154,7 @@ class CandlestickChartView(QChartView):
             tooltip_close_usdt_rate=self._tooltip_close_usdt_rate,
             tooltip_close_usdt_basis=self._tooltip_close_usdt_basis,
             tooltip_entry_price=self._tooltip_entry_price,
+            time_markers=self._time_markers,
         )
 
     def wheelEvent(self, event) -> None:  # type: ignore[override]
@@ -1249,13 +1259,15 @@ class CandlestickChartView(QChartView):
                 self._hide_hover_overlays()
                 return
             plot_area = self.chart().plotArea()
+            painter = QPainter(self.viewport())
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+            self._draw_time_markers(painter, plot_area)
             hover_context = self._resolve_hover_context(plot_area)
             if hover_context is None:
+                painter.end()
                 self._hide_hover_overlays()
                 return
             candle, snapped_x, hover_y, hover_value = hover_context
-            painter = QPainter(self.viewport())
-            painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
             painter.setClipping(False)
             cross_pen = QPen(QColor("#6e7781"), 1)
             cross_pen.setStyle(Qt.PenStyle.DashLine)
@@ -1308,6 +1320,31 @@ class CandlestickChartView(QChartView):
             traceback.print_exc()
             self._hide_hover_overlays()
             return
+
+    def _draw_time_markers(self, painter: QPainter, plot_area: QRectF) -> None:
+        if not self._time_markers or plot_area.isEmpty():
+            return
+        start_ts, end_ts = self._current_x_range()
+        visible_index = 0
+        for label, timestamp in self._time_markers:
+            if timestamp < start_ts or timestamp > end_ts:
+                continue
+            color = QColor("#0969da" if label == "开仓" else "#cf222e")
+            pen = QPen(color, 1)
+            pen.setStyle(Qt.PenStyle.DashLine)
+            painter.setPen(pen)
+            x = self._x_for_ts(timestamp, plot_area)
+            painter.drawLine(QPointF(x, plot_area.top()), QPointF(x, plot_area.bottom()))
+            label_x = min(max(x + 6.0, plot_area.left() + 4.0), plot_area.right() - 116.0)
+            label_y = plot_area.top() + 6.0 + ((visible_index % 2) * 34.0)
+            label_text = f"{label}\n{QDateTime.fromMSecsSinceEpoch(timestamp).toString('yyyy-MM-dd HH:mm')}"
+            painter.setPen(color)
+            painter.drawText(
+                QRectF(label_x, label_y, 112.0, 32.0),
+                Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop,
+                label_text,
+            )
+            visible_index += 1
 
     def _nearest_candle_for_x(self, x: float, plot_area: QRectF) -> Candle | None:
         if not self._candles:
@@ -1744,6 +1781,7 @@ class OptionStrategyQtWindow(QMainWindow):
         self._overlay_chart_request_id = 0
         self._worker_threads: dict[str, QThread] = {}
         self._big_dialog: OptionStrategyBigChartDialog | None = None
+        self._chain_kline_dialog: Any | None = None
         self._overlay_triples: list[tuple[Candle, Candle, Candle]] = []
         self._overlay_combo_ccy = ""
         self._overlay_spot_inst_id = ""
@@ -1858,7 +1896,7 @@ class OptionStrategyQtWindow(QMainWindow):
 
         chain_panel = QWidget()
         chain_layout = QVBoxLayout(chain_panel)
-        self._chain_context_label = QLabel("选择一个行权价后，可把认购 / 认沽直接加入策略腿。")
+        self._chain_context_label = QLabel("点击认购 / 认沽标记可查看 K 线；选择一个行权价后，可直接加入策略腿。")
         self._chain_context_label.setWordWrap(True)
         chain_layout.addWidget(self._chain_context_label)
         self._chain_table = QTableWidget(0, 7)
@@ -1868,6 +1906,7 @@ class OptionStrategyQtWindow(QMainWindow):
         self._chain_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self._chain_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self._chain_table.itemSelectionChanged.connect(self._on_chain_selected)
+        self._chain_table.cellClicked.connect(self._on_chain_table_clicked)
         chain_layout.addWidget(self._chain_table, 1)
         chain_actions = QHBoxLayout()
         for text, option_type, side in (
@@ -2146,6 +2185,37 @@ class OptionStrategyQtWindow(QMainWindow):
         if row < 0 or row >= len(self._chain_rows):
             return None
         return self._chain_rows[row]
+
+    @staticmethod
+    def _chain_quote_for_clicked_column(chain_row: OptionChainRow, column: int) -> OptionQuote | None:
+        if column == 0:
+            return chain_row.call_quote
+        if column == 6:
+            return chain_row.put_quote
+        return None
+
+    @Slot(int, int)
+    def _on_chain_table_clicked(self, row: int, column: int) -> None:
+        if row < 0 or row >= len(self._chain_rows):
+            return
+        quote = self._chain_quote_for_clicked_column(self._chain_rows[row], column)
+        if quote is not None:
+            self._open_chain_quote_kline(quote)
+
+    def _open_chain_quote_kline(self, quote: OptionQuote) -> None:
+        from roll_terminal_qt.account_positions_home import InstrumentKlineDialog
+
+        if self._chain_kline_dialog is None:
+            self._chain_kline_dialog = InstrumentKlineDialog(parent=self)
+        underlying = quote.instrument.inst_id.split("-", 1)[0].strip().upper()
+        underlying_price = quote.index_price or self._current_underlying_price
+        basis = f"{underlying}-USDT {underlying_price}（打开图时）" if underlying_price is not None else ""
+        self._chain_kline_dialog.show_instrument(
+            inst_id=quote.instrument.inst_id,
+            inst_type="OPTION",
+            underlying_usdt_price=underlying_price,
+            underlying_usdt_basis=basis,
+        )
 
     def _selected_leg_index(self) -> int | None:
         row = self._legs_table.currentRow()
@@ -2927,6 +2997,32 @@ class OptionStrategyQtWindow(QMainWindow):
         except Exception:
             return None
         return spot_ticker.last or spot_ticker.bid or spot_ticker.ask
+
+    def load_roll_transfer_payload(self, payload: object) -> None:
+        if not isinstance(payload, OptionRollTransferPayload):
+            raise ValueError("\u5c55\u671f\u7b56\u7565\u8f7d\u8377\u65e0\u6548\u3002")
+        self.clear_legs()
+        self._legs = list(payload.legs)
+        self._instrument_map.update({item.inst_id: item for item in payload.instruments})
+        self._quotes_by_inst_id.update({item.instrument.inst_id: item for item in payload.quotes})
+        self._family_combo.setCurrentText(payload.option_family)
+        self._strategy_name_edit.setText(payload.strategy_name)
+        self._formula_edit.setText(build_default_formula(self._legs))
+        self._alias_counter = max(
+            (int(item.alias[1:]) for item in self._legs if item.alias.startswith("L") and item.alias[1:].isdigit()),
+            default=0,
+        )
+        self._current_underlying_price = next(
+            (item.index_price for item in payload.quotes if item.index_price is not None and item.index_price > 0),
+            None,
+        )
+        if self._current_underlying_price is None:
+            self._current_underlying_price = self._load_spot_reference_price_for_legs(self._legs)
+        self._refresh_leg_greeks()
+        self._render_legs()
+        self._refresh_strategy_summary()
+        self.refresh_charts()
+        self._status_label.setText(f"\u5df2\u8f7d\u5165\u5c55\u671f\u5efa\u8bae\uff1a{payload.strategy_name}")
 
     @Slot()
     def save_current_strategy(self) -> None:

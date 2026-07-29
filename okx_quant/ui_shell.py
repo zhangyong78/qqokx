@@ -8741,8 +8741,22 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
                 messagebox.showerror("打开失败", f"读取行情失败：{exc}", parent=self.root)
                 return
 
+        self._open_option_roll_dialog(
+            position=position,
+            instrument=instrument,
+            ticker=ticker,
+            api_name=self._current_credential_profile(),
+        )
+
+    def _open_option_roll_dialog(
+        self,
+        *,
+        position: OkxPosition,
+        instrument: Instrument,
+        ticker: OkxTicker,
+        api_name: str,
+    ) -> None:
         quote = _build_option_quote(instrument, ticker)
-        api_name = self._current_credential_profile()
 
         def _send_to_option_strategy(payload):
             if self._option_strategy_window is None or not self._option_strategy_window.window.winfo_exists():

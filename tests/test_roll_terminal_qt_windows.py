@@ -17,7 +17,7 @@ from PySide6.QtCharts import QCandlestickSeries, QCandlestickSet, QChart, QLineS
 from PySide6.QtCore import QPointF, QThread, Qt
 from PySide6.QtWidgets import QDoubleSpinBox, QLabel, QMessageBox, QPushButton, QSizePolicy, QSplitter, QTabWidget, QWidget
 from okx_quant.analysis import ChannelDetectionConfig
-from okx_quant.models import Candle
+from okx_quant.models import Candle, Instrument
 from okx_quant.arbitrage.models import ArbitrageTradeRuntime
 from okx_quant.kline_rr_trade import RRTradeLedgerEntry, RRTradeOrderLink, build_rr_trade_plan
 from okx_quant.okx_client import _candle_bar_ms
@@ -45,7 +45,8 @@ from roll_terminal_qt.line_trading_window import (
 from roll_terminal_qt.line_trading_core import LineAnnotation, RiskRewardAnnotation
 from roll_terminal_qt.profile_access import profile_requires_password
 from roll_terminal_qt.smart_order_window import _safe_text as smart_safe_text
-from roll_terminal_qt.option_strategy_window import CandlestickChartView
+from roll_terminal_qt.option_strategy_window import CandlestickChartView, OptionStrategyQtWindow
+from okx_quant.option_strategy import OptionChainRow, OptionQuote
 from roll_terminal_qt.perf_metrics import measure_ui_step
 from roll_terminal_qt.kline_account_drawer import AccountDrawerLoadThread
 from roll_terminal_qt.smart_order_window import (
@@ -112,6 +113,82 @@ from roll_terminal_qt.workspace_shell import LocalTaskCount
 
 
 class RollTerminalQtWindowHelperTests(QtWidgetTestCase):
+
+    def test_candlestick_chart_retains_time_markers_when_toggling_moving_averages(self) -> None:
+        chart = CandlestickChartView()
+        candles = [
+            Candle(1_752_210_000_000, Decimal("0.01"), Decimal("0.02"), Decimal("0.009"), Decimal("0.015"), Decimal("1"), True),
+            Candle(1_752_300_600_000, Decimal("0.015"), Decimal("0.021"), Decimal("0.014"), Decimal("0.018"), Decimal("1"), True),
+        ]
+        markers = (("开仓", 1_752_210_000_000), ("平仓", 1_752_300_600_000))
+        try:
+            chart.set_candles(title="测试", candles=candles, time_markers=markers)
+            chart.set_moving_averages_visible(True)
+
+            self.assertEqual(chart._time_markers, markers)
+        finally:
+            self.dispose_widget(chart)
+
+    def test_option_chain_mark_columns_resolve_the_matching_contract(self) -> None:
+        instrument_kwargs = {
+            "inst_type": "OPTION",
+            "tick_size": Decimal("0.0001"),
+            "lot_size": Decimal("1"),
+            "min_size": Decimal("1"),
+            "state": "live",
+        }
+        call = OptionQuote(instrument=Instrument(inst_id="BTC-USD-260728-62500-C", **instrument_kwargs))
+        put = OptionQuote(instrument=Instrument(inst_id="BTC-USD-260728-62500-P", **instrument_kwargs))
+        chain_row = OptionChainRow(strike=Decimal("62500"), call_quote=call, put_quote=put)
+
+        self.assertIs(OptionStrategyQtWindow._chain_quote_for_clicked_column(chain_row, 0), call)
+        self.assertIs(OptionStrategyQtWindow._chain_quote_for_clicked_column(chain_row, 6), put)
+        self.assertIsNone(OptionStrategyQtWindow._chain_quote_for_clicked_column(chain_row, 3))
+
+    def test_option_chain_mark_click_opens_the_matching_contract_chart(self) -> None:
+        call = OptionQuote(
+            instrument=Instrument(
+                inst_id="BTC-USD-260728-62500-C",
+                inst_type="OPTION",
+                tick_size=Decimal("0.0001"),
+                lot_size=Decimal("1"),
+                min_size=Decimal("1"),
+                state="live",
+            )
+        )
+        window = OptionStrategyQtWindow.__new__(OptionStrategyQtWindow)
+        window._chain_rows = [OptionChainRow(strike=Decimal("62500"), call_quote=call)]
+        window._open_chain_quote_kline = MagicMock()
+
+        window._on_chain_table_clicked(0, 0)
+
+        window._open_chain_quote_kline.assert_called_once_with(call)
+
+    def test_option_chain_chart_uses_the_position_kline_dialog(self) -> None:
+        quote = OptionQuote(
+            instrument=Instrument(
+                inst_id="BTC-USD-260728-62500-C",
+                inst_type="OPTION",
+                tick_size=Decimal("0.0001"),
+                lot_size=Decimal("1"),
+                min_size=Decimal("1"),
+                state="live",
+            )
+        )
+        window = OptionStrategyQtWindow.__new__(OptionStrategyQtWindow)
+        window._chain_kline_dialog = None
+        window._current_underlying_price = Decimal("62500")
+
+        with patch("roll_terminal_qt.account_positions_home.InstrumentKlineDialog") as dialog_type:
+            window._open_chain_quote_kline(quote)
+
+        dialog_type.assert_called_once_with(parent=window)
+        dialog_type.return_value.show_instrument.assert_called_once_with(
+            inst_id="BTC-USD-260728-62500-C",
+            inst_type="OPTION",
+            underlying_usdt_price=Decimal("62500"),
+            underlying_usdt_basis="BTC-USDT 62500（打开图时）",
+        )
 
     def test_near_doji_uses_thicker_body_outline(self) -> None:
         self.assertEqual(_candle_body_pen_width(64000.0, 64005.0, price_span=3000.0), 2)

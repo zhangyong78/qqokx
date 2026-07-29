@@ -8,6 +8,8 @@ from unittest.mock import MagicMock, patch
 
 from PySide6.QtWidgets import QHeaderView
 
+from tests.qt_test_case import QtWidgetTestCase
+import roll_terminal_qt.account_positions_home as account_positions_module
 from roll_terminal_qt.account_positions_home import (
     AccountPositionsHomeWidget,
     LegacyOptionToolsHost,
@@ -27,6 +29,55 @@ from roll_terminal_qt.shared_order_store import SharedOrderSnapshot
 
 
 class PositionDisplayForegroundColorsTest(TestCase):
+    def test_history_position_kline_markers_use_open_and_close_timestamps(self) -> None:
+        history_item = SimpleNamespace(
+            update_time=1_752_300_600_000,
+            raw={"cTime": "1752210000000", "uTime": "1752300600000"},
+        )
+
+        markers = account_positions_module._position_history_kline_time_markers(history_item)
+
+        self.assertEqual(markers, (("开仓", 1_752_210_000_000), ("平仓", 1_752_300_600_000)))
+
+    def test_history_kline_limit_covers_the_oldest_time_marker(self) -> None:
+        now_ms = 1_752_300_600_000
+        markers = (("开仓", now_ms - (300 * 60 * 60 * 1000)), ("平仓", now_ms))
+
+        limit = account_positions_module._position_kline_candle_limit("1H", markers, now_ms=now_ms)
+
+        self.assertEqual(limit, 332)
+
+    def test_history_position_contract_click_opens_matching_kline(self) -> None:
+        history_item = SimpleNamespace(inst_id="BTC-USD-260720-65000-C", inst_type="OPTION")
+        app = SimpleNamespace(
+            _visible_position_history_items=[history_item],
+            _open_position_history_kline=MagicMock(),
+        )
+
+        AccountPositionsHomeWidget._on_position_history_table_clicked(app, 0, 2)
+        AccountPositionsHomeWidget._on_position_history_table_clicked(app, 0, 1)
+
+        app._open_position_history_kline.assert_called_once_with(history_item)
+
+    def test_history_position_kline_uses_the_open_price_as_option_entry(self) -> None:
+        history_item = SimpleNamespace(
+            inst_id="BTC-USD-260720-65000-C",
+            inst_type="OPTION",
+            open_avg_price=Decimal("0.0012"),
+            update_time=1_752_300_600_000,
+            raw={"idxPx": "65000"},
+        )
+        app = SimpleNamespace(_open_position_kline=MagicMock())
+
+        AccountPositionsHomeWidget._open_position_history_kline(app, history_item)
+
+        opened_position = app._open_position_kline.call_args.args[0]
+        self.assertEqual(opened_position.inst_id, history_item.inst_id)
+        self.assertEqual(opened_position.inst_type, history_item.inst_type)
+        self.assertEqual(opened_position.avg_price, history_item.open_avg_price)
+        self.assertEqual(opened_position.raw, history_item.raw)
+        self.assertEqual(app._open_position_kline.call_args.kwargs["time_markers"], (("平仓", history_item.update_time),))
+
     def test_quotes_are_fixed_colors_and_market_value_follows_unrealized_pnl(self) -> None:
         positive = _position_display_foreground_colors(
             time_value_text="B 0.0200",
@@ -78,6 +129,20 @@ class PositionDisplayForegroundColorsTest(TestCase):
         self.assertNotIn("intrinsic_value", zero_or_missing)
         self.assertNotIn("bid_price", zero_or_missing)
         self.assertNotIn("ask_price", zero_or_missing)
+
+
+class AccountPositionsHistoryTabWiringTest(QtWidgetTestCase):
+    def test_active_history_table_click_is_wired_to_kline_handler(self) -> None:
+        with (
+            patch.object(AccountPositionsHomeWidget, "_start_private_threads"),
+            patch.object(AccountPositionsHomeWidget, "_on_position_history_table_clicked") as handler,
+        ):
+            widget = AccountPositionsHomeWidget()
+            try:
+                widget._position_history_table.cellClicked.emit(0, 2)
+                handler.assert_called_once_with(0, 2)
+            finally:
+                self.dispose_widget(widget)
 
 
 class _ThreadRetireStub:
