@@ -161,6 +161,29 @@ class EmailNotifier:
         }.get(normalized, side)
 
     @staticmethod
+    def _position_direction_from_trade_side(side: str, *, closing: bool) -> str:
+        normalized = (side or "").strip().lower()
+        if closing:
+            return {"sell": "做多", "buy": "做空"}.get(normalized, "")
+        return {"buy": "做多", "sell": "做空"}.get(normalized, "")
+
+    @staticmethod
+    def _trade_event_label(text: str, *, closing: bool) -> str:
+        if not closing:
+            return "开仓"
+        normalized = (text or "").strip()
+        if "止损" in normalized:
+            return "平仓-止损"
+        if "止盈" in normalized:
+            return "平仓-止盈"
+        return "平仓"
+
+    @staticmethod
+    def _trade_title_is_close(title: str) -> bool:
+        normalized = (title or "").strip()
+        return any(marker in normalized for marker in ("平仓", "止损", "止盈", "离场"))
+
+    @staticmethod
     def _format_signal_entry_reference(entry_reference: str, trigger_symbol: str) -> str:
         raw = str(entry_reference or "").strip()
         if not raw:
@@ -243,8 +266,11 @@ class EmailNotifier:
     ) -> None:
         if not self._kind_enabled("trade_fill"):
             return
+        closing = self._trade_title_is_close(title)
+        direction = self._position_direction_from_trade_side(side, closing=closing)
+        event = self._trade_event_label(title, closing=closing)
         subject = self._subject_with_context(
-            f"[QQOKX] 成交通知 | {strategy_name} | {title} | {symbol}",
+            f"[QQOKX] {strategy_name} | {direction or '-'} | {event} | {symbol}",
             api_name=api_name,
             session_id=session_id,
             trader_id=trader_id,
@@ -292,8 +318,10 @@ class EmailNotifier:
     ) -> None:
         if not self._kind_enabled("trade_fill"):
             return
+        direction = self._position_direction_from_trade_side(side, closing=True)
+        event = self._trade_event_label(trigger_reason, closing=True)
         subject = self._subject_with_context(
-            f"[QQOKX] 平仓通知 | {trigger_reason} | {symbol}",
+            f"[QQOKX] {strategy_name} | {direction or '-'} | {event} | {symbol}",
             api_name=api_name,
             session_id=session_id,
             trader_id=trader_id,

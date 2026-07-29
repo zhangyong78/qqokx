@@ -64,7 +64,7 @@ class EmailNotifierTest(TestCase):
 
         subject, body = notifier.notify_async.call_args.args
         self.assertIn("EMA 动态委托", subject)
-        self.assertIn("开仓成交", subject)
+        self.assertIn("做多 | 开仓", subject)
         self.assertIn("ETH-USDT-SWAP", subject)
         self.assertIn("API=moni", subject)
         self.assertIn("会话=S08", subject)
@@ -77,6 +77,27 @@ class EmailNotifierTest(TestCase):
         self.assertIn("运行模式：交易并下单", body)
         self.assertIn("K线周期：1H", body)
         self.assertIn("成交方向：买入", body)
+
+    def test_send_trade_fill_subject_marks_actual_long_open(self) -> None:
+        notifier = self._make_notifier()
+
+        notifier.send_trade_fill(
+            strategy_name="EMA 动态委托做多",
+            config=_make_strategy_config(),
+            title="开仓成交",
+            symbol="ETH-USDT-SWAP",
+            side="buy",
+            size="1",
+            price="2500",
+            reason="测试成交",
+            api_name="real",
+            session_id="S01",
+        )
+
+        subject, _ = notifier.notify_async.call_args.args
+        self.assertIn("EMA 动态委托做多 | 做多 | 开仓 | ETH-USDT-SWAP", subject)
+        self.assertIn("API=real", subject)
+        self.assertIn("会话=S01", subject)
 
     def test_send_signal_includes_session_and_rule_context(self) -> None:
         notifier = self._make_notifier()
@@ -205,12 +226,33 @@ class EmailNotifierTest(TestCase):
         )
 
         subject, body = notifier.notify_async.call_args.args
-        self.assertIn("平仓通知", subject)
-        self.assertIn("3R", subject)
+        self.assertIn("EMA 动态委托 | 做多 | 平仓 | ETH-USDT-SWAP", subject)
         self.assertIn("触发原因：3R", body)
         self.assertIn("开仓价格：2500", body)
         self.assertIn("平仓价格：2550", body)
         self.assertIn("本笔净盈亏：+50", body)
+
+    def test_send_trade_close_subject_marks_short_stop_loss(self) -> None:
+        notifier = self._make_notifier()
+
+        notifier.send_trade_close(
+            strategy_name="EMA 动态委托做空",
+            config=replace(_make_strategy_config(), signal_mode="short_only"),
+            symbol="DOGE-USDT-SWAP",
+            side="buy",
+            size="6770",
+            entry_price="0.07051",
+            exit_price="0.06992",
+            trigger_reason="止损",
+            detail="OKX 动态止损平仓",
+            api_name="ReapAi",
+            session_id="S236",
+        )
+
+        subject, _ = notifier.notify_async.call_args.args
+        self.assertIn("EMA 动态委托做空 | 做空 | 平仓-止损 | DOGE-USDT-SWAP", subject)
+        self.assertIn("API=ReapAi", subject)
+        self.assertIn("会话=S236", subject)
 
     def test_login_uses_sender_email_when_username_blank(self) -> None:
         notifier = EmailNotifier(
