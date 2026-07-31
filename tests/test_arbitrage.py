@@ -5,7 +5,7 @@ import unittest
 from decimal import Decimal
 import time
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from okx_quant.arbitrage.arbitrage_auto_open import ArbitrageAutoOpenService
 from okx_quant.arbitrage.arbitrage_auto_close import ArbitrageAutoCloseService, ArbitrageAutoCloseSession
@@ -3798,6 +3798,65 @@ class ArbitrageExecutorCloseTest(unittest.TestCase):
         self.assertEqual(request.current_derivative_qty, Decimal("890"))
         self.assertEqual(request.current_position_side, "short")
         self.assertGreater(request.spot_qty or Decimal("0"), Decimal("0"))
+
+
+class ArbitrageWindowAlertTest(unittest.TestCase):
+    @staticmethod
+    def _window_with_alert_settings(*, active_popup: object | None = None) -> ArbitrageWindow:
+        class _Value:
+            def __init__(self, value: object) -> None:
+                self._value = value
+
+            def get(self) -> object:
+                return self._value
+
+        window = object.__new__(ArbitrageWindow)
+        window.alert_enabled = _Value(True)
+        window.min_annual_threshold = _Value("5")
+        window.window = MagicMock()
+        window._alert_window = active_popup
+        return window
+
+    @staticmethod
+    def _qualifying_row() -> SimpleNamespace:
+        return SimpleNamespace(
+            base_ccy="BTC",
+            pair_kind_label="永续套利",
+            net_annual_pct=Decimal("8.2"),
+            basis_pct=Decimal("0.1234"),
+        )
+
+    def test_maybe_alert_skips_new_popup_while_existing_popup_is_open(self) -> None:
+        active_popup = MagicMock()
+        active_popup.winfo_exists.return_value = True
+        window = self._window_with_alert_settings(active_popup=active_popup)
+
+        with patch("okx_quant.arbitrage_ui.messagebox.showinfo") as showinfo:
+            window._maybe_alert([self._qualifying_row()])
+
+        showinfo.assert_not_called()
+
+    def test_maybe_alert_auto_closes_popup_and_allows_later_popup(self) -> None:
+        window = self._window_with_alert_settings()
+        first_popup = MagicMock()
+        second_popup = MagicMock()
+        first_popup.winfo_exists.return_value = True
+        second_popup.winfo_exists.return_value = True
+        scheduled: dict[int, object] = {}
+        first_popup.after.side_effect = lambda delay, callback: scheduled.__setitem__(delay, callback)
+
+        with patch("okx_quant.arbitrage_ui.Toplevel", side_effect=[first_popup, second_popup]) as popup_type, patch(
+            "okx_quant.arbitrage_ui.messagebox.showinfo"
+        ), patch("okx_quant.arbitrage_ui.ttk.Label"), patch("okx_quant.arbitrage_ui.ttk.Button"):
+            window._maybe_alert([self._qualifying_row()])
+            self.assertIs(window._alert_window, first_popup)
+            scheduled[10_000]()
+            self.assertIsNone(window._alert_window)
+            window._maybe_alert([self._qualifying_row()])
+
+        first_popup.destroy.assert_called_once()
+        self.assertIs(window._alert_window, second_popup)
+        self.assertEqual(popup_type.call_count, 2)
 
 
 class ArbitrageWindowLedgerReloadTest(unittest.TestCase):

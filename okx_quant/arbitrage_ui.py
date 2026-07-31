@@ -46,6 +46,7 @@ from okx_quant.window_layout import apply_adaptive_window_geometry, apply_window
 Logger = Callable[[str], None]
 RuntimeConfigProvider = Callable[[], ArbitrageTradeRuntime | None]
 REFRESH_INTERVAL_MS = 5000
+ALERT_DISMISS_MS = 10_000
 MONITOR_UI_REFRESH_MS = 1000
 PAIR_CLOSE_MONITOR_POLL_SECONDS = 2.0
 PUBLIC_WS_MONITOR_WAIT_SLICE_SECONDS = 0.5
@@ -706,6 +707,7 @@ class ArbitrageWindow:
         self._unlocked_api_profiles: set[str] = set()
         self._scan_thread: threading.Thread | None = None
         self._scan_busy = False
+        self._alert_window: Toplevel | None = None
         self._refresh_job: str | None = None
         self._monitor_job: str | None = None
         self._market_panel_job: str | None = None
@@ -3012,17 +3014,35 @@ class ArbitrageWindow:
         except InvalidOperation:
             return
         best = rows[0]
-        if best.net_annual_pct >= threshold:
-            messagebox.showinfo(
-                "套利机会提醒",
-                (
-                    f"{best.base_ccy} {best.pair_kind_label}\n"
-                    f"净年化：{format_decimal_fixed(best.net_annual_pct, 2)}%\n"
-                    f"基差：{format_decimal_fixed(best.basis_pct, 4)}%\n"
-                    f"可在「建仓/平仓」页一键带入参数。"
-                ),
-                parent=self.window,
-            )
+        if best.net_annual_pct < threshold or self._widget_exists(self._alert_window):
+            return
+
+        alert = Toplevel(self.window)
+        self._alert_window = alert
+        alert.title("套利机会提醒")
+        alert.transient(self.window)
+        alert.resizable(False, False)
+
+        def close_alert() -> None:
+            if self._alert_window is alert:
+                self._alert_window = None
+            if self._widget_exists(alert):
+                alert.destroy()
+
+        ttk.Label(
+            alert,
+            text=(
+                f"{best.base_ccy} {best.pair_kind_label}\n"
+                f"净年化：{format_decimal_fixed(best.net_annual_pct, 2)}%\n"
+                f"基差：{format_decimal_fixed(best.basis_pct, 4)}%\n"
+                "可在「建仓/平仓」页一键带入参数。"
+            ),
+            justify="left",
+            padding=16,
+        ).pack()
+        ttk.Button(alert, text="关闭", command=close_alert).pack(pady=(0, 12))
+        alert.protocol("WM_DELETE_WINDOW", close_alert)
+        alert.after(ALERT_DISMISS_MS, close_alert)
 
     def _on_scan_select(self, _event=None) -> None:
         selected = self.scan_tree.selection()
