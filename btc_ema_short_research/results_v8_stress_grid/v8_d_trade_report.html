@@ -1,0 +1,918 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>V8 D Backtest Trade Report</title>
+  <style>
+    body { font-family: 'Segoe UI', sans-serif; margin: 32px auto; max-width: 1240px; color: #1f2937; background: #f6f3ee; line-height: 1.6; }
+    h1, h2, h3 { color: #111827; }
+    .card { background: #fffdf8; border: 1px solid #e7dccd; border-radius: 14px; padding: 20px 24px; margin: 18px 0; box-shadow: 0 10px 28px rgba(17,24,39,0.06); }
+    .hero { background: linear-gradient(135deg, #f4efe4 0%, #fffdf8 55%, #eef5f1 100%); }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 12px; }
+    .metric { background: #fff; border: 1px solid #eadfce; border-radius: 12px; padding: 14px; }
+    .label { font-size: 12px; color: #6b7280; text-transform: uppercase; letter-spacing: 0.04em; }
+    .value { font-size: 24px; font-weight: 700; margin-top: 6px; }
+    table { width: 100%; border-collapse: collapse; font-size: 14px; }
+    th, td { border: 1px solid #e7dccd; padding: 8px 10px; text-align: left; }
+    th { background: #f3ecdf; }
+    a { color: #0f766e; text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    .gallery { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 16px; }
+    .thumb { background: #fff; border: 1px solid #eadfce; border-radius: 12px; padding: 12px; }
+    .thumb img { width: 100%; height: auto; border-radius: 8px; display: block; }
+    .muted { color: #6b7280; font-size: 13px; }
+    code { background: #f3ecdf; padding: 2px 6px; border-radius: 6px; }
+  </style>
+</head>
+<body>
+  <section class="card hero">
+    <h1>V8 D 回测数据与交易 K 线图</h1>
+    <p>这页汇总的是 <code>v8_d_strong_1_5_weak_0_5</code> 的完整回测数据。交易图使用 <code>stress_cost_2_0x</code> 口径生成，因为这是更贴近实盘压力测试的版本；但同时也给出 <code>base_cost</code> 的完整明细 CSV。</p>
+    <div class="grid">
+      <div class="metric"><div class="label">数据源</div><div class="value">local_okx_candle_cache</div></div>
+      <div class="metric"><div class="label">标的</div><div class="value">BTC-USDT-SWAP</div></div>
+      <div class="metric"><div class="label">周期</div><div class="value">1D, 4H</div></div>
+      <div class="metric"><div class="label">交易笔数</div><div class="value">52</div></div>
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>文件下载</h2>
+    <ul>
+      <li><a href="v8_d_base_cost_trades.csv">v8_d_base_cost_trades.csv</a></li>
+      <li><a href="v8_d_stress_cost_2_0x_trades.csv">v8_d_stress_cost_2_0x_trades.csv</a></li>
+    </ul>
+  </section>
+
+  <section class="card">
+    <h2>回测摘要</h2>
+    <h3>base_cost</h3>
+    <table class="dataframe">
+  <thead>
+    <tr style="text-align: right;">
+      <th>trade_count</th>
+      <th>strong_trades</th>
+      <th>weak_trades</th>
+      <th>total_pnl_usdt</th>
+      <th>final_equity</th>
+      <th>profit_factor</th>
+      <th>win_rate</th>
+      <th>avg_R</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>52</td>
+      <td>30</td>
+      <td>22</td>
+      <td>5319.601159</td>
+      <td>105319.601159</td>
+      <td>1.955082</td>
+      <td>0.288462</td>
+      <td>0.134734</td>
+    </tr>
+  </tbody>
+</table>
+    <h3>stress_cost_2_0x</h3>
+    <table class="dataframe">
+  <thead>
+    <tr style="text-align: right;">
+      <th>trade_count</th>
+      <th>strong_trades</th>
+      <th>weak_trades</th>
+      <th>total_pnl_usdt</th>
+      <th>final_equity</th>
+      <th>profit_factor</th>
+      <th>win_rate</th>
+      <th>avg_R</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>52</td>
+      <td>30</td>
+      <td>22</td>
+      <td>4647.860864</td>
+      <td>104647.860864</td>
+      <td>1.77986</td>
+      <td>0.25</td>
+      <td>0.11222</td>
+    </tr>
+  </tbody>
+</table>
+  </section>
+
+  <section class="card">
+    <h2>stress_cost_2_0x 交易明细</h2>
+    <p class="muted">下面表格保留关键字段，完整字段请直接打开 CSV。</p>
+    <table class="dataframe">
+  <thead>
+    <tr style="text-align: right;">
+      <th>entry_time</th>
+      <th>exit_time</th>
+      <th>regime</th>
+      <th>risk_multiplier</th>
+      <th>risk_amount</th>
+      <th>entry_price</th>
+      <th>stop_loss_price</th>
+      <th>exit_price</th>
+      <th>R_multiple</th>
+      <th>pnl_usdt</th>
+      <th>exit_reason</th>
+      <th>equity_after</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>2021-05-21 16:00:00+00:00</td>
+      <td>2021-05-24 12:00:00+00:00</td>
+      <td>weak</td>
+      <td>0.5</td>
+      <td>250.00</td>
+      <td>36813.27</td>
+      <td>45355.070560</td>
+      <td>37600.03</td>
+      <td>-0.099</td>
+      <td>-24.77</td>
+      <td>close_above_ema21</td>
+      <td>99975.23</td>
+    </tr>
+    <tr>
+      <td>2021-12-16 16:00:00+00:00</td>
+      <td>2021-12-19 04:00:00+00:00</td>
+      <td>strong</td>
+      <td>1.5</td>
+      <td>749.81</td>
+      <td>48573.66</td>
+      <td>50624.559148</td>
+      <td>47731.18</td>
+      <td>0.373</td>
+      <td>279.85</td>
+      <td>close_above_ema21</td>
+      <td>100255.08</td>
+    </tr>
+    <tr>
+      <td>2021-12-31 20:00:00+00:00</td>
+      <td>2022-01-02 00:00:00+00:00</td>
+      <td>strong</td>
+      <td>1.5</td>
+      <td>751.91</td>
+      <td>45697.61</td>
+      <td>49557.171228</td>
+      <td>47742.29</td>
+      <td>-0.549</td>
+      <td>-412.90</td>
+      <td>close_above_ema21</td>
+      <td>99842.17</td>
+    </tr>
+    <tr>
+      <td>2022-01-03 16:00:00+00:00</td>
+      <td>2022-01-09 20:00:00+00:00</td>
+      <td>strong</td>
+      <td>1.5</td>
+      <td>748.82</td>
+      <td>46678.62</td>
+      <td>48792.702910</td>
+      <td>42698.97</td>
+      <td>1.849</td>
+      <td>1384.28</td>
+      <td>close_above_ema21</td>
+      <td>101226.45</td>
+    </tr>
+    <tr>
+      <td>2022-01-11 12:00:00+00:00</td>
+      <td>2022-01-11 20:00:00+00:00</td>
+      <td>weak</td>
+      <td>0.5</td>
+      <td>253.07</td>
+      <td>41803.27</td>
+      <td>43697.848285</td>
+      <td>42980.99</td>
+      <td>-0.657</td>
+      <td>-166.37</td>
+      <td>close_above_ema21</td>
+      <td>101060.08</td>
+    </tr>
+    <tr>
+      <td>2022-01-26 20:00:00+00:00</td>
+      <td>2022-01-28 00:00:00+00:00</td>
+      <td>strong</td>
+      <td>1.5</td>
+      <td>757.95</td>
+      <td>37559.27</td>
+      <td>40035.380621</td>
+      <td>37175.36</td>
+      <td>0.131</td>
+      <td>99.21</td>
+      <td>close_above_ema21</td>
+      <td>101159.30</td>
+    </tr>
+    <tr>
+      <td>2022-02-23 20:00:00+00:00</td>
+      <td>2022-02-25 00:00:00+00:00</td>
+      <td>strong</td>
+      <td>1.5</td>
+      <td>758.69</td>
+      <td>37603.05</td>
+      <td>40254.862425</td>
+      <td>38349.03</td>
+      <td>-0.304</td>
+      <td>-230.81</td>
+      <td>close_above_ema21</td>
+      <td>100928.48</td>
+    </tr>
+    <tr>
+      <td>2022-03-07 20:00:00+00:00</td>
+      <td>2022-03-08 12:00:00+00:00</td>
+      <td>strong</td>
+      <td>1.5</td>
+      <td>756.96</td>
+      <td>37290.48</td>
+      <td>40640.669026</td>
+      <td>39000.49</td>
+      <td>-0.529</td>
+      <td>-400.16</td>
+      <td>close_above_ema21</td>
+      <td>100528.32</td>
+    </tr>
+    <tr>
+      <td>2022-04-26 16:00:00+00:00</td>
+      <td>2022-04-28 04:00:00+00:00</td>
+      <td>weak</td>
+      <td>0.5</td>
+      <td>251.32</td>
+      <td>38534.78</td>
+      <td>41585.075114</td>
+      <td>39358.24</td>
+      <td>-0.290</td>
+      <td>-72.98</td>
+      <td>close_above_ema21</td>
+      <td>100455.34</td>
+    </tr>
+    <tr>
+      <td>2022-04-29 12:00:00+00:00</td>
+      <td>2022-05-02 04:00:00+00:00</td>
+      <td>strong</td>
+      <td>1.5</td>
+      <td>753.42</td>
+      <td>38736.50</td>
+      <td>41193.189769</td>
+      <td>38692.37</td>
+      <td>-0.007</td>
+      <td>-5.46</td>
+      <td>close_above_ema21</td>
+      <td>100449.88</td>
+    </tr>
+    <tr>
+      <td>2022-05-05 16:00:00+00:00</td>
+      <td>2022-05-13 04:00:00+00:00</td>
+      <td>weak</td>
+      <td>0.5</td>
+      <td>251.12</td>
+      <td>36885.24</td>
+      <td>40820.268603</td>
+      <td>30586.93</td>
+      <td>1.587</td>
+      <td>398.50</td>
+      <td>close_above_ema21</td>
+      <td>100848.38</td>
+    </tr>
+    <tr>
+      <td>2022-07-13 16:00:00+00:00</td>
+      <td>2022-07-14 00:00:00+00:00</td>
+      <td>weak</td>
+      <td>0.5</td>
+      <td>252.12</td>
+      <td>19448.32</td>
+      <td>20594.801727</td>
+      <td>20239.69</td>
+      <td>-0.718</td>
+      <td>-181.01</td>
+      <td>close_above_ema21</td>
+      <td>100667.36</td>
+    </tr>
+    <tr>
+      <td>2022-08-26 16:00:00+00:00</td>
+      <td>2022-08-30 00:00:00+00:00</td>
+      <td>weak</td>
+      <td>0.5</td>
+      <td>251.67</td>
+      <td>20769.89</td>
+      <td>22269.557154</td>
+      <td>20295.01</td>
+      <td>0.295</td>
+      <td>74.18</td>
+      <td>close_above_ema21</td>
+      <td>100741.54</td>
+    </tr>
+    <tr>
+      <td>2022-09-02 20:00:00+00:00</td>
+      <td>2022-09-05 00:00:00+00:00</td>
+      <td>strong</td>
+      <td>1.5</td>
+      <td>755.56</td>
+      <td>19901.84</td>
+      <td>20808.566761</td>
+      <td>20008.70</td>
+      <td>-0.153</td>
+      <td>-115.65</td>
+      <td>close_above_ema21</td>
+      <td>100625.89</td>
+    </tr>
+    <tr>
+      <td>2022-09-06 16:00:00+00:00</td>
+      <td>2022-09-08 20:00:00+00:00</td>
+      <td>weak</td>
+      <td>0.5</td>
+      <td>251.56</td>
+      <td>19814.67</td>
+      <td>20448.122403</td>
+      <td>19358.94</td>
+      <td>0.670</td>
+      <td>168.54</td>
+      <td>close_above_ema21</td>
+      <td>100794.43</td>
+    </tr>
+    <tr>
+      <td>2022-09-20 04:00:00+00:00</td>
+      <td>2022-09-22 12:00:00+00:00</td>
+      <td>strong</td>
+      <td>1.5</td>
+      <td>755.96</td>
+      <td>19351.26</td>
+      <td>20448.902480</td>
+      <td>19236.79</td>
+      <td>0.076</td>
+      <td>57.57</td>
+      <td>close_above_ema21</td>
+      <td>100852.00</td>
+    </tr>
+    <tr>
+      <td>2022-09-27 20:00:00+00:00</td>
+      <td>2022-09-28 16:00:00+00:00</td>
+      <td>weak</td>
+      <td>0.5</td>
+      <td>252.13</td>
+      <td>19070.67</td>
+      <td>20827.113138</td>
+      <td>19497.80</td>
+      <td>-0.261</td>
+      <td>-65.74</td>
+      <td>close_above_ema21</td>
+      <td>100786.26</td>
+    </tr>
+    <tr>
+      <td>2022-09-29 16:00:00+00:00</td>
+      <td>2022-09-29 20:00:00+00:00</td>
+      <td>strong</td>
+      <td>1.5</td>
+      <td>755.90</td>
+      <td>19282.28</td>
+      <td>20225.713264</td>
+      <td>19412.56</td>
+      <td>-0.171</td>
+      <td>-129.18</td>
+      <td>close_above_ema21</td>
+      <td>100657.08</td>
+    </tr>
+    <tr>
+      <td>2022-10-14 16:00:00+00:00</td>
+      <td>2022-10-16 20:00:00+00:00</td>
+      <td>strong</td>
+      <td>1.5</td>
+      <td>754.93</td>
+      <td>19354.16</td>
+      <td>20259.721320</td>
+      <td>19385.65</td>
+      <td>-0.069</td>
+      <td>-52.09</td>
+      <td>close_above_ema21</td>
+      <td>100604.98</td>
+    </tr>
+    <tr>
+      <td>2022-11-14 16:00:00+00:00</td>
+      <td>2022-11-15 04:00:00+00:00</td>
+      <td>weak</td>
+      <td>0.5</td>
+      <td>251.51</td>
+      <td>16593.26</td>
+      <td>17707.494949</td>
+      <td>16830.93</td>
+      <td>-0.237</td>
+      <td>-59.68</td>
+      <td>close_above_ema21</td>
+      <td>100545.30</td>
+    </tr>
+    <tr>
+      <td>2022-12-28 16:00:00+00:00</td>
+      <td>2023-01-01 20:00:00+00:00</td>
+      <td>strong</td>
+      <td>1.5</td>
+      <td>754.09</td>
+      <td>16571.67</td>
+      <td>17073.505639</td>
+      <td>16610.44</td>
+      <td>-0.130</td>
+      <td>-98.15</td>
+      <td>close_above_ema21</td>
+      <td>100447.15</td>
+    </tr>
+    <tr>
+      <td>2023-06-13 16:00:00+00:00</td>
+      <td>2023-06-14 04:00:00+00:00</td>
+      <td>strong</td>
+      <td>1.5</td>
+      <td>753.35</td>
+      <td>25750.50</td>
+      <td>26764.810969</td>
+      <td>25998.60</td>
+      <td>-0.285</td>
+      <td>-215.02</td>
+      <td>close_above_ema21</td>
+      <td>100232.13</td>
+    </tr>
+    <tr>
+      <td>2023-08-24 16:00:00+00:00</td>
+      <td>2023-08-27 16:00:00+00:00</td>
+      <td>weak</td>
+      <td>0.5</td>
+      <td>250.58</td>
+      <td>25994.50</td>
+      <td>27127.493753</td>
+      <td>26136.45</td>
+      <td>-0.162</td>
+      <td>-40.62</td>
+      <td>close_above_ema21</td>
+      <td>100191.51</td>
+    </tr>
+    <tr>
+      <td>2024-05-10 16:00:00+00:00</td>
+      <td>2024-05-13 00:00:00+00:00</td>
+      <td>strong</td>
+      <td>1.5</td>
+      <td>751.44</td>
+      <td>60895.73</td>
+      <td>64521.864649</td>
+      <td>61496.49</td>
+      <td>-0.193</td>
+      <td>-144.78</td>
+      <td>close_above_ema21</td>
+      <td>100046.73</td>
+    </tr>
+    <tr>
+      <td>2024-05-14 08:00:00+00:00</td>
+      <td>2024-05-15 04:00:00+00:00</td>
+      <td>weak</td>
+      <td>0.5</td>
+      <td>250.12</td>
+      <td>61998.59</td>
+      <td>64318.698936</td>
+      <td>61974.78</td>
+      <td>-0.032</td>
+      <td>-8.12</td>
+      <td>close_above_ema21</td>
+      <td>100038.60</td>
+    </tr>
+    <tr>
+      <td>2024-07-02 16:00:00+00:00</td>
+      <td>2024-07-06 20:00:00+00:00</td>
+      <td>strong</td>
+      <td>1.5</td>
+      <td>750.29</td>
+      <td>61933.72</td>
+      <td>64565.088445</td>
+      <td>57885.44</td>
+      <td>1.502</td>
+      <td>1126.96</td>
+      <td>close_above_ema21</td>
+      <td>101165.56</td>
+    </tr>
+    <tr>
+      <td>2024-07-10 16:00:00+00:00</td>
+      <td>2024-07-11 00:00:00+00:00</td>
+      <td>weak</td>
+      <td>0.5</td>
+      <td>252.91</td>
+      <td>57677.02</td>
+      <td>60578.031555</td>
+      <td>57747.79</td>
+      <td>-0.056</td>
+      <td>-14.22</td>
+      <td>close_above_ema21</td>
+      <td>101151.34</td>
+    </tr>
+    <tr>
+      <td>2024-07-11 16:00:00+00:00</td>
+      <td>2024-07-12 16:00:00+00:00</td>
+      <td>weak</td>
+      <td>0.5</td>
+      <td>252.88</td>
+      <td>57382.74</td>
+      <td>60805.286200</td>
+      <td>58229.38</td>
+      <td>-0.274</td>
+      <td>-69.39</td>
+      <td>close_above_ema21</td>
+      <td>101081.96</td>
+    </tr>
+    <tr>
+      <td>2024-08-29 20:00:00+00:00</td>
+      <td>2024-09-03 00:00:00+00:00</td>
+      <td>weak</td>
+      <td>0.5</td>
+      <td>252.70</td>
+      <td>59244.29</td>
+      <td>62329.437355</td>
+      <td>59170.56</td>
+      <td>-0.007</td>
+      <td>-1.72</td>
+      <td>close_above_ema21</td>
+      <td>101080.24</td>
+    </tr>
+    <tr>
+      <td>2024-09-05 04:00:00+00:00</td>
+      <td>2024-09-09 04:00:00+00:00</td>
+      <td>strong</td>
+      <td>1.5</td>
+      <td>758.10</td>
+      <td>57099.65</td>
+      <td>60374.555682</td>
+      <td>55141.95</td>
+      <td>0.570</td>
+      <td>432.40</td>
+      <td>close_above_ema21</td>
+      <td>101512.63</td>
+    </tr>
+    <tr>
+      <td>2025-02-24 16:00:00+00:00</td>
+      <td>2025-03-01 20:00:00+00:00</td>
+      <td>strong</td>
+      <td>1.5</td>
+      <td>761.34</td>
+      <td>94291.27</td>
+      <td>97594.428863</td>
+      <td>85514.99</td>
+      <td>2.613</td>
+      <td>1989.69</td>
+      <td>close_above_ema21</td>
+      <td>103502.32</td>
+    </tr>
+    <tr>
+      <td>2025-03-03 20:00:00+00:00</td>
+      <td>2025-03-04 20:00:00+00:00</td>
+      <td>strong</td>
+      <td>1.5</td>
+      <td>776.27</td>
+      <td>85552.57</td>
+      <td>97594.922289</td>
+      <td>88235.38</td>
+      <td>-0.234</td>
+      <td>-181.90</td>
+      <td>close_above_ema21</td>
+      <td>103320.42</td>
+    </tr>
+    <tr>
+      <td>2025-03-07 04:00:00+00:00</td>
+      <td>2025-03-07 12:00:00+00:00</td>
+      <td>strong</td>
+      <td>1.5</td>
+      <td>774.90</td>
+      <td>86954.60</td>
+      <td>95570.975301</td>
+      <td>89015.39</td>
+      <td>-0.256</td>
+      <td>-198.00</td>
+      <td>close_above_ema21</td>
+      <td>103122.43</td>
+    </tr>
+    <tr>
+      <td>2025-03-07 20:00:00+00:00</td>
+      <td>2025-03-11 20:00:00+00:00</td>
+      <td>strong</td>
+      <td>1.5</td>
+      <td>773.42</td>
+      <td>87796.87</td>
+      <td>95472.261445</td>
+      <td>83140.84</td>
+      <td>0.589</td>
+      <td>455.39</td>
+      <td>close_above_ema21</td>
+      <td>103577.82</td>
+    </tr>
+    <tr>
+      <td>2025-03-12 16:00:00+00:00</td>
+      <td>2025-03-12 20:00:00+00:00</td>
+      <td>weak</td>
+      <td>0.5</td>
+      <td>258.94</td>
+      <td>81696.91</td>
+      <td>86690.292836</td>
+      <td>82952.27</td>
+      <td>-0.278</td>
+      <td>-71.93</td>
+      <td>close_above_ema21</td>
+      <td>103505.89</td>
+    </tr>
+    <tr>
+      <td>2025-04-03 00:00:00+00:00</td>
+      <td>2025-04-04 08:00:00+00:00</td>
+      <td>weak</td>
+      <td>0.5</td>
+      <td>258.76</td>
+      <td>82480.49</td>
+      <td>90105.051413</td>
+      <td>84035.00</td>
+      <td>-0.221</td>
+      <td>-57.28</td>
+      <td>close_above_ema21</td>
+      <td>103448.61</td>
+    </tr>
+    <tr>
+      <td>2025-04-08 16:00:00+00:00</td>
+      <td>2025-04-09 20:00:00+00:00</td>
+      <td>weak</td>
+      <td>0.5</td>
+      <td>258.62</td>
+      <td>78468.60</td>
+      <td>83117.395076</td>
+      <td>82365.33</td>
+      <td>-0.866</td>
+      <td>-223.94</td>
+      <td>close_above_ema21</td>
+      <td>103224.67</td>
+    </tr>
+    <tr>
+      <td>2025-04-10 16:00:00+00:00</td>
+      <td>2025-04-11 04:00:00+00:00</td>
+      <td>strong</td>
+      <td>1.5</td>
+      <td>774.18</td>
+      <td>78736.49</td>
+      <td>85722.544338</td>
+      <td>80879.84</td>
+      <td>-0.325</td>
+      <td>-251.67</td>
+      <td>close_above_ema21</td>
+      <td>102972.99</td>
+    </tr>
+    <tr>
+      <td>2025-09-02 12:00:00+00:00</td>
+      <td>2025-09-02 16:00:00+00:00</td>
+      <td>weak</td>
+      <td>0.5</td>
+      <td>257.43</td>
+      <td>109664.82</td>
+      <td>111860.120654</td>
+      <td>110838.52</td>
+      <td>-0.615</td>
+      <td>-158.32</td>
+      <td>close_above_ema21</td>
+      <td>102814.67</td>
+    </tr>
+    <tr>
+      <td>2025-10-22 00:00:00+00:00</td>
+      <td>2025-10-23 08:00:00+00:00</td>
+      <td>weak</td>
+      <td>0.5</td>
+      <td>257.04</td>
+      <td>108199.80</td>
+      <td>115927.229489</td>
+      <td>109273.59</td>
+      <td>-0.161</td>
+      <td>-41.50</td>
+      <td>close_above_ema21</td>
+      <td>102773.17</td>
+    </tr>
+    <tr>
+      <td>2025-11-12 16:00:00+00:00</td>
+      <td>2025-11-13 08:00:00+00:00</td>
+      <td>strong</td>
+      <td>1.5</td>
+      <td>770.80</td>
+      <td>102082.35</td>
+      <td>108967.879392</td>
+      <td>103463.87</td>
+      <td>-0.225</td>
+      <td>-173.06</td>
+      <td>close_above_ema21</td>
+      <td>102600.11</td>
+    </tr>
+    <tr>
+      <td>2025-11-13 16:00:00+00:00</td>
+      <td>2025-11-23 16:00:00+00:00</td>
+      <td>weak</td>
+      <td>0.5</td>
+      <td>256.50</td>
+      <td>101281.57</td>
+      <td>106853.134173</td>
+      <td>87068.01</td>
+      <td>2.524</td>
+      <td>647.42</td>
+      <td>close_above_ema21</td>
+      <td>103247.53</td>
+    </tr>
+    <tr>
+      <td>2025-12-15 16:00:00+00:00</td>
+      <td>2025-12-18 16:00:00+00:00</td>
+      <td>strong</td>
+      <td>1.5</td>
+      <td>774.36</td>
+      <td>86949.61</td>
+      <td>91615.231644</td>
+      <td>88514.99</td>
+      <td>-0.366</td>
+      <td>-283.11</td>
+      <td>close_above_ema21</td>
+      <td>102964.42</td>
+    </tr>
+    <tr>
+      <td>2025-12-18 20:00:00+00:00</td>
+      <td>2025-12-19 08:00:00+00:00</td>
+      <td>strong</td>
+      <td>1.5</td>
+      <td>772.23</td>
+      <td>84399.23</td>
+      <td>91888.417806</td>
+      <td>87945.06</td>
+      <td>-0.492</td>
+      <td>-379.84</td>
+      <td>close_above_ema21</td>
+      <td>102584.58</td>
+    </tr>
+    <tr>
+      <td>2025-12-26 16:00:00+00:00</td>
+      <td>2025-12-28 00:00:00+00:00</td>
+      <td>strong</td>
+      <td>1.5</td>
+      <td>769.38</td>
+      <td>87059.96</td>
+      <td>90639.141968</td>
+      <td>87868.63</td>
+      <td>-0.265</td>
+      <td>-203.92</td>
+      <td>close_above_ema21</td>
+      <td>102380.67</td>
+    </tr>
+    <tr>
+      <td>2026-01-29 04:00:00+00:00</td>
+      <td>2026-02-07 04:00:00+00:00</td>
+      <td>strong</td>
+      <td>1.5</td>
+      <td>767.85</td>
+      <td>87974.80</td>
+      <td>91698.146487</td>
+      <td>70906.45</td>
+      <td>4.550</td>
+      <td>3493.74</td>
+      <td>close_above_ema21</td>
+      <td>105874.40</td>
+    </tr>
+    <tr>
+      <td>2026-02-07 08:00:00+00:00</td>
+      <td>2026-02-08 12:00:00+00:00</td>
+      <td>weak</td>
+      <td>0.5</td>
+      <td>264.69</td>
+      <td>68050.77</td>
+      <td>74282.787958</td>
+      <td>70981.18</td>
+      <td>-0.488</td>
+      <td>-129.18</td>
+      <td>close_above_ema21</td>
+      <td>105745.22</td>
+    </tr>
+    <tr>
+      <td>2026-02-27 12:00:00+00:00</td>
+      <td>2026-02-28 20:00:00+00:00</td>
+      <td>strong</td>
+      <td>1.5</td>
+      <td>793.09</td>
+      <td>66065.56</td>
+      <td>71360.928963</td>
+      <td>66348.73</td>
+      <td>-0.073</td>
+      <td>-58.28</td>
+      <td>close_above_ema21</td>
+      <td>105686.95</td>
+    </tr>
+    <tr>
+      <td>2026-03-01 20:00:00+00:00</td>
+      <td>2026-03-02 04:00:00+00:00</td>
+      <td>strong</td>
+      <td>1.5</td>
+      <td>792.65</td>
+      <td>65904.23</td>
+      <td>69518.819183</td>
+      <td>66819.42</td>
+      <td>-0.283</td>
+      <td>-223.98</td>
+      <td>close_above_ema21</td>
+      <td>105462.97</td>
+    </tr>
+    <tr>
+      <td>2026-03-30 20:00:00+00:00</td>
+      <td>2026-03-31 04:00:00+00:00</td>
+      <td>strong</td>
+      <td>1.5</td>
+      <td>790.97</td>
+      <td>66494.89</td>
+      <td>69158.796341</td>
+      <td>67710.87</td>
+      <td>-0.497</td>
+      <td>-392.93</td>
+      <td>close_above_ema21</td>
+      <td>105070.04</td>
+    </tr>
+    <tr>
+      <td>2026-03-31 12:00:00+00:00</td>
+      <td>2026-03-31 20:00:00+00:00</td>
+      <td>strong</td>
+      <td>1.5</td>
+      <td>788.03</td>
+      <td>66626.84</td>
+      <td>69415.684837</td>
+      <td>67835.52</td>
+      <td>-0.472</td>
+      <td>-371.93</td>
+      <td>close_above_ema21</td>
+      <td>104698.11</td>
+    </tr>
+    <tr>
+      <td>2026-04-02 04:00:00+00:00</td>
+      <td>2026-04-04 12:00:00+00:00</td>
+      <td>weak</td>
+      <td>0.5</td>
+      <td>261.75</td>
+      <td>66514.88</td>
+      <td>70415.289993</td>
+      <td>67156.75</td>
+      <td>-0.192</td>
+      <td>-50.25</td>
+      <td>close_above_ema21</td>
+      <td>104647.86</td>
+    </tr>
+  </tbody>
+</table>
+  </section>
+
+  <section class="card">
+    <h2>交易 K 线图</h2>
+    <p class="muted">每张图展示入场前后窗口、EMA21、EMA55、入场价、止损价、出场点。点击图片可打开原图。</p>
+    <div class="gallery">
+      <div class='thumb'><a href='trade_charts/v8_d_stress_cost_2_0x/01_20210521_1600_20210524_1200_-0.10R.png'><img src='trade_charts/v8_d_stress_cost_2_0x/01_20210521_1600_20210524_1200_-0.10R.png' alt='01_20210521_1600_20210524_1200_-0.10R.png'></a><div><strong>#1</strong> 2021-05-21 16:00 | R=-0.10 | weak</div><div class='muted'>exit=close_above_ema21 | pnl=-24.77 USDT</div></div>
+<div class='thumb'><a href='trade_charts/v8_d_stress_cost_2_0x/02_20211216_1600_20211219_0400_+0.37R.png'><img src='trade_charts/v8_d_stress_cost_2_0x/02_20211216_1600_20211219_0400_+0.37R.png' alt='02_20211216_1600_20211219_0400_+0.37R.png'></a><div><strong>#2</strong> 2021-12-16 16:00 | R=0.37 | strong</div><div class='muted'>exit=close_above_ema21 | pnl=279.85 USDT</div></div>
+<div class='thumb'><a href='trade_charts/v8_d_stress_cost_2_0x/03_20211231_2000_20220102_0000_-0.55R.png'><img src='trade_charts/v8_d_stress_cost_2_0x/03_20211231_2000_20220102_0000_-0.55R.png' alt='03_20211231_2000_20220102_0000_-0.55R.png'></a><div><strong>#3</strong> 2021-12-31 20:00 | R=-0.55 | strong</div><div class='muted'>exit=close_above_ema21 | pnl=-412.90 USDT</div></div>
+<div class='thumb'><a href='trade_charts/v8_d_stress_cost_2_0x/04_20220103_1600_20220109_2000_+1.85R.png'><img src='trade_charts/v8_d_stress_cost_2_0x/04_20220103_1600_20220109_2000_+1.85R.png' alt='04_20220103_1600_20220109_2000_+1.85R.png'></a><div><strong>#4</strong> 2022-01-03 16:00 | R=1.85 | strong</div><div class='muted'>exit=close_above_ema21 | pnl=1384.28 USDT</div></div>
+<div class='thumb'><a href='trade_charts/v8_d_stress_cost_2_0x/05_20220111_1200_20220111_2000_-0.66R.png'><img src='trade_charts/v8_d_stress_cost_2_0x/05_20220111_1200_20220111_2000_-0.66R.png' alt='05_20220111_1200_20220111_2000_-0.66R.png'></a><div><strong>#5</strong> 2022-01-11 12:00 | R=-0.66 | weak</div><div class='muted'>exit=close_above_ema21 | pnl=-166.37 USDT</div></div>
+<div class='thumb'><a href='trade_charts/v8_d_stress_cost_2_0x/06_20220126_2000_20220128_0000_+0.13R.png'><img src='trade_charts/v8_d_stress_cost_2_0x/06_20220126_2000_20220128_0000_+0.13R.png' alt='06_20220126_2000_20220128_0000_+0.13R.png'></a><div><strong>#6</strong> 2022-01-26 20:00 | R=0.13 | strong</div><div class='muted'>exit=close_above_ema21 | pnl=99.21 USDT</div></div>
+<div class='thumb'><a href='trade_charts/v8_d_stress_cost_2_0x/07_20220223_2000_20220225_0000_-0.30R.png'><img src='trade_charts/v8_d_stress_cost_2_0x/07_20220223_2000_20220225_0000_-0.30R.png' alt='07_20220223_2000_20220225_0000_-0.30R.png'></a><div><strong>#7</strong> 2022-02-23 20:00 | R=-0.30 | strong</div><div class='muted'>exit=close_above_ema21 | pnl=-230.81 USDT</div></div>
+<div class='thumb'><a href='trade_charts/v8_d_stress_cost_2_0x/08_20220307_2000_20220308_1200_-0.53R.png'><img src='trade_charts/v8_d_stress_cost_2_0x/08_20220307_2000_20220308_1200_-0.53R.png' alt='08_20220307_2000_20220308_1200_-0.53R.png'></a><div><strong>#8</strong> 2022-03-07 20:00 | R=-0.53 | strong</div><div class='muted'>exit=close_above_ema21 | pnl=-400.16 USDT</div></div>
+<div class='thumb'><a href='trade_charts/v8_d_stress_cost_2_0x/09_20220426_1600_20220428_0400_-0.29R.png'><img src='trade_charts/v8_d_stress_cost_2_0x/09_20220426_1600_20220428_0400_-0.29R.png' alt='09_20220426_1600_20220428_0400_-0.29R.png'></a><div><strong>#9</strong> 2022-04-26 16:00 | R=-0.29 | weak</div><div class='muted'>exit=close_above_ema21 | pnl=-72.98 USDT</div></div>
+<div class='thumb'><a href='trade_charts/v8_d_stress_cost_2_0x/10_20220429_1200_20220502_0400_-0.01R.png'><img src='trade_charts/v8_d_stress_cost_2_0x/10_20220429_1200_20220502_0400_-0.01R.png' alt='10_20220429_1200_20220502_0400_-0.01R.png'></a><div><strong>#10</strong> 2022-04-29 12:00 | R=-0.01 | strong</div><div class='muted'>exit=close_above_ema21 | pnl=-5.46 USDT</div></div>
+<div class='thumb'><a href='trade_charts/v8_d_stress_cost_2_0x/11_20220505_1600_20220513_0400_+1.59R.png'><img src='trade_charts/v8_d_stress_cost_2_0x/11_20220505_1600_20220513_0400_+1.59R.png' alt='11_20220505_1600_20220513_0400_+1.59R.png'></a><div><strong>#11</strong> 2022-05-05 16:00 | R=1.59 | weak</div><div class='muted'>exit=close_above_ema21 | pnl=398.50 USDT</div></div>
+<div class='thumb'><a href='trade_charts/v8_d_stress_cost_2_0x/12_20220713_1600_20220714_0000_-0.72R.png'><img src='trade_charts/v8_d_stress_cost_2_0x/12_20220713_1600_20220714_0000_-0.72R.png' alt='12_20220713_1600_20220714_0000_-0.72R.png'></a><div><strong>#12</strong> 2022-07-13 16:00 | R=-0.72 | weak</div><div class='muted'>exit=close_above_ema21 | pnl=-181.01 USDT</div></div>
+<div class='thumb'><a href='trade_charts/v8_d_stress_cost_2_0x/13_20220826_1600_20220830_0000_+0.29R.png'><img src='trade_charts/v8_d_stress_cost_2_0x/13_20220826_1600_20220830_0000_+0.29R.png' alt='13_20220826_1600_20220830_0000_+0.29R.png'></a><div><strong>#13</strong> 2022-08-26 16:00 | R=0.29 | weak</div><div class='muted'>exit=close_above_ema21 | pnl=74.18 USDT</div></div>
+<div class='thumb'><a href='trade_charts/v8_d_stress_cost_2_0x/14_20220902_2000_20220905_0000_-0.15R.png'><img src='trade_charts/v8_d_stress_cost_2_0x/14_20220902_2000_20220905_0000_-0.15R.png' alt='14_20220902_2000_20220905_0000_-0.15R.png'></a><div><strong>#14</strong> 2022-09-02 20:00 | R=-0.15 | strong</div><div class='muted'>exit=close_above_ema21 | pnl=-115.65 USDT</div></div>
+<div class='thumb'><a href='trade_charts/v8_d_stress_cost_2_0x/15_20220906_1600_20220908_2000_+0.67R.png'><img src='trade_charts/v8_d_stress_cost_2_0x/15_20220906_1600_20220908_2000_+0.67R.png' alt='15_20220906_1600_20220908_2000_+0.67R.png'></a><div><strong>#15</strong> 2022-09-06 16:00 | R=0.67 | weak</div><div class='muted'>exit=close_above_ema21 | pnl=168.54 USDT</div></div>
+<div class='thumb'><a href='trade_charts/v8_d_stress_cost_2_0x/16_20220920_0400_20220922_1200_+0.08R.png'><img src='trade_charts/v8_d_stress_cost_2_0x/16_20220920_0400_20220922_1200_+0.08R.png' alt='16_20220920_0400_20220922_1200_+0.08R.png'></a><div><strong>#16</strong> 2022-09-20 04:00 | R=0.08 | strong</div><div class='muted'>exit=close_above_ema21 | pnl=57.57 USDT</div></div>
+<div class='thumb'><a href='trade_charts/v8_d_stress_cost_2_0x/17_20220927_2000_20220928_1600_-0.26R.png'><img src='trade_charts/v8_d_stress_cost_2_0x/17_20220927_2000_20220928_1600_-0.26R.png' alt='17_20220927_2000_20220928_1600_-0.26R.png'></a><div><strong>#17</strong> 2022-09-27 20:00 | R=-0.26 | weak</div><div class='muted'>exit=close_above_ema21 | pnl=-65.74 USDT</div></div>
+<div class='thumb'><a href='trade_charts/v8_d_stress_cost_2_0x/18_20220929_1600_20220929_2000_-0.17R.png'><img src='trade_charts/v8_d_stress_cost_2_0x/18_20220929_1600_20220929_2000_-0.17R.png' alt='18_20220929_1600_20220929_2000_-0.17R.png'></a><div><strong>#18</strong> 2022-09-29 16:00 | R=-0.17 | strong</div><div class='muted'>exit=close_above_ema21 | pnl=-129.18 USDT</div></div>
+<div class='thumb'><a href='trade_charts/v8_d_stress_cost_2_0x/19_20221014_1600_20221016_2000_-0.07R.png'><img src='trade_charts/v8_d_stress_cost_2_0x/19_20221014_1600_20221016_2000_-0.07R.png' alt='19_20221014_1600_20221016_2000_-0.07R.png'></a><div><strong>#19</strong> 2022-10-14 16:00 | R=-0.07 | strong</div><div class='muted'>exit=close_above_ema21 | pnl=-52.09 USDT</div></div>
+<div class='thumb'><a href='trade_charts/v8_d_stress_cost_2_0x/20_20221114_1600_20221115_0400_-0.24R.png'><img src='trade_charts/v8_d_stress_cost_2_0x/20_20221114_1600_20221115_0400_-0.24R.png' alt='20_20221114_1600_20221115_0400_-0.24R.png'></a><div><strong>#20</strong> 2022-11-14 16:00 | R=-0.24 | weak</div><div class='muted'>exit=close_above_ema21 | pnl=-59.68 USDT</div></div>
+<div class='thumb'><a href='trade_charts/v8_d_stress_cost_2_0x/21_20221228_1600_20230101_2000_-0.13R.png'><img src='trade_charts/v8_d_stress_cost_2_0x/21_20221228_1600_20230101_2000_-0.13R.png' alt='21_20221228_1600_20230101_2000_-0.13R.png'></a><div><strong>#21</strong> 2022-12-28 16:00 | R=-0.13 | strong</div><div class='muted'>exit=close_above_ema21 | pnl=-98.15 USDT</div></div>
+<div class='thumb'><a href='trade_charts/v8_d_stress_cost_2_0x/22_20230613_1600_20230614_0400_-0.29R.png'><img src='trade_charts/v8_d_stress_cost_2_0x/22_20230613_1600_20230614_0400_-0.29R.png' alt='22_20230613_1600_20230614_0400_-0.29R.png'></a><div><strong>#22</strong> 2023-06-13 16:00 | R=-0.29 | strong</div><div class='muted'>exit=close_above_ema21 | pnl=-215.02 USDT</div></div>
+<div class='thumb'><a href='trade_charts/v8_d_stress_cost_2_0x/23_20230824_1600_20230827_1600_-0.16R.png'><img src='trade_charts/v8_d_stress_cost_2_0x/23_20230824_1600_20230827_1600_-0.16R.png' alt='23_20230824_1600_20230827_1600_-0.16R.png'></a><div><strong>#23</strong> 2023-08-24 16:00 | R=-0.16 | weak</div><div class='muted'>exit=close_above_ema21 | pnl=-40.62 USDT</div></div>
+<div class='thumb'><a href='trade_charts/v8_d_stress_cost_2_0x/24_20240510_1600_20240513_0000_-0.19R.png'><img src='trade_charts/v8_d_stress_cost_2_0x/24_20240510_1600_20240513_0000_-0.19R.png' alt='24_20240510_1600_20240513_0000_-0.19R.png'></a><div><strong>#24</strong> 2024-05-10 16:00 | R=-0.19 | strong</div><div class='muted'>exit=close_above_ema21 | pnl=-144.78 USDT</div></div>
+<div class='thumb'><a href='trade_charts/v8_d_stress_cost_2_0x/25_20240514_0800_20240515_0400_-0.03R.png'><img src='trade_charts/v8_d_stress_cost_2_0x/25_20240514_0800_20240515_0400_-0.03R.png' alt='25_20240514_0800_20240515_0400_-0.03R.png'></a><div><strong>#25</strong> 2024-05-14 08:00 | R=-0.03 | weak</div><div class='muted'>exit=close_above_ema21 | pnl=-8.12 USDT</div></div>
+<div class='thumb'><a href='trade_charts/v8_d_stress_cost_2_0x/26_20240702_1600_20240706_2000_+1.50R.png'><img src='trade_charts/v8_d_stress_cost_2_0x/26_20240702_1600_20240706_2000_+1.50R.png' alt='26_20240702_1600_20240706_2000_+1.50R.png'></a><div><strong>#26</strong> 2024-07-02 16:00 | R=1.50 | strong</div><div class='muted'>exit=close_above_ema21 | pnl=1126.96 USDT</div></div>
+<div class='thumb'><a href='trade_charts/v8_d_stress_cost_2_0x/27_20240710_1600_20240711_0000_-0.06R.png'><img src='trade_charts/v8_d_stress_cost_2_0x/27_20240710_1600_20240711_0000_-0.06R.png' alt='27_20240710_1600_20240711_0000_-0.06R.png'></a><div><strong>#27</strong> 2024-07-10 16:00 | R=-0.06 | weak</div><div class='muted'>exit=close_above_ema21 | pnl=-14.22 USDT</div></div>
+<div class='thumb'><a href='trade_charts/v8_d_stress_cost_2_0x/28_20240711_1600_20240712_1600_-0.27R.png'><img src='trade_charts/v8_d_stress_cost_2_0x/28_20240711_1600_20240712_1600_-0.27R.png' alt='28_20240711_1600_20240712_1600_-0.27R.png'></a><div><strong>#28</strong> 2024-07-11 16:00 | R=-0.27 | weak</div><div class='muted'>exit=close_above_ema21 | pnl=-69.39 USDT</div></div>
+<div class='thumb'><a href='trade_charts/v8_d_stress_cost_2_0x/29_20240829_2000_20240903_0000_-0.01R.png'><img src='trade_charts/v8_d_stress_cost_2_0x/29_20240829_2000_20240903_0000_-0.01R.png' alt='29_20240829_2000_20240903_0000_-0.01R.png'></a><div><strong>#29</strong> 2024-08-29 20:00 | R=-0.01 | weak</div><div class='muted'>exit=close_above_ema21 | pnl=-1.72 USDT</div></div>
+<div class='thumb'><a href='trade_charts/v8_d_stress_cost_2_0x/30_20240905_0400_20240909_0400_+0.57R.png'><img src='trade_charts/v8_d_stress_cost_2_0x/30_20240905_0400_20240909_0400_+0.57R.png' alt='30_20240905_0400_20240909_0400_+0.57R.png'></a><div><strong>#30</strong> 2024-09-05 04:00 | R=0.57 | strong</div><div class='muted'>exit=close_above_ema21 | pnl=432.40 USDT</div></div>
+<div class='thumb'><a href='trade_charts/v8_d_stress_cost_2_0x/31_20250224_1600_20250301_2000_+2.61R.png'><img src='trade_charts/v8_d_stress_cost_2_0x/31_20250224_1600_20250301_2000_+2.61R.png' alt='31_20250224_1600_20250301_2000_+2.61R.png'></a><div><strong>#31</strong> 2025-02-24 16:00 | R=2.61 | strong</div><div class='muted'>exit=close_above_ema21 | pnl=1989.69 USDT</div></div>
+<div class='thumb'><a href='trade_charts/v8_d_stress_cost_2_0x/32_20250303_2000_20250304_2000_-0.23R.png'><img src='trade_charts/v8_d_stress_cost_2_0x/32_20250303_2000_20250304_2000_-0.23R.png' alt='32_20250303_2000_20250304_2000_-0.23R.png'></a><div><strong>#32</strong> 2025-03-03 20:00 | R=-0.23 | strong</div><div class='muted'>exit=close_above_ema21 | pnl=-181.90 USDT</div></div>
+<div class='thumb'><a href='trade_charts/v8_d_stress_cost_2_0x/33_20250307_0400_20250307_1200_-0.26R.png'><img src='trade_charts/v8_d_stress_cost_2_0x/33_20250307_0400_20250307_1200_-0.26R.png' alt='33_20250307_0400_20250307_1200_-0.26R.png'></a><div><strong>#33</strong> 2025-03-07 04:00 | R=-0.26 | strong</div><div class='muted'>exit=close_above_ema21 | pnl=-198.00 USDT</div></div>
+<div class='thumb'><a href='trade_charts/v8_d_stress_cost_2_0x/34_20250307_2000_20250311_2000_+0.59R.png'><img src='trade_charts/v8_d_stress_cost_2_0x/34_20250307_2000_20250311_2000_+0.59R.png' alt='34_20250307_2000_20250311_2000_+0.59R.png'></a><div><strong>#34</strong> 2025-03-07 20:00 | R=0.59 | strong</div><div class='muted'>exit=close_above_ema21 | pnl=455.39 USDT</div></div>
+<div class='thumb'><a href='trade_charts/v8_d_stress_cost_2_0x/35_20250312_1600_20250312_2000_-0.28R.png'><img src='trade_charts/v8_d_stress_cost_2_0x/35_20250312_1600_20250312_2000_-0.28R.png' alt='35_20250312_1600_20250312_2000_-0.28R.png'></a><div><strong>#35</strong> 2025-03-12 16:00 | R=-0.28 | weak</div><div class='muted'>exit=close_above_ema21 | pnl=-71.93 USDT</div></div>
+<div class='thumb'><a href='trade_charts/v8_d_stress_cost_2_0x/36_20250403_0000_20250404_0800_-0.22R.png'><img src='trade_charts/v8_d_stress_cost_2_0x/36_20250403_0000_20250404_0800_-0.22R.png' alt='36_20250403_0000_20250404_0800_-0.22R.png'></a><div><strong>#36</strong> 2025-04-03 00:00 | R=-0.22 | weak</div><div class='muted'>exit=close_above_ema21 | pnl=-57.28 USDT</div></div>
+<div class='thumb'><a href='trade_charts/v8_d_stress_cost_2_0x/37_20250408_1600_20250409_2000_-0.87R.png'><img src='trade_charts/v8_d_stress_cost_2_0x/37_20250408_1600_20250409_2000_-0.87R.png' alt='37_20250408_1600_20250409_2000_-0.87R.png'></a><div><strong>#37</strong> 2025-04-08 16:00 | R=-0.87 | weak</div><div class='muted'>exit=close_above_ema21 | pnl=-223.94 USDT</div></div>
+<div class='thumb'><a href='trade_charts/v8_d_stress_cost_2_0x/38_20250410_1600_20250411_0400_-0.33R.png'><img src='trade_charts/v8_d_stress_cost_2_0x/38_20250410_1600_20250411_0400_-0.33R.png' alt='38_20250410_1600_20250411_0400_-0.33R.png'></a><div><strong>#38</strong> 2025-04-10 16:00 | R=-0.33 | strong</div><div class='muted'>exit=close_above_ema21 | pnl=-251.67 USDT</div></div>
+<div class='thumb'><a href='trade_charts/v8_d_stress_cost_2_0x/39_20250902_1200_20250902_1600_-0.61R.png'><img src='trade_charts/v8_d_stress_cost_2_0x/39_20250902_1200_20250902_1600_-0.61R.png' alt='39_20250902_1200_20250902_1600_-0.61R.png'></a><div><strong>#39</strong> 2025-09-02 12:00 | R=-0.61 | weak</div><div class='muted'>exit=close_above_ema21 | pnl=-158.32 USDT</div></div>
+<div class='thumb'><a href='trade_charts/v8_d_stress_cost_2_0x/40_20251022_0000_20251023_0800_-0.16R.png'><img src='trade_charts/v8_d_stress_cost_2_0x/40_20251022_0000_20251023_0800_-0.16R.png' alt='40_20251022_0000_20251023_0800_-0.16R.png'></a><div><strong>#40</strong> 2025-10-22 00:00 | R=-0.16 | weak</div><div class='muted'>exit=close_above_ema21 | pnl=-41.50 USDT</div></div>
+<div class='thumb'><a href='trade_charts/v8_d_stress_cost_2_0x/41_20251112_1600_20251113_0800_-0.22R.png'><img src='trade_charts/v8_d_stress_cost_2_0x/41_20251112_1600_20251113_0800_-0.22R.png' alt='41_20251112_1600_20251113_0800_-0.22R.png'></a><div><strong>#41</strong> 2025-11-12 16:00 | R=-0.22 | strong</div><div class='muted'>exit=close_above_ema21 | pnl=-173.06 USDT</div></div>
+<div class='thumb'><a href='trade_charts/v8_d_stress_cost_2_0x/42_20251113_1600_20251123_1600_+2.52R.png'><img src='trade_charts/v8_d_stress_cost_2_0x/42_20251113_1600_20251123_1600_+2.52R.png' alt='42_20251113_1600_20251123_1600_+2.52R.png'></a><div><strong>#42</strong> 2025-11-13 16:00 | R=2.52 | weak</div><div class='muted'>exit=close_above_ema21 | pnl=647.42 USDT</div></div>
+<div class='thumb'><a href='trade_charts/v8_d_stress_cost_2_0x/43_20251215_1600_20251218_1600_-0.37R.png'><img src='trade_charts/v8_d_stress_cost_2_0x/43_20251215_1600_20251218_1600_-0.37R.png' alt='43_20251215_1600_20251218_1600_-0.37R.png'></a><div><strong>#43</strong> 2025-12-15 16:00 | R=-0.37 | strong</div><div class='muted'>exit=close_above_ema21 | pnl=-283.11 USDT</div></div>
+<div class='thumb'><a href='trade_charts/v8_d_stress_cost_2_0x/44_20251218_2000_20251219_0800_-0.49R.png'><img src='trade_charts/v8_d_stress_cost_2_0x/44_20251218_2000_20251219_0800_-0.49R.png' alt='44_20251218_2000_20251219_0800_-0.49R.png'></a><div><strong>#44</strong> 2025-12-18 20:00 | R=-0.49 | strong</div><div class='muted'>exit=close_above_ema21 | pnl=-379.84 USDT</div></div>
+<div class='thumb'><a href='trade_charts/v8_d_stress_cost_2_0x/45_20251226_1600_20251228_0000_-0.27R.png'><img src='trade_charts/v8_d_stress_cost_2_0x/45_20251226_1600_20251228_0000_-0.27R.png' alt='45_20251226_1600_20251228_0000_-0.27R.png'></a><div><strong>#45</strong> 2025-12-26 16:00 | R=-0.27 | strong</div><div class='muted'>exit=close_above_ema21 | pnl=-203.92 USDT</div></div>
+<div class='thumb'><a href='trade_charts/v8_d_stress_cost_2_0x/46_20260129_0400_20260207_0400_+4.55R.png'><img src='trade_charts/v8_d_stress_cost_2_0x/46_20260129_0400_20260207_0400_+4.55R.png' alt='46_20260129_0400_20260207_0400_+4.55R.png'></a><div><strong>#46</strong> 2026-01-29 04:00 | R=4.55 | strong</div><div class='muted'>exit=close_above_ema21 | pnl=3493.74 USDT</div></div>
+<div class='thumb'><a href='trade_charts/v8_d_stress_cost_2_0x/47_20260207_0800_20260208_1200_-0.49R.png'><img src='trade_charts/v8_d_stress_cost_2_0x/47_20260207_0800_20260208_1200_-0.49R.png' alt='47_20260207_0800_20260208_1200_-0.49R.png'></a><div><strong>#47</strong> 2026-02-07 08:00 | R=-0.49 | weak</div><div class='muted'>exit=close_above_ema21 | pnl=-129.18 USDT</div></div>
+<div class='thumb'><a href='trade_charts/v8_d_stress_cost_2_0x/48_20260227_1200_20260228_2000_-0.07R.png'><img src='trade_charts/v8_d_stress_cost_2_0x/48_20260227_1200_20260228_2000_-0.07R.png' alt='48_20260227_1200_20260228_2000_-0.07R.png'></a><div><strong>#48</strong> 2026-02-27 12:00 | R=-0.07 | strong</div><div class='muted'>exit=close_above_ema21 | pnl=-58.28 USDT</div></div>
+<div class='thumb'><a href='trade_charts/v8_d_stress_cost_2_0x/49_20260301_2000_20260302_0400_-0.28R.png'><img src='trade_charts/v8_d_stress_cost_2_0x/49_20260301_2000_20260302_0400_-0.28R.png' alt='49_20260301_2000_20260302_0400_-0.28R.png'></a><div><strong>#49</strong> 2026-03-01 20:00 | R=-0.28 | strong</div><div class='muted'>exit=close_above_ema21 | pnl=-223.98 USDT</div></div>
+<div class='thumb'><a href='trade_charts/v8_d_stress_cost_2_0x/50_20260330_2000_20260331_0400_-0.50R.png'><img src='trade_charts/v8_d_stress_cost_2_0x/50_20260330_2000_20260331_0400_-0.50R.png' alt='50_20260330_2000_20260331_0400_-0.50R.png'></a><div><strong>#50</strong> 2026-03-30 20:00 | R=-0.50 | strong</div><div class='muted'>exit=close_above_ema21 | pnl=-392.93 USDT</div></div>
+<div class='thumb'><a href='trade_charts/v8_d_stress_cost_2_0x/51_20260331_1200_20260331_2000_-0.47R.png'><img src='trade_charts/v8_d_stress_cost_2_0x/51_20260331_1200_20260331_2000_-0.47R.png' alt='51_20260331_1200_20260331_2000_-0.47R.png'></a><div><strong>#51</strong> 2026-03-31 12:00 | R=-0.47 | strong</div><div class='muted'>exit=close_above_ema21 | pnl=-371.93 USDT</div></div>
+<div class='thumb'><a href='trade_charts/v8_d_stress_cost_2_0x/52_20260402_0400_20260404_1200_-0.19R.png'><img src='trade_charts/v8_d_stress_cost_2_0x/52_20260402_0400_20260404_1200_-0.19R.png' alt='52_20260402_0400_20260404_1200_-0.19R.png'></a><div><strong>#52</strong> 2026-04-02 04:00 | R=-0.19 | weak</div><div class='muted'>exit=close_above_ema21 | pnl=-50.25 USDT</div></div>
+    </div>
+  </section>
+</body>
+</html>

@@ -1,0 +1,15 @@
+{
+  "generated_at": "2026-06-28T09:02:26",
+  "output_dir": "D:\\qqokx\\reports\\best_parameter_bundle_1h_standard_100u",
+  "report_html": "D:\\qqokx\\reports\\best_parameter_bundle_1h_standard_100u\\report.html",
+  "trades_csv": "D:\\qqokx\\reports\\best_parameter_bundle_1h_standard_100u\\trades.csv",
+  "summary_csv": "D:\\qqokx\\reports\\best_parameter_bundle_1h_standard_100u\\summary.csv",
+  "equity_curve_csv": "D:\\qqokx\\reports\\best_parameter_bundle_1h_standard_100u\\equity_curve.csv",
+  "monthly_returns_csv": "D:\\qqokx\\reports\\best_parameter_bundle_1h_standard_100u\\monthly_returns.csv",
+  "yearly_returns_csv": "D:\\qqokx\\reports\\best_parameter_bundle_1h_standard_100u\\yearly_returns.csv",
+  "monthly_breakdown_csv": "D:\\qqokx\\reports\\best_parameter_bundle_1h_standard_100u\\monthly_side_coin_breakdown.csv",
+  "yearly_breakdown_csv": "D:\\qqokx\\reports\\best_parameter_bundle_1h_standard_100u\\yearly_side_coin_breakdown.csv",
+  "initial_capital": "10000",
+  "risk_amount": "100",
+  "constraints_enabled": false
+}

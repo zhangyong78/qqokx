@@ -1,0 +1,702 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>V11 Trade Sequence Guardrail Report</title>
+  <style>
+body { font-family: 'Segoe UI', sans-serif; margin: 32px auto; max-width: 1100px; color: #1f2937; background: #f7f4ed; line-height: 1.6; }
+h1, h2, h3 { color: #111827; }
+.card { background: #fffdf8; border: 1px solid #e5dccb; border-radius: 14px; padding: 20px 24px; margin: 18px 0; box-shadow: 0 8px 24px rgba(17,24,39,0.06); }
+.hero { background: linear-gradient(135deg, #f4efe4 0%, #fffdf8 60%, #eef5f1 100%); }
+.metric-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; margin-top: 16px; }
+.metric { background: #fff; border: 1px solid #e8dfd1; border-radius: 12px; padding: 14px; }
+.metric-label { font-size: 12px; color: #6b7280; text-transform: uppercase; letter-spacing: 0.04em; }
+.metric-value { font-size: 24px; font-weight: 700; margin-top: 6px; color: #111827; }
+table { width: 100%; border-collapse: collapse; font-size: 14px; }
+th, td { border: 1px solid #e5dccb; padding: 8px 10px; text-align: left; }
+th { background: #f3ecdf; }
+ul { margin: 0; padding-left: 20px; }
+.yes { color: #0f766e; font-weight: 700; }
+.no { color: #b45309; font-weight: 700; }
+code { background: #f3ecdf; padding: 2px 6px; border-radius: 6px; }
+</style>
+</head>
+<body>
+  <section class="card hero">
+    <h1>V11 研究结论</h1>
+    <p><span class="yes">这个方向有必要继续做</span>，而且现在已经有了第一轮直接数据。原因不是月度停手有效，而是 <code>V9</code> 和 <code>V10</code> 一起证明：真正的痛点在连续亏损簇，月度规则太慢。</p>
+    <div class="metric-grid">
+      <div class="metric"><div class="metric-label">当前推荐</div><div class="metric-value">v8_d_strong_1_5_weak_0_5__v11_c_after_4_losses_half</div></div>
+      <div class="metric"><div class="metric-label">最佳总收益</div><div class="metric-value">4.19%</div></div>
+      <div class="metric"><div class="metric-label">最佳 PF</div><div class="metric-value">1.79</div></div>
+      <div class="metric"><div class="metric-label">最佳回撤</div><div class="metric-value">-1.29%</div></div>
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>为什么这条线值得继续</h2>
+    <ul>
+      <li>V9 proved the pain was concentrated in loss clusters, not in whole months.</li><li>V10 proved monthly stop rules were too slow because they triggered late and skipped zero trades.</li><li>That made short-cycle guardrails the only remaining protection path worth testing.</li>
+    </ul>
+  </section>
+
+  <section class="card">
+    <h2>固定前提</h2>
+    <ul>
+      <li>数据源：local_okx_candle_cache</li>
+      <li>数据目录：D:\qqokx_data</li>
+      <li>标的：BTC-USDT-SWAP</li>
+      <li>周期：1D, 4H</li>
+      <li>成本场景：stress_cost_2_0x</li>
+    </ul>
+  </section>
+
+  <section class="card">
+    <h2>V11 全量结果</h2>
+    <table class="dataframe">
+  <thead>
+    <tr style="text-align: right;">
+      <th>strategy_name</th>
+      <th>start_date</th>
+      <th>end_date</th>
+      <th>initial_capital</th>
+      <th>final_equity</th>
+      <th>total_return</th>
+      <th>annual_return</th>
+      <th>max_drawdown</th>
+      <th>profit_factor</th>
+      <th>win_rate</th>
+      <th>trade_count</th>
+      <th>average_R</th>
+      <th>median_R</th>
+      <th>largest_win_R</th>
+      <th>largest_loss_R</th>
+      <th>average_holding_days</th>
+      <th>max_consecutive_losses</th>
+      <th>sharpe</th>
+      <th>sortino</th>
+      <th>calmar</th>
+      <th>schedule_name</th>
+      <th>loss_throttle_rule_name</th>
+      <th>cost_scenario_name</th>
+      <th>description</th>
+      <th>fee_rate</th>
+      <th>slippage_rate</th>
+      <th>score</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>v8_d_strong_1_5_weak_0_5__v11_c_after_4_losses_half</td>
+      <td>2019-12-16T04:00:00+00:00</td>
+      <td>2026-06-02T12:00:00+00:00</td>
+      <td>100000.0</td>
+      <td>104193.940328</td>
+      <td>0.041939</td>
+      <td>0.006379</td>
+      <td>-0.012867</td>
+      <td>1.792894</td>
+      <td>0.25</td>
+      <td>52</td>
+      <td>0.11222</td>
+      <td>-0.192329</td>
+      <td>4.549999</td>
+      <td>-0.865902</td>
+      <td>2.314103</td>
+      <td>9</td>
+      <td>0.152637</td>
+      <td>0.050055</td>
+      <td>0.495722</td>
+      <td>v8_d_strong_1_5_weak_0_5</td>
+      <td>v11_c_after_4_losses_half</td>
+      <td>stress_cost_2_0x</td>
+      <td>1.5x strong risk, half weak risk + After 4 consecutive losses, cut risk in half until the next winning trade.</td>
+      <td>0.0008</td>
+      <td>0.0004</td>
+      <td>4.904939</td>
+    </tr>
+    <tr>
+      <td>v8_d_strong_1_5_weak_0_5__v11_a_no_throttle</td>
+      <td>2019-12-16T04:00:00+00:00</td>
+      <td>2026-06-02T12:00:00+00:00</td>
+      <td>100000.0</td>
+      <td>104647.860864</td>
+      <td>0.046479</td>
+      <td>0.007056</td>
+      <td>-0.011735</td>
+      <td>1.779860</td>
+      <td>0.25</td>
+      <td>52</td>
+      <td>0.11222</td>
+      <td>-0.192329</td>
+      <td>4.549999</td>
+      <td>-0.865902</td>
+      <td>2.314103</td>
+      <td>9</td>
+      <td>0.162338</td>
+      <td>0.054484</td>
+      <td>0.601296</td>
+      <td>v8_d_strong_1_5_weak_0_5</td>
+      <td>v11_a_no_throttle</td>
+      <td>stress_cost_2_0x</td>
+      <td>1.5x strong risk, half weak risk + No sequence guardrail. Keep normal risk sizing.</td>
+      <td>0.0008</td>
+      <td>0.0004</td>
+      <td>4.884571</td>
+    </tr>
+    <tr>
+      <td>v8_c_strong_1_25_weak_0_5__v11_a_no_throttle</td>
+      <td>2019-12-16T04:00:00+00:00</td>
+      <td>2026-06-02T12:00:00+00:00</td>
+      <td>100000.0</td>
+      <td>103848.657212</td>
+      <td>0.038487</td>
+      <td>0.005862</td>
+      <td>-0.009942</td>
+      <td>1.742432</td>
+      <td>0.25</td>
+      <td>52</td>
+      <td>0.11222</td>
+      <td>-0.192329</td>
+      <td>4.549999</td>
+      <td>-0.865902</td>
+      <td>2.314103</td>
+      <td>9</td>
+      <td>0.160121</td>
+      <td>0.054590</td>
+      <td>0.589599</td>
+      <td>v8_c_strong_1_25_weak_0_5</td>
+      <td>v11_a_no_throttle</td>
+      <td>stress_cost_2_0x</td>
+      <td>1.25x strong risk, half weak risk + No sequence guardrail. Keep normal risk sizing.</td>
+      <td>0.0008</td>
+      <td>0.0004</td>
+      <td>4.792202</td>
+    </tr>
+    <tr>
+      <td>v8_c_strong_1_25_weak_0_5__v11_c_after_4_losses_half</td>
+      <td>2019-12-16T04:00:00+00:00</td>
+      <td>2026-06-02T12:00:00+00:00</td>
+      <td>100000.0</td>
+      <td>103409.195069</td>
+      <td>0.034092</td>
+      <td>0.005202</td>
+      <td>-0.010936</td>
+      <td>1.740588</td>
+      <td>0.25</td>
+      <td>52</td>
+      <td>0.11222</td>
+      <td>-0.192329</td>
+      <td>4.549999</td>
+      <td>-0.865902</td>
+      <td>2.314103</td>
+      <td>9</td>
+      <td>0.148434</td>
+      <td>0.048874</td>
+      <td>0.475662</td>
+      <td>v8_c_strong_1_25_weak_0_5</td>
+      <td>v11_c_after_4_losses_half</td>
+      <td>stress_cost_2_0x</td>
+      <td>1.25x strong risk, half weak risk + After 4 consecutive losses, cut risk in half until the next winning trade.</td>
+      <td>0.0008</td>
+      <td>0.0004</td>
+      <td>4.776350</td>
+    </tr>
+    <tr>
+      <td>v8_d_strong_1_5_weak_0_5__v11_b_after_3_losses_half</td>
+      <td>2019-12-16T04:00:00+00:00</td>
+      <td>2026-06-02T12:00:00+00:00</td>
+      <td>100000.0</td>
+      <td>102606.182450</td>
+      <td>0.026062</td>
+      <td>0.003990</td>
+      <td>-0.011661</td>
+      <td>1.529612</td>
+      <td>0.25</td>
+      <td>52</td>
+      <td>0.11222</td>
+      <td>-0.192329</td>
+      <td>4.549999</td>
+      <td>-0.865902</td>
+      <td>2.314103</td>
+      <td>9</td>
+      <td>0.129841</td>
+      <td>0.033458</td>
+      <td>0.342144</td>
+      <td>v8_d_strong_1_5_weak_0_5</td>
+      <td>v11_b_after_3_losses_half</td>
+      <td>stress_cost_2_0x</td>
+      <td>1.5x strong risk, half weak risk + After 3 consecutive losses, cut risk in half until the next winning trade.</td>
+      <td>0.0008</td>
+      <td>0.0004</td>
+      <td>4.234862</td>
+    </tr>
+    <tr>
+      <td>v8_a_flat_1_0__v11_a_no_throttle</td>
+      <td>2019-12-16T04:00:00+00:00</td>
+      <td>2026-06-02T12:00:00+00:00</td>
+      <td>100000.0</td>
+      <td>102898.975703</td>
+      <td>0.028990</td>
+      <td>0.004433</td>
+      <td>-0.013383</td>
+      <td>1.496799</td>
+      <td>0.25</td>
+      <td>52</td>
+      <td>0.11222</td>
+      <td>-0.192329</td>
+      <td>4.549999</td>
+      <td>-0.865902</td>
+      <td>2.314103</td>
+      <td>9</td>
+      <td>0.134608</td>
+      <td>0.039066</td>
+      <td>0.331210</td>
+      <td>v8_a_flat_1_0</td>
+      <td>v11_a_no_throttle</td>
+      <td>stress_cost_2_0x</td>
+      <td>Flat baseline risk on every trade + No sequence guardrail. Keep normal risk sizing.</td>
+      <td>0.0008</td>
+      <td>0.0004</td>
+      <td>4.146039</td>
+    </tr>
+    <tr>
+      <td>v8_c_strong_1_25_weak_0_5__v11_b_after_3_losses_half</td>
+      <td>2019-12-16T04:00:00+00:00</td>
+      <td>2026-06-02T12:00:00+00:00</td>
+      <td>100000.0</td>
+      <td>102093.296257</td>
+      <td>0.020933</td>
+      <td>0.003211</td>
+      <td>-0.009929</td>
+      <td>1.487362</td>
+      <td>0.25</td>
+      <td>52</td>
+      <td>0.11222</td>
+      <td>-0.192329</td>
+      <td>4.549999</td>
+      <td>-0.865902</td>
+      <td>2.314103</td>
+      <td>9</td>
+      <td>0.124312</td>
+      <td>0.032089</td>
+      <td>0.323433</td>
+      <td>v8_c_strong_1_25_weak_0_5</td>
+      <td>v11_b_after_3_losses_half</td>
+      <td>stress_cost_2_0x</td>
+      <td>1.25x strong risk, half weak risk + After 3 consecutive losses, cut risk in half until the next winning trade.</td>
+      <td>0.0008</td>
+      <td>0.0004</td>
+      <td>4.133400</td>
+    </tr>
+    <tr>
+      <td>v8_a_flat_1_0__v11_c_after_4_losses_half</td>
+      <td>2019-12-16T04:00:00+00:00</td>
+      <td>2026-06-02T12:00:00+00:00</td>
+      <td>100000.0</td>
+      <td>102104.485062</td>
+      <td>0.021045</td>
+      <td>0.003228</td>
+      <td>-0.010907</td>
+      <td>1.405998</td>
+      <td>0.25</td>
+      <td>52</td>
+      <td>0.11222</td>
+      <td>-0.192329</td>
+      <td>4.549999</td>
+      <td>-0.865902</td>
+      <td>2.314103</td>
+      <td>9</td>
+      <td>0.109000</td>
+      <td>0.028269</td>
+      <td>0.296001</td>
+      <td>v8_a_flat_1_0</td>
+      <td>v11_c_after_4_losses_half</td>
+      <td>stress_cost_2_0x</td>
+      <td>Flat baseline risk on every trade + After 4 consecutive losses, cut risk in half until the next winning trade.</td>
+      <td>0.0008</td>
+      <td>0.0004</td>
+      <td>3.924261</td>
+    </tr>
+    <tr>
+      <td>v8_d_strong_1_5_weak_0_5__v11_d_after_3_losses_quarter</td>
+      <td>2019-12-16T04:00:00+00:00</td>
+      <td>2026-06-02T12:00:00+00:00</td>
+      <td>100000.0</td>
+      <td>101587.333500</td>
+      <td>0.015873</td>
+      <td>0.002440</td>
+      <td>-0.011717</td>
+      <td>1.359952</td>
+      <td>0.25</td>
+      <td>52</td>
+      <td>0.11222</td>
+      <td>-0.192329</td>
+      <td>4.549999</td>
+      <td>-0.865902</td>
+      <td>2.314103</td>
+      <td>9</td>
+      <td>0.092257</td>
+      <td>0.019934</td>
+      <td>0.208267</td>
+      <td>v8_d_strong_1_5_weak_0_5</td>
+      <td>v11_d_after_3_losses_quarter</td>
+      <td>stress_cost_2_0x</td>
+      <td>1.5x strong risk, half weak risk + After 3 consecutive losses, cut risk to 25% until the next winning trade.</td>
+      <td>0.0008</td>
+      <td>0.0004</td>
+      <td>3.797978</td>
+    </tr>
+    <tr>
+      <td>v8_c_strong_1_25_weak_0_5__v11_d_after_3_losses_quarter</td>
+      <td>2019-12-16T04:00:00+00:00</td>
+      <td>2026-06-02T12:00:00+00:00</td>
+      <td>100000.0</td>
+      <td>101217.562555</td>
+      <td>0.012176</td>
+      <td>0.001875</td>
+      <td>-0.010156</td>
+      <td>1.315678</td>
+      <td>0.25</td>
+      <td>52</td>
+      <td>0.11222</td>
+      <td>-0.192329</td>
+      <td>4.549999</td>
+      <td>-0.865902</td>
+      <td>2.314103</td>
+      <td>9</td>
+      <td>0.084398</td>
+      <td>0.018113</td>
+      <td>0.184599</td>
+      <td>v8_c_strong_1_25_weak_0_5</td>
+      <td>v11_d_after_3_losses_quarter</td>
+      <td>stress_cost_2_0x</td>
+      <td>1.25x strong risk, half weak risk + After 3 consecutive losses, cut risk to 25% until the next winning trade.</td>
+      <td>0.0008</td>
+      <td>0.0004</td>
+      <td>3.692137</td>
+    </tr>
+    <tr>
+      <td>v8_a_flat_1_0__v11_b_after_3_losses_half</td>
+      <td>2019-12-16T04:00:00+00:00</td>
+      <td>2026-06-02T12:00:00+00:00</td>
+      <td>100000.0</td>
+      <td>101094.865040</td>
+      <td>0.010949</td>
+      <td>0.001687</td>
+      <td>-0.010102</td>
+      <td>1.223246</td>
+      <td>0.25</td>
+      <td>52</td>
+      <td>0.11222</td>
+      <td>-0.192329</td>
+      <td>4.549999</td>
+      <td>-0.865902</td>
+      <td>2.314103</td>
+      <td>9</td>
+      <td>0.074295</td>
+      <td>0.014983</td>
+      <td>0.166971</td>
+      <td>v8_a_flat_1_0</td>
+      <td>v11_b_after_3_losses_half</td>
+      <td>stress_cost_2_0x</td>
+      <td>Flat baseline risk on every trade + After 3 consecutive losses, cut risk in half until the next winning trade.</td>
+      <td>0.0008</td>
+      <td>0.0004</td>
+      <td>3.459878</td>
+    </tr>
+    <tr>
+      <td>v8_a_flat_1_0__v11_d_after_3_losses_quarter</td>
+      <td>2019-12-16T04:00:00+00:00</td>
+      <td>2026-06-02T12:00:00+00:00</td>
+      <td>100000.0</td>
+      <td>100197.006255</td>
+      <td>0.001970</td>
+      <td>0.000305</td>
+      <td>-0.010907</td>
+      <td>1.044319</td>
+      <td>0.25</td>
+      <td>52</td>
+      <td>0.11222</td>
+      <td>-0.192329</td>
+      <td>4.549999</td>
+      <td>-0.865902</td>
+      <td>2.314103</td>
+      <td>9</td>
+      <td>0.016946</td>
+      <td>0.002769</td>
+      <td>0.027932</td>
+      <td>v8_a_flat_1_0</td>
+      <td>v11_d_after_3_losses_quarter</td>
+      <td>stress_cost_2_0x</td>
+      <td>Flat baseline risk on every trade + After 3 consecutive losses, cut risk to 25% until the next winning trade.</td>
+      <td>0.0008</td>
+      <td>0.0004</td>
+      <td>2.996675</td>
+    </tr>
+  </tbody>
+</table>
+  </section>
+
+  <section class="card">
+    <h2>Guardrail 使用情况</h2>
+    <table class="dataframe">
+  <thead>
+    <tr style="text-align: right;">
+      <th>strategy_name</th>
+      <th>schedule_name</th>
+      <th>loss_throttle_rule_name</th>
+      <th>activation_count</th>
+      <th>reduced_risk_trade_count</th>
+      <th>reduced_risk_win_rate</th>
+      <th>average_effective_risk_multiplier</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>v8_a_flat_1_0__v11_a_no_throttle</td>
+      <td>v8_a_flat_1_0</td>
+      <td>v11_a_no_throttle</td>
+      <td>0</td>
+      <td>0</td>
+      <td>0.000000</td>
+      <td>1.000000</td>
+    </tr>
+    <tr>
+      <td>v8_a_flat_1_0__v11_b_after_3_losses_half</td>
+      <td>v8_a_flat_1_0</td>
+      <td>v11_b_after_3_losses_half</td>
+      <td>6</td>
+      <td>19</td>
+      <td>0.263158</td>
+      <td>0.817308</td>
+    </tr>
+    <tr>
+      <td>v8_a_flat_1_0__v11_c_after_4_losses_half</td>
+      <td>v8_a_flat_1_0</td>
+      <td>v11_c_after_4_losses_half</td>
+      <td>4</td>
+      <td>13</td>
+      <td>0.230769</td>
+      <td>0.875000</td>
+    </tr>
+    <tr>
+      <td>v8_a_flat_1_0__v11_d_after_3_losses_quarter</td>
+      <td>v8_a_flat_1_0</td>
+      <td>v11_d_after_3_losses_quarter</td>
+      <td>6</td>
+      <td>19</td>
+      <td>0.263158</td>
+      <td>0.725962</td>
+    </tr>
+    <tr>
+      <td>v8_c_strong_1_25_weak_0_5__v11_a_no_throttle</td>
+      <td>v8_c_strong_1_25_weak_0_5</td>
+      <td>v11_a_no_throttle</td>
+      <td>0</td>
+      <td>0</td>
+      <td>0.000000</td>
+      <td>0.932692</td>
+    </tr>
+    <tr>
+      <td>v8_c_strong_1_25_weak_0_5__v11_b_after_3_losses_half</td>
+      <td>v8_c_strong_1_25_weak_0_5</td>
+      <td>v11_b_after_3_losses_half</td>
+      <td>6</td>
+      <td>19</td>
+      <td>0.263158</td>
+      <td>0.762019</td>
+    </tr>
+    <tr>
+      <td>v8_c_strong_1_25_weak_0_5__v11_c_after_4_losses_half</td>
+      <td>v8_c_strong_1_25_weak_0_5</td>
+      <td>v11_c_after_4_losses_half</td>
+      <td>4</td>
+      <td>13</td>
+      <td>0.230769</td>
+      <td>0.826923</td>
+    </tr>
+    <tr>
+      <td>v8_c_strong_1_25_weak_0_5__v11_d_after_3_losses_quarter</td>
+      <td>v8_c_strong_1_25_weak_0_5</td>
+      <td>v11_d_after_3_losses_quarter</td>
+      <td>6</td>
+      <td>19</td>
+      <td>0.263158</td>
+      <td>0.676683</td>
+    </tr>
+    <tr>
+      <td>v8_d_strong_1_5_weak_0_5__v11_a_no_throttle</td>
+      <td>v8_d_strong_1_5_weak_0_5</td>
+      <td>v11_a_no_throttle</td>
+      <td>0</td>
+      <td>0</td>
+      <td>0.000000</td>
+      <td>1.076923</td>
+    </tr>
+    <tr>
+      <td>v8_d_strong_1_5_weak_0_5__v11_b_after_3_losses_half</td>
+      <td>v8_d_strong_1_5_weak_0_5</td>
+      <td>v11_b_after_3_losses_half</td>
+      <td>6</td>
+      <td>19</td>
+      <td>0.263158</td>
+      <td>0.879808</td>
+    </tr>
+    <tr>
+      <td>v8_d_strong_1_5_weak_0_5__v11_c_after_4_losses_half</td>
+      <td>v8_d_strong_1_5_weak_0_5</td>
+      <td>v11_c_after_4_losses_half</td>
+      <td>4</td>
+      <td>13</td>
+      <td>0.230769</td>
+      <td>0.956731</td>
+    </tr>
+    <tr>
+      <td>v8_d_strong_1_5_weak_0_5__v11_d_after_3_losses_quarter</td>
+      <td>v8_d_strong_1_5_weak_0_5</td>
+      <td>v11_d_after_3_losses_quarter</td>
+      <td>6</td>
+      <td>19</td>
+      <td>0.263158</td>
+      <td>0.781250</td>
+    </tr>
+  </tbody>
+</table>
+  </section>
+
+  <section class="card">
+    <h2>连续亏损压力</h2>
+    <table class="dataframe">
+  <thead>
+    <tr style="text-align: right;">
+      <th>strategy_name</th>
+      <th>trade_count</th>
+      <th>max_consecutive_losses</th>
+      <th>worst_consecutive_loss_sum</th>
+      <th>worst_3_trade_pnl</th>
+      <th>worst_5_trade_pnl</th>
+      <th>worst_10_trade_pnl</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>v8_a_flat_1_0__v11_a_no_throttle</td>
+      <td>52</td>
+      <td>9</td>
+      <td>-1369.001551</td>
+      <td>-918.804097</td>
+      <td>-1173.936653</td>
+      <td>-1318.993470</td>
+    </tr>
+    <tr>
+      <td>v8_a_flat_1_0__v11_b_after_3_losses_half</td>
+      <td>52</td>
+      <td>9</td>
+      <td>-1026.658566</td>
+      <td>-692.403395</td>
+      <td>-929.504828</td>
+      <td>-976.973496</td>
+    </tr>
+    <tr>
+      <td>v8_a_flat_1_0__v11_c_after_4_losses_half</td>
+      <td>52</td>
+      <td>9</td>
+      <td>-1109.386760</td>
+      <td>-758.543020</td>
+      <td>-1012.233286</td>
+      <td>-1059.661380</td>
+    </tr>
+    <tr>
+      <td>v8_a_flat_1_0__v11_d_after_3_losses_quarter</td>
+      <td>52</td>
+      <td>9</td>
+      <td>-856.834074</td>
+      <td>-690.155067</td>
+      <td>-829.079878</td>
+      <td>-971.473818</td>
+    </tr>
+    <tr>
+      <td>v8_c_strong_1_25_weak_0_5__v11_a_no_throttle</td>
+      <td>52</td>
+      <td>9</td>
+      <td>-1042.831725</td>
+      <td>-816.868414</td>
+      <td>-992.965242</td>
+      <td>-905.111079</td>
+    </tr>
+    <tr>
+      <td>v8_c_strong_1_25_weak_0_5__v11_b_after_3_losses_half</td>
+      <td>52</td>
+      <td>9</td>
+      <td>-714.362118</td>
+      <td>-714.362118</td>
+      <td>-681.188332</td>
+      <td>-945.238741</td>
+    </tr>
+    <tr>
+      <td>v8_c_strong_1_25_weak_0_5__v11_c_after_4_losses_half</td>
+      <td>52</td>
+      <td>9</td>
+      <td>-859.106398</td>
+      <td>-714.677082</td>
+      <td>-834.284627</td>
+      <td>-1049.823086</td>
+    </tr>
+    <tr>
+      <td>v8_c_strong_1_25_weak_0_5__v11_d_after_3_losses_quarter</td>
+      <td>52</td>
+      <td>9</td>
+      <td>-712.068576</td>
+      <td>-712.068576</td>
+      <td>-681.188332</td>
+      <td>-965.549313</td>
+    </tr>
+    <tr>
+      <td>v8_d_strong_1_5_weak_0_5__v11_a_no_throttle</td>
+      <td>52</td>
+      <td>9</td>
+      <td>-1226.543975</td>
+      <td>-988.834193</td>
+      <td>-1176.293726</td>
+      <td>-1125.219756</td>
+    </tr>
+    <tr>
+      <td>v8_d_strong_1_5_weak_0_5__v11_b_after_3_losses_half</td>
+      <td>52</td>
+      <td>9</td>
+      <td>-860.856860</td>
+      <td>-860.856860</td>
+      <td>-775.700632</td>
+      <td>-1128.154768</td>
+    </tr>
+    <tr>
+      <td>v8_d_strong_1_5_weak_0_5__v11_c_after_4_losses_half</td>
+      <td>52</td>
+      <td>9</td>
+      <td>-1009.061118</td>
+      <td>-861.362166</td>
+      <td>-984.050981</td>
+      <td>-1254.515962</td>
+    </tr>
+    <tr>
+      <td>v8_d_strong_1_5_weak_0_5__v11_d_after_3_losses_quarter</td>
+      <td>52</td>
+      <td>9</td>
+      <td>-857.853669</td>
+      <td>-857.853669</td>
+      <td>-771.113014</td>
+      <td>-1130.052519</td>
+    </tr>
+  </tbody>
+</table>
+  </section>
+
+  <section class="card">
+    <h2>一句话判断</h2>
+    <p>如果目标是继续优化实盘体验，<span class="yes">短节奏保护值得继续研究</span>。但是否值得正式保留，要看它能不能在不明显伤害收益的前提下，真正改善 <code>v8_d</code> 的亏损簇压力。</p>
+    <p>本轮基准参考 <code>v8_d + no throttle</code> 为：收益 4.65%，PF 1.78，回撤 -1.17%。</p>
+  </section>
+</body>
+</html>

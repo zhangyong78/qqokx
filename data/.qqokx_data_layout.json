@@ -1,0 +1,8 @@
+{
+  "layout_version": 1,
+  "data_root": "D:\\qqokx\\data",
+  "project_root": "D:\\qqokx",
+  "env_var": "QQOKX_DATA_DIR",
+  "default_data_dir_name": "qqokx_data",
+  "written_at": "2026-08-02T02:26:39Z"
+}

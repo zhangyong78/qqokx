@@ -1,0 +1,3 @@
+﻿strategy_name,test_window_count,positive_test_windows,pf_gt1_test_windows,median_test_return,median_test_profit_factor,worst_test_drawdown,median_test_trade_count
+v5_e_close_rsi_ema55,5,4,4,0.0059945089449642275,1.9192467598118874,-0.007873811720554125,5.0
+v5_a_baseline,5,4,4,0.008425262459741845,1.489885470944603,-0.012636734970622787,7.0

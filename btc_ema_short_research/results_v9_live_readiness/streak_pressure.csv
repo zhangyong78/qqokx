@@ -1,0 +1,6 @@
+﻿strategy_name,trade_count,max_consecutive_losses,worst_consecutive_loss_sum,worst_3_trade_pnl,worst_5_trade_pnl,worst_10_trade_pnl,schedule_name,cost_scenario_name,description
+v8_a_flat_1_0__base_cost,52,9,-1297.5442276115018,-878.8599003777716,-1118.7609687261643,-1229.4785050282842,v8_a_flat_1_0,base_cost,Flat baseline under original cost assumptions
+v8_a_flat_1_0__stress_cost_2_0x,52,9,-1369.0015507199773,-918.8040971164812,-1173.9366527982493,-1318.9934699168787,v8_a_flat_1_0,stress_cost_2_0x,Flat baseline under harsh cost assumptions
+v8_c_strong_1_25_weak_0_5__stress_cost_2_0x,52,9,-1042.8317250807715,-816.8684143926505,-992.9652416864287,-905.1110789509572,v8_c_strong_1_25_weak_0_5,stress_cost_2_0x,Moderate dynamic sizing under harsh cost assumptions
+v8_d_strong_1_5_weak_0_5__base_cost,52,9,-1153.2161980719916,-934.5232154662347,-1107.9077974286915,-1024.771837179911,v8_d_strong_1_5_weak_0_5,base_cost,Best dynamic sizing under original costs
+v8_d_strong_1_5_weak_0_5__stress_cost_2_0x,52,9,-1226.5439745914155,-988.8341932286995,-1176.2937262382163,-1125.2197556866572,v8_d_strong_1_5_weak_0_5,stress_cost_2_0x,Best dynamic sizing under harsh cost assumptions

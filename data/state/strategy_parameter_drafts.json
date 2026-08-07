@@ -1,0 +1,41 @@
+{
+  "launcher": {
+    "ema_dynamic_order_long": {
+      "bar": "1H",
+      "signal_mode": "只做多",
+      "ema_type": "EMA",
+      "ema_period": "21",
+      "trend_ema_type": "EMA",
+      "trend_ema_period": "55",
+      "atr_period": "10",
+      "atr_stop_multiplier": "1.5",
+      "atr_take_multiplier": "1.5",
+      "entry_reference_ema_period": "55",
+      "entry_reference_ema_type": "EMA",
+      "reentry_confirmation_enabled": true,
+      "reentry_confirmation_min_sequence": "3",
+      "reentry_confirmation_ma_period": "21",
+      "reentry_confirmation_ma_type": "EMA",
+      "take_profit_mode": "动态止盈",
+      "max_entries_per_trend": "3",
+      "dynamic_two_r_break_even": true,
+      "dynamic_protection_rules": "[{\"trigger_r\": 1, \"action\": \"break_even\", \"lock_r\": null, \"trail_mode\": \"none\", \"trail_every_r\": null, \"trail_add_r\": null}, {\"trigger_r\": 4, \"action\": \"lock_profit\", \"lock_r\": 1, \"trail_mode\": \"step\", \"trail_every_r\": 1, \"trail_add_r\": 1}, {\"trigger_r\": 11, \"action\": \"lock_profit\", \"lock_r\": 10, \"trail_mode\": \"step\", \"trail_every_r\": 1, \"trail_add_r\": 1}]",
+      "dynamic_break_even_trigger_r": "1",
+      "dynamic_fee_offset_enabled": true,
+      "ema55_slope_lock_profit_trigger_r": "4",
+      "dynamic_first_lock_r": "1",
+      "dynamic_trailing_step_r": "1",
+      "trend_ema_slope_filter_enabled": true,
+      "trend_ema_slope_filter_min_ratio": "0",
+      "time_stop_break_even_enabled": false,
+      "time_stop_break_even_bars": "0",
+      "trend_ema_close_exit_after_trigger_r_enabled": false,
+      "trend_ema_close_exit_after_trigger_r": "5",
+      "startup_chase_window_seconds": "0",
+      "startup_chase_current_signal": false
+    }
+  },
+  "backtest": {},
+  "observer": {},
+  "updated_at": "2026-08-01T16:28:07Z"
+}
