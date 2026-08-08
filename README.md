@@ -1,6 +1,6 @@
 ﻿# OKX 策略工作台
 
-当前版本：`v0.6.90`
+当前版本：`v0.6.91`
 
 一个面向 OKX 的桌面量化交易工作台，围绕策略运行、交易辅助、回测研究和分析导出构建，适合做策略验证、实盘辅助和研究沉淀。
 
@@ -29,7 +29,7 @@
 
 ## 近期更新
 
-`v0.6.90` 这一轮版本内容比较集中，重点新增和调整如下：
+`v0.6.91` 这一轮版本内容比较集中，重点新增和调整如下：
 
 - API 环境与策略环境的一致性防呆补齐：
   - 启动确认弹窗现在会同时显示 `API环境`、`策略环境` 和 `环境状态`
@@ -438,7 +438,7 @@ python main.py
 - [okx_quant/backtest_ui.py](/D:/qqokx/okx_quant/backtest_ui.py)：回测界面，当前已支持动态保护规则编辑、运行编号/归档编号区分、以及新的回测 K 线图交互
 - [okx_quant/backtest_audit.py](/D:/qqokx/okx_quant/backtest_audit.py)：回测审计导出，当前已改成流式 CSV 写出
 - [okx_quant/candle_store.py](/D:/qqokx/okx_quant/candle_store.py)：本地 K 线存储，当前已支持查询缓存根数与时间覆盖范围，以及过期未确认 K 线自动转确认
-- [okx_quant/strategy_symbol_defaults.py](/D:/qqokx/okx_quant/strategy_symbol_defaults.py)：分币种策略默认模板，当前已固化 `v0.6.90` 的多头/空头独立参数
+- [okx_quant/strategy_symbol_defaults.py](/D:/qqokx/okx_quant/strategy_symbol_defaults.py)：分币种策略默认模板，当前已固化 `v0.6.91` 的多头/空头独立参数
 - [okx_quant/multi_coin_market_digest.py](/D:/qqokx/okx_quant/multi_coin_market_digest.py)：多币种市场早报，当前已支持“明确观点 + 最近复盘命中率”邮件内容
 - [okx_quant/analysis_email_validation.py](/D:/qqokx/okx_quant/analysis_email_validation.py)：多币种早报邮件的历史观点回放验证与汇总导出
 - [reports/ema55_slope_short_research_report.html](/D:/qqokx/reports/ema55_slope_short_research_report.html)：EMA55 斜率做空研究报告（HTML）

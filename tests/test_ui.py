@@ -371,6 +371,41 @@ class UiHelpersTest(TestCase):
             show_dialog=False,
         )
 
+    def test_reconciliation_settles_linked_semi_auto_task(self) -> None:
+        task = self._semi_auto_task("P001-1", session_id="S01", status="settling")
+        request_stop = MagicMock(return_value=True)
+        session = SimpleNamespace(session_id="S01", semi_auto_task_id=task.task_id, active_trade=None)
+        ledger = SimpleNamespace(record_id="L01", semi_auto_task_id=task.task_id, close_reason="止盈")
+        app = SimpleNamespace(
+            sessions={session.session_id: session},
+            _semi_auto_desk_tasks=[task],
+            _save_semi_auto_desk_snapshot=MagicMock(),
+            _request_stop_strategy_session=request_stop,
+            _upsert_strategy_trade_ledger_record=MagicMock(),
+            _refresh_session_financials_from_trade_ledger=MagicMock(),
+            _refresh_running_session_summary=MagicMock(),
+            _log_session_message=MagicMock(),
+            _apply_trader_desk_reconciliation=MagicMock(),
+            _apply_semi_auto_task_settlement=QuantApp._apply_semi_auto_task_settlement,
+            _clear_session_manual_management_state=MagicMock(),
+            _publish_session_trade_settlement_result=MagicMock(),
+        )
+        result = SimpleNamespace(
+            session_id=session.session_id,
+            round_id="R01",
+            environment_note="",
+            error_message="",
+            ledger_record=ledger,
+            attribution_summary="归因完成",
+            cumulative_summary="累计完成",
+        )
+
+        QuantApp._apply_strategy_trade_reconciliation_result(app, result)
+
+        self.assertEqual(task.status, "completed_closed")
+        self.assertEqual(task.ledger_record_id, "L01")
+        request_stop.assert_called_once()
+
     def test_trade_ledger_payload_round_trip_keeps_semi_auto_task_identity(self) -> None:
         record = StrategyTradeLedgerRecord(
             record_id="L01",

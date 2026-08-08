@@ -7807,7 +7807,7 @@ class UiStrategySessionsMixin:
         self._log_session_message(session, result.cumulative_summary)
         try:
             self._apply_trader_desk_reconciliation(session, result.ledger_record)
-            self._apply_semi_auto_task_settlement(session, result.ledger_record)
+            QuantApp._apply_semi_auto_task_settlement(self, session, result.ledger_record)
         finally:
             if matching_trade:
                 self._clear_session_manual_management_state(session)
