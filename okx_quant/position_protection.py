@@ -284,6 +284,22 @@ class PositionProtectionManager:
     def clear_finished(self) -> int:
         return self._cleanup_dead_workers()
 
+    @staticmethod
+    def _protection_key_conflicts(
+        api_name: str,
+        protection: OptionProtectionConfig,
+        active_keys: list[tuple[str, OptionProtectionConfig]],
+    ) -> bool:
+        normalized_api = (api_name or "").strip()
+        normalized_inst_id = (protection.option_inst_id or "").strip().upper()
+        normalized_pos_side = (protection.pos_side or "").strip().lower()
+        return any(
+            normalized_api == (existing_api or "").strip()
+            and normalized_inst_id == (existing.option_inst_id or "").strip().upper()
+            and normalized_pos_side == (existing.pos_side or "").strip().lower()
+            for existing_api, existing in active_keys
+        )
+
     def start(
         self,
         credentials: Credentials,
@@ -291,9 +307,17 @@ class PositionProtectionManager:
         protection: OptionProtectionConfig,
     ) -> str:
         with self._lock:
-            for existing in self._workers.values():
-                if existing.protection.option_inst_id == protection.option_inst_id and existing.status in {"运行中", "准备中"}:
-                    raise RuntimeError(f"{protection.option_inst_id} 已经有一个运行中的保护任务。")
+            api_name = credentials.profile_name or credentials.api_key
+            active_keys = [
+                (existing.credentials.profile_name or existing.credentials.api_key, existing.protection)
+                for existing in self._workers.values()
+                if existing.status in {"运行中", "准备中"}
+            ]
+            if self._protection_key_conflicts(api_name, protection, active_keys):
+                raise RuntimeError(
+                    f"{api_name} / {protection.option_inst_id} / {protection.pos_side or '-'} "
+                    "已经有一个运行中的保护任务。"
+                )
 
             self._counter += 1
             session_id = f"P{self._counter:02d}"

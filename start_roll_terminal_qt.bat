@@ -3,6 +3,16 @@ setlocal
 
 cd /d "%~dp0"
 
+if exist ".venv\Scripts\python.exe" (
+    .venv\Scripts\python.exe run_roll_terminal_qt.pyw %*
+    exit /b %errorlevel%
+)
+
+if exist ".venv\Scripts\pythonw.exe" (
+    .venv\Scripts\pythonw.exe run_roll_terminal_qt.pyw %*
+    exit /b %errorlevel%
+)
+
 if exist "RUN_QT.bat" (
     call "RUN_QT.bat" %*
     exit /b %errorlevel%

@@ -176,7 +176,14 @@ class EngineRetryPolicy:
     def _is_terminal_order_state(state: str | None) -> bool:
         return str(state or "").strip().lower() in _TERMINAL_ORDER_STATES
 
-    def get_trigger_price(self, inst_id: str, price_type: str, *, environment: str | None = None) -> Decimal:
+    def get_trigger_price(
+        self,
+        inst_id: str,
+        price_type: str,
+        *,
+        environment: str | None = None,
+        max_cached_age_seconds: float | None = None,
+    ) -> Decimal:
         """与 `OkxRestClient.get_trigger_price` 对齐：`mark` 在 ticker 缺字段时会回退到 public mark-price。"""
         pt = (price_type or "last").strip().lower()
         if pt in {"bid", "ask"}:
@@ -200,7 +207,12 @@ class EngineRetryPolicy:
             return self.call_okx_read_with_retry(f"读取触发价格 {inst_id} {price_type}", _read_ba)
         return self.call_okx_read_with_retry(
             f"读取触发价格 {inst_id} {price_type}",
-            lambda: self._engine._client.get_trigger_price(inst_id, pt, environment=environment),  # type: ignore[arg-type]
+            lambda: self._engine._client.get_trigger_price(
+                inst_id,
+                pt,
+                environment=environment,
+                max_cached_age_seconds=max_cached_age_seconds,
+            ),  # type: ignore[arg-type]
         )
 
     def get_pending_orders(

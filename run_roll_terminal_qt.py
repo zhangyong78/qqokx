@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ctypes
 import faulthandler
+import importlib.util
 import io
 import os
 import sys
@@ -47,6 +48,29 @@ class _TeeTextStream(io.TextIOBase):
                 original.flush()
             except Exception:
                 pass
+
+
+def _repo_root() -> Path:
+    return Path(__file__).resolve().parent
+
+
+def _venv_python_candidates() -> tuple[Path, ...]:
+    scripts_dir = _repo_root() / ".venv" / "Scripts"
+    current_name = Path(sys.executable).name.lower()
+    ordered_names = ("pythonw.exe", "python.exe") if current_name == "pythonw.exe" else ("python.exe", "pythonw.exe")
+    return tuple(scripts_dir / name for name in ordered_names)
+
+
+def _bootstrap_local_venv() -> None:
+    if importlib.util.find_spec("PySide6") is not None:
+        return
+    current_executable = Path(sys.executable).resolve()
+    for candidate in _venv_python_candidates():
+        if not candidate.exists():
+            continue
+        if candidate.resolve() == current_executable:
+            return
+        os.execv(str(candidate), [str(candidate), str(Path(__file__).resolve()), *sys.argv[1:]])
 
 
 def _set_console_title() -> None:
@@ -153,6 +177,7 @@ def _ensure_qt_dependency() -> bool:
 
 def main() -> int:
     _set_console_title()
+    _bootstrap_local_venv()
     _install_runtime_logging()
     _configure_qt_webengine_runtime()
     if not _ensure_qt_dependency():

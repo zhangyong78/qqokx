@@ -2580,7 +2580,12 @@ class AccountPositionsHomeWidget(QWidget):
         for table in self.findChildren(QTableWidget):
             table.verticalHeader().setDefaultSectionSize(21)
         for tree in self.findChildren(QTreeWidget):
-            tree.setStyleSheet("QTreeView::item { height: 21px; }")
+            tree.setStyleSheet(
+                "QTreeView::item { height: 21px; }"
+                "QTreeView::item:selected { background: #e8f1ff; color: #111827; }"
+                "QTreeView::item:selected:active { background: #e8f1ff; color: #111827; }"
+                "QTreeView::item:selected:!active { background: #e8f1ff; color: #111827; }"
+            )
 
     def _build_header(self) -> QWidget:
         panel = QFrame()

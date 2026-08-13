@@ -38,6 +38,10 @@ def _make_credentials() -> Credentials:
     return Credentials(api_key="key", secret_key="secret", passphrase="pass")
 
 
+def _make_credentials_for_profile(profile_name: str) -> Credentials:
+    return Credentials(api_key=f"key-{profile_name}", secret_key="secret", passphrase="pass", profile_name=profile_name)
+
+
 def _make_strategy_config() -> StrategyConfig:
     return StrategyConfig(
         inst_id="BTC-USD-20260327-70000-C",
@@ -520,6 +524,30 @@ class _OrderStatusClient:
 
 
 class PositionProtectionTest(TestCase):
+    def test_manager_allows_same_option_protection_for_different_api_profiles(self) -> None:
+        manager = PositionProtectionManager(object(), lambda _message: None)
+        protection = OptionProtectionConfig(
+            option_inst_id="BTC-USD-20260327-70000-C",
+            trigger_inst_id="BTC-USD-20260327-70000-C",
+            trigger_price_type="mark",
+            direction="long",
+            pos_side="long",
+            take_profit_trigger=Decimal("0.02"),
+            stop_loss_trigger=None,
+            take_profit_order_mode="fixed_price",
+            take_profit_order_price=Decimal("0.019"),
+            take_profit_slippage=Decimal("0"),
+            stop_loss_order_mode="fixed_price",
+            stop_loss_order_price=None,
+            stop_loss_slippage=Decimal("0"),
+            poll_seconds=1,
+            trigger_label="option mark",
+        )
+
+        self.assertFalse(manager._protection_key_conflicts("api-a", protection, []))
+        self.assertFalse(manager._protection_key_conflicts("api-b", protection, [("api-a", protection)]))
+        self.assertTrue(manager._protection_key_conflicts("api-a", protection, [("api-a", protection)]))
+
     def test_manager_treats_remote_end_closed_as_transient_error(self) -> None:
         manager = PositionProtectionManager(
             _SimulatedProtectionClient(

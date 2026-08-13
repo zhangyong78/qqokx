@@ -1137,6 +1137,26 @@ class OkxRestClient:
         version, item = payload
         return version, self._build_ticker_from_public_item(inst_id=inst_id, item=item)
 
+    def get_cached_public_ticker_with_age(
+        self,
+        inst_id: str,
+        *,
+        environment: str,
+    ) -> tuple[int, OkxTicker, float] | None:
+        """Return a public WS ticker and how long ago it was received locally."""
+        connection = self._public_ws_connection_for(environment=environment)
+        if connection is None:
+            return None
+        payload = connection.get_latest_ticker_snapshot(inst_id)
+        if payload is None:
+            return None
+        version, item, received_at = payload
+        return (
+            version,
+            self._build_ticker_from_public_item(inst_id=inst_id, item=item),
+            max(time.time() - received_at, 0.0),
+        )
+
     def get_cached_public_order_book(
         self,
         inst_id: str,
@@ -1302,11 +1322,20 @@ class OkxRestClient:
         price_type: TriggerPriceType,
         *,
         environment: str | None = None,
+        max_cached_age_seconds: float | None = None,
     ) -> Decimal:
         env = str(environment or "").strip().lower()
         if env:
             self.ensure_public_ws_market_watch(inst_id, environment=env)
-            cached_payload = self.get_cached_public_ticker(inst_id, environment=env)
+            cached_payload = None
+            if max_cached_age_seconds is not None:
+                snapshot = self.get_cached_public_ticker_with_age(inst_id, environment=env)
+                if snapshot is not None:
+                    version, cached_ticker, cached_age_seconds = snapshot
+                    if cached_age_seconds <= max(max_cached_age_seconds, 0.0):
+                        cached_payload = version, cached_ticker
+            else:
+                cached_payload = self.get_cached_public_ticker(inst_id, environment=env)
             if cached_payload is not None:
                 _version, cached_ticker = cached_payload
                 cached_price = self._trigger_price_from_ticker(cached_ticker, inst_id, price_type)

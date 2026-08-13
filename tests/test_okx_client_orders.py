@@ -463,6 +463,82 @@ class OkxClientOrderRequestTest(TestCase):
 
         self.assertEqual(price, Decimal("69995"))
 
+    def test_get_trigger_price_uses_rest_when_dynamic_stop_cache_is_stale(self) -> None:
+        client = OkxRestClient()
+        client.ensure_public_ws_market_watch = lambda inst_id, environment: None  # type: ignore[method-assign]
+        cached_ticker = type(
+            "Ticker",
+            (),
+            {
+                "inst_id": "ETH-USDT-SWAP",
+                "last": Decimal("1900"),
+                "bid": Decimal("1899"),
+                "ask": Decimal("1901"),
+                "mark": Decimal("1900"),
+                "index": Decimal("1900"),
+                "raw": {},
+            },
+        )()
+        client.get_cached_public_ticker_with_age = lambda inst_id, environment: (  # type: ignore[method-assign]
+            5,
+            cached_ticker,
+            3.1,
+        )
+        client.get_ticker = lambda inst_id: type(  # type: ignore[method-assign]
+            "Ticker",
+            (),
+            {
+                "inst_id": inst_id,
+                "last": Decimal("1934"),
+                "bid": Decimal("1933"),
+                "ask": Decimal("1935"),
+                "mark": Decimal("1934"),
+                "index": Decimal("1934"),
+                "raw": {},
+            },
+        )()
+
+        price = client.get_trigger_price(
+            "ETH-USDT-SWAP",
+            "mark",
+            environment="live",
+            max_cached_age_seconds=3.0,
+        )
+
+        self.assertEqual(price, Decimal("1934"))
+
+    def test_get_trigger_price_keeps_fresh_dynamic_stop_cache(self) -> None:
+        client = OkxRestClient()
+        client.ensure_public_ws_market_watch = lambda inst_id, environment: None  # type: ignore[method-assign]
+        cached_ticker = type(
+            "Ticker",
+            (),
+            {
+                "inst_id": "ETH-USDT-SWAP",
+                "last": Decimal("1934"),
+                "bid": Decimal("1933"),
+                "ask": Decimal("1935"),
+                "mark": Decimal("1934"),
+                "index": Decimal("1934"),
+                "raw": {},
+            },
+        )()
+        client.get_cached_public_ticker_with_age = lambda inst_id, environment: (  # type: ignore[method-assign]
+            5,
+            cached_ticker,
+            0.2,
+        )
+        client.get_ticker = lambda inst_id: self.fail(f"should not call REST ticker for {inst_id}")  # type: ignore[method-assign]
+
+        price = client.get_trigger_price(
+            "ETH-USDT-SWAP",
+            "mark",
+            environment="live",
+            max_cached_age_seconds=3.0,
+        )
+
+        self.assertEqual(price, Decimal("1934"))
+
     def test_get_public_ws_debug_status_reports_disabled_mode(self) -> None:
         client = OkxRestClient()
 

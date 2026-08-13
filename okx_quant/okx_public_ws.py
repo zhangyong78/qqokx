@@ -109,12 +109,20 @@ class OkxPublicWsConnection:
                 pass
 
     def get_latest_ticker(self, inst_id: str) -> tuple[int, dict[str, Any]] | None:
+        snapshot = self.get_latest_ticker_snapshot(inst_id)
+        if snapshot is None:
+            return None
+        version, payload, _received_at = snapshot
+        return version, payload
+
+    def get_latest_ticker_snapshot(self, inst_id: str) -> tuple[int, dict[str, Any], float] | None:
+        """Return the latest ticker together with its local receive time."""
         normalized = inst_id.strip().upper()
         with self._lock:
             record = self._ticker_by_inst_id.get(normalized)
             if record is None:
                 return None
-            return record.version, dict(record.payload)
+            return record.version, dict(record.payload), record.received_at
 
     def get_latest_order_book(self, inst_id: str) -> tuple[int, dict[str, Any]] | None:
         normalized = inst_id.strip().upper()

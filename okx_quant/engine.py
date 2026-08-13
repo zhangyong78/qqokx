@@ -80,6 +80,7 @@ from okx_quant.strategy_ui_schema import strategy_forces_follow_signal, strategy
 Logger = Callable[[str], None]
 OKX_SINGLE_REQUEST_MAX_CANDLES = 300
 _HOUR_MS = 3_600_000
+EXCHANGE_DYNAMIC_STOP_MAX_CACHED_TICKER_AGE_SECONDS = 3.0
 
 
 def _live_dynamic_take_profit_enabled(config: StrategyConfig) -> bool:
@@ -4289,6 +4290,7 @@ class StrategyEngine:
                         trade_instrument.inst_id,
                         config.tp_sl_trigger_type,
                         environment=config.environment,
+                        max_cached_age_seconds=EXCHANGE_DYNAMIC_STOP_MAX_CACHED_TICKER_AGE_SECONDS,
                     )
                 except Exception:
                     infer_price = Decimal("0")
@@ -4332,6 +4334,7 @@ class StrategyEngine:
             trade_instrument.inst_id,
             config.tp_sl_trigger_type,
             environment=config.environment,
+            max_cached_age_seconds=EXCHANGE_DYNAMIC_STOP_MAX_CACHED_TICKER_AGE_SECONDS,
         )
         holding_bars = _holding_bars_live(position.entry_ts, int(time.time() * 1000), config.bar)
         updated_stop_loss, next_trigger_price, updated_trigger_r, moved = _advance_dynamic_stop_live(
@@ -4411,6 +4414,7 @@ class StrategyEngine:
             trade_instrument.inst_id,
             config.tp_sl_trigger_type,
             environment=config.environment,
+            max_cached_age_seconds=EXCHANGE_DYNAMIC_STOP_MAX_CACHED_TICKER_AGE_SECONDS,
         )
         if not _is_exchange_dynamic_stop_candidate_valid(
             direction=direction,
@@ -4507,6 +4511,7 @@ class StrategyEngine:
                 trade_instrument.inst_id,
                 config.tp_sl_trigger_type,
                 environment=config.environment,
+                max_cached_age_seconds=EXCHANGE_DYNAMIC_STOP_MAX_CACHED_TICKER_AGE_SECONDS,
             )
             detail = str(exc).strip() or f"code={exc.code or '-'}"
             if not _is_exchange_dynamic_stop_candidate_valid(
@@ -5131,8 +5136,14 @@ class StrategyEngine:
         price_type: str,
         *,
         environment: str | None = None,
+        max_cached_age_seconds: float | None = None,
     ) -> Decimal:
-        return self._retry_policy.get_trigger_price(inst_id, price_type, environment=environment)
+        return self._retry_policy.get_trigger_price(
+            inst_id,
+            price_type,
+            environment=environment,
+            max_cached_age_seconds=max_cached_age_seconds,
+        )
 
     def _get_pending_orders_with_retry(
         self,
