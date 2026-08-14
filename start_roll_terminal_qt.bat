@@ -4,8 +4,19 @@ setlocal
 cd /d "%~dp0"
 
 if exist ".venv\Scripts\python.exe" (
-    .venv\Scripts\python.exe run_roll_terminal_qt.pyw %*
-    exit /b %errorlevel%
+    .venv\Scripts\python.exe -c "import PySide6" >nul 2>&1
+    if not errorlevel 1 (
+        .venv\Scripts\python.exe run_roll_terminal_qt.pyw %*
+        exit /b %errorlevel%
+    )
+)
+
+if exist ".venv_old\Scripts\python.exe" (
+    .venv_old\Scripts\python.exe -c "import PySide6" >nul 2>&1
+    if not errorlevel 1 (
+        .venv_old\Scripts\python.exe run_roll_terminal_qt.pyw %*
+        exit /b %errorlevel%
+    )
 )
 
 if exist ".venv\Scripts\pythonw.exe" (

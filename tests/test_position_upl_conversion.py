@@ -338,6 +338,12 @@ class PositionUplConversionTest(TestCase):
             },
         )
         self.assertEqual(metrics["delta"], Decimal("-0.15000"))
+        self.assertEqual(metrics["market_value_native"], Decimal("0.25"))
+        self.assertEqual(metrics["market_value_currency"], "BTC")
+        self.assertEqual(
+            _build_group_row_values("分组", metrics)[21],
+            "0.25 BTC（≈20000 USDT）",
+        )
 
     def test_format_position_avg_price_usdt_for_option(self) -> None:
         position = _make_position(inst_id="BTC-USD-260626-100000-C", upl="0", margin_ccy="BTC")
@@ -988,6 +994,31 @@ class PositionUplConversionTest(TestCase):
         self.assertEqual(values[19], "-31.36")
         self.assertEqual(values[26], "250000.00000")
         self.assertEqual(values[30], "+123.46")
+
+    def test_group_row_values_display_btc_market_value_before_usdt_total(self) -> None:
+        values = _build_group_row_values(
+            "风险单元",
+            {
+                "count": 2,
+                "size_display": "1 BTC",
+                "upl": Decimal("0"),
+                "upl_usdt": Decimal("0"),
+                "market_value_usdt": Decimal("94356"),
+                "market_value_native": Decimal("1.42"),
+                "market_value_currency": "BTC",
+                "realized": Decimal("0"),
+                "pnl_currency": "USDT",
+                "imr": None,
+                "mmr": None,
+                "delta": None,
+                "gamma": None,
+                "vega": None,
+                "theta": None,
+                "theta_usdt": None,
+            },
+        )
+
+        self.assertEqual(values[21], "1.42 BTC（≈94356 USDT）")
 
     def test_format_group_position_size_accumulates_coin_quantity(self) -> None:
         positions = [

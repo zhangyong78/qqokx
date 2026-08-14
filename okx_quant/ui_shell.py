@@ -15422,15 +15422,33 @@ def _aggregate_position_metrics(
         }
     )
     pnl_currency: str | None = pnl_currencies[0] if len(pnl_currencies) == 1 else None
+    market_value_usdt_values = [
+        _position_market_value_usdt(item, position_instruments, upl_usdt_prices)
+        for item in positions
+    ]
+    btc_price_usdt = upl_usdt_prices.get("BTC")
+    btc_market_value = (
+        sum(
+            (
+                value / btc_price_usdt
+                for item, value in zip(positions, market_value_usdt_values)
+                if value is not None
+                and _extract_asset_key(item.inst_id).strip().upper() == "BTC"
+            ),
+            Decimal("0"),
+        )
+        if btc_price_usdt is not None and btc_price_usdt > 0
+        else None
+    )
     return {
         "count": len(positions),
         "size_display": _format_group_position_size(positions, position_instruments),
         "option_side_display": _format_group_option_trade_side(positions, position_instruments),
         "upl": _sum_decimal([item.unrealized_pnl for item in positions]),
         "upl_usdt": _sum_decimal([_position_unrealized_pnl_usdt(item, upl_usdt_prices) for item in positions]),
-        "market_value_usdt": _sum_decimal(
-            [_position_market_value_usdt(item, position_instruments, upl_usdt_prices) for item in positions]
-        ),
+        "market_value_usdt": _sum_decimal(market_value_usdt_values),
+        "market_value_native": btc_market_value,
+        "market_value_currency": "BTC" if btc_market_value is not None else None,
         "realized": _sum_decimal([item.realized_pnl for item in positions]),
         "realized_usdt": _sum_decimal([_position_realized_pnl_usdt(item, upl_usdt_prices) for item in positions]),
         "pnl_currency": pnl_currency,
@@ -15452,6 +15470,17 @@ def _build_group_row_values(group_type: str, metrics: dict[str, Decimal | int | 
     pnl_places = _group_pnl_places(metrics.get("pnl_currency"))
     size_display = metrics.get("size_display")
     option_side_display = metrics.get("option_side_display")
+    market_value_native = metrics.get("market_value_native")
+    market_value_currency = metrics.get("market_value_currency")
+    if isinstance(market_value_native, Decimal) and isinstance(market_value_currency, str) and market_value_currency:
+        market_value_text = (
+            f"{format_decimal_fixed(market_value_native, 2)} {market_value_currency}"
+            f"（{_format_optional_approx_usdt(metrics['market_value_usdt'] if isinstance(metrics.get('market_value_usdt'), Decimal) else None)}）"
+        )
+    else:
+        market_value_text = _format_optional_approx_usdt(
+            metrics["market_value_usdt"] if isinstance(metrics.get("market_value_usdt"), Decimal) else None
+        )
     return (
         group_type,
         "--",
@@ -15490,9 +15519,7 @@ def _build_group_row_values(group_type: str, metrics: dict[str, Decimal | int | 
         _format_optional_usdt(
             metrics.get("realized_usdt") if isinstance(metrics.get("realized_usdt"), Decimal) else None
         ),
-        _format_optional_approx_usdt(
-            metrics["market_value_usdt"] if isinstance(metrics["market_value_usdt"], Decimal) else None
-        ),
+        market_value_text,
         "--",
         "--",
         _format_optional_integer(metrics["imr"] if isinstance(metrics["imr"], Decimal) else None),
