@@ -19,6 +19,7 @@ from okx_quant.option_strategy_ui import (
     _strategy_leg_quote_currency,
     _pan_kline_view,
     _zoom_kline_view,
+    _format_compact_number,
 )
 from okx_quant.option_strategy import (
     OptionQuote,
@@ -68,6 +69,12 @@ def _make_instrument(inst_id: str) -> Instrument:
 
 
 class OptionStrategyTest(TestCase):
+    def test_format_compact_number_uses_at_most_four_decimal_places(self) -> None:
+        self.assertEqual(_format_compact_number(Decimal("0.000800")), "0.0008")
+        self.assertEqual(_format_compact_number(Decimal("0.01850")), "0.0185")
+        self.assertEqual(_format_compact_number(Decimal("50.478200")), "50.4782")
+        self.assertEqual(_format_compact_number(Decimal("1167.3100")), "1167.31")
+
     def test_strategy_leg_quote_currency_prefers_instrument_and_falls_back_to_contract(self) -> None:
         instrument = _make_instrument("BTC-USD-260626-90000-C")
 

@@ -3971,14 +3971,7 @@ def _format_compact_number(value: Decimal | int | float | None) -> str:
             value = Decimal(str(value))
         except Exception:
             return "-"
-    magnitude = abs(value)
-    if magnitude >= 1000:
-        return format_decimal_fixed(value, 2)
-    if magnitude >= 1:
-        return format_decimal_fixed(value, 4)
-    if magnitude >= Decimal("0.01"):
-        return format_decimal_fixed(value, 5)
-    return format_decimal_fixed(value, 6)
+    return format_decimal_fixed(value, 4).rstrip("0").rstrip(".") or "0"
 
 
 def _format_signed_percent(value: Decimal) -> str:
