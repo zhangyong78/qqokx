@@ -45,7 +45,22 @@ class PositionDisplayForegroundColorsTest(TestCase):
 
         limit = account_positions_module._position_kline_candle_limit("1H", markers, now_ms=now_ms)
 
-        self.assertEqual(limit, 332)
+        self.assertEqual(limit, 480)
+
+    def test_current_position_kline_reuses_matching_history_markers(self) -> None:
+        position = SimpleNamespace(inst_id="BTC-USD-260720-65000-C", raw={"cTime": "1752210000000"})
+        history_item = SimpleNamespace(
+            inst_id="BTC-USD-260720-65000-C",
+            update_time=1_752_300_600_000,
+            raw={"cTime": "1752210000000", "uTime": "1752300600000"},
+        )
+
+        markers = account_positions_module._current_position_kline_time_markers(position, [history_item])
+
+        self.assertEqual(
+            markers,
+            (("开仓", 1_752_210_000_000), ("平仓", 1_752_300_600_000)),
+        )
 
     def test_history_position_contract_click_opens_matching_kline(self) -> None:
         history_item = SimpleNamespace(inst_id="BTC-USD-260720-65000-C", inst_type="OPTION")

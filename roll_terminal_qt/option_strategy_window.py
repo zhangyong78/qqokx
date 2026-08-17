@@ -948,6 +948,7 @@ def _build_moving_average_series(candles: list[Candle]) -> tuple[list[Decimal], 
 class CandlestickChartView(QChartView):
     hover_changed = Signal(int, float)
     hover_cleared = Signal()
+    older_data_requested = Signal(int)
 
     def __init__(self, *, percent_axis: bool = False, parent: QWidget | None = None) -> None:
         chart = QChart()
@@ -1141,6 +1142,45 @@ class CandlestickChartView(QChartView):
             f"L {_format_compact_number(latest.low)}{suffix} "
             f"C {_format_compact_number(latest.close)}{suffix}{moving_average_title}"
         )
+
+    def prepend_candles(self, candles: list[Candle]) -> bool:
+        """Prepend an older page while keeping the current chart settings and zoom."""
+        if not candles or not self._candles:
+            return False
+        existing_by_ts = {candle.ts: candle for candle in self._candles}
+        for candle in candles:
+            existing_by_ts[candle.ts] = candle
+        merged = sorted(existing_by_ts.values(), key=lambda candle: candle.ts)
+        if len(merged) == len(self._candles):
+            return False
+        current_min, current_max = self._current_x_range()
+        current_span = max(current_max - current_min, 1.0)
+        old_full_min = self._full_x_min_ms
+        self.set_candles(
+            title=self._chart_title,
+            candles=merged,
+            hide_wicks=self._hide_wicks,
+            show_moving_averages=self._show_moving_averages,
+            tooltip_close_usdt_rate=self._tooltip_close_usdt_rate,
+            tooltip_close_usdt_basis=self._tooltip_close_usdt_basis,
+            tooltip_entry_price=self._tooltip_entry_price,
+            time_markers=self._time_markers,
+        )
+        if self._axis_x is not None:
+            if current_min <= old_full_min + 1.0:
+                new_min = self._full_x_min_ms
+            else:
+                new_min = max(self._full_x_min_ms, current_min)
+            new_max = min(self._full_x_max_ms, new_min + current_span)
+            if new_max - new_min < current_span:
+                new_min = max(self._full_x_min_ms, new_max - current_span)
+            self._axis_x.setRange(
+                QDateTime.fromMSecsSinceEpoch(int(new_min)),
+                QDateTime.fromMSecsSinceEpoch(int(new_max)),
+            )
+            self._fit_y_axis_to_visible_range()
+        self.viewport().update()
+        return True
 
     @Slot(bool)
     def set_moving_averages_visible(self, visible: bool) -> None:
@@ -1454,6 +1494,8 @@ class CandlestickChartView(QChartView):
             QDateTime.fromMSecsSinceEpoch(int(new_x_max)),
         )
         self._fit_y_axis_to_visible_range()
+        if delta_px > 0 and new_x_min <= self._full_x_min_ms + 1.0:
+            self.older_data_requested.emit(int(self._full_x_min_ms))
 
     def _create_hover_label(self, *, multiline: bool, center: bool) -> QLabel:
         label = QLabel(self)

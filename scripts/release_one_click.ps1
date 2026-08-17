@@ -29,11 +29,13 @@ function Resolve-GitExecutable {
         (Join-Path ${env:ProgramFiles(x86)} 'Git\cmd\git.exe'),
         (Join-Path ${env:ProgramFiles(x86)} 'Git\bin\git.exe'),
         (Join-Path $env:LocalAppData 'Programs\Git\cmd\git.exe'),
-        (Join-Path $env:LocalAppData 'Programs\Git\bin\git.exe')
+        (Join-Path $env:LocalAppData 'Programs\Git\bin\git.exe'),
+        (Join-Path $env:USERPROFILE '.cache\codex-runtimes\codex-primary-runtime\dependencies\native\git\cmd\git.exe'),
+        (Join-Path $env:USERPROFILE '.cache\codex-runtimes\codex-primary-runtime\dependencies\native\git\bin\git.exe')
     ) | Where-Object { $_ -and (Test-Path -LiteralPath $_) }
 
     if ($candidates.Count -gt 0) {
-        return $candidates[0]
+        return @($candidates)[0]
     }
 
     throw (U '\u672a\u627e\u5230 git \u53ef\u6267\u884c\u6587\u4ef6\u3002\u8bf7\u5148\u5b89\u88c5 Git\uff0c\u6216\u628a git.exe \u52a0\u5165 PATH \u540e\u518d\u6267\u884c\u53d1\u7248\u811a\u672c\u3002')

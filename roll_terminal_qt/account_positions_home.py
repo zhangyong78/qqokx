@@ -726,22 +726,23 @@ POSITION_KLINE_BAR_MS = {
 }
 
 
+def _position_kline_timestamp(*values: object) -> int | None:
+    for value in values:
+        try:
+            timestamp = int(str(value or "").strip())
+        except (TypeError, ValueError):
+            continue
+        if timestamp <= 0:
+            continue
+        return timestamp * 1000 if timestamp < 100_000_000_000 else timestamp
+    return None
+
+
 def _position_history_kline_time_markers(item: OkxPositionHistoryItem) -> tuple[tuple[str, int], ...]:
     raw = item.raw if isinstance(item.raw, dict) else {}
 
-    def _timestamp(*values: object) -> int | None:
-        for value in values:
-            try:
-                timestamp = int(str(value or "").strip())
-            except (TypeError, ValueError):
-                continue
-            if timestamp <= 0:
-                continue
-            return timestamp * 1000 if timestamp < 100_000_000_000 else timestamp
-        return None
-
-    opened_at = _timestamp(raw.get("openTime"), raw.get("openTs"), raw.get("cTime"), raw.get("createdTime"))
-    closed_at = _timestamp(raw.get("closeTime"), raw.get("closeTs"), raw.get("uTime"), raw.get("updateTime"), item.update_time)
+    opened_at = _position_kline_timestamp(raw.get("openTime"), raw.get("openTs"), raw.get("cTime"), raw.get("createdTime"))
+    closed_at = _position_kline_timestamp(raw.get("closeTime"), raw.get("closeTs"), raw.get("uTime"), raw.get("updateTime"), item.update_time)
     markers: list[tuple[str, int]] = []
     if opened_at is not None:
         markers.append(("开仓", opened_at))
@@ -750,13 +751,44 @@ def _position_history_kline_time_markers(item: OkxPositionHistoryItem) -> tuple[
     return tuple(markers)
 
 
+def _current_position_kline_time_markers(
+    position: OkxPosition,
+    history_items: list[OkxPositionHistoryItem],
+) -> tuple[tuple[str, int], ...]:
+    inst_id = str(getattr(position, "inst_id", "") or "").strip().upper()
+    if not inst_id:
+        return ()
+    raw = position.raw if isinstance(position.raw, dict) else {}
+    markers: list[tuple[str, int]] = []
+    opened_at = _position_kline_timestamp(
+        raw.get("openTime"),
+        raw.get("openTs"),
+        raw.get("cTime"),
+        raw.get("createdTime"),
+    )
+    if opened_at is not None:
+        markers.append(("开仓", opened_at))
+    for item in history_items:
+        if str(item.inst_id or "").strip().upper() != inst_id:
+            continue
+        markers.extend(_position_history_kline_time_markers(item))
+    seen: set[tuple[str, int]] = set()
+    unique_markers: list[tuple[str, int]] = []
+    for marker in markers:
+        if marker in seen:
+            continue
+        seen.add(marker)
+        unique_markers.append(marker)
+    return tuple(unique_markers)
+
+
 def _position_kline_candle_limit(
     bar: str,
     time_markers: tuple[tuple[str, int], ...],
     *,
     now_ms: int | None = None,
 ) -> int:
-    base_limit = 240
+    base_limit = 480
     bar_ms = POSITION_KLINE_BAR_MS.get(bar)
     timestamps = [timestamp for _label, timestamp in time_markers if timestamp > 0]
     if bar_ms is None or not timestamps:
@@ -882,22 +914,34 @@ class InstrumentKlineLoadThread(QThread):
     loaded = Signal(str, str, str, str, object)
     failed = Signal(str, str, str, str)
 
-    def __init__(self, *, inst_id: str, inst_type: str, bar: str, limit: int = 240) -> None:
+    def __init__(self, *, inst_id: str, inst_type: str, bar: str, limit: int = 240, before_ts: int | None = None) -> None:
         super().__init__()
         self._inst_id = inst_id.strip().upper()
         self._inst_type = inst_type.strip().upper()
         self._bar = bar.strip()
         self._limit = max(60, limit)
+        self._before_ts = before_ts if before_ts is not None and before_ts > 0 else None
 
     def run(self) -> None:
         source = "mark" if self._inst_type == "OPTION" else "trade"
         try:
             client = OkxRestClient()
             if source == "mark":
-                candles = client.get_mark_price_candles(self._inst_id, self._bar, limit=self._limit)
+                candles = (
+                    client.get_mark_price_candles_before(self._inst_id, self._bar, self._before_ts, limit=self._limit)
+                    if self._before_ts is not None
+                    else client.get_mark_price_candles(self._inst_id, self._bar, limit=self._limit)
+                )
             else:
-                candles = client.get_candles_history(self._inst_id, self._bar, limit=self._limit)
+                candles = (
+                    client.get_candles_history_before(self._inst_id, self._bar, self._before_ts, limit=self._limit)
+                    if self._before_ts is not None
+                    else client.get_candles_history(self._inst_id, self._bar, limit=self._limit)
+                )
             if not candles:
+                if self._before_ts is not None:
+                    self.loaded.emit(self._inst_id, self._inst_type, self._bar, source, [])
+                    return
                 raise ValueError("当前周期没有可用 K 线数据。")
             self.loaded.emit(self._inst_id, self._inst_type, self._bar, source, candles)
         except Exception as exc:  # noqa: BLE001
@@ -927,6 +971,8 @@ class InstrumentKlineDialog(QDialog):
         self._time_markers: tuple[tuple[str, int], ...] = ()
         self._current_bar = initial_bar if initial_bar in {bar for _text, bar in POSITION_KLINE_BAR_OPTIONS} else "1H"
         self._load_thread: InstrumentKlineLoadThread | None = None
+        self._loading_older_candles = False
+        self._no_more_older_candles = False
         self._bar_buttons: dict[str, QPushButton] = {}
         self._prefs_changed = prefs_changed
 
@@ -957,6 +1003,9 @@ class InstrumentKlineDialog(QDialog):
         layout.addLayout(bar_row)
 
         self._chart = CandlestickChartView()
+        # Use a small relay lambda here.  PySide can fail to resolve a dynamically
+        # imported decorated slot on this dialog's meta-object at runtime.
+        self._chart.older_data_requested.connect(lambda before_ts: self._load_older_candles(int(before_ts)))
         self._chart.show_message("请点击一条持仓加载 K 线")
         layout.addWidget(self._chart, 1)
         self._sync_bar_buttons()
@@ -977,6 +1026,7 @@ class InstrumentKlineDialog(QDialog):
         self._underlying_usdt_basis = underlying_usdt_basis.strip() if self._underlying_usdt_price is not None else ""
         self._option_entry_price = option_entry_price if option_entry_price is not None and option_entry_price > 0 else None
         self._time_markers = tuple(time_markers)
+        self._no_more_older_candles = False
         self._update_title()
         self._load_current_bar()
         self.show()
@@ -1031,6 +1081,28 @@ class InstrumentKlineDialog(QDialog):
             bar=self._current_bar,
             limit=_position_kline_candle_limit(self._current_bar, self._time_markers),
         )
+        self._loading_older_candles = False
+        self._load_thread.loaded.connect(self._apply_loaded_candles)
+        self._load_thread.failed.connect(self._apply_load_error)
+        self._load_thread.finished.connect(self._clear_finished_thread)
+        self._load_thread.start()
+
+    def _load_older_candles(self, before_ts: int) -> None:
+        if not self._inst_id or self._no_more_older_candles:
+            return
+        if self._load_thread is not None and self._load_thread.isRunning():
+            return
+        if before_ts <= 0:
+            return
+        self._loading_older_candles = True
+        self._status_label.setText(f"正在加载 {self._inst_id} 更早的 K 线...")
+        self._load_thread = InstrumentKlineLoadThread(
+            inst_id=self._inst_id,
+            inst_type=self._inst_type,
+            bar=self._current_bar,
+            limit=240,
+            before_ts=before_ts,
+        )
         self._load_thread.loaded.connect(self._apply_loaded_candles)
         self._load_thread.failed.connect(self._apply_load_error)
         self._load_thread.finished.connect(self._clear_finished_thread)
@@ -1050,15 +1122,29 @@ class InstrumentKlineDialog(QDialog):
         if not isinstance(candles, list):
             return
         source_label = "标记价格" if source == "mark" else "成交价格"
-        self._chart.set_candles(
-            title=f"{inst_id} {source_label}K线 | {bar}",
-            candles=candles,
-            show_moving_averages=True,
-            tooltip_close_usdt_rate=self._underlying_usdt_price if inst_type == "OPTION" else None,
-            tooltip_close_usdt_basis=self._underlying_usdt_basis if inst_type == "OPTION" else "",
-            tooltip_entry_price=self._option_entry_price if inst_type == "OPTION" else None,
-            time_markers=self._time_markers,
-        )
+        if self._loading_older_candles:
+            self._loading_older_candles = False
+            if not candles:
+                self._no_more_older_candles = True
+                self._status_label.setText(f"{inst_id} | 已加载到最早的 K 线数据")
+                return
+            loaded_more = self._chart.prepend_candles(candles)
+            if not loaded_more:
+                self._no_more_older_candles = True
+                self._status_label.setText(f"{inst_id} | 已加载到最早的 K 线数据")
+                return
+            self._status_label.setText(f"{inst_id} | 已加载更多 K 线，可继续向左拖动")
+            return
+        else:
+            self._chart.set_candles(
+                title=f"{inst_id} {source_label}K线 | {bar}",
+                candles=candles,
+                show_moving_averages=True,
+                tooltip_close_usdt_rate=self._underlying_usdt_price if inst_type == "OPTION" else None,
+                tooltip_close_usdt_basis=self._underlying_usdt_basis if inst_type == "OPTION" else "",
+                tooltip_entry_price=self._option_entry_price if inst_type == "OPTION" else None,
+                time_markers=self._time_markers,
+            )
         latest = candles[-1] if candles else None
         latest_text = ""
         latest_time_text = ""
@@ -1070,6 +1156,10 @@ class InstrumentKlineDialog(QDialog):
     @Slot(str, str, str, str)
     def _apply_load_error(self, inst_id: str, inst_type: str, bar: str, message: str) -> None:
         if inst_id != self._inst_id or inst_type != self._inst_type or bar != self._current_bar:
+            return
+        if self._loading_older_candles:
+            self._loading_older_candles = False
+            self._status_label.setText(f"更早的 K 线加载失败：{message}；继续向左拖动可重试")
             return
         self._chart.show_message(f"{inst_id} K 线加载失败")
         self._status_label.setText(f"K 线加载失败：{message}")
@@ -4651,6 +4741,8 @@ class AccountPositionsHomeWidget(QWidget):
                 prefs_changed=self._on_position_kline_prefs_changed,
                 parent=self,
             )
+        if not time_markers:
+            time_markers = _current_position_kline_time_markers(position, self._position_history_items)
         underlying_usdt_price: Decimal | None = None
         underlying_usdt_basis = ""
         option_entry_price: Decimal | None = None

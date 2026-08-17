@@ -964,6 +964,17 @@ class OkxRestClient:
         candles.sort(key=lambda candle: candle.ts)
         return candles
 
+    def get_candles_history_before(self, inst_id: str, bar: str, before_ts: int, limit: int = 240) -> list[Candle]:
+        """Load one older trade-price candle page whose timestamps precede ``before_ts``."""
+        if before_ts <= 0:
+            return []
+        return self._fetch_history_candles_page(
+            inst_id,
+            bar,
+            limit=min(max(1, limit), MAX_PUBLIC_CANDLE_LIMIT),
+            after=str(before_ts),
+        )
+
     def get_mark_price_candles(self, inst_id: str, bar: str, limit: int = 200) -> list[Candle]:
         requested_limit = max(1, limit)
         collected = self._fetch_mark_price_candles_page(
@@ -987,6 +998,17 @@ class OkxRestClient:
             if len(batch) < page_limit:
                 break
         return collected[-requested_limit:]
+
+    def get_mark_price_candles_before(self, inst_id: str, bar: str, before_ts: int, limit: int = 240) -> list[Candle]:
+        """Load one older mark-price candle page whose timestamps precede ``before_ts``."""
+        if before_ts <= 0:
+            return []
+        return self._fetch_mark_price_candles_page(
+            inst_id,
+            bar,
+            limit=min(max(1, limit), MAX_PUBLIC_CANDLE_LIMIT),
+            after=str(before_ts),
+        )
 
     def _fetch_mark_price_candles_page(
         self,

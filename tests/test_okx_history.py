@@ -663,6 +663,30 @@ class OkxHistoryParsingTest(TestCase):
         self.assertEqual(requests[1]["limit"], "2")
         self.assertEqual(requests[1]["after"], "1000")
 
+    def test_get_mark_price_candles_before_requests_only_one_older_page(self) -> None:
+        client = OkxRestClient()
+        requests: list[dict[str, str]] = []
+
+        def _stub_request(method: str, path: str, params=None, **kwargs):
+            requests.append(dict(params or {}))
+            return {
+                "data": [
+                    ["900", "1.0", "1.1", "0.9", "1.05", "1"],
+                    ["800", "0.9", "1.0", "0.8", "0.95", "1"],
+                ]
+            }
+
+        client._request = _stub_request  # type: ignore[method-assign]
+        candles = client.get_mark_price_candles_before(
+            "BTC-USD-260626-100000-C",
+            "1H",
+            before_ts=1000,
+            limit=240,
+        )
+
+        self.assertEqual([item.ts for item in candles], [800, 900])
+        self.assertEqual(requests, [{"instId": "BTC-USD-260626-100000-C", "bar": "1H", "limit": "240", "after": "1000"}])
+
     def test_position_history_realized_pnl_usdt_converts_coin_margin(self) -> None:
         item = OkxPositionHistoryItem(
             update_time=1710000000200,
