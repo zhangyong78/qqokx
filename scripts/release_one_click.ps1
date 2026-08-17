@@ -273,6 +273,29 @@ if ([string]::IsNullOrWhiteSpace($CommitMessage)) { $CommitMessage = "release: v
 Invoke-GitCommand @('commit', '-m', $CommitMessage)
 if (-not $SkipPush) {
     $currentBranch = Get-CurrentGitBranch
-    [void](Invoke-GitUtf8 @('push', 'origin', $currentBranch))
+    $pushError = $null
+    for ($attempt = 1; $attempt -le 3; $attempt++) {
+        try {
+            $pushArguments = if ($attempt -eq 1) {
+                @('push', 'origin', $currentBranch)
+            }
+            else {
+                @('-c', 'http.version=HTTP/1.1', 'push', 'origin', $currentBranch)
+            }
+            [void](Invoke-GitUtf8 $pushArguments)
+            $pushError = $null
+            break
+        }
+        catch {
+            $pushError = $_.Exception.Message
+            if ($attempt -lt 3) {
+                Write-Host (U ("\u63a8\u9001\u5931\u8d25，第 {0}/3 次重试：{1}" -f $attempt, $pushError))
+                Start-Sleep -Seconds (2 * $attempt)
+            }
+        }
+    }
+    if ($pushError) {
+        throw (U ("\u63a8\u9001仍失败（已重试 3 次）。本地提交已保留，稍后可重新运行 123.bat 重试。\n" + $pushError))
+    }
 }
 Write-Host "DONE v$nextVersionText"
