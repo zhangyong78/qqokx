@@ -4,6 +4,7 @@ from dataclasses import dataclass, replace
 from typing import Iterable
 
 from PySide6.QtCore import QThread, Qt, Signal
+from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QComboBox,
@@ -21,7 +22,100 @@ from PySide6.QtWidgets import (
 
 from okx_quant.okx_client import OkxPosition, OkxTradeOrderItem
 from okx_quant.okx_client import OkxRestClient
+from roll_terminal_qt.account_positions_home import (
+    POSITION_COLUMNS,
+    _break_even_taker_fee_rate,
+    _position_break_even_price,
+)
+from okx_quant.ui_shell import (
+    _augment_upl_usdt_prices_from_positions,
+    _build_position_instrument_map,
+    _build_position_ticker_map,
+    _build_upl_usdt_price_map,
+    _format_margin_mode,
+    _format_mark_price,
+    _format_option_trade_side_display,
+    _format_optional_approx_usdt,
+    _format_optional_decimal,
+    _format_optional_decimal_fixed,
+    _format_optional_integer,
+    _format_optional_usdt,
+    _format_optional_usdt_precise,
+    _format_position_avg_price,
+    _format_position_avg_price_usdt,
+    _format_position_market_value,
+    _format_position_mark_price_usdt,
+    _format_position_option_component_usdt,
+    _format_position_option_price_component,
+    _format_position_quote_price,
+    _format_position_quote_price_usdt,
+    _format_position_realized_pnl,
+    _format_position_size,
+    _format_position_unrealized_pnl,
+    _format_ratio,
+    _position_delta_value,
+    _position_realized_pnl_usdt,
+    _position_signed_open_value_approx_usdt,
+    _position_theta_usdt,
+    _position_unrealized_pnl_usdt,
+)
 from roll_terminal_qt.shared_order_store import SharedOrderSnapshot, get_shared_order_store
+from roll_terminal_qt.realtime_account_store import (
+    AccountRealtimeSnapshot,
+    get_shared_realtime_account_store,
+)
+
+
+_POSITION_COLUMN_IDS = tuple(column_id for column_id, _heading, _width, _alignment in POSITION_COLUMNS)
+_POSITION_COLUMN_INDEX = {column_id: index for index, column_id in enumerate(_POSITION_COLUMN_IDS)}
+
+
+def _position_table_values(
+    position: object,
+    *,
+    upl_usdt_prices: dict[str, object],
+    position_instruments: dict[str, object],
+    position_tickers: dict[str, object],
+) -> list[object]:
+    values = (
+        getattr(position, "inst_type", "-"),
+        _format_margin_mode(getattr(position, "mgn_mode", "")),
+        _format_position_option_price_component(position, upl_usdt_prices, component="time_value"),
+        _format_position_option_component_usdt(position, upl_usdt_prices, component="time_value"),
+        _format_position_option_price_component(position, upl_usdt_prices, component="intrinsic_value"),
+        _format_position_option_component_usdt(position, upl_usdt_prices, component="intrinsic_value"),
+        _format_position_quote_price(position, position_instruments, position_tickers, side="bid"),
+        _format_position_quote_price_usdt(position, position_tickers, upl_usdt_prices, side="bid"),
+        _format_position_quote_price(position, position_instruments, position_tickers, side="ask"),
+        _format_position_quote_price_usdt(position, position_tickers, upl_usdt_prices, side="ask"),
+        _format_mark_price(position),
+        _format_position_mark_price_usdt(position, upl_usdt_prices),
+        _format_position_avg_price(position, position_instruments),
+        _format_position_avg_price_usdt(position, upl_usdt_prices),
+        _format_optional_approx_usdt(_position_signed_open_value_approx_usdt(position, position_instruments, upl_usdt_prices)),
+        _format_optional_decimal_fixed(
+            _position_break_even_price(position, upl_usdt_prices, fee_rate=_break_even_taker_fee_rate({}, inst_type=getattr(position, "inst_type", ""))),
+            places=2,
+        ),
+        _format_position_size(position, position_instruments),
+        _format_option_trade_side_display(position),
+        _format_position_unrealized_pnl(position),
+        _format_optional_usdt(_position_unrealized_pnl_usdt(position, upl_usdt_prices)),
+        _format_position_realized_pnl(position),
+        _format_optional_usdt(_position_realized_pnl_usdt(position, upl_usdt_prices)),
+        _format_position_market_value(position, position_instruments, upl_usdt_prices),
+        _format_optional_decimal(getattr(position, "liquidation_price", None)),
+        _format_ratio(getattr(position, "margin_ratio", None), places=2),
+        _format_optional_integer(getattr(position, "initial_margin", None)),
+        _format_optional_integer(getattr(position, "maintenance_margin", None)),
+        _format_optional_decimal_fixed(_position_delta_value(position, position_instruments), places=5),
+        _format_optional_decimal_fixed(getattr(position, "gamma", None), places=5),
+        _format_optional_decimal_fixed(getattr(position, "vega", None), places=5),
+        _format_optional_decimal_fixed(getattr(position, "theta", None), places=5),
+        _format_optional_usdt_precise(_position_theta_usdt(position, upl_usdt_prices), places=2),
+        getattr(position, "note", "-"),
+    )
+    return [getattr(position, "inst_id", "-"), *values]
 
 
 @dataclass(frozen=True)
@@ -29,6 +123,9 @@ class AccountDrawerSnapshot:
     positions: tuple[OkxPosition, ...] = ()
     orders: tuple[OkxTradeOrderItem, ...] = ()
     order_history: tuple[OkxTradeOrderItem, ...] = ()
+    upl_usdt_prices: dict[str, object] | None = None
+    position_instruments: dict[str, object] | None = None
+    position_tickers: dict[str, object] | None = None
 
 
 def filter_account_items(items: Iterable[object], *, scope: str, symbol: str) -> list[object]:
@@ -138,9 +235,37 @@ class AccountDrawerLoadThread(QThread):
         except Exception as exc:
             self.failed.emit(self._request_generation, str(exc))
             return
+        upl_usdt_prices: dict[str, object] = {}
+        position_instruments: dict[str, object] = {}
+        position_tickers: dict[str, object] = {}
+        try:
+            upl_usdt_prices = _build_upl_usdt_price_map(positions_client, list(positions))
+        except Exception:
+            pass
+        try:
+            position_instruments = _build_position_instrument_map(positions_client, list(positions))
+        except Exception:
+            pass
+        try:
+            position_tickers = _build_position_ticker_map(positions_client, list(positions))
+        except Exception:
+            pass
+        try:
+            upl_usdt_prices = _augment_upl_usdt_prices_from_positions(
+                upl_usdt_prices,
+                list(positions),
+                position_tickers,
+            )
+        except Exception:
+            pass
         self.completed.emit(
             self._request_generation,
-            AccountDrawerSnapshot(positions=tuple(positions)),
+            AccountDrawerSnapshot(
+                positions=tuple(positions),
+                upl_usdt_prices=upl_usdt_prices,
+                position_instruments=position_instruments,
+                position_tickers=position_tickers,
+            ),
         )
 
 
@@ -197,6 +322,8 @@ class KlineAccountDrawer(QWidget):
         self._shared_order_store = get_shared_order_store()
         self._shared_order_store.snapshot_changed.connect(self._apply_shared_order_snapshot)
         self._shared_order_store.refresh_failed.connect(self._apply_shared_order_refresh_error)
+        self._realtime_store = get_shared_realtime_account_store()
+        self._realtime_store.snapshot_ready.connect(self._apply_realtime_snapshot)
         self._build_ui()
 
     def _build_ui(self) -> None:
@@ -262,7 +389,8 @@ class KlineAccountDrawer(QWidget):
         self._tabs.addTab(orders_tab, "当前委托")
 
         self._positions_table = self._create_table(
-            ["合约", "方向", "持仓量", "可平量", "开仓均价", "标记价", "未实现盈亏", "保证金模式", "持仓模式"]
+            ["合约 / 分组", *[heading for _column_id, heading, _width, _alignment in POSITION_COLUMNS]],
+            column_defs=(("contract", "合约 / 分组", 220, Qt.AlignmentFlag.AlignLeft), *POSITION_COLUMNS),
         )
         positions_tab = QWidget()
         positions_layout = QVBoxLayout(positions_tab)
@@ -292,15 +420,27 @@ class KlineAccountDrawer(QWidget):
         history_orders_layout.addWidget(self._history_orders_table, 1)
         self._tabs.addTab(history_orders_tab, "历史委托")
 
-    def _create_table(self, headers: list[str]) -> QTableWidget:
+    def _create_table(
+        self,
+        headers: list[str],
+        *,
+        column_defs: tuple[tuple[str, str, int, Qt.AlignmentFlag], ...] | None = None,
+    ) -> QTableWidget:
         table = QTableWidget(0, len(headers), self)
         table.setHorizontalHeaderLabels(headers)
         table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         table.verticalHeader().setVisible(False)
-        table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
-        table.horizontalHeader().setStretchLastSection(True)
+        header = table.horizontalHeader()
+        header.setStretchLastSection(False)
+        if column_defs is None:
+            header.setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+            header.setStretchLastSection(True)
+        else:
+            for index, (_column_id, _heading, width, _alignment) in enumerate(column_defs):
+                header.setSectionResizeMode(index, QHeaderView.ResizeMode.Interactive)
+                table.setColumnWidth(index, width)
         return table
 
     def show_tab(self, tab_name: str) -> None:
@@ -406,20 +546,28 @@ class KlineAccountDrawer(QWidget):
 
     def _populate_positions_table(self, positions: list[object]) -> None:
         self._positions_table.setRowCount(len(positions))
+        upl_usdt_prices = dict(self._snapshot.upl_usdt_prices or {})
+        position_instruments = dict(self._snapshot.position_instruments or {})
+        position_tickers = dict(self._snapshot.position_tickers or {})
         for row, position in enumerate(positions):
-            values = [
-                getattr(position, "inst_id", ""),
-                order_display_direction(position),
-                getattr(position, "position", ""),
-                getattr(position, "avail_position", ""),
-                getattr(position, "avg_price", ""),
-                getattr(position, "mark_price", ""),
-                getattr(position, "unrealized_pnl", ""),
-                getattr(position, "mgn_mode", ""),
-                getattr(position, "pos_side", ""),
-            ]
+            values = _position_table_values(
+                position,
+                upl_usdt_prices=upl_usdt_prices,
+                position_instruments=position_instruments,
+                position_tickers=position_tickers,
+            )
             for column, value in enumerate(values):
-                self._positions_table.setItem(row, column, QTableWidgetItem(self._format_value(value)))
+                item = QTableWidgetItem(self._format_value(value))
+                self._positions_table.setItem(row, column, item)
+            pnl = getattr(position, "unrealized_pnl", None)
+            if pnl is not None:
+                try:
+                    pnl_color = QColor("#13803d" if pnl > 0 else "#c23b3b" if pnl < 0 else "#1f2937")
+                    for column_id in ("upl", "upl_usdt", "market_value"):
+                        column = 1 + _POSITION_COLUMN_INDEX[column_id]
+                        self._positions_table.item(row, column).setForeground(pnl_color)
+                except (TypeError, ValueError):
+                    pass
 
     def _populate_history_orders_table(self, orders: list[object]) -> None:
         self._history_orders_table.setRowCount(len(orders))
@@ -546,6 +694,14 @@ def _shared_set_context(
     self._symbol = normalized_symbol
     if changed:
         self._load_shared_order_snapshot()
+        if runtime is not None:
+            self._realtime_store.start_if_needed(runtime)
+        realtime_snapshot = self._realtime_store.snapshot_for(
+            profile_name=self._profile_name,
+            environment=self._environment,
+        )
+        if realtime_snapshot is not None:
+            self._apply_realtime_snapshot(realtime_snapshot)
         self._refresh_tables()
     if changed and refresh_if_visible and self.isVisible():
         self.refresh_data()
@@ -556,18 +712,21 @@ def _shared_refresh_data(self: KlineAccountDrawer) -> None:
         self._status_label.setText("未连接账户")
         return
     self._shared_order_store.request_refresh(runtime=self._runtime, profile_name=self._profile_name)
-    self._request_generation += 1
-    if self._load_thread is not None and self._load_thread.isRunning():
-        self._refresh_pending = True
-        self._status_label.setText("加载中...")
-        return
-    self._start_load(self._request_generation)
+    self._realtime_store.start_if_needed(self._runtime)
+    self._realtime_store.request_reconcile("drawer")
+    self._status_label.setText("同步持仓中...")
 
 
 def _shared_apply_snapshot(self: KlineAccountDrawer, generation: int, snapshot: AccountDrawerSnapshot) -> None:
     if generation != self._request_generation:
         return
-    self._snapshot = replace(self._snapshot, positions=tuple(snapshot.positions))
+    self._snapshot = replace(
+        self._snapshot,
+        positions=tuple(snapshot.positions),
+        upl_usdt_prices=dict(snapshot.upl_usdt_prices or {}),
+        position_instruments=dict(snapshot.position_instruments or {}),
+        position_tickers=dict(snapshot.position_tickers or {}),
+    )
     self._status_label.setText(f"委托 {len(self._snapshot.orders)} | 持仓 {len(self._snapshot.positions)}")
     self._refresh_tables()
 
@@ -603,6 +762,22 @@ def _shared_apply_shared_order_snapshot(
     self._refresh_tables()
 
 
+def _shared_apply_realtime_snapshot(self: KlineAccountDrawer, snapshot: object) -> None:
+    if not isinstance(snapshot, AccountRealtimeSnapshot):
+        return
+    if snapshot.profile_name != self._profile_name or snapshot.environment != self._environment:
+        return
+    self._snapshot = replace(
+        self._snapshot,
+        positions=tuple(snapshot.positions),
+        position_instruments=dict(snapshot.position_instruments),
+        position_tickers=dict(snapshot.position_tickers),
+        upl_usdt_prices=dict(snapshot.upl_usdt_prices),
+    )
+    self._status_label.setText(f"委托 {len(self._snapshot.orders)} | 持仓 {len(self._snapshot.positions)}")
+    self._refresh_tables()
+
+
 def _shared_apply_shared_order_refresh_error(
     self: KlineAccountDrawer,
     profile_name: str,
@@ -620,3 +795,4 @@ KlineAccountDrawer._apply_snapshot = _shared_apply_snapshot
 KlineAccountDrawer._load_shared_order_snapshot = _shared_load_shared_order_snapshot
 KlineAccountDrawer._apply_shared_order_snapshot = _shared_apply_shared_order_snapshot
 KlineAccountDrawer._apply_shared_order_refresh_error = _shared_apply_shared_order_refresh_error
+KlineAccountDrawer._apply_realtime_snapshot = _shared_apply_realtime_snapshot

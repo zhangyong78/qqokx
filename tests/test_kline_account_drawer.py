@@ -17,7 +17,9 @@ from roll_terminal_qt.kline_account_drawer import (
     order_cancel_reference,
     order_source_kind,
 )
+from roll_terminal_qt.account_positions_home import POSITION_COLUMNS
 from roll_terminal_qt.kline_analysis_window import KlineAnalysisWindow
+from roll_terminal_qt.realtime_account_store import AccountRealtimeSnapshot
 from roll_terminal_qt.shared_order_store import SharedOrderSnapshot
 from tests.qt_test_case import QtWidgetTestCase
 
@@ -59,6 +61,49 @@ class KlineAccountDrawerHelperTests(TestCase):
 
 
 class KlineAccountDrawerWidgetTests(QtWidgetTestCase):
+    def test_drawer_uses_the_holdings_realtime_snapshot_context(self) -> None:
+        drawer = KlineAccountDrawer()
+        try:
+            drawer._profile_name = "moni"
+            drawer._environment = "demo"
+            snapshot = AccountRealtimeSnapshot(
+                profile_name="moni",
+                environment="demo",
+                positions=(),
+                orders=(),
+                account=None,
+                generation=1,
+                source="rest",
+                position_instruments={"BTC-USDT-SWAP": object()},
+                position_tickers={"BTC-USDT-SWAP": object()},
+                upl_usdt_prices={"BTC": Decimal("65000")},
+            )
+
+            drawer._apply_realtime_snapshot(snapshot)
+
+            self.assertEqual(drawer._snapshot.position_instruments, snapshot.position_instruments)
+            self.assertEqual(drawer._snapshot.position_tickers, snapshot.position_tickers)
+            self.assertEqual(drawer._snapshot.upl_usdt_prices, snapshot.upl_usdt_prices)
+        finally:
+            self.dispose_widget(drawer)
+
+    def test_positions_table_uses_the_holdings_page_column_definition(self) -> None:
+        drawer = KlineAccountDrawer()
+        try:
+            expected_headers = ["合约 / 分组", *[heading for _column_id, heading, _width, _alignment in POSITION_COLUMNS]]
+            actual_headers = [
+                drawer._positions_table.horizontalHeaderItem(index).text()
+                for index in range(drawer._positions_table.columnCount())
+            ]
+
+            self.assertEqual(actual_headers, expected_headers)
+            self.assertEqual(
+                drawer._positions_table.horizontalScrollBarPolicy(),
+                Qt.ScrollBarPolicy.ScrollBarAsNeeded,
+            )
+        finally:
+            self.dispose_widget(drawer)
+
     def test_drawer_defaults_to_symbol_scope_and_read_only_positions(self) -> None:
         drawer = KlineAccountDrawer()
         try:
@@ -119,23 +164,18 @@ class KlineAccountDrawerWidgetTests(QtWidgetTestCase):
         finally:
             self.dispose_widget(drawer)
 
-    def test_refresh_data_defers_new_request_until_running_load_finishes(self) -> None:
+    def test_refresh_data_uses_shared_realtime_store_instead_of_drawer_load_thread(self) -> None:
         drawer = KlineAccountDrawer()
         try:
             drawer._runtime = SimpleNamespace(credentials=object(), environment="demo")
-            running_thread = Mock()
-            running_thread.isRunning.return_value = True
-            running_thread.deleteLater = Mock()
-            drawer._load_thread = running_thread
-            drawer._request_generation = 4
+            drawer._realtime_store = Mock()
 
             drawer.refresh_data()
 
-            self.assertEqual(drawer._request_generation, 5)
-            self.assertTrue(drawer._refresh_pending)
-            with patch.object(drawer, "_start_load") as start_load:
-                drawer._clear_load_thread()
-            start_load.assert_called_once_with(5)
+            drawer._realtime_store.start_if_needed.assert_called_once_with(drawer._runtime)
+            drawer._realtime_store.request_reconcile.assert_called_once_with("drawer")
+            self.assertEqual(drawer._request_generation, 0)
+            self.assertFalse(drawer._refresh_pending)
         finally:
             self.dispose_widget(drawer)
 
@@ -148,14 +188,15 @@ class KlineAccountDrawerWidgetTests(QtWidgetTestCase):
             drawer._runtime = SimpleNamespace(credentials=object(), environment="demo")
             drawer._profile_name = "moni"
 
-            with patch.object(drawer, "_start_load") as start_load:
-                drawer.refresh_data()
+            drawer._realtime_store = Mock()
+            drawer.refresh_data()
 
             shared_order_store.request_refresh.assert_called_once_with(
                 runtime=drawer._runtime,
                 profile_name="moni",
             )
-            start_load.assert_called_once_with(1)
+            drawer._realtime_store.start_if_needed.assert_called_once_with(drawer._runtime)
+            drawer._realtime_store.request_reconcile.assert_called_once_with("drawer")
         finally:
             self.dispose_widget(drawer)
 
@@ -209,25 +250,35 @@ class KlineAccountDrawerWidgetTests(QtWidgetTestCase):
         finally:
             self.dispose_widget(drawer)
 
-    def test_positions_table_shows_chinese_direction_labels(self) -> None:
+    def test_positions_table_uses_holdings_formatter_for_option_side_column(self) -> None:
         drawer = KlineAccountDrawer()
         try:
             position = SimpleNamespace(
                 inst_id="BTC-USDT-SWAP",
+                inst_type="SWAP",
                 pos_side="long",
                 position=Decimal("1"),
                 avail_position=Decimal("1"),
                 avg_price=Decimal("100"),
                 mark_price=Decimal("101"),
                 unrealized_pnl=Decimal("1"),
+                unrealized_pnl_ratio=None,
+                realized_pnl=None,
+                delta=None,
+                gamma=None,
+                vega=None,
+                theta=None,
                 mgn_mode="cross",
+                margin_ccy="USDT",
                 raw={},
             )
             drawer._symbol = "BTC-USDT-SWAP"
             drawer._snapshot = AccountDrawerSnapshot(positions=(position,))
             drawer._refresh_tables()
 
-            self.assertEqual(drawer._positions_table.item(0, 1).text(), "买入")
+            headers = [drawer._positions_table.horizontalHeaderItem(index).text() for index in range(drawer._positions_table.columnCount())]
+            option_side_col = headers.index("买购:卖购 | 买沽:卖沽")
+            self.assertEqual(drawer._positions_table.item(0, option_side_col).text(), "-")
         finally:
             self.dispose_widget(drawer)
 

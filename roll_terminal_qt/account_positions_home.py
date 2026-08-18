@@ -166,7 +166,7 @@ from roll_terminal_qt.option_strategy_window import CandlestickChartView
 from roll_terminal_qt.order_service import OrderFeedThread, OrderStatusView
 from roll_terminal_qt.perf_metrics import measure_ui_step
 from roll_terminal_qt.profile_access import ensure_profile_unlocked, load_profile_snapshots, profile_requires_password
-from roll_terminal_qt.realtime_account_store import AccountRealtimeSnapshot, RealtimeAccountStore
+from roll_terminal_qt.realtime_account_store import AccountRealtimeSnapshot, get_shared_realtime_account_store
 from roll_terminal_qt.shared_order_store import SharedOrderSnapshot, get_shared_order_store
 from roll_terminal_qt.runtime import load_runtime, profile_names
 
@@ -1965,7 +1965,7 @@ class AccountPositionsHomeWidget(QWidget):
         self._current_order_canceling = False
         self._selected_position_manual_flatten_running = False
         self._shared_client = OkxRestClient()
-        self._realtime_store = RealtimeAccountStore(client=self._shared_client, parent=self)
+        self._realtime_store = get_shared_realtime_account_store(client=self._shared_client)
         self._realtime_store.snapshot_ready.connect(self._apply_realtime_snapshot)
         self._realtime_store.status_changed.connect(self._set_realtime_status)
         self._protection_manager = PositionProtectionManager(self._shared_client, lambda _message: None)

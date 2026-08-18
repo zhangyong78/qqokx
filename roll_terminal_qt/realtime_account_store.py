@@ -102,6 +102,33 @@ class RealtimeAccountStore(QObject):
                 pass
         self._unsubscribers.clear()
 
+    def start_if_needed(self, runtime: ArbitrageTradeRuntime | object) -> None:
+        profile_name = str(getattr(getattr(runtime, "credentials", None), "profile_name", "") or "").strip()
+        environment = str(getattr(runtime, "environment", "") or "").strip()
+        if self._runtime is not None and profile_name == self._profile_name and environment == self._environment:
+            return
+        self.start(runtime)
+
+    def snapshot_for(self, *, profile_name: str, environment: str) -> AccountRealtimeSnapshot | None:
+        if (
+            str(profile_name or "").strip() != self._profile_name
+            or str(environment or "").strip() != self._environment
+            or self._runtime is None
+        ):
+            return None
+        return AccountRealtimeSnapshot(
+            profile_name=self._profile_name,
+            environment=self._environment,
+            positions=tuple(self._positions),
+            orders=tuple(self._orders),
+            account=self._account,
+            generation=self._generation,
+            source=self._source,
+            position_instruments=dict(self._position_instruments),
+            position_tickers=dict(self._position_tickers),
+            upl_usdt_prices=dict(self._upl_usdt_prices),
+        )
+
     def request_reconcile(self, reason: str) -> None:
         if self._runtime is None or self._reconcile_in_flight:
             return
@@ -331,3 +358,13 @@ class RealtimeAccountStore(QObject):
                 upl_usdt_prices=dict(self._upl_usdt_prices),
             )
         )
+
+
+_SHARED_REALTIME_ACCOUNT_STORE: RealtimeAccountStore | None = None
+
+
+def get_shared_realtime_account_store(*, client: OkxRestClient | object | None = None) -> RealtimeAccountStore:
+    global _SHARED_REALTIME_ACCOUNT_STORE
+    if _SHARED_REALTIME_ACCOUNT_STORE is None:
+        _SHARED_REALTIME_ACCOUNT_STORE = RealtimeAccountStore(client=client)
+    return _SHARED_REALTIME_ACCOUNT_STORE
