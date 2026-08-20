@@ -315,13 +315,18 @@ class EmailNotifier:
         direction_label: str = "",
         run_mode_label: str = "",
         price_label: str = "平仓价格",
+        stop_execution_status: str = "",
+        stop_execution_summary: str = "",
     ) -> None:
         if not self._kind_enabled("trade_fill"):
             return
         direction = self._position_direction_from_trade_side(side, closing=True)
         event = self._trade_event_label(trigger_reason, closing=True)
+        status = str(stop_execution_status or "").strip().lower()
+        status_prefix = {"warning": "⚠️ 止损超额", "critical": "🚨 止损严重超额"}.get(status, "")
+        subject_text = f"[QQOKX] {status_prefix} | {strategy_name} | {direction or '-'} | {event} | {symbol}" if status_prefix else f"[QQOKX] {strategy_name} | {direction or '-'} | {event} | {symbol}"
         subject = self._subject_with_context(
-            f"[QQOKX] {strategy_name} | {direction or '-'} | {event} | {symbol}",
+            subject_text,
             api_name=api_name,
             session_id=session_id,
             trader_id=trader_id,
@@ -341,6 +346,8 @@ class EmailNotifier:
             f"平仓数量：{size}",
             f"触发原因：{trigger_reason}",
         ]
+        if stop_execution_summary.strip():
+            lines.extend(["", "【止损执行归因】", stop_execution_summary])
         if entry_price.strip():
             lines.append(f"开仓价格：{entry_price}")
         if exit_price.strip():

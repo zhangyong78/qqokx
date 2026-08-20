@@ -163,6 +163,7 @@ from okx_quant.position_protection import (
 )
 from okx_quant.protection_replay_ui import ProtectionReplayLaunchState, ProtectionReplayWindow
 from okx_quant.pricing import format_decimal, format_decimal_by_increment, format_decimal_fixed, snap_to_increment
+from okx_quant.stop_execution import assess_stop_execution
 from okx_quant.strategy_profiles import StrategyProfile, build_strategy_profile_from_config
 from okx_quant.signal_monitor_ui import SignalMonitorWindow
 from okx_quant.signal_replay_mock_ui import SignalReplayMockWindow
@@ -1042,6 +1043,14 @@ class StrategyTradeRuntimeState:
     manual_override_at: datetime | None = None
     close_reason_hint: str = ""
     reconciliation_started: bool = False
+    stop_execution_status: str = ""
+    planned_risk_usdt: Decimal | None = None
+    actual_price_loss_usdt: Decimal | None = None
+    effective_stop_price_at_exit: Decimal | None = None
+    stop_slippage_price: Decimal | None = None
+    stop_slippage_usdt: Decimal | None = None
+    stop_overrun_usdt: Decimal | None = None
+    stop_overrun_pct: Decimal | None = None
 
 
 @dataclass
@@ -1076,6 +1085,14 @@ class StrategyTradeLedgerRecord:
     close_reason: str = ""
     reason_confidence: str = "low"
     summary_note: str = ""
+    planned_initial_risk_usdt: Decimal | None = None
+    actual_price_loss_usdt: Decimal | None = None
+    effective_stop_price_at_exit: Decimal | None = None
+    stop_slippage_price: Decimal | None = None
+    stop_slippage_usdt: Decimal | None = None
+    stop_overrun_usdt: Decimal | None = None
+    stop_overrun_pct: Decimal | None = None
+    stop_execution_status: str = ""
     updated_at: datetime | None = None
     semi_auto_pool_id: str = ""
     semi_auto_task_id: str = ""

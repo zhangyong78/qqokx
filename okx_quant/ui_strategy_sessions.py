@@ -60,6 +60,7 @@ from okx_quant.strategy_live_chart import (
     build_strategy_live_chart_snapshot,
     render_strategy_live_chart,
 )
+from okx_quant.stop_execution import assess_stop_execution
 
 _SESSION_RUNTIME_HEARTBEAT_PREFIX = "__qqokx_runtime_heartbeat__|"
 _SESSION_RUNTIME_HEARTBEAT_TIMEOUT_POLLS = 6
@@ -7669,6 +7670,42 @@ class UiStrategySessionsMixin:
         if gross_pnl is None and net_pnl is not None and (entry_fee is not None or exit_fee is not None or funding_fee is not None):
             gross_pnl = net_pnl - (entry_fee or Decimal("0")) - (exit_fee or Decimal("0")) - (funding_fee or Decimal("0"))
 
+        stop_assessment = None
+        if "止损" in close_reason and entry_price is not None and exit_price is not None and size is not None:
+            instruments = dict(getattr(snapshot, "position_instruments", {}) or {})
+            if not instruments:
+                instruments = dict(getattr(self, "_position_instruments", {}) or {})
+            amount, currency = _history_display_amount(
+                inst_id=trade_inst_id,
+                inst_type=infer_inst_type(trade_inst_id),
+                size=size,
+                reference_price=entry_price,
+                instruments=instruments,
+            )
+            base_currency = _extract_asset_key(trade_inst_id).upper()
+            direction_sign = UiStrategySessionsMixin._strategy_trade_direction_sign(session)
+            effective_stop = trade.current_stop_price or trade.initial_stop_price
+            if amount is not None and amount > 0 and currency == base_currency and direction_sign and trade.initial_stop_price and effective_stop:
+                stop_assessment = assess_stop_execution(
+                    direction="long" if direction_sign > 0 else "short",
+                    entry_price=entry_price,
+                    initial_stop_price=trade.initial_stop_price,
+                    effective_stop_price=effective_stop,
+                    actual_exit_price=exit_price,
+                    size=size,
+                    price_delta_multiplier=amount / abs(size),
+                    actual_price_loss_usdt=gross_pnl,
+                )
+        if stop_assessment is not None:
+            trade.stop_execution_status = stop_assessment.status
+            trade.planned_risk_usdt = stop_assessment.planned_risk_usdt
+            trade.actual_price_loss_usdt = stop_assessment.actual_price_loss_usdt
+            trade.effective_stop_price_at_exit = stop_assessment.effective_stop_price
+            trade.stop_slippage_price = stop_assessment.stop_slippage_price
+            trade.stop_slippage_usdt = stop_assessment.stop_slippage_usdt
+            trade.stop_overrun_usdt = stop_assessment.stop_overrun_usdt
+            trade.stop_overrun_pct = stop_assessment.stop_overrun_pct
+
         ledger_record = StrategyTradeLedgerRecord(
             record_id=self._next_strategy_trade_ledger_record_id(session, trade.round_id, closed_at),
             history_record_id=session.history_record_id or "",
@@ -7705,6 +7742,14 @@ class UiStrategySessionsMixin:
             close_reason=close_reason,
             reason_confidence=reason_confidence,
             summary_note=snapshot.environment_note or "",
+            planned_initial_risk_usdt=stop_assessment.planned_risk_usdt if stop_assessment is not None else None,
+            actual_price_loss_usdt=stop_assessment.actual_price_loss_usdt if stop_assessment is not None else None,
+            effective_stop_price_at_exit=stop_assessment.effective_stop_price if stop_assessment is not None else None,
+            stop_slippage_price=stop_assessment.stop_slippage_price if stop_assessment is not None else None,
+            stop_slippage_usdt=stop_assessment.stop_slippage_usdt if stop_assessment is not None else None,
+            stop_overrun_usdt=stop_assessment.stop_overrun_usdt if stop_assessment is not None else None,
+            stop_overrun_pct=stop_assessment.stop_overrun_pct if stop_assessment is not None else None,
+            stop_execution_status=stop_assessment.status if stop_assessment is not None else "",
             updated_at=datetime.now(),
             semi_auto_pool_id=str(getattr(session, "semi_auto_pool_id", "") or "").strip(),
             semi_auto_task_id=str(getattr(session, "semi_auto_task_id", "") or "").strip(),
@@ -8073,6 +8118,9 @@ class UiStrategySessionsMixin:
     def _session_trade_detail_reason_text(record: StrategyTradeLedgerRecord) -> str:
         reason = str(record.close_reason or "").strip()
         note = str(record.summary_note or "").strip()
+        status = str(record.stop_execution_status or "").strip().upper()
+        if status and record.stop_overrun_usdt is not None:
+            reason = f"{reason} | 止损执行={status} 超额{record.stop_overrun_usdt:.2f}U"
         if reason and note and note != reason:
             return f"{reason} | {note}"
         return reason or note or "-"
@@ -10824,6 +10872,14 @@ class UiStrategySessionsMixin:
             close_reason=str(payload.get("close_reason", "")).strip(),
             reason_confidence=str(payload.get("reason_confidence", "")).strip() or "low",
             summary_note=str(payload.get("summary_note", "")).strip(),
+            planned_initial_risk_usdt=_parse_decimal_snapshot(payload.get("planned_initial_risk_usdt"), default=None) if payload.get("planned_initial_risk_usdt") else None,
+            actual_price_loss_usdt=_parse_decimal_snapshot(payload.get("actual_price_loss_usdt"), default=None) if payload.get("actual_price_loss_usdt") else None,
+            effective_stop_price_at_exit=_parse_decimal_snapshot(payload.get("effective_stop_price_at_exit"), default=None) if payload.get("effective_stop_price_at_exit") else None,
+            stop_slippage_price=_parse_decimal_snapshot(payload.get("stop_slippage_price"), default=None) if payload.get("stop_slippage_price") else None,
+            stop_slippage_usdt=_parse_decimal_snapshot(payload.get("stop_slippage_usdt"), default=None) if payload.get("stop_slippage_usdt") else None,
+            stop_overrun_usdt=_parse_decimal_snapshot(payload.get("stop_overrun_usdt"), default=None) if payload.get("stop_overrun_usdt") else None,
+            stop_overrun_pct=_parse_decimal_snapshot(payload.get("stop_overrun_pct"), default=None) if payload.get("stop_overrun_pct") else None,
+            stop_execution_status=str(payload.get("stop_execution_status", "")).strip(),
             updated_at=_parse_datetime_snapshot(payload.get("updated_at")),
             semi_auto_pool_id=str(payload.get("semi_auto_pool_id", "")).strip(),
             semi_auto_task_id=str(payload.get("semi_auto_task_id", "")).strip(),
@@ -10862,6 +10918,14 @@ class UiStrategySessionsMixin:
             "close_reason": record.close_reason,
             "reason_confidence": record.reason_confidence,
             "summary_note": record.summary_note,
+            "planned_initial_risk_usdt": format(record.planned_initial_risk_usdt, "f") if record.planned_initial_risk_usdt is not None else None,
+            "actual_price_loss_usdt": format(record.actual_price_loss_usdt, "f") if record.actual_price_loss_usdt is not None else None,
+            "effective_stop_price_at_exit": format(record.effective_stop_price_at_exit, "f") if record.effective_stop_price_at_exit is not None else None,
+            "stop_slippage_price": format(record.stop_slippage_price, "f") if record.stop_slippage_price is not None else None,
+            "stop_slippage_usdt": format(record.stop_slippage_usdt, "f") if record.stop_slippage_usdt is not None else None,
+            "stop_overrun_usdt": format(record.stop_overrun_usdt, "f") if record.stop_overrun_usdt is not None else None,
+            "stop_overrun_pct": format(record.stop_overrun_pct, "f") if record.stop_overrun_pct is not None else None,
+            "stop_execution_status": record.stop_execution_status,
             "updated_at": record.updated_at.isoformat(timespec="seconds") if record.updated_at is not None else None,
             "semi_auto_pool_id": record.semi_auto_pool_id,
             "semi_auto_task_id": record.semi_auto_task_id,

@@ -40,6 +40,7 @@ from okx_quant.okx_client import (
 )
 from okx_quant.pricing import format_decimal, format_decimal_fixed, snap_to_increment
 from okx_quant.protection_validation import InvalidProtectionPlanError, validate_protection_prices
+from okx_quant.stop_execution import assess_stop_execution, format_stop_execution_summary
 from okx_quant.engine_order_service import EngineOrderService
 from okx_quant.engine_retry_policy import EngineRetryPolicy
 from okx_quant.engine_session_runner import EngineSessionRunner
@@ -4919,20 +4920,24 @@ class StrategyEngine:
             update_time = item.update_time
             if close_ms > 0:
                 if update_time is None:
-                    continue
-                if update_time + 10 * 60 * 1000 < close_ms:
-                    continue
-                if update_time - close_ms > 2 * 60 * 60 * 1000:
-                    continue
-                time_gap = abs(update_time - close_ms)
-                if time_gap <= 2 * 60 * 1000:
-                    score += 25
-                elif time_gap <= 15 * 60 * 1000:
-                    score += 15
-                elif time_gap <= 2 * 60 * 60 * 1000:
-                    score += 5
+                    # Some OKX history responses omit uTime; keep matching on
+                    # symbol, side, size and prices instead of discarding a
+                    # record that otherwise uniquely identifies this close.
+                    time_gap = None
                 else:
-                    score -= 10
+                    if update_time + 10 * 60 * 1000 < close_ms:
+                        continue
+                    if update_time - close_ms > 2 * 60 * 60 * 1000:
+                        continue
+                    time_gap = abs(update_time - close_ms)
+                    if time_gap <= 2 * 60 * 1000:
+                        score += 25
+                    elif time_gap <= 15 * 60 * 1000:
+                        score += 15
+                    elif time_gap <= 2 * 60 * 60 * 1000:
+                        score += 5
+                    else:
+                        score -= 10
             else:
                 time_gap = None
                 if update_time is not None:
@@ -6583,6 +6588,8 @@ class StrategyEngine:
         trade_pnl: str = "",
         price_label: str = "平仓价格",
         size_text: str = "",
+        stop_execution_status: str = "",
+        stop_execution_summary: str = "",
     ) -> None:
         if self._notifier is None:
             return
@@ -6603,6 +6610,8 @@ class StrategyEngine:
             direction_label=self._direction_label,
             run_mode_label=self._run_mode_label,
             price_label=price_label,
+            stop_execution_status=stop_execution_status,
+            stop_execution_summary=stop_execution_summary,
         )
 
     def _notify_exchange_dynamic_stop_close(
@@ -6645,6 +6654,25 @@ class StrategyEngine:
             exit_price=current_stop_loss,
             close_ms=int(time.time() * 1000),
         )
+        assessment = None
+        actual_exit_price = history_item.close_avg_price if history_item is not None else None
+        if "止损" in trigger_reason and actual_exit_price is not None:
+            assessment = assess_stop_execution(
+                direction=direction,
+                entry_price=position.entry_price,
+                initial_stop_price=initial_stop_loss,
+                effective_stop_price=current_stop_loss,
+                actual_exit_price=actual_exit_price,
+                size=position.size,
+                price_delta_multiplier=self._resolve_trade_fill_price_delta_multiplier(
+                    position,
+                    trade_instrument=trade_instrument,
+                ),
+                actual_price_loss_usdt=history_item.pnl,
+            )
+        execution_summary = format_stop_execution_summary(assessment) if assessment is not None else ""
+        if execution_summary:
+            self._logger(execution_summary)
         self._notify_trade_close(
             config,
             symbol=trade_instrument.inst_id,
@@ -6652,7 +6680,7 @@ class StrategyEngine:
             size=position.size,
             size_text=_format_notify_size_with_unit(trade_instrument, position.size),
             entry_price=position.entry_price,
-            exit_price=current_stop_loss,
+            exit_price=actual_exit_price or current_stop_loss,
             tick_size=trade_instrument.tick_size,
             trigger_reason=trigger_reason,
             detail=detail,
@@ -6663,7 +6691,9 @@ class StrategyEngine:
                 position=position,
                 history_item=history_item,
             ),
-            price_label="触发止损价",
+            price_label="实际平仓均价" if actual_exit_price is not None else "触发止损价",
+            stop_execution_status=assessment.status if assessment is not None else "",
+            stop_execution_summary=execution_summary,
         )
 
     @staticmethod
