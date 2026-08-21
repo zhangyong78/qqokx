@@ -604,6 +604,16 @@ class AccountPositionsHomeQtHelpersTest(TestCase):
         header.setSectionResizeMode.assert_any_call(1, QHeaderView.ResizeMode.Stretch)
         header.setSectionResizeMode.assert_any_call(2, QHeaderView.ResizeMode.Interactive)
 
+    @patch("roll_terminal_qt.account_positions_home.QTableWidget")
+    def test_build_history_table_enables_header_sorting(self, table_type: MagicMock) -> None:
+        AccountPositionsHomeWidget._build_history_table(
+            SimpleNamespace(),
+            ("时间", "合约"),
+            stretch_columns=set(),
+        )
+
+        table_type.return_value.setSortingEnabled.assert_called_once_with(True)
+
     def test_apply_shared_order_snapshot_updates_matching_profile_environment(self) -> None:
         current_order = OrderStatusView(
             inst_id="BTC-USDT-SWAP",

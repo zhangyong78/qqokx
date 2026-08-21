@@ -2515,7 +2515,9 @@ class AccountPositionsHomeWidget(QWidget):
         filtered = self._filtered_position_history_items()
         selected_key = ""
         row = self._position_history_table.currentRow()
-        if 0 <= row < len(self._visible_position_history_items):
+        if row >= 0 and self._position_history_table.item(row, 0) is not None:
+            selected_key = str(self._position_history_table.item(row, 0).data(Qt.ItemDataRole.UserRole) or "")
+        if not selected_key and 0 <= row < len(self._visible_position_history_items):
             selected_key = self._position_history_row_key(self._visible_position_history_items[row])
         self._visible_position_history_items = filtered
         stats_text = _format_position_history_filter_stats(list(enumerate(filtered)), self._position_history_usdt_prices)
@@ -2536,6 +2538,8 @@ class AccountPositionsHomeWidget(QWidget):
                 )
             )
         )
+        sorting_enabled = self._position_history_table.isSortingEnabled()
+        self._position_history_table.setSortingEnabled(False)
         self._position_history_table.setRowCount(len(filtered))
         for row, item in enumerate(filtered):
             values = (
@@ -2558,6 +2562,11 @@ class AccountPositionsHomeWidget(QWidget):
                 _position_history_note_summary_text(item, self._position_history_note_text(item)),
             )
             self._set_table_row(self._position_history_table, row, values, left_align={2, 11})
+            self._position_history_table.item(row, 0).setData(
+                Qt.ItemDataRole.UserRole,
+                self._position_history_row_key(item),
+            )
+        self._position_history_table.setSortingEnabled(sorting_enabled)
         self._restore_table_selection(
             self._position_history_table,
             filtered,
@@ -5236,6 +5245,7 @@ class AccountPositionsHomeWidget(QWidget):
     def _build_history_table(self, headings: tuple[str, ...], *, stretch_columns: set[int]) -> QTableWidget:
         table = QTableWidget(0, len(headings))
         table.setHorizontalHeaderLabels(headings)
+        table.setSortingEnabled(True)
         table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
@@ -5922,7 +5932,9 @@ class AccountPositionsHomeWidget(QWidget):
         filtered = self._filtered_position_history_items()
         selected_key = ""
         row = self._position_history_table.currentRow()
-        if 0 <= row < len(self._visible_position_history_items):
+        if row >= 0 and self._position_history_table.item(row, 0) is not None:
+            selected_key = str(self._position_history_table.item(row, 0).data(Qt.ItemDataRole.UserRole) or "")
+        if not selected_key and 0 <= row < len(self._visible_position_history_items):
             selected_key = self._position_history_row_key(self._visible_position_history_items[row])
         self._visible_position_history_items = filtered
         stats_text = _format_position_history_filter_stats(
@@ -5937,6 +5949,8 @@ class AccountPositionsHomeWidget(QWidget):
                 )
             )
         )
+        sorting_enabled = self._position_history_table.isSortingEnabled()
+        self._position_history_table.setSortingEnabled(False)
         self._position_history_table.setRowCount(len(filtered))
         for row, item in enumerate(filtered):
             values = (
@@ -5959,6 +5973,11 @@ class AccountPositionsHomeWidget(QWidget):
                 _position_history_note_summary_text(item, self._position_history_note_text(item)),
             )
             self._set_table_row(self._position_history_table, row, values, left_align={2, 11})
+            self._position_history_table.item(row, 0).setData(
+                Qt.ItemDataRole.UserRole,
+                self._position_history_row_key(item),
+            )
+        self._position_history_table.setSortingEnabled(sorting_enabled)
         self._restore_table_selection(
             self._position_history_table,
             filtered,
@@ -6157,6 +6176,12 @@ class AccountPositionsHomeWidget(QWidget):
     ) -> None:
         target_row = -1
         if selected_key:
+            for index in range(table.rowCount()):
+                cell = table.item(index, 0)
+                if cell is not None and str(cell.data(Qt.ItemDataRole.UserRole) or "") == selected_key:
+                    target_row = index
+                    break
+        if target_row < 0 and selected_key:
             for index, item in enumerate(items):
                 if key_fn(item) == selected_key:
                     target_row = index
