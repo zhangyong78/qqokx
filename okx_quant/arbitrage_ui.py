@@ -28,6 +28,7 @@ from okx_quant.arbitrage.launch_support import (
 from okx_quant.arbitrage.arbitrage_manager import ArbitrageManager
 from okx_quant.arbitrage.models import ArbitrageOpportunity, ArbitrageRuntimeConfig, ArbitrageTradeRuntime
 from okx_quant.models import Candle, Credentials, Instrument, StrategyConfig
+from okx_quant.client_order_id import with_custom_order_id_prefix
 from okx_quant.okx_client import OkxApiError, OkxOrderBook, OkxPosition, OkxTicker, infer_inst_type
 from okx_quant.persistence import (
     DEFAULT_CREDENTIAL_PROFILE_NAME,
@@ -4560,7 +4561,7 @@ class ArbitrageWindow:
             ord_type="market",
             pos_side=pos_side,
             reduce_only=reduce_only,
-            cl_ord_id=f"pair{uuid.uuid4().hex[:14]}",
+            cl_ord_id=with_custom_order_id_prefix(f"pair{uuid.uuid4().hex[:14]}"),
         )
         return _wait_order_fill(
             self.client,
@@ -4601,7 +4602,7 @@ class ArbitrageWindow:
             pos_side=derivative_pos_side,
             price=derivative_price if self.use_limit_orders.get() else None,
             reduce_only=True,
-            cl_ord_id=f"pair{uuid.uuid4().hex[:14]}",
+            cl_ord_id=with_custom_order_id_prefix(f"pair{uuid.uuid4().hex[:14]}"),
         )
         derivative_filled, derivative_avg = _wait_order_fill(
             self.client,
@@ -4629,7 +4630,7 @@ class ArbitrageWindow:
             size=actual_spot_qty,
             ord_type="limit" if self.use_limit_orders.get() else "market",
             price=spot_price if self.use_limit_orders.get() else None,
-            cl_ord_id=f"pair{uuid.uuid4().hex[:14]}",
+            cl_ord_id=with_custom_order_id_prefix(f"pair{uuid.uuid4().hex[:14]}"),
         )
         spot_filled, spot_avg = _wait_order_fill(
             self.client,
@@ -4709,7 +4710,7 @@ class ArbitrageWindow:
                 pos_side=maker_pos_side,
                 price=maker_price,
                 reduce_only=maker_reduce_only,
-                cl_ord_id=f"pair{uuid.uuid4().hex[:14]}",
+                cl_ord_id=with_custom_order_id_prefix(f"pair{uuid.uuid4().hex[:14]}"),
             )
             maker_filled, maker_avg, maker_done = self._wait_pair_close_order_until(
                 runtime=runtime,

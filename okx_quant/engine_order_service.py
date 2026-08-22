@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-from datetime import datetime
 from decimal import Decimal
 import inspect
 from typing import TYPE_CHECKING, Callable, Literal
 
 from okx_quant.models import Credentials, Instrument, StrategyConfig
 from okx_quant.okx_client import OkxApiError, OkxOrderResult
+from okx_quant.client_order_id import new_strategy_order_id
 
 if TYPE_CHECKING:
     from okx_quant.engine import StrategyEngine
@@ -19,12 +19,11 @@ class EngineOrderService:
     def next_client_order_id(self, *, role: str) -> str:
         engine = self._engine
         engine._order_ref_counter += 1
-        session_token = "".join(ch for ch in engine._session_id.lower() if ch.isascii() and ch.isalnum())[:4] or "sess"
-        strategy_token = "".join(ch for ch in engine._strategy_name.lower() if ch.isascii() and ch.isalnum())[:4] or "stg"
-        role_token = "".join(ch for ch in role.lower() if ch.isascii() and ch.isalnum())[:3] or "ord"
-        timestamp = datetime.utcnow().strftime("%m%d%H%M%S%f")[:-3]
-        suffix = f"{engine._order_ref_counter % 100:02d}"
-        return f"{session_token}{strategy_token}{role_token}{timestamp}{suffix}"[:32]
+        return new_strategy_order_id(
+            session_id=engine._session_id,
+            strategy_name=engine._strategy_name,
+            role=role,
+        )
 
     def submit_order_with_recovery(
         self,

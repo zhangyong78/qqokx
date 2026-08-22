@@ -11,6 +11,7 @@ from unittest import TestCase
 from unittest.mock import MagicMock, patch
 
 from okx_quant.backtest_ui import BacktestWindow
+from okx_quant.client_order_id import CUSTOM_ORDER_ID_PREFIX, with_custom_order_id_prefix
 from okx_quant.models import StrategyConfig
 from okx_quant.okx_client import Instrument, OkxOrderResult, OkxOrderStatus, OkxPosition, OkxPositionHistoryItem
 from okx_quant.persistence import build_profile_switch_password_snapshot
@@ -100,6 +101,7 @@ from okx_quant.ui import (
     _session_order_prefixes,
     _strategy_template_record_from_payload,
     _trade_order_belongs_to_session,
+    _trade_order_program_owner_label,
     _trade_order_session_role,
     _app_restart_workdir,
     _extract_log_field_decimal,
@@ -2119,6 +2121,39 @@ HTTP 502: <!DOCTYPE html>
 
         self.assertEqual(_trade_order_session_role(order, session), "slg")
         self.assertTrue(_trade_order_belongs_to_session(order, session))
+
+    def test_trade_order_session_role_matches_new_prefixed_strategy_id(self) -> None:
+        session = SimpleNamespace(
+            session_id="S233",
+            strategy_id="ema_dynamic_order",
+            strategy_name="EMA 动态委托做多",
+        )
+        compact_identity = _session_order_prefixes(session)[1]
+        order = SimpleNamespace(
+            client_order_id=f"{CUSTOM_ORDER_ID_PREFIX}{compact_identity}ent1234567",
+            algo_client_order_id="",
+        )
+
+        self.assertEqual(_trade_order_session_role(order, session), "ent")
+        self.assertTrue(_trade_order_belongs_to_session(order, session))
+
+    def test_program_owner_recognizes_prefixed_protection_smart_and_fallback_orders(self) -> None:
+        protection = SimpleNamespace(
+            client_order_id=with_custom_order_id_prefix("ppp1234567890"),
+            algo_client_order_id="",
+        )
+        smart = SimpleNamespace(
+            client_order_id=with_custom_order_id_prefix("soabcd123456"),
+            algo_client_order_id="",
+        )
+        fallback = SimpleNamespace(
+            client_order_id=with_custom_order_id_prefix("ordabcdef1234567"),
+            algo_client_order_id="",
+        )
+
+        self.assertEqual(_trade_order_program_owner_label(protection), "风控保护")
+        self.assertEqual(_trade_order_program_owner_label(smart), "智能下单")
+        self.assertEqual(_trade_order_program_owner_label(fallback), "本程序委托")
 
     def test_trade_order_session_role_does_not_match_other_session(self) -> None:
         session = SimpleNamespace(

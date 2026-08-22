@@ -1709,7 +1709,8 @@ class StrategyEngineTest(TestCase):
         client_order_id = engine._next_client_order_id(role="entry")
 
         self.assertTrue(client_order_id.isascii())
-        self.assertRegex(client_order_id, r"^[a-z0-9]+$")
+        self.assertTrue(client_order_id.startswith("9b182c653bfd49BC"))
+        self.assertRegex(client_order_id[16:], r"^[a-z0-9]+$")
         self.assertLessEqual(len(client_order_id), 32)
 
     def test_idle_signal_wait_seconds_caps_hourly_polling_to_one_minute(self) -> None:

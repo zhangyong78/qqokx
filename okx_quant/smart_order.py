@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Callable, Literal
 
 from okx_quant.log_utils import append_log_line, ensure_log_timestamp
+from okx_quant.client_order_id import with_custom_order_id_prefix
 from okx_quant.models import Credentials, Instrument, PositionMode, StrategyConfig, TradeMode, TriggerPriceType
 from okx_quant.okx_client import OkxApiError, OkxOrderBook, OkxOrderResult, OkxOrderStatus, OkxRestClient, OkxTicker, infer_inst_type
 from okx_quant.persistence import load_smart_order_tasks_snapshot, save_smart_order_tasks_snapshot
@@ -2005,7 +2006,7 @@ class SmartOrderManager:
                 ignore_task_id=task.task_id,
             )
         resolved_pos_side = self._resolve_order_pos_side(task, side=side, pos_side=pos_side)
-        cl_ord_id = f"so{task.task_id.lower()}{int(time.time() * 1000) % 1000000:06d}"
+        cl_ord_id = with_custom_order_id_prefix(f"so{task.task_id.lower()}{int(time.time() * 1000) % 1000000:06d}")
         result = self._submit_order_with_recovery(
             task,
             label=message_prefix,
@@ -2052,7 +2053,7 @@ class SmartOrderManager:
                 ignore_task_id=task.task_id,
             )
         resolved_pos_side = self._resolve_order_pos_side(task, side=side, pos_side=pos_side)
-        cl_ord_id = f"so{task.task_id.lower()}{int(time.time() * 1000) % 1000000:06d}"
+        cl_ord_id = with_custom_order_id_prefix(f"so{task.task_id.lower()}{int(time.time() * 1000) % 1000000:06d}")
         result = self._submit_order_with_recovery(
             task,
             label=message_prefix,

@@ -7,6 +7,7 @@ from decimal import Decimal
 from typing import Callable, Literal
 
 from okx_quant.models import Credentials, StrategyConfig
+from okx_quant.client_order_id import with_custom_order_id_prefix
 from okx_quant.notifications import EmailNotifier
 from okx_quant.okx_client import OkxApiError, OkxOrderResult, OkxOrderStatus, OkxPosition, OkxRestClient, OkxTicker
 from okx_quant.pricing import format_decimal, snap_to_increment
@@ -624,7 +625,7 @@ class PositionProtectionManager:
 
     def _next_close_cl_ord_id(self, worker: _ProtectionWorker) -> str:
         worker.close_order_sequence += 1
-        return f"pp{worker.session_id.lower()}{worker.close_order_sequence:04d}"
+        return with_custom_order_id_prefix(f"pp{worker.session_id.lower()}{worker.close_order_sequence:04d}")
 
     def _clear_active_close_order(self, worker: _ProtectionWorker) -> None:
         worker.active_close_cl_ord_id = None

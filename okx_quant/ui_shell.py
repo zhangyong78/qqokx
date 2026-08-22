@@ -21,6 +21,7 @@ from tkinter import BooleanVar, Canvas, END, Label, Listbox, Menu, StringVar, Te
 from tkinter import messagebox, ttk
 
 from okx_quant.app_paths import configured_data_root, data_root
+from okx_quant.client_order_id import CUSTOM_ORDER_ID_PREFIX, strategy_order_identity, with_custom_order_id_prefix
 from okx_quant.app_meta import APP_VERSION, build_app_title, build_version_info_text
 from okx_quant.analysis import (
     BoxDetectionConfig,
@@ -774,7 +775,9 @@ ORDER_STATE_FILTER_OPTIONS = {
     "算法生效 effective": "effective",
     "失败 order_failed": "order_failed",
 }
-ENGINE_CL_ORD_ID_PATTERN = re.compile(r"^[a-z0-9]{4,8}(ent|exi)[0-9]{15}$")
+ENGINE_CL_ORD_ID_PATTERN = re.compile(
+    rf"^(?:{CUSTOM_ORDER_ID_PREFIX.lower()})?[a-z0-9]{{4,8}}(ent|exi|slg)[a-z0-9]{{5,15}}$"
+)
 PROTECTION_CL_ORD_ID_PATTERN = re.compile(r"^ppp\d{2,}\d{4}$")
 SMART_ORDER_CL_ORD_ID_PATTERN = re.compile(r"^so[a-z0-9]{4}\d{6}$")
 SESSION_BAR_TIME_PATTERN = re.compile(r"^(?P<ts>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) \|")
@@ -13894,7 +13897,7 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         order_mode = state.param_order_mode.get() if state.param_order_mode is not None else "限价挂单"
         session_log_tag = f"desk:{_normalize_symbol_input(symbol)}"
         api_profile = profile
-        cl_ord_id = f"ld{datetime.utcnow().strftime('%y%m%d%H%M%S%f')}"[:32]
+        cl_ord_id = with_custom_order_id_prefix(f"ld{datetime.utcnow().strftime('%y%m%d%H%M%S%f')}")
         desk_ref = state
         ann_ref = ray_annotation
         if ann_ref is not None:
@@ -17618,12 +17621,18 @@ def _trade_order_program_owner_label(item: OkxTradeOrderItem) -> str | None:
     for candidate in candidates:
         if not candidate:
             continue
-        if PROTECTION_CL_ORD_ID_PATTERN.fullmatch(candidate):
+        has_broker_prefix = candidate.startswith(CUSTOM_ORDER_ID_PREFIX.lower())
+        suffix = candidate[len(CUSTOM_ORDER_ID_PREFIX):] if has_broker_prefix else candidate
+        if PROTECTION_CL_ORD_ID_PATTERN.fullmatch(suffix) or (has_broker_prefix and suffix.startswith("pp")):
             return "风控保护"
-        if SMART_ORDER_CL_ORD_ID_PATTERN.fullmatch(candidate):
+        if SMART_ORDER_CL_ORD_ID_PATTERN.fullmatch(suffix) or (has_broker_prefix and suffix.startswith("so")):
             return "智能下单"
-        if ENGINE_CL_ORD_ID_PATTERN.fullmatch(candidate):
+        if ENGINE_CL_ORD_ID_PATTERN.fullmatch(candidate) or ENGINE_CL_ORD_ID_PATTERN.fullmatch(suffix):
             return "策略引擎"
+        if has_broker_prefix and suffix.startswith(("arb", "pair")):
+            return "套利执行"
+        if has_broker_prefix:
+            return "本程序委托"
     return None
 
 
@@ -17632,7 +17641,10 @@ def _session_order_prefixes(session: StrategySession) -> tuple[str, ...]:
     strategy_name = str(getattr(session, "strategy_name", "") or getattr(session, "strategy_id", "") or "")
     session_token = "".join(ch for ch in session_id.lower() if ch.isascii() and ch.isalnum())[:4] or "sess"
     strategy_token = "".join(ch for ch in strategy_name.lower() if ch.isascii() and ch.isalnum())[:4] or "stg"
-    return (f"{session_token}{strategy_token}",)
+    return (
+        f"{session_token}{strategy_token}",
+        strategy_order_identity(session_id, strategy_name),
+    )
 
 
 def _strategy_live_chart_fill_session_role(item: OkxFillHistoryItem, session: StrategySession) -> str | None:
@@ -17646,6 +17658,8 @@ def _strategy_live_chart_fill_session_role(item: OkxFillHistoryItem, session: St
     for candidate in candidates:
         if not candidate:
             continue
+        if candidate.startswith(CUSTOM_ORDER_ID_PREFIX.lower()):
+            candidate = candidate[len(CUSTOM_ORDER_ID_PREFIX):]
         for prefix in prefixes:
             if candidate.startswith(prefix):
                 role = candidate[len(prefix): len(prefix) + 3]
@@ -17667,6 +17681,8 @@ def _trade_order_session_role(item: OkxTradeOrderItem, session: StrategySession)
     for candidate in candidates:
         if not candidate:
             continue
+        if candidate.startswith(CUSTOM_ORDER_ID_PREFIX.lower()):
+            candidate = candidate[len(CUSTOM_ORDER_ID_PREFIX):]
         for prefix in prefixes:
             if not candidate.startswith(prefix):
                 continue

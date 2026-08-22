@@ -20,6 +20,7 @@ from okx_quant.arbitrage.models import ArbitrageLedgerEntry, ArbitrageTradeRunti
 from okx_quant.arbitrage.position_ledger import find_ledger_entry, load_open_ledger_entries, upsert_ledger_entry
 from okx_quant.arbitrage.size_converter import preview_arbitrage_size
 from okx_quant.models import StrategyConfig
+from okx_quant.client_order_id import with_custom_order_id_prefix
 from okx_quant.okx_client import (
     OkxApiError,
     OkxMaxOrderSize,
@@ -1609,7 +1610,7 @@ class ArbitrageExecutor:
             ord_type="market",
             pos_side=pos_side,
             reduce_only=reduce_only,
-            cl_ord_id=f"arb{uuid.uuid4().hex[:14]}",
+            cl_ord_id=with_custom_order_id_prefix(f"arb{uuid.uuid4().hex[:14]}"),
         )
         return _wait_order_fill(
             self._client,
@@ -1853,7 +1854,7 @@ class ArbitrageExecutor:
                     environment=runtime.environment,
                 ),
                 reduce_only=False,
-                cl_ord_id=f"arb{uuid.uuid4().hex[:14]}",
+                cl_ord_id=with_custom_order_id_prefix(f"arb{uuid.uuid4().hex[:14]}"),
             )
             deriv_order = self._place_simple_order_with_recovery(
                 credentials,
@@ -1870,7 +1871,7 @@ class ArbitrageExecutor:
                     environment=runtime.environment,
                 ),
                 reduce_only=deriv_reduce_only,
-                cl_ord_id=f"arb{uuid.uuid4().hex[:14]}",
+                cl_ord_id=with_custom_order_id_prefix(f"arb{uuid.uuid4().hex[:14]}"),
             )
             (
                 spot_maker_filled,
@@ -2102,7 +2103,7 @@ class ArbitrageExecutor:
                     environment=runtime.environment,
                 ),
                 reduce_only=maker_reduce_only,
-                cl_ord_id=f"arb{uuid.uuid4().hex[:14]}",
+                cl_ord_id=with_custom_order_id_prefix(f"arb{uuid.uuid4().hex[:14]}"),
             )
             maker_filled, maker_avg, maker_done = self._wait_order_fill_until(
                 credentials=credentials,
@@ -2262,7 +2263,7 @@ class ArbitrageExecutor:
                     environment=runtime.environment,
                 ),
                 reduce_only=maker_reduce_only,
-                cl_ord_id=f"arb{uuid.uuid4().hex[:14]}",
+                cl_ord_id=with_custom_order_id_prefix(f"arb{uuid.uuid4().hex[:14]}"),
             )
             maker_filled, maker_avg, maker_done = self._wait_order_fill_until(
                 credentials=credentials,
@@ -2560,7 +2561,7 @@ class ArbitrageExecutor:
                     size=preview.spot_base_qty,
                     ord_type=spot_ord_type,
                     price=spot_price if spot_ord_type == "limit" else None,
-                    cl_ord_id=f"arb{uuid.uuid4().hex[:14]}",
+                    cl_ord_id=with_custom_order_id_prefix(f"arb{uuid.uuid4().hex[:14]}"),
                 )
                 spot_filled, spot_avg = _wait_order_fill(
                     self._client,
@@ -2591,7 +2592,7 @@ class ArbitrageExecutor:
                     size=adjusted_contracts,
                     ord_type=deriv_ord_type,
                     price=deriv_price if deriv_ord_type == "limit" else None,
-                    cl_ord_id=f"arb{uuid.uuid4().hex[:14]}",
+                    cl_ord_id=with_custom_order_id_prefix(f"arb{uuid.uuid4().hex[:14]}"),
                 )
                 deriv_filled, deriv_avg = _wait_order_fill(
                     self._client,
@@ -2905,7 +2906,7 @@ class ArbitrageExecutor:
                 price=deriv_price if deriv_ord_type == "limit" else None,
                 reduce_only=True,
                 pos_side=_resolve_close_reduce_only_pos_side(self._client, runtime),
-                cl_ord_id=f"arb{uuid.uuid4().hex[:14]}",
+                cl_ord_id=with_custom_order_id_prefix(f"arb{uuid.uuid4().hex[:14]}"),
             )
             deriv_filled, deriv_avg = _wait_order_fill(
                 self._client,
@@ -2944,7 +2945,7 @@ class ArbitrageExecutor:
                 size=spot_qty,
                 ord_type=spot_ord_type,
                 price=spot_price if spot_ord_type == "limit" else None,
-                cl_ord_id=f"arb{uuid.uuid4().hex[:14]}",
+                cl_ord_id=with_custom_order_id_prefix(f"arb{uuid.uuid4().hex[:14]}"),
             )
             spot_filled, spot_avg = _wait_order_fill(
                 self._client,
@@ -3662,7 +3663,7 @@ class ArbitrageExecutor:
                         environment=runtime.environment,
                     ),
                     reduce_only=True,
-                    cl_ord_id=f"arb{uuid.uuid4().hex[:14]}",
+                    cl_ord_id=with_custom_order_id_prefix(f"arb{uuid.uuid4().hex[:14]}"),
                 )
                 target_order = self._place_simple_order_with_recovery(
                     credentials,
@@ -3679,7 +3680,7 @@ class ArbitrageExecutor:
                         environment=runtime.environment,
                     ),
                     reduce_only=False,
-                    cl_ord_id=f"arb{uuid.uuid4().hex[:14]}",
+                    cl_ord_id=with_custom_order_id_prefix(f"arb{uuid.uuid4().hex[:14]}"),
                 )
                 (
                     current_maker_filled,
@@ -3947,7 +3948,7 @@ class ArbitrageExecutor:
                         environment=runtime.environment,
                     ),
                     reduce_only=True,
-                    cl_ord_id=f"arb{uuid.uuid4().hex[:14]}",
+                    cl_ord_id=with_custom_order_id_prefix(f"arb{uuid.uuid4().hex[:14]}"),
                 )
                 current_filled, current_avg_once, current_done = self._wait_order_fill_until(
                     credentials=credentials,
@@ -4102,7 +4103,7 @@ class ArbitrageExecutor:
                         environment=runtime.environment,
                     ),
                     reduce_only=False,
-                    cl_ord_id=f"arb{uuid.uuid4().hex[:14]}",
+                    cl_ord_id=with_custom_order_id_prefix(f"arb{uuid.uuid4().hex[:14]}"),
                 )
                 target_filled, target_avg_once, target_done = self._wait_order_fill_until(
                     credentials=credentials,
@@ -4257,7 +4258,7 @@ class ArbitrageExecutor:
             price=current_order_price if current_ord_type == "limit" else None,
             reduce_only=True,
             pos_side=derivative_pos_side,
-            cl_ord_id=f"arb{uuid.uuid4().hex[:14]}",
+            cl_ord_id=with_custom_order_id_prefix(f"arb{uuid.uuid4().hex[:14]}"),
         )
         current_filled, current_avg = _wait_order_fill(
             self._client,
@@ -4282,7 +4283,7 @@ class ArbitrageExecutor:
             price=target_order_price if target_ord_type == "limit" else None,
             reduce_only=False,
             pos_side=derivative_pos_side,
-            cl_ord_id=f"arb{uuid.uuid4().hex[:14]}",
+            cl_ord_id=with_custom_order_id_prefix(f"arb{uuid.uuid4().hex[:14]}"),
         )
         target_filled, target_avg = _wait_order_fill(
             self._client,

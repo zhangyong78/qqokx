@@ -6,6 +6,7 @@ from tempfile import TemporaryDirectory
 from unittest import TestCase
 from unittest.mock import MagicMock, patch
 
+from okx_quant.client_order_id import CUSTOM_ORDER_ID_PREFIX, OKX_BROKER_TAG
 from okx_quant.models import Credentials, OrderPlan, StrategyConfig
 from okx_quant.okx_client import OkxApiError, OkxOrderStatus, OkxRestClient, OkxTicker, _okx_trade_order_request_log_fragment
 
@@ -817,6 +818,7 @@ class OkxClientOrderRequestTest(TestCase):
                 "slTriggerPxType": "last",
                 "reduceOnly": True,
                 "cxlOnClosePos": True,
+                "tag": OKX_BROKER_TAG,
                 "posSide": "long",
                 "algoClOrdId": "slg-1",
             },
@@ -917,6 +919,7 @@ class OkxClientOrderRequestTest(TestCase):
                 "side": "buy",
                 "ordType": "market",
                 "sz": "0.1",
+                "tag": OKX_BROKER_TAG,
                 "attachAlgoOrds": [
                     {
                         "slTriggerPx": "71000",
@@ -1025,6 +1028,7 @@ class OkxClientOrderRequestTest(TestCase):
                 "ordType": "limit",
                 "px": "75000",
                 "sz": "0.1",
+                "tag": OKX_BROKER_TAG,
                 "posSide": "long",
                 "clOrdId": "entry-2",
             },
@@ -1121,7 +1125,9 @@ class OkxClientOrderRequestTest(TestCase):
         self.assertEqual(body["orderPx"], "75000")
         self.assertEqual(body["triggerPx"], "75000.1")
         self.assertEqual(body["triggerPxType"], "mark")
+        self.assertEqual(body["tag"], OKX_BROKER_TAG)
         self.assertEqual(len(body["attachAlgoOrds"]), 1)
+        self.assertTrue(body["attachAlgoOrds"][0]["attachAlgoClOrdId"].startswith(CUSTOM_ORDER_ID_PREFIX))
 
     def test_place_limit_net_mode_skips_pos_side_despite_launcher_long_short(self) -> None:
         """OKX net_mode 下发 posSide 会拒单；须以账户 /account/config 为准。"""
@@ -1194,6 +1200,8 @@ class OkxClientOrderRequestTest(TestCase):
         assert isinstance(body, dict)
         self.assertNotIn("posSide", body)
         self.assertEqual(body["ccy"], "BTC")
+        self.assertEqual(body["tag"], OKX_BROKER_TAG)
+        self.assertTrue(body["clOrdId"].startswith(CUSTOM_ORDER_ID_PREFIX))
 
     def test_place_simple_option_order_does_not_send_pos_side(self) -> None:
         client = OkxRestClient()

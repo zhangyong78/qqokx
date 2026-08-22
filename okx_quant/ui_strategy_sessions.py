@@ -27,6 +27,7 @@ from okx_quant.models import (
     dynamic_protection_rules_to_payload,
     normalize_dynamic_protection_rules,
 )
+from okx_quant.client_order_id import with_custom_order_id_prefix
 from okx_quant.pricing import format_decimal
 from okx_quant.strategy_parameters import (
     iter_strategy_parameter_keys,
@@ -2172,7 +2173,7 @@ class UiStrategySessionsMixin:
         side = "buy" if direction == "long" else "sell"
         pos_side = resolve_open_pos_side(config, side)
         order_mode = state.trade_order_mode.get() if state.trade_order_mode is not None else "限价挂单"
-        cl_ord_id = f"lt{session.session_id.lower()}{datetime.utcnow().strftime('%m%d%H%M%S%f')[-12:]}"
+        cl_ord_id = with_custom_order_id_prefix(f"lt{session.session_id.lower()}{datetime.utcnow().strftime('%m%d%H%M%S%f')[-12:]}")
         try:
             if order_mode == "对手价":
                 result = self.client.place_aggressive_limit_order(
@@ -4018,7 +4019,7 @@ class UiStrategySessionsMixin:
         session_token = "".join(ch for ch in slot.session_id.lower() if ch.isascii() and ch.isalnum())[:4] or "sess"
         strategy_token = "".join(ch for ch in slot.strategy_name.lower() if ch.isascii() and ch.isalnum())[:4] or "trdr"
         suffix = datetime.now().strftime("%m%d%H%M%S%f")[-15:]
-        return f"{session_token}{strategy_token}exi{suffix}"[:32]
+        return with_custom_order_id_prefix(f"{session_token}{strategy_token}exi{suffix}")
 
     @staticmethod
     def _normalize_trader_manual_flatten_mode(flatten_mode: str) -> str:

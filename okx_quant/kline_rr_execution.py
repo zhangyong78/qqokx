@@ -6,6 +6,7 @@ from decimal import Decimal, ROUND_FLOOR
 from hashlib import sha1
 from typing import Any
 
+from okx_quant.client_order_id import with_custom_order_id_prefix
 from okx_quant.engine import resolve_open_pos_side
 from okx_quant.kline_rr_trade import RRTradeEvent, RRTradeLedgerEntry, RRTradeOrderLink, RRTradePlan
 from okx_quant.models import OrderPlan
@@ -477,7 +478,7 @@ class RRTradeExecutionService:
     def _client_id(entry_id: str, role: str, *, revision: int) -> str:
         raw = f"{entry_id}|{role}|{revision}".encode("utf-8")
         role_token = "".join(char for char in role.lower() if char.isascii() and char.isalnum())[:3] or "ord"
-        return f"rr{role_token}{sha1(raw).hexdigest()[:24]}"[:32]
+        return with_custom_order_id_prefix(f"rr{role_token}{sha1(raw).hexdigest()[:24]}")
 
     @staticmethod
     def _event(kind: str, message: str) -> RRTradeEvent:

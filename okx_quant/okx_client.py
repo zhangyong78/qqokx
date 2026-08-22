@@ -23,6 +23,7 @@ from okx_quant.candle_cache import (
     merge_candles,
     save_candle_cache,
 )
+from okx_quant.client_order_id import OKX_BROKER_TAG, new_custom_order_id
 from okx_quant.models import Candle, Credentials, Instrument, OrderPlan, StrategyConfig, TriggerPriceType
 from okx_quant.okx_algo_ws import OkxAlgoWsConnection, OkxAlgoWsConnectionUnavailable
 from okx_quant.okx_candle_ws import CandleStreamKey, OkxCandleWsConnection, OkxCandleWsConnectionUnavailable
@@ -2432,6 +2433,9 @@ class OkxRestClient:
         stop_loss_algo_cl_ord_id: str | None = None,
         include_attached_protection: bool = True,
     ) -> OkxOrderResult:
+        cl_ord_id = cl_ord_id or new_custom_order_id("mkt")
+        if include_attached_protection:
+            stop_loss_algo_cl_ord_id = stop_loss_algo_cl_ord_id or new_custom_order_id("att")
         instrument = self.get_instrument(plan.inst_id)
         if instrument.inst_type == "OPTION":
             raise OkxApiError("OKX 期权不支持这里的市价附带止盈止损下单，请改走本地下单/本地止盈止损流程")
@@ -2448,6 +2452,7 @@ class OkxRestClient:
             "side": plan.side,
             "ordType": "market",
             "sz": _format_exchange_contract_sz(instrument, plan.size),
+            "tag": OKX_BROKER_TAG,
         }
         tick = instrument.tick_size if instrument.tick_size and instrument.tick_size > 0 else None
         if include_attached_protection:
@@ -2501,6 +2506,9 @@ class OkxRestClient:
         stop_loss_algo_cl_ord_id: str | None = None,
         include_attached_protection: bool = True,
     ) -> OkxOrderResult:
+        cl_ord_id = cl_ord_id or new_custom_order_id("lmt")
+        if include_attached_protection:
+            stop_loss_algo_cl_ord_id = stop_loss_algo_cl_ord_id or new_custom_order_id("att")
         instrument = self.get_instrument(plan.inst_id)
         if instrument.inst_type == "OPTION":
             raise OkxApiError("OKX 期权不支持这里的限价附带止盈止损下单，请改走本地下单/本地止盈止损流程")
@@ -2519,6 +2527,7 @@ class OkxRestClient:
             "ordType": "limit",
             "px": px_txt,
             "sz": _format_exchange_contract_sz(instrument, plan.size),
+            "tag": OKX_BROKER_TAG,
         }
         if include_attached_protection:
             order["attachAlgoOrds"] = [
@@ -2572,6 +2581,9 @@ class OkxRestClient:
         include_attached_protection: bool = True,
     ) -> OkxOrderResult:
         """POST /api/v5/trade/order-algo — ordType=trigger: when triggerPx is touched, place a limit at orderPx (entry)."""
+        algo_cl_ord_id = algo_cl_ord_id or new_custom_order_id("trg")
+        if include_attached_protection:
+            stop_loss_algo_cl_ord_id = stop_loss_algo_cl_ord_id or new_custom_order_id("att")
         instrument = self.get_instrument(plan.inst_id)
         if instrument.inst_type == "OPTION":
             raise OkxApiError("OKX 期权不支持这里的触发限价附带止盈止损下单，请改走本地下单/本地止盈止损流程")
@@ -2604,6 +2616,7 @@ class OkxRestClient:
             "triggerPx": format_decimal(trigger_px),
             "triggerPxType": config.tp_sl_trigger_type,
             "orderPx": format_decimal(entry),
+            "tag": OKX_BROKER_TAG,
         }
         if include_attached_protection:
             order["attachAlgoOrds"] = [
@@ -2657,6 +2670,7 @@ class OkxRestClient:
         stop_loss_trigger_price: Decimal,
         algo_cl_ord_id: str | None = None,
     ) -> OkxOrderResult:
+        algo_cl_ord_id = algo_cl_ord_id or new_custom_order_id("slg")
         instrument = self.get_instrument(inst_id)
         if instrument.inst_type == "OPTION":
             raise OkxApiError("OKX 期权不支持这里的独立止损算法单，请改走本地止损流程")
@@ -2686,6 +2700,7 @@ class OkxRestClient:
             "slTriggerPxType": config.tp_sl_trigger_type,
             "reduceOnly": True,
             "cxlOnClosePos": True,
+            "tag": OKX_BROKER_TAG,
         }
         if resolved_pos_side:
             order["posSide"] = resolved_pos_side
@@ -2724,6 +2739,7 @@ class OkxRestClient:
         cl_ord_id: str | None = None,
         reduce_only: bool = False,
     ) -> OkxOrderResult:
+        cl_ord_id = cl_ord_id or new_custom_order_id("ord")
         normalized_inst_id = inst_id.strip().upper()
         inst: Instrument | None = None
         try:
@@ -2737,6 +2753,7 @@ class OkxRestClient:
             "side": side,
             "ordType": ord_type,
             "sz": sz_txt,
+            "tag": OKX_BROKER_TAG,
         }
         resolved_pos = pos_side
         if inst is not None and inst.inst_type == "SPOT":
