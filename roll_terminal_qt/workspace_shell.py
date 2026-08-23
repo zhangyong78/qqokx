@@ -96,7 +96,7 @@ class WorkspaceHeader(QFrame):
         layout.setContentsMargins(12, 5, 10, 5)
         layout.setSpacing(5)
 
-        brand = QLabel("量化交易台", self)
+        brand = QLabel("量化交易控制台 · 本地版本", self)
         brand.setObjectName("WorkspaceBrand")
         layout.addWidget(brand)
 

@@ -6,6 +6,7 @@ import os
 import re
 import sys
 import time
+from bisect import bisect_right
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from decimal import Decimal
@@ -79,7 +80,7 @@ from okx_quant.deribit_volatility_ui import (
 )
 from okx_quant.kline_rr_execution import RRTradeExecutionService
 from okx_quant.kline_rr_trade import RRTradeLedgerEntry, RRTradePlan, build_rr_trade_plan
-from okx_quant.okx_client import OkxRestClient
+from okx_quant.okx_client import OkxPositionHistoryItem, OkxRestClient, infer_inst_type
 from okx_quant.engine import _dynamic_two_taker_fee_offset_live
 from okx_quant.pricing import format_decimal, format_decimal_by_increment, format_decimal_fixed, snap_to_increment
 from okx_quant.persistence import (
@@ -92,6 +93,8 @@ from okx_quant.persistence import (
 )
 from okx_quant.arbitrage.arbitrage_executor import _build_strategy_config
 from okx_quant.signal_replay_engine import SignalReplayConfig, build_signal_replay_dataset
+from okx_quant.strategy_catalog import STRATEGY_DYNAMIC_LONG_ID, STRATEGY_EMA55_SLOPE_SHORT_ID
+from okx_quant.strategy_symbol_defaults import get_strategy_symbol_parameter_defaults
 from roll_terminal_qt.line_trading_core import (
     compute_rr_target,
     decimal_to_text,
@@ -149,6 +152,9 @@ _CHART_UP_COLOR = "#22c55e"
 _CHART_DOWN_COLOR = "#e04f84"
 _CHART_EMA15_COLOR = "#ff4d6d"
 _CHART_SMA50_COLOR = "#58c66d"
+_CHART_BEST_INDICATOR_COLORS = ("#f59e0b", "#8b5cf6", "#38bdf8", "#ec4899")
+_HISTORY_TRADE_OPEN_COLOR = "#38bdf8"
+_HISTORY_TRADE_CLOSE_COLOR = "#f97316"
 _CHART_CROSSHAIR_COLOR = "#6b7280"
 _REPLAY_SIGNAL_NEAR_MA_MAX_PCT = 0.006
 
@@ -2657,6 +2663,204 @@ class KlineAlertSnapshot:
     structure: dict[str, object]
 
 
+@dataclass(frozen=True)
+class KlineHistoryTradeMarker:
+    """One opening or closing event from an account position rendered on the K-line chart."""
+
+    at_seconds: int
+    price: float
+    direction: str
+    event: str
+    realized_pnl: Decimal | None = None
+
+
+def _history_position_direction(item: OkxPositionHistoryItem) -> str:
+    for raw_value in (getattr(item, "pos_side", None), getattr(item, "direction", None)):
+        value = str(raw_value or "").strip().lower()
+        if value in {"long", "short"}:
+            return value
+        if "long" in value or "多" in value:
+            return "long"
+        if "short" in value or "空" in value:
+            return "short"
+    return ""
+
+
+def _history_time_to_seconds(value: object) -> int:
+    try:
+        timestamp = int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+    return timestamp // 1000 if timestamp > 10_000_000_000 else timestamp
+
+
+def _history_position_time(item: OkxPositionHistoryItem, *, event: str) -> int:
+    raw = item.raw if isinstance(item.raw, dict) else {}
+    if event == "open":
+        values = (raw.get("openTime"), raw.get("openTs"), raw.get("cTime"), raw.get("createdTime"))
+    else:
+        values = (
+            raw.get("closeTime"),
+            raw.get("closeTs"),
+            raw.get("uTime"),
+            raw.get("updateTime"),
+            item.update_time,
+        )
+    for value in values:
+        timestamp = _history_time_to_seconds(value)
+        if timestamp > 0:
+            return timestamp
+    return 0
+
+
+def _build_kline_history_trade_markers(
+    items: list[OkxPositionHistoryItem] | tuple[OkxPositionHistoryItem, ...],
+    *,
+    symbol: str,
+) -> list[KlineHistoryTradeMarker]:
+    """Map each exchange position record to opening and closing K-line markers."""
+
+    normalized_symbol = symbol.strip().upper()
+    markers: list[KlineHistoryTradeMarker] = []
+    seen_openings: set[tuple[str, str, int]] = set()
+    for item in items:
+        if str(getattr(item, "inst_id", "") or "").strip().upper() != normalized_symbol:
+            continue
+        direction = _history_position_direction(item)
+        if direction not in {"long", "short"}:
+            continue
+        try:
+            open_price = float(getattr(item, "open_avg_price", None) or 0.0)
+            close_price = float(getattr(item, "close_avg_price", None) or 0.0)
+        except (TypeError, ValueError):
+            open_price = 0.0
+            close_price = 0.0
+        opened_at = _history_position_time(item, event="open")
+        if opened_at > 0 and open_price > 0.0:
+            # One position may generate several partial-close records.  cTime is the
+            # position creation time, so render its opening only once.
+            opening_key = (normalized_symbol, direction, opened_at)
+            if opening_key not in seen_openings:
+                seen_openings.add(opening_key)
+                markers.append(
+                    KlineHistoryTradeMarker(
+                        at_seconds=opened_at,
+                        price=open_price,
+                        direction=direction,
+                        event="open",
+                    )
+                )
+
+        closed_at = _history_position_time(item, event="close")
+        if closed_at <= 0 or close_price <= 0.0:
+            continue
+        realized_pnl = getattr(item, "realized_pnl", None)
+        if realized_pnl is None:
+            realized_pnl = getattr(item, "pnl", None)
+        markers.append(
+            KlineHistoryTradeMarker(
+                at_seconds=closed_at,
+                price=close_price,
+                direction=direction,
+                event="close",
+                realized_pnl=realized_pnl if isinstance(realized_pnl, Decimal) else None,
+            )
+        )
+    markers.sort(key=lambda item: (item.at_seconds, item.direction, item.event, item.price))
+    return markers
+
+
+def _filter_kline_history_trade_markers(
+    markers: list[KlineHistoryTradeMarker] | tuple[KlineHistoryTradeMarker, ...],
+    *,
+    direction_filter: str,
+) -> list[KlineHistoryTradeMarker]:
+    normalized_filter = str(direction_filter or "all").strip().lower()
+    if normalized_filter not in {"long", "short"}:
+        return list(markers)
+    return [item for item in markers if item.direction == normalized_filter]
+
+
+def _history_trade_markers_for_candles(
+    markers: list[KlineHistoryTradeMarker] | tuple[KlineHistoryTradeMarker, ...],
+    candles: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Attach close events to the candle that contains their exchange timestamp."""
+
+    if not markers or not candles:
+        return []
+    times = [int(item.get("time", 0) or 0) for item in candles]
+    result: list[dict[str, Any]] = []
+    for marker in markers:
+        index = bisect_right(times, marker.at_seconds) - 1
+        if index < 0 or index >= len(candles):
+            continue
+        is_open = marker.event == "open"
+        pnl_text = ""
+        if not is_open and marker.realized_pnl is not None:
+            pnl_text = f" {marker.realized_pnl:+.2f}"
+        is_long = marker.direction == "long"
+        result.append(
+            {
+                "index": index,
+                "price": marker.price,
+                "direction": marker.direction,
+                "event": marker.event,
+                "label": f"{'开' if is_open else '平'}{'多' if is_long else '空'}{pnl_text}",
+                "color": _HISTORY_TRADE_OPEN_COLOR if is_open else _HISTORY_TRADE_CLOSE_COLOR,
+            }
+        )
+    return result
+
+
+def _best_parameter_indicator_specs(
+    symbol: str,
+    period: str,
+    *,
+    direction_filter: str = "all",
+) -> list[tuple[str, str, int, str]]:
+    """Return the selected long/short 1H best-parameter indicator lines for one symbol."""
+
+    if period.strip().upper() != "1H":
+        return []
+    normalized_direction = str(direction_filter or "all").strip().lower()
+    include_long = normalized_direction != "short"
+    include_short = normalized_direction != "long"
+    seen: set[tuple[str, int]] = set()
+    result: list[tuple[str, str, int, str]] = []
+    defaults_by_strategy: list[dict[str, object]] = []
+    if include_long:
+        defaults_by_strategy.append(
+            get_strategy_symbol_parameter_defaults(STRATEGY_DYNAMIC_LONG_ID, symbol, "launcher")
+        )
+    if include_short:
+        defaults_by_strategy.append(
+            get_strategy_symbol_parameter_defaults(STRATEGY_EMA55_SLOPE_SHORT_ID, symbol, "launcher")
+        )
+    for defaults in defaults_by_strategy:
+        for type_key, period_key in (
+            ("ema_type", "ema_period"),
+            ("trend_ema_type", "trend_ema_period"),
+            ("entry_reference_ema_type", "entry_reference_ema_period"),
+        ):
+            raw_type = str(defaults.get(type_key, "ema") or "ema").strip().lower()
+            try:
+                line_period = int(defaults.get(period_key, 0) or 0)
+            except (TypeError, ValueError):
+                line_period = 0
+            if raw_type not in {"ema", "ma", "sma"} or line_period <= 0:
+                continue
+            normalized_type = "ma" if raw_type in {"ma", "sma"} else "ema"
+            key = (normalized_type, line_period)
+            if key in seen:
+                continue
+            seen.add(key)
+            label = f"最佳 {'EMA' if normalized_type == 'ema' else 'MA'} {line_period}"
+            color = _CHART_BEST_INDICATOR_COLORS[len(result) % len(_CHART_BEST_INDICATOR_COLORS)]
+            result.append((label, normalized_type, line_period, color))
+    return result
+
+
 def _merge_realtime_candle_payload(payload: KlineChartPayload, candle: Candle) -> KlineChartPayload:
     """Replace an open bar or append a new bar without loading history again."""
     raw_candles = list(payload.raw_candles)
@@ -2892,6 +3096,7 @@ if QChartView is not None:
             self._workspace_lines: list[dict[str, object]] = []
             self._workspace_rr_items: list[dict[str, object]] = []
             self._signal_markers: list[dict[str, Any]] = []
+            self._history_trade_markers: list[dict[str, Any]] = []
             self._box_overlays: list[dict[str, Any]] = []
             self._channel_overlays: list[dict[str, Any]] = []
             self._selected_workspace_line_index = -1
@@ -3016,6 +3221,7 @@ if QChartView is not None:
             workspace_rr_items: list[dict[str, object]] | None = None,
             trend_indicators: list[dict[str, Any]] | None = None,
             signal_markers: list[dict[str, Any]] | None = None,
+            history_trade_markers: list[dict[str, Any]] | None = None,
             box_overlays: list[dict[str, Any]] | None = None,
             channel_overlays: list[dict[str, Any]] | None = None,
             selected_workspace_line_index: int = -1,
@@ -3038,6 +3244,7 @@ if QChartView is not None:
             self._workspace_lines = [dict(item) for item in (workspace_lines or []) if isinstance(item, dict)]
             self._workspace_rr_items = [dict(item) for item in (workspace_rr_items or []) if isinstance(item, dict)]
             self._signal_markers = [dict(item) for item in (signal_markers or []) if isinstance(item, dict)]
+            self._history_trade_markers = [dict(item) for item in (history_trade_markers or []) if isinstance(item, dict)]
             self._box_overlays = [dict(item) for item in (box_overlays or []) if isinstance(item, dict)]
             self._channel_overlays = [dict(item) for item in (channel_overlays or []) if isinstance(item, dict)]
             self._selected_workspace_line_index = int(selected_workspace_line_index)
@@ -3056,6 +3263,14 @@ if QChartView is not None:
             if candles:
                 self._full_y_min = min(float(item["low"]) for item in candles)
                 self._full_y_max = max(float(item["high"]) for item in candles)
+                trade_prices = [
+                    float(item.get("price", 0.0) or 0.0)
+                    for item in self._history_trade_markers
+                    if float(item.get("price", 0.0) or 0.0) > 0.0
+                ]
+                if trade_prices:
+                    self._full_y_min = min(self._full_y_min, min(trade_prices))
+                    self._full_y_max = max(self._full_y_max, max(trade_prices))
             else:
                 self._full_y_min = 0.0
                 self._full_y_max = 1.0
@@ -3078,6 +3293,7 @@ if QChartView is not None:
             self._workspace_lines = []
             self._workspace_rr_items = []
             self._signal_markers = []
+            self._history_trade_markers = []
             self._box_overlays = []
             self._channel_overlays = []
             self._selected_workspace_rr_index = -1
@@ -3259,6 +3475,7 @@ if QChartView is not None:
                 self._draw_workspace_rr_items(painter, plot_area)
                 self._draw_preview_rr_item(painter, plot_area)
                 self._draw_signal_markers(painter, plot_area)
+                self._draw_history_trade_markers(painter, plot_area)
                 self._draw_selected_line_handles(painter, plot_area)
                 self._draw_preview_line(painter, plot_area)
                 hover_context = self._resolve_hover_context()
@@ -3623,6 +3840,17 @@ if QChartView is not None:
                 visible_values = series[left_index : right_index + 1] or series
                 lows.extend(float(value) for value in visible_values)
                 highs.extend(float(value) for value in visible_values)
+            for marker in self._history_trade_markers:
+                index = int(marker.get("index", -1))
+                if not left_index <= index <= right_index:
+                    continue
+                try:
+                    price = float(marker.get("price", 0.0) or 0.0)
+                except (TypeError, ValueError):
+                    continue
+                if price > 0.0:
+                    lows.append(price)
+                    highs.append(price)
             min_price = min(lows) if lows else self._full_y_min
             max_price = max(highs) if highs else self._full_y_max
             top_padding, bottom_padding = _compute_axis_y_padding(min_price, max_price)
@@ -3777,6 +4005,127 @@ if QChartView is not None:
                     text_y = y_pos + 4.0 if stack_down else y_pos - 6.0
                     painter.setPen(color)
                     painter.drawText(QPointF(text_x, text_y), label)
+
+        def _draw_history_trade_markers(self, painter: QPainter, plot_area: QRectF) -> None:
+            if not self._history_trade_markers or not self._candles:
+                return
+            left_index, right_index = self._visible_index_range()
+            font = painter.font()
+            font.setPointSize(8)
+            font.setBold(True)
+            painter.setFont(font)
+            metrics = painter.fontMetrics()
+            visible_markers: list[tuple[int, float, dict[str, Any]]] = []
+            for marker in self._history_trade_markers:
+                index = int(marker.get("index", -1))
+                if index < left_index or index > right_index or index >= len(self._candles):
+                    continue
+                try:
+                    price = float(marker.get("price", 0.0) or 0.0)
+                except (TypeError, ValueError):
+                    continue
+                if price > 0.0:
+                    visible_markers.append((index, price, marker))
+
+            # Labels from nearby trades often share the same price area.  Track their
+            # occupied rectangles and choose another side/level before drawing one.
+            visible_markers.sort(
+                key=lambda item: (
+                    item[0],
+                    str(item[2].get("event", "") or "").strip().lower() != "close",
+                    item[1],
+                )
+            )
+            occupied_label_rects: list[QRectF] = []
+            text_height = float(metrics.height())
+            text_ascent = float(metrics.ascent())
+            tag_horizontal_padding = 6.0
+            tag_vertical_padding = 4.0
+            tag_height = text_height + (tag_vertical_padding * 2.0)
+            top_limit = float(plot_area.top()) + (tag_height / 2.0) + 3.0
+            bottom_limit = float(plot_area.bottom()) - (tag_height / 2.0) - 3.0
+            for index, price, marker in visible_markers:
+                x_center = self._x_for_index(index, plot_area)
+                y_center = self._y_for_value(price, plot_area)
+                event = str(marker.get("event", "") or "").strip().lower()
+                is_open = event == "open"
+                color = QColor(
+                    str(marker.get("color", _HISTORY_TRADE_OPEN_COLOR if is_open else _HISTORY_TRADE_CLOSE_COLOR))
+                )
+                label = str(marker.get("label", "") or "")
+                if label:
+                    text_width = float(metrics.horizontalAdvance(label))
+                    label_rect: QRectF | None = None
+                    label_center_y = y_center
+                    draw_below = is_open
+                    text_x = x_center + 7.0
+                    # Entries prefer below their price and exits above it.  If another
+                    # label occupies that space, try the opposite side and then widen
+                    # the vertical gap progressively.
+                    for side in (1 if is_open else -1, -1 if is_open else 1):
+                        if label_rect is not None:
+                            break
+                        for level in range(12):
+                            candidate_center_y = _clamp(
+                                y_center + (side * (22.0 + (level * (tag_height + 10.0)))),
+                                top_limit,
+                                bottom_limit,
+                            )
+                            right_x = _clamp(
+                                x_center + 10.0,
+                                float(plot_area.left()) + 2.0,
+                                float(plot_area.right()) - text_width - 2.0,
+                            )
+                            left_x = _clamp(
+                                x_center - text_width - 10.0,
+                                float(plot_area.left()) + 2.0,
+                                float(plot_area.right()) - text_width - 2.0,
+                            )
+                            for candidate_x in (right_x, left_x):
+                                candidate_rect = QRectF(
+                                    candidate_x - tag_horizontal_padding,
+                                    candidate_center_y - (tag_height / 2.0),
+                                    text_width + (tag_horizontal_padding * 2.0),
+                                    tag_height,
+                                )
+                                if any(candidate_rect.intersects(rect) for rect in occupied_label_rects):
+                                    continue
+                                label_rect = candidate_rect
+                                label_center_y = candidate_center_y
+                                draw_below = side > 0
+                                text_x = candidate_x
+                                break
+                            if label_rect is not None:
+                                break
+                    if label_rect is None:
+                        label_center_y = _clamp(y_center + (22.0 if is_open else -22.0), top_limit, bottom_limit)
+                        text_x = _clamp(
+                            x_center + 10.0,
+                            float(plot_area.left()) + 2.0,
+                            float(plot_area.right()) - text_width - 2.0,
+                        )
+                        label_rect = QRectF(
+                            text_x - tag_horizontal_padding,
+                            label_center_y - (tag_height / 2.0),
+                            text_width + (tag_horizontal_padding * 2.0),
+                            tag_height,
+                        )
+                    occupied_label_rects.append(label_rect)
+                    painter.setPen(QPen(color, 1))
+                    painter.drawLine(
+                        QPointF(x_center, y_center + (4.5 if draw_below else -4.5)),
+                        QPointF(x_center, float(label_rect.top()) if draw_below else float(label_rect.bottom())),
+                    )
+                    painter.setBrush(QColor(_CHART_BACKGROUND_COLOR))
+                    painter.drawRoundedRect(label_rect, 3.0, 3.0)
+                    painter.setPen(color)
+                    painter.drawText(
+                        QPointF(text_x, float(label_rect.top()) + tag_vertical_padding + text_ascent),
+                        label,
+                    )
+                painter.setPen(QPen(color, 2))
+                painter.setBrush(color if is_open else QColor(_CHART_BACKGROUND_COLOR))
+                painter.drawEllipse(QPointF(x_center, y_center), 4.5, 4.5)
 
         def _draw_channel_overlays(self, painter: QPainter, plot_area: QRectF) -> None:
             if not self._channel_overlays or not self._candles:
@@ -4619,6 +4968,41 @@ class KlineDataLoader(QThread):
             self.failed.emit(self._request_id, str(exc))
 
 
+class KlineHistoryTradeLoader(QThread):
+    """Fetch closed account positions without blocking chart interaction."""
+
+    loaded = Signal(int, object)
+    failed = Signal(int, str)
+
+    def __init__(self, *, request_id: int, runtime: object, symbol: str) -> None:
+        super().__init__()
+        self._request_id = request_id
+        self._runtime = runtime
+        self._symbol = symbol.strip().upper()
+
+    def run(self) -> None:
+        try:
+            credentials = getattr(self._runtime, "credentials", None)
+            environment = str(getattr(self._runtime, "environment", "") or "").strip()
+            if credentials is None or not environment:
+                self.loaded.emit(self._request_id, ())
+                return
+            inst_type = infer_inst_type(self._symbol)
+            if inst_type not in {"SWAP", "FUTURES", "OPTION"}:
+                self.loaded.emit(self._request_id, ())
+                return
+            client = OkxRestClient()
+            records = client.get_positions_history(
+                credentials,
+                environment=environment,
+                inst_types=(inst_type,),
+                limit=100,
+            )
+            self.loaded.emit(self._request_id, tuple(_build_kline_history_trade_markers(records, symbol=self._symbol)))
+        except Exception as exc:  # noqa: BLE001
+            self.failed.emit(self._request_id, str(exc))
+
+
 class SecondaryVolatilityDataLoader(QThread):
     loaded = Signal(int, object)
     failed = Signal(int, str)
@@ -4855,6 +5239,13 @@ class KlineAnalysisWindow(QMainWindow):
         self._active_primary_request_key: tuple[Any, ...] | None = None
         self._loaded_primary_request_key: tuple[Any, ...] | None = None
         self._loader: KlineDataLoader | None = None
+        self._history_trade_request_id = 0
+        self._active_history_trade_request_id = 0
+        self._history_trade_loader: KlineHistoryTradeLoader | None = None
+        self._history_trade_context_by_request: dict[int, tuple[str, str, str]] = {}
+        self._pending_history_trade_reload = False
+        self._history_trade_markers_by_context: dict[tuple[str, str, str], tuple[KlineHistoryTradeMarker, ...]] = {}
+        self._history_trade_sync_error_by_context: dict[tuple[str, str, str], str] = {}
         self._secondary_request_id = 0
         self._active_secondary_request_id = 0
         self._active_secondary_request_key: tuple[Any, ...] | None = None
@@ -5214,6 +5605,45 @@ class KlineAnalysisWindow(QMainWindow):
         self._ema21.toggled.connect(self._sync_chart_options)
         ma_group_layout.addWidget(self._ema21)
         top_row.addWidget(ma_group, 0)
+
+        self._best_parameter_indicators_check = QCheckBox("最佳参数指标")
+        self._best_parameter_indicators_check.setToolTip(
+            "显示当前品种已固化的 1H 最佳参数均线；开启时隐藏原 EMA 15 / SMA 50。"
+        )
+        self._best_parameter_indicators_check.toggled.connect(self._on_best_parameter_indicators_changed)
+        top_row.addWidget(self._best_parameter_indicators_check, 0)
+
+        history_trade_group = QFrame()
+        history_trade_group.setObjectName("ToolbarGroup")
+        history_trade_group.setStyleSheet(
+            """
+            QFrame#ToolbarGroup {
+                background: #f8fafc;
+                border: 1px solid #cbd5e1;
+                border-radius: 7px;
+            }
+            """
+        )
+        history_trade_layout = QHBoxLayout(history_trade_group)
+        history_trade_layout.setContentsMargins(10, 3, 10, 3)
+        history_trade_layout.setSpacing(6)
+        self._show_history_trades_check = QCheckBox("历史交易")
+        self._show_history_trades_check.setChecked(True)
+        self._show_history_trades_check.setToolTip("显示当前 API、环境和品种对应的 OKX 历史仓位开仓、平仓标记。")
+        self._show_history_trades_check.toggled.connect(self._on_history_trade_visibility_changed)
+        history_trade_layout.addWidget(self._show_history_trades_check)
+        self._history_trade_direction_combo = QComboBox()
+        self._history_trade_direction_combo.addItem("全部", "all")
+        self._history_trade_direction_combo.addItem("多头", "long")
+        self._history_trade_direction_combo.addItem("空头", "short")
+        self._history_trade_direction_combo.setToolTip("筛选 K 线上的历史交易标记，并切换最佳参数指标的多头/空头配置。")
+        self._history_trade_direction_combo.currentIndexChanged.connect(self._sync_chart_options)
+        history_trade_layout.addWidget(self._history_trade_direction_combo)
+        self._sync_history_trades_button = QPushButton("同步")
+        self._sync_history_trades_button.setToolTip("重新从 OKX 同步当前品种的历史仓位开仓、平仓记录。")
+        self._sync_history_trades_button.clicked.connect(lambda: self._load_history_trades(force=True))
+        history_trade_layout.addWidget(self._sync_history_trades_button)
+        top_row.addWidget(history_trade_group, 0)
 
         shape_signal_tooltip = (
             "形态说明：1H/4H/1D 显示核心标志K触发的形态信号。\n"
@@ -6412,6 +6842,9 @@ class KlineAnalysisWindow(QMainWindow):
         if self._loader is not None and self._loader.isRunning():
             self._loader.requestInterruption()
             self._loader.wait(1000)
+        if self._history_trade_loader is not None and self._history_trade_loader.isRunning():
+            self._history_trade_loader.requestInterruption()
+            self._history_trade_loader.wait(1000)
         if self._secondary_loader is not None and self._secondary_loader.isRunning():
             self._secondary_loader.requestInterruption()
             self._secondary_loader.wait(1000)
@@ -6538,6 +6971,94 @@ class KlineAnalysisWindow(QMainWindow):
         if self._runtime is None:
             return ""
         return str(getattr(self._runtime, "environment", "") or "").strip()
+
+    def _history_trade_context_key(self) -> tuple[str, str, str]:
+        return (
+            self._active_profile_name().strip(),
+            self._active_environment().strip(),
+            self._selected_symbol().strip().upper(),
+        )
+
+    def _visible_history_trade_markers(self) -> list[KlineHistoryTradeMarker]:
+        if not hasattr(self, "_show_history_trades_check") or not self._show_history_trades_check.isChecked():
+            return []
+        markers = self._history_trade_markers_by_context.get(self._history_trade_context_key(), ())
+        return _filter_kline_history_trade_markers(markers, direction_filter=self._history_trade_direction_filter())
+
+    def _history_trade_direction_filter(self) -> str:
+        if not hasattr(self, "_history_trade_direction_combo"):
+            return "all"
+        return str(self._history_trade_direction_combo.currentData() or "all").strip().lower()
+
+    def _load_history_trades(self, *, force: bool = False) -> None:
+        if not hasattr(self, "_show_history_trades_check") or not self._show_history_trades_check.isChecked():
+            return
+        context_key = self._history_trade_context_key()
+        if not all(context_key) or self._runtime is None:
+            return
+        if not force and context_key in self._history_trade_markers_by_context:
+            return
+        if self._history_trade_loader is not None and self._history_trade_loader.isRunning():
+            self._pending_history_trade_reload = True
+            if force:
+                self._set_status("历史交易仍在同步，请稍候...")
+            return
+        self._history_trade_request_id += 1
+        request_id = self._history_trade_request_id
+        self._active_history_trade_request_id = request_id
+        self._history_trade_context_by_request[request_id] = context_key
+        loader = KlineHistoryTradeLoader(
+            request_id=request_id,
+            runtime=self._runtime,
+            symbol=context_key[2],
+        )
+        self._history_trade_loader = loader
+        loader.loaded.connect(self._on_history_trades_loaded)
+        loader.failed.connect(self._on_history_trades_failed)
+        loader.finished.connect(self._on_history_trade_loader_finished)
+        loader.start()
+
+    @Slot(int, object)
+    def _on_history_trades_loaded(self, request_id: int, markers: object) -> None:
+        if request_id != self._active_history_trade_request_id:
+            return
+        parsed = tuple(item for item in markers if isinstance(item, KlineHistoryTradeMarker)) if isinstance(markers, (tuple, list)) else ()
+        context_key = self._history_trade_context_by_request.pop(request_id, self._history_trade_context_key())
+        self._history_trade_markers_by_context[context_key] = parsed
+        self._history_trade_sync_error_by_context.pop(context_key, None)
+        self._sync_chart_options()
+
+    @Slot(int, str)
+    def _on_history_trades_failed(self, request_id: int, message: str) -> None:
+        if request_id != self._active_history_trade_request_id:
+            return
+        context_key = self._history_trade_context_by_request.pop(request_id, self._history_trade_context_key())
+        self._history_trade_sync_error_by_context[context_key] = str(message)
+        self._set_status(f"历史交易同步失败：{message}")
+
+    @Slot()
+    def _on_history_trade_loader_finished(self) -> None:
+        loader = self._history_trade_loader
+        if loader is not None:
+            loader.deleteLater()
+            self._history_trade_loader = None
+        if self._pending_history_trade_reload:
+            self._pending_history_trade_reload = False
+            QTimer.singleShot(0, self._load_history_trades)
+
+    @Slot(bool)
+    def _on_history_trade_visibility_changed(self, enabled: bool) -> None:
+        self._history_trade_direction_combo.setEnabled(enabled)
+        self._sync_history_trades_button.setEnabled(enabled)
+        if enabled:
+            self._load_history_trades()
+        self._sync_chart_options()
+
+    @Slot(bool)
+    def _on_best_parameter_indicators_changed(self, enabled: bool) -> None:
+        self._ema9.setEnabled(not enabled)
+        self._ema21.setEnabled(not enabled)
+        self._sync_chart_options()
 
     def _runtime_for_task_profile(self, profile_name: str):
         target = profile_name.strip()
@@ -6918,6 +7439,7 @@ class KlineAnalysisWindow(QMainWindow):
         self._loader.failed.connect(self._on_data_failed)
         self._loader.finished.connect(self._on_loader_finished)
         self._loader.start()
+        self._load_history_trades()
         if self._secondary_chart_check.isChecked() and self._use_native_chart:
             self._load_secondary_data(symbol=self._selected_secondary_symbol())
             if self._triple_chart_enabled():
@@ -7263,10 +7785,28 @@ class KlineAnalysisWindow(QMainWindow):
             candle_series.append(QCandlestickSet(float(candle_values["open"]), float(candle_values["high"]), float(candle_values["low"]), float(candle_values["close"]), timestamp))
         else:
             return
-        latest_points = {
-            "EMA 15": display_payload.ema_9[-1] if display_payload.ema_9 else None,
-            "SMA 50": display_payload.ema_21[-1] if display_payload.ema_21 else None,
-        }
+        best_parameter_indicators = bool(
+            getattr(self, "_best_parameter_indicators_check", None)
+            and self._best_parameter_indicators_check.isChecked()
+        )
+        if best_parameter_indicators:
+            closes = [float(item["close"]) for item in display_payload.candles]
+            latest_points = {
+                label: {"value": (values[-1] if values else None)}
+                for label, ma_type, line_period, _color in _best_parameter_indicator_specs(
+                    self._selected_symbol(),
+                    self._period_combo.currentText().strip(),
+                    direction_filter=self._history_trade_direction_filter(),
+                )
+                for values in [
+                    _to_ema(closes, line_period) if ma_type == "ema" else _to_sma(closes, line_period)
+                ]
+            }
+        else:
+            latest_points = {
+                "EMA 15": display_payload.ema_9[-1] if display_payload.ema_9 else None,
+                "SMA 50": display_payload.ema_21[-1] if display_payload.ema_21 else None,
+            }
         for series in self._native_chart.series():
             if not isinstance(series, QLineSeries):
                 continue
@@ -7980,6 +8520,19 @@ class KlineAnalysisWindow(QMainWindow):
         workspace_lines: list[dict[str, object]] = []
         workspace_rr_items: list[dict[str, object]] = []
         trend_indicators = payload.trend_indicator if _supports_trend_indicator(period) else []
+        history_trade_markers: list[dict[str, Any]] = []
+        if not is_secondary:
+            history_trade_markers = _history_trade_markers_for_candles(
+                self._visible_history_trade_markers(),
+                payload.candles,
+            )
+            logical_payload = source_payload or payload
+            for marker in history_trade_markers:
+                marker["price"] = self._display_price_from_logical(
+                    logical_payload,
+                    float(marker.get("price", 0.0) or 0.0),
+                    is_secondary=False,
+                )
 
         for index, item in enumerate(candles):
             candle_set = QCandlestickSet(
@@ -8004,10 +8557,34 @@ class KlineAnalysisWindow(QMainWindow):
 
         chart.addSeries(candle_series)
 
-        line_specs = (
-            ("EMA 15", payload.ema_9, self._ema9.isChecked(), _CHART_EMA15_COLOR, _EMA15_LINE_WIDTH),
-            ("SMA 50", payload.ema_21, self._ema21.isChecked(), _CHART_SMA50_COLOR, _SMA50_LINE_WIDTH),
-        )
+        if not is_secondary and self._best_parameter_indicators_check.isChecked():
+            best_closes = [float(item["close"]) for item in candles]
+            line_specs = tuple(
+                (
+                    label,
+                    [
+                        {"time": int(candles[index]["time"]), "value": value}
+                        for index, value in enumerate(
+                            _to_ema(best_closes, line_period)
+                            if ma_type == "ema"
+                            else _to_sma(best_closes, line_period)
+                        )
+                    ],
+                    True,
+                    color,
+                    2,
+                )
+                for label, ma_type, line_period, color in _best_parameter_indicator_specs(
+                    display_symbol or self._selected_symbol(),
+                    period,
+                    direction_filter=self._history_trade_direction_filter(),
+                )
+            )
+        else:
+            line_specs = (
+                ("EMA 15", payload.ema_9, self._ema9.isChecked(), _CHART_EMA15_COLOR, _EMA15_LINE_WIDTH),
+                ("SMA 50", payload.ema_21, self._ema21.isChecked(), _CHART_SMA50_COLOR, _SMA50_LINE_WIDTH),
+            )
         for label, points, enabled, color, width in line_specs:
             if not enabled:
                 continue
@@ -8029,6 +8606,15 @@ class KlineAnalysisWindow(QMainWindow):
             chart.addSeries(line_series)
             overlay_values.append(values)
             indicator_series.append({"label": label, "color": color, "values": values})
+
+        for marker in history_trade_markers:
+            try:
+                trade_price = float(marker.get("price", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                continue
+            if trade_price > 0.0:
+                min_price = min(min_price, trade_price)
+                max_price = max(max_price, trade_price)
 
         if include_workspace_lines:
             entry = self._workspace_entry()
@@ -8210,6 +8796,7 @@ class KlineAnalysisWindow(QMainWindow):
                     period=period,
                     is_secondary=is_secondary,
                 ),
+                history_trade_markers=history_trade_markers,
                 box_overlays=self._visible_box_overlays(payload),
                 channel_overlays=self._visible_channel_overlays(payload),
                 workspace_lines=workspace_lines if include_workspace_lines else [],

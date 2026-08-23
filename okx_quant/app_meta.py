@@ -6,7 +6,7 @@ from pathlib import Path
 from okx_quant import __version__
 
 
-APP_NAME = "OKX 策略工作台"
+APP_NAME = "OKX 策略工作台（服务器版本）"
 DEFAULT_APP_VERSION = __version__
 
 

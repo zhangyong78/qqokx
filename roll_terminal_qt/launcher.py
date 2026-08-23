@@ -278,7 +278,7 @@ class LauncherWindow(QMainWindow):
         self._local_task_timer.setInterval(1000)
         self._local_task_timer.timeout.connect(self._refresh_workspace_status)
         self._local_task_timer.start()
-        self.setWindowTitle("量化交易控制台")
+        self.setWindowTitle("量化交易控制台（本地版本）")
         self.resize(1680, 980)
         self.setCentralWidget(workspace_root)
         self._build_menu()
