@@ -789,6 +789,9 @@ POSITION_REFRESH_INTERVAL_OPTIONS = {
     "30秒": 30_000,
     "60秒": 60_000,
 }
+# 非前台 API 只承担运行中策略的仓位展示核对。保持低频，避免把
+# 500ms 的界面状态刷新循环放大成账户 REST 轮询。
+RUNNING_SESSION_POSITION_SNAPSHOT_MAX_AGE_SECONDS = 60
 REFRESH_STALE_FAILURE_THRESHOLD = 3
 REFRESH_BADGE_PALETTES = {
     "idle": {"bg": "#f3f4f6", "fg": "#4b5563"},
@@ -3519,6 +3522,8 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         self._positions_enrichment_request: tuple[int, list[OkxPosition], str, str] | None = None
         self._session_positions_snapshot_refreshing = False
         self._session_positions_snapshot_refresh_requested = False
+        self._session_position_snapshot_force_refresh_keys: set[tuple[str, str]] = set()
+        self._session_position_snapshot_last_attempt_at_by_key: dict[tuple[str, str], datetime] = {}
         self._upl_usdt_prices: dict[str, Decimal] = {}
         self._position_history_usdt_prices: dict[str, Decimal] = {}
         self._order_history_usdt_prices: dict[str, Decimal] = {}

@@ -8644,6 +8644,118 @@ class SessionLivePnlSummaryTest(TestCase):
 
         self.assertEqual([("desk", "live")], targets)
 
+    def test_session_position_snapshot_targets_refreshes_stale_active_trade_profile(self) -> None:
+        checked_at = datetime(2026, 4, 23, 19, 6, 1)
+        session = SimpleNamespace(
+            session_id="S01",
+            api_name="moni",
+            config=SimpleNamespace(environment="demo"),
+            engine=SimpleNamespace(is_running=True),
+            stop_cleanup_in_progress=False,
+            status="运行中",
+            active_trade=SimpleNamespace(size=Decimal("1")),
+        )
+        app = SimpleNamespace(
+            sessions={"S01": session},
+            _positions_snapshot_by_profile={
+                "moni": ProfilePositionSnapshot(
+                    api_name="moni",
+                    effective_environment="demo",
+                    positions=[],
+                    upl_usdt_prices={},
+                    refreshed_at=datetime(2026, 4, 23, 19, 5, 0),
+                )
+            },
+            _session_position_snapshot_force_refresh_keys=set(),
+        )
+
+        targets = QuantApp._session_position_snapshot_targets(app, now=checked_at, max_age_seconds=60)
+
+        self.assertEqual([("moni", "demo")], targets)
+
+    def test_session_position_snapshot_targets_keeps_idle_profile_cache_without_polling(self) -> None:
+        checked_at = datetime(2026, 4, 23, 20, 5, 0)
+        session = SimpleNamespace(
+            session_id="S01",
+            api_name="moni",
+            config=SimpleNamespace(environment="demo"),
+            engine=SimpleNamespace(is_running=True),
+            stop_cleanup_in_progress=False,
+            status="运行中",
+            active_trade=None,
+        )
+        app = SimpleNamespace(
+            sessions={"S01": session},
+            _positions_snapshot_by_profile={
+                "moni": ProfilePositionSnapshot(
+                    api_name="moni",
+                    effective_environment="demo",
+                    positions=[],
+                    upl_usdt_prices={},
+                    refreshed_at=datetime(2026, 4, 23, 19, 5, 0),
+                )
+            },
+            _session_position_snapshot_force_refresh_keys=set(),
+        )
+
+        targets = QuantApp._session_position_snapshot_targets(app, now=checked_at, max_age_seconds=60)
+
+        self.assertEqual([], targets)
+
+    def test_session_position_snapshot_targets_respects_failed_attempt_cooldown(self) -> None:
+        checked_at = datetime(2026, 4, 23, 19, 6, 0)
+        session = SimpleNamespace(
+            session_id="S01",
+            api_name="desk",
+            config=SimpleNamespace(environment="live"),
+            engine=SimpleNamespace(is_running=True),
+            stop_cleanup_in_progress=False,
+            status="运行中",
+            active_trade=SimpleNamespace(size=Decimal("1")),
+        )
+        app = SimpleNamespace(
+            sessions={"S01": session},
+            _positions_snapshot_by_profile={},
+            _session_position_snapshot_force_refresh_keys=set(),
+            _session_position_snapshot_last_attempt_at_by_key={
+                ("desk", "live"): datetime(2026, 4, 23, 19, 5, 31),
+            },
+        )
+
+        targets = QuantApp._session_position_snapshot_targets(app, now=checked_at, max_age_seconds=60)
+
+        self.assertEqual([], targets)
+
+    def test_session_position_snapshot_force_refresh_bypasses_attempt_cooldown(self) -> None:
+        checked_at = datetime(2026, 4, 23, 19, 6, 0)
+        session = SimpleNamespace(
+            session_id="S01",
+            api_name="desk",
+            config=SimpleNamespace(environment="live"),
+            engine=SimpleNamespace(is_running=True),
+            stop_cleanup_in_progress=False,
+            status="运行中",
+            active_trade=SimpleNamespace(size=Decimal("1")),
+        )
+        app = SimpleNamespace(
+            sessions={"S01": session},
+            _positions_snapshot_by_profile={},
+            _session_position_snapshot_force_refresh_keys={("desk", "live")},
+            _session_position_snapshot_last_attempt_at_by_key={
+                ("desk", "live"): datetime(2026, 4, 23, 19, 5, 59),
+            },
+        )
+
+        targets = QuantApp._session_position_snapshot_targets(app, now=checked_at, max_age_seconds=60)
+
+        self.assertEqual([("desk", "live")], targets)
+
+    def test_position_snapshot_refresh_is_requested_only_for_position_changing_runtime_messages(self) -> None:
+        self.assertTrue(QuantApp._runtime_message_requires_position_snapshot_refresh("挂单已成交 | ordId=1"))
+        self.assertTrue(QuantApp._runtime_message_requires_position_snapshot_refresh("本轮持仓已结束，继续监控下一次信号。"))
+        self.assertFalse(QuantApp._runtime_message_requires_position_snapshot_refresh("委托未成交，继续等待。"))
+        self.assertFalse(QuantApp._runtime_message_requires_position_snapshot_refresh("等待信号"))
+
     def test_session_open_position_amount_text_uses_signed_coin_size(self) -> None:
         snapshot = ProfilePositionSnapshot(
             api_name="moni",

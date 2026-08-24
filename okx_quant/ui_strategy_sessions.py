@@ -6754,6 +6754,10 @@ class UiStrategySessionsMixin:
         if visible_heartbeat_label is not None:
             self._touch_session_runtime_heartbeat(session, visible_heartbeat_label, observed_at=observed_at)
         self._track_session_trade_runtime(session, text)
+        if QuantApp._runtime_message_requires_position_snapshot_refresh(text):
+            request_position_refresh = getattr(self, "_request_session_position_snapshot_refresh", None)
+            if callable(request_position_refresh):
+                request_position_refresh(session)
         QuantApp._apply_semi_auto_runtime_message(self, session, text)
         pending_updates = getattr(self, "_pending_runtime_session_updates", None)
         if not isinstance(pending_updates, set):

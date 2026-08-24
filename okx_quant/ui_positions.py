@@ -4074,6 +4074,35 @@ class UiPositionsMixin:
             or session.status in {"运行中", "停止中", "待恢复", "恢复中"}
         )
 
+    @staticmethod
+    def _runtime_message_requires_position_snapshot_refresh(message: str) -> bool:
+        text = str(message or "").strip()
+        if not text:
+            return False
+        fill_changed = "成交" in text and "未成交" not in text
+        position_ended = any(
+            token in text
+            for token in (
+                "本轮持仓已结束",
+                "持仓已结束",
+                "未再检测到策略持仓",
+            )
+        )
+        return fill_changed or position_ended
+
+    def _request_session_position_snapshot_refresh(self, session: StrategySession) -> None:
+        profile_name = str(getattr(session, "api_name", "") or "").strip()
+        environment = str(getattr(getattr(session, "config", None), "environment", "") or "").strip().lower()
+        if not profile_name or not environment:
+            return
+        forced_keys = getattr(self, "_session_position_snapshot_force_refresh_keys", None)
+        if not isinstance(forced_keys, set):
+            forced_keys = set()
+            self._session_position_snapshot_force_refresh_keys = forced_keys
+        forced_keys.add((profile_name, environment))
+        if getattr(self, "_session_positions_snapshot_refreshing", False):
+            self._session_positions_snapshot_refresh_requested = True
+
     def _positions_snapshot_for_session(self, session: StrategySession) -> ProfilePositionSnapshot | None:
         profile_name = (session.api_name or "").strip()
         if not profile_name:
@@ -4087,7 +4116,20 @@ class UiPositionsMixin:
             return None
         return snapshot
 
-    def _session_position_snapshot_targets(self) -> list[tuple[str, str]]:
+    def _session_position_snapshot_targets(
+        self,
+        *,
+        now: datetime | None = None,
+        max_age_seconds: int | None = None,
+    ) -> list[tuple[str, str]]:
+        checked_at = now or datetime.now()
+        stale_after = (
+            RUNNING_SESSION_POSITION_SNAPSHOT_MAX_AGE_SECONDS
+            if max_age_seconds is None
+            else max(1, int(max_age_seconds))
+        )
+        forced_keys = getattr(self, "_session_position_snapshot_force_refresh_keys", set())
+        last_attempts = getattr(self, "_session_position_snapshot_last_attempt_at_by_key", {})
         targets: list[tuple[str, str]] = []
         seen: set[tuple[str, str]] = set()
         for session in self.sessions.values():
@@ -4097,11 +4139,26 @@ class UiPositionsMixin:
             environment = str(getattr(getattr(session, "config", None), "environment", "") or "").strip().lower()
             if not profile_name or not environment:
                 continue
+            key = (profile_name, environment)
+            if key not in forced_keys:
+                last_attempt_at = last_attempts.get(key) if isinstance(last_attempts, dict) else None
+                if isinstance(last_attempt_at, datetime):
+                    seconds_since_attempt = (checked_at - last_attempt_at).total_seconds()
+                    if seconds_since_attempt < stale_after:
+                        continue
             snapshot = self._positions_snapshot_by_profile.get(profile_name)
             snapshot_environment = str(getattr(snapshot, "effective_environment", "") or "").strip().lower()
-            if snapshot is not None and snapshot_environment == environment:
+            snapshot_is_current_environment = snapshot is not None and snapshot_environment == environment
+            active_trade = getattr(session, "active_trade", None)
+            snapshot_is_stale = False
+            if snapshot_is_current_environment and active_trade is not None:
+                refreshed_at = getattr(snapshot, "refreshed_at", None)
+                if not isinstance(refreshed_at, datetime):
+                    snapshot_is_stale = True
+                else:
+                    snapshot_is_stale = (checked_at - refreshed_at).total_seconds() >= stale_after
+            if snapshot_is_current_environment and key not in forced_keys and not snapshot_is_stale:
                 continue
-            key = (profile_name, environment)
             if key in seen:
                 continue
             seen.add(key)
@@ -4117,6 +4174,16 @@ class UiPositionsMixin:
             return
         self._session_positions_snapshot_refreshing = True
         self._session_positions_snapshot_refresh_requested = False
+        attempted_at = datetime.now()
+        last_attempts = getattr(self, "_session_position_snapshot_last_attempt_at_by_key", None)
+        if not isinstance(last_attempts, dict):
+            last_attempts = {}
+            self._session_position_snapshot_last_attempt_at_by_key = last_attempts
+        for key in targets:
+            last_attempts[key] = attempted_at
+        forced_keys = getattr(self, "_session_position_snapshot_force_refresh_keys", None)
+        if isinstance(forced_keys, set):
+            forced_keys.difference_update(targets)
         try:
             threading.Thread(
                 target=self._refresh_session_position_snapshots_worker,
@@ -4126,6 +4193,8 @@ class UiPositionsMixin:
         except RuntimeError:
             self._session_positions_snapshot_refreshing = False
             self._session_positions_snapshot_refresh_requested = True
+            if isinstance(forced_keys, set):
+                forced_keys.update(targets)
 
     def _refresh_session_position_snapshots_worker(self, targets: list[tuple[str, str]]) -> None:
         results: list[tuple[str, str, list[OkxPosition], str, dict[str, Decimal], dict[str, Instrument]]] = []
