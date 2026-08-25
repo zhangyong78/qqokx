@@ -43,6 +43,54 @@ class EmailNotifierTest(TestCase):
         notifier.notify_async = MagicMock()
         return notifier
 
+    def test_notify_async_logs_submission_and_send_success(self) -> None:
+        logs: list[str] = []
+        notifier = EmailNotifier(
+            EmailNotificationConfig(
+                enabled=True,
+                smtp_host="smtp.example.com",
+                smtp_username="sender@example.com",
+                smtp_password="secret",
+                recipient_emails=("receiver@example.com",),
+            ),
+            logger=logs.append,
+        )
+        with patch("okx_quant.notifications.smtplib.SMTP_SSL") as smtp_cls:
+            smtp_context = smtp_cls.return_value
+            smtp_context.__enter__.return_value = MagicMock()
+            smtp_context.__exit__.return_value = False
+            notifier.notify_async("subject", "body")
+            notifier._send("subject", "body")
+
+        self.assertTrue(any("邮件发送任务已提交 | subject" in item for item in logs))
+        self.assertTrue(any("邮件已发送 | subject" in item for item in logs))
+
+    def test_disabled_trade_close_logs_reason(self) -> None:
+        logs: list[str] = []
+        notifier = EmailNotifier(
+            EmailNotificationConfig(
+                enabled=True,
+                smtp_host="smtp.example.com",
+                recipient_emails=("receiver@example.com",),
+                notify_trade_fills=False,
+            ),
+            logger=logs.append,
+        )
+
+        notifier.send_trade_close(
+            strategy_name="EMA 动态委托",
+            config=_make_strategy_config(),
+            symbol="BTC-USDT-SWAP",
+            side="sell",
+            size="1",
+            trigger_reason="止损",
+            detail="测试平仓",
+            api_name="xhb",
+            session_id="S244",
+        )
+
+        self.assertTrue(any("邮件未发送" in item and "会话=S244" in item for item in logs))
+
     def test_send_trade_fill_includes_api_name_in_subject_and_body(self) -> None:
         notifier = self._make_notifier()
 

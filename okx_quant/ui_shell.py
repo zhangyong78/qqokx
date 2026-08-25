@@ -3435,6 +3435,10 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         self._minimum_order_risk_hint_request_serial = 0
         self._minimum_order_risk_hint_active_request_serial = 0
         self.sessions: dict[str, StrategySession] = {}
+        # Strategy workers must not read Tkinter variables directly. Keep a
+        # UI-thread-updated snapshot for email delivery policy checks.
+        self._email_runtime_policy_lock = threading.Lock()
+        self._email_runtime_policy_by_session: dict[str, tuple[bool, bool, bool, bool, bool]] = {}
         self._strategy_history_records: list[StrategyHistoryRecord] = []
         self._strategy_history_by_id: dict[str, StrategyHistoryRecord] = {}
         self._strategy_trade_ledger_records: list[StrategyTradeLedgerRecord] = []
@@ -9247,6 +9251,7 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
     def _on_notification_settings_changed(self, *_: str) -> None:
         if not self._settings_watch_enabled:
             return
+        self._refresh_email_runtime_policy_cache()
         self._refresh_global_email_toggle_text()
         self._refresh_running_session_tree()
         self._refresh_selected_session_details()

@@ -6521,6 +6521,7 @@ class StrategyEngine:
         reason: str,
     ) -> None:
         if self._notifier is None:
+            self._logger(f"邮件未发送 | 类型=信号 | 会话={self._session_id or '-'} | 原因=邮件通知器未创建")
             return
         entry_reference_text = _format_notify_price_by_tick_size(entry_reference, tick_size)
         reason_for_email = reason
@@ -6555,6 +6556,7 @@ class StrategyEngine:
         trade_pnl: str = "",
     ) -> None:
         if self._notifier is None:
+            self._logger(f"邮件未发送 | 类型=成交 | 会话={self._session_id or '-'} | 原因=邮件通知器未创建")
             return
         self._notifier.send_trade_fill(
             strategy_name=self._strategy_name,
@@ -6592,6 +6594,7 @@ class StrategyEngine:
         stop_execution_summary: str = "",
     ) -> None:
         if self._notifier is None:
+            self._logger(f"邮件未发送 | 类型=平仓 | 会话={self._session_id or '-'} | 原因=邮件通知器未创建")
             return
         self._notifier.send_trade_close(
             strategy_name=self._strategy_name,
@@ -6734,6 +6737,7 @@ class StrategyEngine:
 
     def _notify_error(self, config: StrategyConfig | None, message: str) -> None:
         if self._notifier is None:
+            self._logger(f"邮件未发送 | 类型=异常 | 会话={self._session_id or '-'} | 原因=邮件通知器未创建")
             return
         self._notifier.send_error(
             strategy_name=self._strategy_name,

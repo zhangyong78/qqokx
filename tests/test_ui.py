@@ -8880,6 +8880,41 @@ class SessionLivePnlSummaryTest(TestCase):
 
         self.assertEqual(text, "-0.2 BTC")
 
+    def test_session_open_position_amount_text_hides_stale_snapshot_after_terminal_message(self) -> None:
+        snapshot = ProfilePositionSnapshot(
+            api_name="moni",
+            effective_environment="demo",
+            positions=[
+                SimpleNamespace(
+                    inst_id="BTC-USDT-SWAP",
+                    pos_side="long",
+                    position=Decimal("1"),
+                    margin_ccy="USDT",
+                )
+            ],
+            upl_usdt_prices={},
+            refreshed_at=datetime(2026, 4, 23, 19, 5, 0),
+        )
+        session = SimpleNamespace(
+            active_trade=None,
+            last_message="累计净盈亏=+14.40",
+            runtime_status="等待信号",
+            api_name="moni",
+            config=SimpleNamespace(
+                trade_inst_id="BTC-USDT-SWAP",
+                inst_id="BTC-USDT-SWAP",
+                environment="demo",
+                signal_mode="long_only",
+            ),
+        )
+        app = SimpleNamespace(
+            _positions_snapshot_for_session=lambda _session: snapshot,
+        )
+
+        text = QuantApp._session_open_position_amount_text(app, session)
+
+        self.assertEqual(text, "-")
+
     def test_refresh_session_live_pnl_cache_allocates_same_position_by_trade_size(self) -> None:
         refreshed_at = datetime(2026, 4, 23, 19, 5, 0)
         snapshot = ProfilePositionSnapshot(

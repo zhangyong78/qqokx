@@ -6300,19 +6300,73 @@ class UiStrategySessionsMixin:
     def _refresh_global_email_toggle_text(self) -> None:
         self.global_email_toggle_text.set("发邮件：开" if self.notify_enabled.get() else "发邮件：关")
 
+    def _set_session_email_runtime_policy(
+        self,
+        session_id: str,
+        *,
+        session_enabled: bool | None = None,
+    ) -> None:
+        """Cache email switches on the UI thread for strategy-worker reads."""
+        normalized_session_id = str(session_id or "").strip()
+        if not normalized_session_id:
+            return
+        try:
+            global_enabled = bool(self.notify_enabled.get())
+            signals_enabled = bool(self.notify_signals.get())
+            trade_fills_enabled = bool(self.notify_trade_fills.get())
+            errors_enabled = bool(self.notify_errors.get())
+        except Exception:
+            return
+        if session_enabled is None:
+            session = getattr(self, "sessions", {}).get(normalized_session_id)
+            session_enabled = bool(getattr(session, "email_notifications_enabled", True)) if session else True
+        policy = (
+            global_enabled,
+            signals_enabled,
+            trade_fills_enabled,
+            errors_enabled,
+            bool(session_enabled),
+        )
+        cache = getattr(self, "_email_runtime_policy_by_session", None)
+        if not isinstance(cache, dict):
+            return
+        lock = getattr(self, "_email_runtime_policy_lock", None)
+        if lock is None:
+            cache[normalized_session_id] = policy
+            return
+        with lock:
+            cache[normalized_session_id] = policy
+
+    def _refresh_email_runtime_policy_cache(self) -> None:
+        for session_id, session in getattr(self, "sessions", {}).items():
+            self._set_session_email_runtime_policy(
+                session_id,
+                session_enabled=bool(getattr(session, "email_notifications_enabled", True)),
+            )
+
     def _session_email_runtime_enabled(self, session_id: str, kind: str) -> bool:
-        if not self.notify_enabled.get():
+        normalized_session_id = str(session_id or "").strip()
+        cache = getattr(self, "_email_runtime_policy_by_session", None)
+        if not isinstance(cache, dict):
             return False
-        if kind == "signal" and not self.notify_signals.get():
+        lock = getattr(self, "_email_runtime_policy_lock", None)
+        if lock is None:
+            policy = cache.get(normalized_session_id)
+        else:
+            with lock:
+                policy = cache.get(normalized_session_id)
+        if not policy:
             return False
-        if kind == "trade_fill" and not self.notify_trade_fills.get():
+        global_enabled, signals_enabled, trade_fills_enabled, errors_enabled, session_enabled = policy
+        if not global_enabled or not session_enabled:
             return False
-        if kind == "error" and not self.notify_errors.get():
-            return False
-        session = self.sessions.get(session_id)
-        if session is None:
-            return False
-        return bool(getattr(session, "email_notifications_enabled", True))
+        if kind == "signal":
+            return signals_enabled
+        if kind == "trade_fill":
+            return trade_fills_enabled
+        if kind == "error":
+            return errors_enabled
+        return True
 
     def _session_email_status_label(self, session: StrategySession) -> str:
         if not self.notify_enabled.get():
@@ -6322,6 +6376,9 @@ class UiStrategySessionsMixin:
     def toggle_global_email_notifications(self) -> None:
         enabled = not self.notify_enabled.get()
         self.notify_enabled.set(enabled)
+        refresh_policy_cache = getattr(self, "_refresh_email_runtime_policy_cache", None)
+        if callable(refresh_policy_cache):
+            refresh_policy_cache()
         self._refresh_global_email_toggle_text()
         self._refresh_running_session_tree()
         self._refresh_selected_session_details()
@@ -6333,6 +6390,9 @@ class UiStrategySessionsMixin:
         if session is None:
             messagebox.showinfo("提示", "请先选择一个运行中策略。", parent=self.root)
             return
+        set_policy = getattr(self, "_set_session_email_runtime_policy", None)
+        if callable(set_policy):
+            set_policy(session.session_id, session_enabled=enabled)
         current = bool(getattr(session, "email_notifications_enabled", True))
         if current == enabled:
             status_text = "开启" if enabled else "关闭"
@@ -6361,6 +6421,7 @@ class UiStrategySessionsMixin:
         )
         if not notification_config.enabled:
             return None
+        self._set_session_email_runtime_policy(session_id)
         return EmailNotifier(
             notification_config,
             logger=self._make_system_logger(f"邮件 {config.strategy_id}"),
@@ -7862,6 +7923,12 @@ class UiStrategySessionsMixin:
             if matching_trade:
                 self._clear_session_manual_management_state(session)
                 session.active_trade = None
+            # A successful reconciliation is a low-frequency close event; use
+            # it to invalidate this API's cached position snapshot even when
+            # the local active-trade state was already cleared.
+            request_position_refresh = getattr(self, "_request_session_position_snapshot_refresh", None)
+            if callable(request_position_refresh):
+                request_position_refresh(session)
             self._publish_session_trade_settlement_result(result.session_id, result.round_id, success=True)
 
     def _apply_trader_desk_reconciliation(
@@ -8388,6 +8455,13 @@ class UiStrategySessionsMixin:
         window.focus_force()
 
     def _session_open_position_amount_text(self, session: StrategySession) -> str:
+        last_message = str(getattr(session, "last_message", "") or "").strip()
+        runtime_status = str(getattr(session, "runtime_status", "") or "").strip()
+        if getattr(session, "active_trade", None) is None and (
+            runtime_status in {"等待信号", "已停止"}
+            or QuantApp._session_message_marks_trade_terminal(last_message)
+        ):
+            return "-"
         snapshot = self._positions_snapshot_for_session(session)
         if snapshot is None:
             return "-"

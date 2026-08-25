@@ -41,14 +41,31 @@ class EmailNotifier:
         except Exception:
             return False
 
-    def _kind_enabled(self, kind: Literal["signal", "trade_fill", "error"]) -> bool:
+    def _base_delivery_disabled_reason(self) -> str:
+        if not self._config.enabled:
+            return "全局邮件通知未启用"
+        if not self._config.smtp_host.strip():
+            return "SMTP 主机为空"
+        if not self._recipients():
+            return "收件邮箱为空"
+        return ""
+
+    def _kind_disabled_reason(self, kind: Literal["signal", "trade_fill", "error"]) -> str:
+        base_reason = self._base_delivery_disabled_reason()
+        if base_reason:
+            return base_reason
         if not self._delivery_allowed(kind):
-            return False
-        if kind == "signal":
-            return self._config.notify_signals
-        if kind == "trade_fill":
-            return self._config.notify_trade_fills
-        return self._config.notify_errors
+            return "全局/会话邮件开关或该类型邮件开关已关闭"
+        if kind == "signal" and not self._config.notify_signals:
+            return "信号邮件开关已关闭"
+        if kind == "trade_fill" and not self._config.notify_trade_fills:
+            return "成交邮件开关已关闭"
+        if kind == "error" and not self._config.notify_errors:
+            return "异常邮件开关已关闭"
+        return ""
+
+    def _kind_enabled(self, kind: Literal["signal", "trade_fill", "error"]) -> bool:
+        return not self._kind_disabled_reason(kind)
 
     @staticmethod
     def _clean_api_name(api_name: str | None) -> str:
@@ -219,14 +236,16 @@ class EmailNotifier:
         direction_label: str = "",
         run_mode_label: str = "",
     ) -> None:
-        if not self._kind_enabled("signal"):
-            return
         subject = self._subject_with_context(
             f"[QQOKX] 信号提醒 | {strategy_name} | {trigger_symbol} | {self._signal_label(signal)}",
             api_name=api_name,
             session_id=session_id,
             trader_id=trader_id,
         )
+        skip_reason = self._kind_disabled_reason("signal")
+        if skip_reason:
+            self._log(f"邮件未发送 | 类型=信号 | {subject} | 原因={skip_reason}")
+            return
         body = "\n".join(
             [
                 *self._build_base_lines(
@@ -264,8 +283,6 @@ class EmailNotifier:
         direction_label: str = "",
         run_mode_label: str = "",
     ) -> None:
-        if not self._kind_enabled("trade_fill"):
-            return
         closing = self._trade_title_is_close(title)
         direction = self._position_direction_from_trade_side(side, closing=closing)
         event = self._trade_event_label(title, closing=closing)
@@ -275,6 +292,10 @@ class EmailNotifier:
             session_id=session_id,
             trader_id=trader_id,
         )
+        skip_reason = self._kind_disabled_reason("trade_fill")
+        if skip_reason:
+            self._log(f"邮件未发送 | 类型=成交 | {subject} | 原因={skip_reason}")
+            return
         body = "\n".join(
             [
                 *self._build_base_lines(
@@ -318,8 +339,6 @@ class EmailNotifier:
         stop_execution_status: str = "",
         stop_execution_summary: str = "",
     ) -> None:
-        if not self._kind_enabled("trade_fill"):
-            return
         direction = self._position_direction_from_trade_side(side, closing=True)
         event = self._trade_event_label(trigger_reason, closing=True)
         status = str(stop_execution_status or "").strip().lower()
@@ -331,6 +350,10 @@ class EmailNotifier:
             session_id=session_id,
             trader_id=trader_id,
         )
+        skip_reason = self._kind_disabled_reason("trade_fill")
+        if skip_reason:
+            self._log(f"邮件未发送 | 类型=平仓 | {subject} | 原因={skip_reason}")
+            return
         lines = [
             *self._build_base_lines(
                 strategy_name=strategy_name,
@@ -369,14 +392,16 @@ class EmailNotifier:
         direction_label: str = "",
         run_mode_label: str = "",
     ) -> None:
-        if not self._kind_enabled("error"):
-            return
         subject = self._subject_with_context(
             f"[QQOKX] 异常提醒 | {strategy_name}",
             api_name=api_name,
             session_id=session_id,
             trader_id=trader_id,
         )
+        skip_reason = self._kind_disabled_reason("error")
+        if skip_reason:
+            self._log(f"邮件未发送 | 类型=异常 | {subject} | 原因={skip_reason}")
+            return
         lines = self._build_base_lines(
             strategy_name=strategy_name,
             config=config,
@@ -390,8 +415,11 @@ class EmailNotifier:
         self.notify_async(subject, "\n".join(lines))
 
     def notify_async(self, subject: str, body: str, html_body: str | None = None) -> None:
-        if not self.enabled:
+        skip_reason = self._base_delivery_disabled_reason()
+        if skip_reason:
+            self._log(f"邮件未发送 | {subject} | 原因={skip_reason}")
             return
+        self._log(f"邮件发送任务已提交 | {subject}")
         threading.Thread(
             target=self._send,
             args=(subject, body, html_body),
@@ -403,6 +431,7 @@ class EmailNotifier:
         sender = (self._config.sender_email or self._config.smtp_username).strip()
         recipients = self._recipients()
         if not sender or not recipients:
+            self._log(f"邮件发送失败 | {subject} | 原因=发件邮箱或收件邮箱为空")
             return
 
         message = EmailMessage()
