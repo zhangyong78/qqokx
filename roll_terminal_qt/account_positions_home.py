@@ -2072,7 +2072,9 @@ class AccountPositionsHomeWidget(QWidget):
                 if thread.isRunning():
                     thread.wait(wait_ms)
                 if thread.isRunning():
-                    thread.terminate()
+                    # Never force-terminate a Python QThread: Qt may stop it
+                    # while it owns Python objects and corrupt the process.
+                    thread.requestInterruption()
                     thread.wait(terminate_wait_ms)
             except Exception:
                 pass
@@ -2082,7 +2084,8 @@ class AccountPositionsHomeWidget(QWidget):
             except Exception:
                 pass
             try:
-                thread.deleteLater()
+                if not thread.isRunning():
+                    thread.deleteLater()
             except Exception:
                 pass
 
@@ -2152,9 +2155,10 @@ class AccountPositionsHomeWidget(QWidget):
             deadline = self._profile_switch_deadline_monotonic
             if (not self._profile_switch_force_terminate_sent) and deadline and time.monotonic() >= deadline:
                 self._profile_switch_force_terminate_sent = True
+                self._profile_switch_deadline_monotonic = time.monotonic() + 5.0
                 for thread in running_threads:
                     try:
-                        thread.terminate()
+                        thread.requestInterruption()
                     except Exception:
                         pass
             timer = self._ensure_profile_switch_poll_timer()
@@ -2469,10 +2473,10 @@ class AccountPositionsHomeWidget(QWidget):
             return
         if (not self._shutdown_force_terminate_sent) and time.monotonic() >= self._shutdown_deadline_monotonic:
             self._shutdown_force_terminate_sent = True
-            self._shutdown_deadline_monotonic = time.monotonic() + 1.0
+            self._shutdown_deadline_monotonic = time.monotonic() + 5.0
             for thread in running_threads:
                 try:
-                    thread.terminate()
+                    thread.requestInterruption()
                 except Exception:
                     pass
         if self._shutdown_poll_timer is not None and not self._shutdown_poll_timer.isActive():

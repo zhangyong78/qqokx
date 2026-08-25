@@ -352,7 +352,7 @@ class SpotArbitrageScanWidget(QWidget):
         if self._scan_thread is not None and self._scan_thread.isRunning():
             self._scan_thread.requestInterruption()
             if not self._scan_thread.wait(1500):
-                self._scan_thread.terminate()
+                self._scan_thread.requestInterruption()
                 self._scan_thread.wait(800)
 
     def _build_ui(self) -> None:
@@ -526,7 +526,7 @@ class SpotArbitrageChartWidget(QWidget):
         if self._load_thread is not None and self._load_thread.isRunning():
             self._load_thread.requestInterruption()
             if not self._load_thread.wait(1500):
-                self._load_thread.terminate()
+                self._load_thread.requestInterruption()
                 self._load_thread.wait(800)
 
     def load_from_opportunity(self, opportunity: ArbitrageOpportunity) -> None:

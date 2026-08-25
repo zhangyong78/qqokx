@@ -308,7 +308,7 @@ class RollTerminalWindow(QMainWindow):
             if time.monotonic() >= float(getattr(self, "_shutdown_deadline_monotonic", 0.0)):
                 for thread in threads:
                     try:
-                        thread.terminate()
+                        thread.requestInterruption()
                     except Exception:
                         pass
             QTimer.singleShot(50, lambda: RollTerminalWindow._poll_shutdown_threads(self))
@@ -327,7 +327,7 @@ class RollTerminalWindow(QMainWindow):
         self._stop_runtime_threads()
         if self._target_thread is not None and self._target_thread.isRunning():
             if not self._target_thread.wait(800):
-                self._target_thread.terminate()
+                self._target_thread.requestInterruption()
                 self._target_thread.wait(800)
         if self._spot_arbitrage_scan_widget is not None:
             self._spot_arbitrage_scan_widget.close_running_thread()
@@ -346,7 +346,7 @@ class RollTerminalWindow(QMainWindow):
                 continue
             thread.stop()
             if not thread.wait(1500):
-                thread.terminate()
+                thread.requestInterruption()
                 thread.wait(1500)
         self._private_threads_started = False
 
