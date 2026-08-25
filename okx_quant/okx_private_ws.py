@@ -9,6 +9,7 @@ from decimal import Decimal, InvalidOperation
 from typing import Any, Callable
 
 from okx_quant.models import Credentials
+from okx_quant.websockets_compat import connect_okx_websocket
 
 try:
     import websockets
@@ -262,15 +263,7 @@ class OkxPrivateWsConnection:
             "close_timeout": 5,
             "max_queue": 1000,
         }
-        if headers:
-            connect_kwargs["additional_headers"] = headers
-        try:
-            socket_context = websockets.connect(url, **connect_kwargs)
-        except TypeError:
-            if headers:
-                connect_kwargs.pop("additional_headers", None)
-                connect_kwargs["extra_headers"] = headers
-            socket_context = websockets.connect(url, **connect_kwargs)
+        socket_context = connect_okx_websocket(url, headers=headers or None, **connect_kwargs)
         async with socket_context as socket:
             with self._lock:
                 self._socket = socket

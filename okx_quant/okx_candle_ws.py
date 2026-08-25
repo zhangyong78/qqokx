@@ -8,6 +8,7 @@ from decimal import Decimal
 from typing import Any, Callable
 
 from okx_quant.models import Candle
+from okx_quant.websockets_compat import connect_okx_websocket
 
 try:
     import websockets
@@ -142,15 +143,7 @@ class OkxCandleWsConnection:
         url = self._DEMO_BUSINESS_URL if self._environment == "demo" else self._BUSINESS_URL
         headers = {"x-simulated-trading": "1"} if self._environment == "demo" else None
         kwargs: dict[str, Any] = {"ping_interval": 20, "ping_timeout": 20, "open_timeout": 20}
-        if headers:
-            kwargs["additional_headers"] = headers
-        try:
-            context = websockets.connect(url, **kwargs)
-        except TypeError:
-            kwargs.pop("additional_headers", None)
-            if headers:
-                kwargs["extra_headers"] = headers
-            context = websockets.connect(url, **kwargs)
+        context = connect_okx_websocket(url, headers=headers, **kwargs)
         async with context as socket:
             with self._lock:
                 self._socket = socket
