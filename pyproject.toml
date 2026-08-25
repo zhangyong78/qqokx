@@ -1,12 +1,12 @@
 ﻿[project]
 name = "okx-quant-mvp"
-version = "0.6.104"
+version = "0.6.105"
 description = "Desktop MVP for OKX EMA signal trading with ATR-based TP/SL"
 requires-python = ">=3.11"
 dependencies = [
     "numpy>=1.26",
     "pandas>=2.2",
-    "websockets>=12,<16",
+    "websockets>=14.2,<15",
 ]
 
 [build-system]

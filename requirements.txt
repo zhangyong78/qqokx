@@ -1,4 +1,4 @@
 # 当前项目运行依赖很少，核心版本以 pyproject.toml 为准。
 numpy>=1.26
 pandas>=2.2
-websockets>=12,<16
+websockets>=14.2,<15

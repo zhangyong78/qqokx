@@ -90,6 +90,10 @@ class PositionHistoryFeedThread(QThread):
 
     def stop(self) -> None:
         self._running = False
+        try:
+            self._client.close()
+        except Exception:
+            pass
 
     def run(self) -> None:
         if self._runtime is None:
@@ -200,6 +204,10 @@ class OrderHistoryFeedThread(QThread):
 
     def stop(self) -> None:
         self._running = False
+        try:
+            self._client.close()
+        except Exception:
+            pass
 
     def run(self) -> None:
         if self._runtime is None:
@@ -261,6 +269,10 @@ class FillHistoryFeedThread(QThread):
 
     def stop(self) -> None:
         self._running = False
+        try:
+            self._client.close()
+        except Exception:
+            pass
 
     def run(self) -> None:
         if self._runtime is None:

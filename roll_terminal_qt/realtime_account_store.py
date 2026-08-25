@@ -89,6 +89,7 @@ class RealtimeAccountStore(QObject):
         self.request_reconcile("startup")
 
     def stop(self) -> None:
+        runtime = self._runtime
         self._generation += 1
         self._reconcile_timer.stop()
         self._emit_timer.stop()
@@ -101,6 +102,19 @@ class RealtimeAccountStore(QObject):
             except Exception:
                 pass
         self._unsubscribers.clear()
+        if runtime is not None:
+            close_profile_websockets = getattr(self._client, "close_profile_websockets", None)
+            if callable(close_profile_websockets):
+                try:
+                    close_profile_websockets(
+                        getattr(runtime, "credentials"),
+                        environment=str(getattr(runtime, "environment", "") or ""),
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    self.status_changed.emit(f"关闭旧 API WS 失败：{exc}")
+        self._runtime = None
+        self._profile_name = ""
+        self._environment = ""
 
     def start_if_needed(self, runtime: ArbitrageTradeRuntime | object) -> None:
         profile_name = str(getattr(getattr(runtime, "credentials", None), "profile_name", "") or "").strip()

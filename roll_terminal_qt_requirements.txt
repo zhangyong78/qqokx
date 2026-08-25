@@ -1,2 +1,2 @@
 PySide6>=6.11
-websockets>=12,<16
+websockets>=14.2,<15

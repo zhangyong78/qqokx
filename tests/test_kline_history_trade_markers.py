@@ -3,12 +3,14 @@ from __future__ import annotations
 from decimal import Decimal
 from unittest import TestCase
 
-from okx_quant.okx_client import OkxPositionHistoryItem
+from okx_quant.okx_client import OkxPosition, OkxPositionHistoryItem
 from roll_terminal_qt.kline_analysis_window import (
     _best_parameter_indicator_specs,
+    _build_kline_current_position_markers,
     _build_kline_history_trade_markers,
     _filter_kline_history_trade_markers,
     _history_trade_markers_for_candles,
+    _merge_kline_trade_markers,
 )
 
 
@@ -39,7 +41,62 @@ def _position(
     )
 
 
+def _current_position(*, inst_id: str, opened_at: int, price: str, pos_side: str = "long") -> OkxPosition:
+    return OkxPosition(
+        inst_id=inst_id,
+        inst_type="SWAP",
+        pos_side=pos_side,
+        mgn_mode="cross",
+        position=Decimal("1" if pos_side == "long" else "-1"),
+        avail_position=Decimal("1"),
+        avg_price=Decimal(price),
+        mark_price=None,
+        unrealized_pnl=None,
+        unrealized_pnl_ratio=None,
+        liquidation_price=None,
+        leverage=None,
+        margin_ccy="USDT",
+        last_price=None,
+        realized_pnl=None,
+        margin_ratio=None,
+        initial_margin=None,
+        maintenance_margin=None,
+        delta=None,
+        gamma=None,
+        vega=None,
+        theta=None,
+        raw={"cTime": str(opened_at), "avgPx": price},
+    )
+
+
 class KlineHistoryTradeMarkersTest(TestCase):
+    def test_current_positions_fill_unclosed_openings_and_merge_duplicate_history(self) -> None:
+        history = _build_kline_history_trade_markers(
+            [_position(
+                inst_id="BTC-USDT-SWAP", direction="long", opened_at=1_700_000_000_000,
+                update_time=1_700_000_300_000, open_price="60000", close_price="60100", pnl="1",
+            )],
+            symbol="BTC-USDT-SWAP",
+        )
+        current = _build_kline_current_position_markers(
+            [
+                _current_position(inst_id="BTC-USDT-SWAP", opened_at=1_700_000_000_000, price="60000"),
+                _current_position(inst_id="BTC-USDT-SWAP", opened_at=1_700_001_000_000, price="60200", pos_side="short"),
+            ],
+            symbol="BTC-USDT-SWAP",
+        )
+
+        merged = _merge_kline_trade_markers(history, current)
+
+        self.assertEqual(
+            [(item.event, item.direction, item.at_seconds) for item in merged],
+            [
+                ("open", "long", 1_700_000_000),
+                ("close", "long", 1_700_000_300),
+                ("open", "short", 1_700_001_000),
+            ],
+        )
+
     def test_history_trade_markers_include_open_and_close_events(self) -> None:
         markers = _build_kline_history_trade_markers(
             [

@@ -44,6 +44,10 @@ class AccountFeedThread(QThread):
 
     def stop(self) -> None:
         self._running = False
+        try:
+            self._client.close()
+        except Exception:
+            pass
 
     def run(self) -> None:
         while self._running:

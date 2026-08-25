@@ -37,14 +37,16 @@ class SharedOrderRefreshThread(QThread):
         cached_history = load_cached_order_history(self._profile_name, environment, self._limit)
         if cached_history:
             self.cached_history_ready.emit(self._profile_name, environment, cached_history)
+        client = OkxRestClient()
         try:
             with ThreadPoolExecutor(max_workers=2) as executor:
                 current_future = executor.submit(
                     load_current_order_views,
                     self._runtime,
+                    client=client,
                     limit=min(self._limit, 100),
                 )
-                history_future = executor.submit(self._load_history_orders)
+                history_future = executor.submit(self._load_history_orders, client)
                 _status_text, current_views = current_future.result()
                 history_orders, history_prices = history_future.result()
             snapshot = SharedOrderSnapshot(
@@ -56,37 +58,47 @@ class SharedOrderRefreshThread(QThread):
         except Exception as exc:  # noqa: BLE001
             self.failed.emit(self._profile_name, environment, str(exc))
             return
+        finally:
+            client.close()
         self.completed.emit(self._profile_name, environment, snapshot)
 
-    def _load_history_orders(self) -> tuple[list[OkxTradeOrderItem], dict[str, Decimal]]:
-        client = OkxRestClient()
-        remote_items = client.get_order_history(
-            self._runtime.credentials,
-            environment=self._runtime.environment,
-            limit=self._limit,
-            include_algo=True,
-        )
-        items = merge_order_history_cache(
-            profile_name=self._profile_name,
-            environment=str(getattr(self._runtime, "environment", "") or "").strip(),
-            remote_items=remote_items,
-            limit=self._limit,
-        )
-        currencies = {
-            str(item.fee_currency).strip().upper()
-            for item in items
-            if item.fee is not None and str(item.fee_currency or "").strip()
-        }
-        prices: dict[str, Decimal] = {}
-        for currency in currencies:
-            if currency == "USDT":
-                prices[currency] = Decimal("1")
-                continue
-            try:
-                prices[currency] = client.get_ccy_to_usdt_price(currency, prefer_cached=True)
-            except Exception:
-                continue
-        return items, prices
+    def _load_history_orders(
+        self,
+        client: OkxRestClient | None = None,
+    ) -> tuple[list[OkxTradeOrderItem], dict[str, Decimal]]:
+        resolved_client = client or OkxRestClient()
+        owns_client = client is None
+        try:
+            remote_items = resolved_client.get_order_history(
+                self._runtime.credentials,
+                environment=self._runtime.environment,
+                limit=self._limit,
+                include_algo=True,
+            )
+            items = merge_order_history_cache(
+                profile_name=self._profile_name,
+                environment=str(getattr(self._runtime, "environment", "") or "").strip(),
+                remote_items=remote_items,
+                limit=self._limit,
+            )
+            currencies = {
+                str(item.fee_currency).strip().upper()
+                for item in items
+                if item.fee is not None and str(item.fee_currency or "").strip()
+            }
+            prices: dict[str, Decimal] = {}
+            for currency in currencies:
+                if currency == "USDT":
+                    prices[currency] = Decimal("1")
+                    continue
+                try:
+                    prices[currency] = resolved_client.get_ccy_to_usdt_price(currency, prefer_cached=True)
+                except Exception:
+                    continue
+            return items, prices
+        finally:
+            if owns_client:
+                resolved_client.close()
 
 
 class SharedOrderStore(QObject):

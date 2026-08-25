@@ -490,6 +490,50 @@ class OkxRestClient:
         self._instrument_cache_loaded = False
         self._instrument_cache_by_id: dict[str, Instrument] = {}
 
+    def close_profile_websockets(self, credentials: Credentials, *, environment: str) -> None:
+        """Stop and forget private WS connections for one API profile.
+
+        Account/profile switching must not leave the old profile's asyncio
+        threads running while the new profile is being started.
+        """
+        profile_name = (credentials.profile_name or "").strip()
+        key = (credentials.api_key, profile_name, environment)
+        connections: list[object] = []
+        with self._private_ws_lock:
+            connection = self._private_ws_connections.pop(key, None)
+            if connection is not None:
+                connections.append(connection)
+            self._private_ws_error_once.discard(key)
+        with self._algo_ws_lock:
+            connection = self._algo_ws_connections.pop(key, None)
+            if connection is not None:
+                connections.append(connection)
+            self._algo_ws_error_once.discard(key)
+        for connection in connections:
+            try:
+                connection.stop()  # type: ignore[attr-defined]
+            except Exception as exc:  # noqa: BLE001
+                self._logger(f"关闭 API Profile WS 失败：{exc}")
+
+    def close(self) -> None:
+        """Stop all WS connections owned by this REST client."""
+        connections: list[object] = []
+        for lock, mapping, error_once in (
+            (self._public_ws_lock, self._public_ws_connections, self._public_ws_error_once),
+            (self._private_ws_lock, self._private_ws_connections, self._private_ws_error_once),
+            (self._algo_ws_lock, self._algo_ws_connections, self._algo_ws_error_once),
+            (self._candle_ws_lock, self._candle_ws_connections, self._candle_ws_error_once),
+        ):
+            with lock:
+                connections.extend(mapping.values())
+                mapping.clear()
+                error_once.clear()
+        for connection in connections:
+            try:
+                connection.stop()  # type: ignore[attr-defined]
+            except Exception as exc:  # noqa: BLE001
+                self._logger(f"关闭 WS 连接失败：{exc}")
+
     def get_instruments(
         self,
         inst_type: str,

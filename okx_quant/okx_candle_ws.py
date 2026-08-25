@@ -94,6 +94,17 @@ class OkxCandleWsConnection:
 
     def stop(self) -> None:
         self._stop_event.set()
+        loop = self._loop
+        socket = self._socket
+        if loop is not None and socket is not None:
+            try:
+                asyncio.run_coroutine_threadsafe(socket.close(), loop).result(timeout=2.0)
+            except Exception:
+                pass
+        with self._lock:
+            thread = self._thread
+        if thread is not None:
+            thread.join(timeout=3.0)
 
     def watch(self, key: CandleStreamKey, listener: Callable[[Candle, bool], None]) -> Callable[[], None]:
         with self._lock:

@@ -15,7 +15,7 @@ from types import SimpleNamespace
 from typing import Callable
 
 from PySide6.QtCore import QSignalBlocker, QThread, QTimer, Qt, Signal, Slot
-from PySide6.QtGui import QColor, QFont
+from PySide6.QtGui import QAction, QActionGroup, QColor, QFont
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -29,6 +29,7 @@ from PySide6.QtWidgets import (
     QHeaderView,
     QLabel,
     QLineEdit,
+    QMenu,
     QMessageBox,
     QPushButton,
     QTableWidget,
@@ -38,6 +39,7 @@ from PySide6.QtWidgets import (
     QTextEdit,
     QTreeWidget,
     QTreeWidgetItem,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
@@ -589,35 +591,37 @@ DEFAULT_VISIBLE_COLUMNS: tuple[str, ...] = (
     "vega",
 )
 
-DEFAULT_TREE_LABEL_WIDTH = 221
+# Default widths promoted from the current holdings-table layout.
+DEFAULT_TREE_LABEL_WIDTH = 278
 DEFAULT_TREE_COLUMN_WIDTHS: dict[str, int] = {
-    "time_value": 69,
+    "time_value": 153,
     "time_value_usdt": 72,
-    "intrinsic_value": 63,
+    "intrinsic_value": 64,
     "intrinsic_usdt": 66,
-    "bid_price": 66,
+    "bid_price": 88,
     "bid_usdt": 71,
-    "ask_price": 64,
+    "ask_price": 85,
     "ask_usdt": 69,
-    "mark": 56,
+    "mark": 85,
     "mark_usdt": 63,
-    "avg": 66,
+    "avg": 81,
     "avg_usdt": 72,
     "open_value_usdt": 102,
-    "break_even": 92,
+    "break_even": 91,
     "pos": 154,
-    "option_side": 170,
-    "upl": 164,
-    "upl_usdt": 72,
+    "option_side": 185,
+    "upl": 197,
+    "upl_usdt": 81,
     "realized": 102,
-    "market_value": 149,
-    "mgn_ratio": 55,
-    "delta": 84,
+    "realized_usdt": 81,
+    "market_value": 196,
+    "mgn_ratio": 64,
+    "delta": 109,
     "gamma": 69,
     "vega": 70,
-    "theta": 71,
-    "theta_usdt": 75,
-    "note": 457,
+    "theta": 77,
+    "theta_usdt": 93,
+    "note": 1230,
 }
 
 
@@ -1956,6 +1960,7 @@ class AccountPositionsHomeWidget(QWidget):
         self._tree_column_width_overrides: dict[str, int] = {}
         self._expanded_row_keys: set[str] = set()
         self._position_kline_last_bar = "1H"
+        self._position_tree_font_mode = "standard"
         self._position_kline_window_width = 1280
         self._position_kline_window_height = 760
         self._fill_history_fetch_limit = 100
@@ -2405,6 +2410,10 @@ class AccountPositionsHomeWidget(QWidget):
         if self._protection_dialog is not None:
             self._protection_dialog.close()
         self._legacy_option_tools.shutdown()
+        try:
+            self._shared_client.close()
+        except Exception:
+            pass
         self._flush_retired_threads()
 
     def begin_shutdown(self, finished: Callable[[], None] | None = None) -> None:
@@ -2424,6 +2433,10 @@ class AccountPositionsHomeWidget(QWidget):
         if self._protection_dialog is not None:
             self._protection_dialog.close()
         self._legacy_option_tools.shutdown()
+        try:
+            self._shared_client.close()
+        except Exception:
+            pass
         if self._shutdown_poll_timer is None:
             self._shutdown_poll_timer = QTimer(self)
             self._shutdown_poll_timer.setInterval(100)
@@ -2685,6 +2698,8 @@ class AccountPositionsHomeWidget(QWidget):
                 "QTreeView::item:selected:active { background: #e8f1ff; color: #111827; }"
                 "QTreeView::item:selected:!active { background: #e8f1ff; color: #111827; }"
             )
+        if hasattr(self, "_position_tree"):
+            self._apply_position_tree_font_mode(persist=False)
 
     def _build_header(self) -> QWidget:
         panel = QFrame()
@@ -2819,6 +2834,23 @@ class AccountPositionsHomeWidget(QWidget):
         self._expand_toggle_button = QPushButton("展开全部")
         self._expand_toggle_button.clicked.connect(self._toggle_all_positions)
         title_row.addWidget(self._expand_toggle_button)
+        self._position_font_button = QToolButton()
+        font_menu = QMenu(self._position_font_button)
+        font_group = QActionGroup(font_menu)
+        font_group.setExclusive(True)
+        for mode, label in (("standard", "标准"), ("large", "大字体"), ("extra_large", "特大")):
+            action = QAction(label, font_menu)
+            action.setCheckable(True)
+            action.setData(mode)
+            action.triggered.connect(
+                lambda checked=False, mode=mode: self._set_position_tree_font_mode(mode) if checked else None
+            )
+            font_group.addAction(action)
+            font_menu.addAction(action)
+        self._position_font_button.setMenu(font_menu)
+        self._position_font_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        self._position_font_button.setToolTip("只调整当前持仓表格字体")
+        title_row.addWidget(self._position_font_button)
         title_row.addWidget(self._positions_hint)
         panel_layout.addLayout(title_row)
 
@@ -2835,7 +2867,9 @@ class AccountPositionsHomeWidget(QWidget):
         self._position_tree.setRootIsDecorated(True)
         self._position_tree.setUniformRowHeights(True)
         header = self._position_tree.header()
-        header.setStretchLastSection(False)
+        # Let the final remarks column fill unused monitor width so the
+        # holdings table does not stop at the fixed column total.
+        header.setStretchLastSection(True)
         header.setDefaultAlignment(Qt.AlignmentFlag.AlignCenter | Qt.AlignmentFlag.AlignVCenter)
         header_item = self._position_tree.headerItem()
         for index in range(self._position_tree.columnCount()):
@@ -2845,6 +2879,7 @@ class AccountPositionsHomeWidget(QWidget):
             self._position_tree.setColumnWidth(index, DEFAULT_TREE_COLUMN_WIDTHS.get(_column_id, width))
         self._apply_tree_column_width_overrides()
         self._apply_column_visibility()
+        self._apply_position_tree_font_mode(persist=False)
         header.sectionResized.connect(self._schedule_positions_view_prefs_save)
         panel_layout.addWidget(self._position_tree, 1)
         layout.addWidget(panel, 1)
@@ -3940,6 +3975,9 @@ class AccountPositionsHomeWidget(QWidget):
         raw_position_kline_bar = str(snapshot.get("position_kline_bar") or "").strip()
         if raw_position_kline_bar in {bar for _text, bar in POSITION_KLINE_BAR_OPTIONS}:
             self._position_kline_last_bar = raw_position_kline_bar
+        raw_position_tree_font_mode = str(snapshot.get("position_tree_font_mode") or "").strip().lower()
+        if raw_position_tree_font_mode in {"standard", "large", "extra_large"}:
+            self._position_tree_font_mode = raw_position_tree_font_mode
         try:
             loaded_width = int(str(snapshot.get("position_kline_window_width", self._position_kline_window_width)).strip())
             if loaded_width > 0:
@@ -3963,6 +4001,54 @@ class AccountPositionsHomeWidget(QWidget):
             width = self._tree_column_width_overrides.get(column_id)
             if width:
                 self._position_tree.setColumnWidth(index, width)
+
+    def _set_position_tree_font_mode(self, mode: str) -> None:
+        normalized = mode if mode in {"standard", "large", "extra_large"} else "standard"
+        self._position_tree_font_mode = normalized
+        self._apply_position_tree_font_mode(persist=True)
+
+    def _apply_position_tree_font_mode(self, *, persist: bool) -> None:
+        tree = getattr(self, "_position_tree", None)
+        if tree is None:
+            return
+        settings = {
+            "standard": (8, 18, "标准"),
+            "large": (9, 21, "大字体"),
+            "extra_large": (10, 24, "特大"),
+        }
+        normalized = self._position_tree_font_mode if self._position_tree_font_mode in settings else "standard"
+        self._position_tree_font_mode = normalized
+        font_size, row_height, label = settings[normalized]
+        tree_font = QFont(tree.font())
+        tree_font.setPointSize(font_size)
+        tree.setFont(tree_font)
+        # Keep headers slightly smaller than cell values so the existing
+        # column names remain visible across the wide holdings table.
+        header_size = 8
+        header_font = QFont(tree.header().font())
+        header_font.setPointSize(header_size)
+        tree.header().setFont(header_font)
+        tree.setStyleSheet(
+            # The application stylesheet sets QWidget to 11px.  Explicitly
+            # set the tree, item delegate, and header font here; otherwise
+            # changing QFont alone is overridden during painting.
+            f"QTreeWidget {{ font-size: {font_size}pt; }}"
+            f"QTreeWidget::item {{ font-size: {font_size}pt; height: {row_height}px; }}"
+            f"QHeaderView {{ font-size: {header_size}pt; }}"
+            f"QHeaderView::section {{ font-size: {header_size}pt; }}"
+            "QTreeView::item:selected { background: #e8f1ff; color: #111827; }"
+            "QTreeView::item:selected:active { background: #e8f1ff; color: #111827; }"
+            "QTreeView::item:selected:!active { background: #e8f1ff; color: #111827; }"
+        )
+        button = getattr(self, "_position_font_button", None)
+        if button is not None:
+            button.setText(f"字号：{label}")
+            menu = button.menu()
+            if menu is not None:
+                for action in menu.actions():
+                    action.setChecked(str(action.data() or "") == self._position_tree_font_mode)
+        if persist:
+            self._schedule_positions_view_prefs_save()
 
     @Slot()
     def _schedule_positions_view_prefs_save(self, *_args: object) -> None:
@@ -3989,6 +4075,7 @@ class AccountPositionsHomeWidget(QWidget):
                 position_kline_bar=self._position_kline_last_bar,
                 position_kline_window_width=self._position_kline_window_width,
                 position_kline_window_height=self._position_kline_window_height,
+                position_tree_font_mode=self._position_tree_font_mode,
             )
         except Exception:
             return

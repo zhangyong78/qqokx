@@ -80,7 +80,7 @@ from okx_quant.deribit_volatility_ui import (
 )
 from okx_quant.kline_rr_execution import RRTradeExecutionService
 from okx_quant.kline_rr_trade import RRTradeLedgerEntry, RRTradePlan, build_rr_trade_plan
-from okx_quant.okx_client import OkxPositionHistoryItem, OkxRestClient, infer_inst_type
+from okx_quant.okx_client import OkxPosition, OkxPositionHistoryItem, OkxRestClient, infer_inst_type
 from okx_quant.engine import _dynamic_two_taker_fee_offset_live
 from okx_quant.pricing import format_decimal, format_decimal_by_increment, format_decimal_fixed, snap_to_increment
 from okx_quant.persistence import (
@@ -2686,6 +2686,22 @@ def _history_position_direction(item: OkxPositionHistoryItem) -> str:
     return ""
 
 
+def _current_position_direction(item: OkxPosition) -> str:
+    raw = item.raw if isinstance(item.raw, dict) else {}
+    for raw_value in (getattr(item, "pos_side", None), raw.get("posSide"), raw.get("direction")):
+        value = str(raw_value or "").strip().lower()
+        if value in {"long", "short"}:
+            return value
+        if "long" in value or "多" in value:
+            return "long"
+        if "short" in value or "空" in value:
+            return "short"
+    try:
+        return "long" if Decimal(str(getattr(item, "position", 0) or 0)) > 0 else "short"
+    except (TypeError, ValueError):
+        return ""
+
+
 def _history_time_to_seconds(value: object) -> int:
     try:
         timestamp = int(value or 0)
@@ -2770,6 +2786,71 @@ def _build_kline_history_trade_markers(
     return markers
 
 
+def _build_kline_current_position_markers(
+    items: list[OkxPosition] | tuple[OkxPosition, ...],
+    *,
+    symbol: str,
+) -> list[KlineHistoryTradeMarker]:
+    """Map currently held positions to opening markers without inventing a close."""
+
+    normalized_symbol = symbol.strip().upper()
+    markers: list[KlineHistoryTradeMarker] = []
+    seen: set[tuple[str, str, int]] = set()
+    for item in items:
+        if str(getattr(item, "inst_id", "") or "").strip().upper() != normalized_symbol:
+            continue
+        direction = _current_position_direction(item)
+        raw = item.raw if isinstance(item.raw, dict) else {}
+        opened_at = 0
+        for value in (raw.get("openTime"), raw.get("openTs"), raw.get("cTime"), raw.get("createdTime")):
+            opened_at = _history_time_to_seconds(value)
+            if opened_at > 0:
+                break
+        try:
+            open_price = float(getattr(item, "avg_price", None) or raw.get("avgPx") or 0.0)
+        except (TypeError, ValueError):
+            open_price = 0.0
+        if direction not in {"long", "short"} or opened_at <= 0 or open_price <= 0.0:
+            continue
+        key = (normalized_symbol, direction, opened_at)
+        if key in seen:
+            continue
+        seen.add(key)
+        markers.append(
+            KlineHistoryTradeMarker(
+                at_seconds=opened_at,
+                price=open_price,
+                direction=direction,
+                event="open",
+            )
+        )
+    markers.sort(key=lambda item: (item.at_seconds, item.direction, item.price))
+    return markers
+
+
+def _merge_kline_trade_markers(
+    history_markers: list[KlineHistoryTradeMarker] | tuple[KlineHistoryTradeMarker, ...],
+    current_markers: list[KlineHistoryTradeMarker] | tuple[KlineHistoryTradeMarker, ...],
+) -> tuple[KlineHistoryTradeMarker, ...]:
+    """Merge current openings with history while keeping one opening per position."""
+
+    merged = list(history_markers)
+    existing_openings = {
+        (item.direction, item.at_seconds)
+        for item in merged
+        if item.event == "open"
+    }
+    for item in current_markers:
+        key = (item.direction, item.at_seconds)
+        if item.event == "open" and key in existing_openings:
+            continue
+        merged.append(item)
+        if item.event == "open":
+            existing_openings.add(key)
+    merged.sort(key=lambda item: (item.at_seconds, item.direction, item.event, item.price))
+    return tuple(merged)
+
+
 def _filter_kline_history_trade_markers(
     markers: list[KlineHistoryTradeMarker] | tuple[KlineHistoryTradeMarker, ...],
     *,
@@ -2785,7 +2866,7 @@ def _history_trade_markers_for_candles(
     markers: list[KlineHistoryTradeMarker] | tuple[KlineHistoryTradeMarker, ...],
     candles: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    """Attach close events to the candle that contains their exchange timestamp."""
+    """Attach opening and closing events to the candles containing their timestamps."""
 
     if not markers or not candles:
         return []
@@ -4969,7 +5050,7 @@ class KlineDataLoader(QThread):
 
 
 class KlineHistoryTradeLoader(QThread):
-    """Fetch closed account positions without blocking chart interaction."""
+    """Fetch history and current account positions once without blocking the chart."""
 
     loaded = Signal(int, object)
     failed = Signal(int, str)
@@ -4992,13 +5073,33 @@ class KlineHistoryTradeLoader(QThread):
                 self.loaded.emit(self._request_id, ())
                 return
             client = OkxRestClient()
-            records = client.get_positions_history(
-                credentials,
-                environment=environment,
-                inst_types=(inst_type,),
-                limit=100,
-            )
-            self.loaded.emit(self._request_id, tuple(_build_kline_history_trade_markers(records, symbol=self._symbol)))
+            history_error: Exception | None = None
+            current_error: Exception | None = None
+            try:
+                records = client.get_positions_history(
+                    credentials,
+                    environment=environment,
+                    inst_types=(inst_type,),
+                    limit=100,
+                )
+            except Exception as exc:  # noqa: BLE001
+                records = []
+                history_error = exc
+            try:
+                current_positions = client.get_positions(
+                    credentials,
+                    environment=environment,
+                    inst_type=inst_type,
+                    prefer_cache=False,
+                )
+            except Exception as exc:  # noqa: BLE001
+                current_positions = []
+                current_error = exc
+            if history_error is not None and current_error is not None:
+                raise history_error
+            history_markers = _build_kline_history_trade_markers(records, symbol=self._symbol)
+            current_markers = _build_kline_current_position_markers(current_positions, symbol=self._symbol)
+            self.loaded.emit(self._request_id, _merge_kline_trade_markers(history_markers, current_markers))
         except Exception as exc:  # noqa: BLE001
             self.failed.emit(self._request_id, str(exc))
 
