@@ -41,6 +41,41 @@ function Resolve-GitExecutable {
     throw (U '\u672a\u627e\u5230 git \u53ef\u6267\u884c\u6587\u4ef6\u3002\u8bf7\u5148\u5b89\u88c5 Git\uff0c\u6216\u628a git.exe \u52a0\u5165 PATH \u540e\u518d\u6267\u884c\u53d1\u7248\u811a\u672c\u3002')
 }
 
+function Invoke-PythonScript([string[]]$Arguments) {
+    $candidates = @(
+        (Join-Path $repoRoot '.venv\Scripts\python.exe'),
+        (Join-Path $repoRoot '.venv_old\Scripts\python.exe'),
+        (Join-Path $env:ProgramFiles 'Python313\python.exe'),
+        (Join-Path $env:ProgramFiles 'Python312\python.exe'),
+        (Join-Path $env:LocalAppData 'Programs\Python\Python313\python.exe'),
+        (Join-Path $env:LocalAppData 'Programs\Python\Python312\python.exe')
+    ) | Where-Object { $_ -and (Test-Path -LiteralPath $_) }
+
+    foreach ($candidate in $candidates) {
+        & $candidate @Arguments
+        if ($LASTEXITCODE -ne 0) {
+            throw "Python script failed with exit code ${LASTEXITCODE}: $candidate $($Arguments -join ' ')"
+        }
+        return
+    }
+
+    $py = Get-Command py -ErrorAction SilentlyContinue
+    if ($py) {
+        & $py.Source '-3.12' @Arguments
+        if ($LASTEXITCODE -eq 0) { return }
+        & $py.Source '-3.13' @Arguments
+        if ($LASTEXITCODE -eq 0) { return }
+    }
+
+    $python = Get-Command python -ErrorAction SilentlyContinue
+    if ($python) {
+        & $python.Source @Arguments
+        if ($LASTEXITCODE -eq 0) { return }
+    }
+
+    throw (U '\u672a\u627e\u5230\u53ef\u7528\u7684 Python 3.11+ \u89e3\u91ca\u5668\u3002\u8bf7\u5148\u5b89\u88c5 Python \u540e\u518d\u6267\u884c\u53d1\u7248\u3002')
+}
+
 function Invoke-GitCommand([string[]]$Arguments) {
     & $script:GitExe @Arguments
     if ($LASTEXITCODE -ne 0) {
@@ -254,7 +289,7 @@ if ($DryRun) {
 }
 
 Update-Version-Files -oldVersionText $currentVersionText -newVersionText $nextVersionText -releaseSummary $releaseSummary
-if (-not $SkipBuild) { python scripts\build_server_package.py }
+if (-not $SkipBuild) { Invoke-PythonScript @('scripts\build_server_package.py') }
 Invoke-GitCommand @('add', '-u')
 $changedFiles = Get-ChangedFiles
 if ($changedFiles.Count -gt 0) {
