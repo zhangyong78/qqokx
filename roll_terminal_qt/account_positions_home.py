@@ -35,6 +35,9 @@ from PySide6.QtWidgets import (
     QTableWidget,
     QTableWidgetItem,
     QSplitter,
+    QStyle,
+    QStyledItemDelegate,
+    QStyleOptionViewItem,
     QTabWidget,
     QTextEdit,
     QTreeWidget,
@@ -43,6 +46,41 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+
+
+class _PositionTreeDelegate(QStyledItemDelegate):
+    """Keep normal cell colors and outline the selected row without filling it."""
+
+    def paint(self, painter, option, index):  # type: ignore[no-untyped-def]
+        selected = bool(option.state & QStyle.StateFlag.State_Selected)
+        if selected:
+            option = QStyleOptionViewItem(option)
+            # The item view's selected palette uses one foreground color for
+            # the whole row.  Removing only this paint state lets the model's
+            # foreground brush (buy/sell/profit/loss colors) remain visible.
+            option.state &= ~QStyle.StateFlag.State_Selected
+        super().paint(painter, option, index)
+        if not selected:
+            return
+
+        # Draw a light outline across the complete selected row.  The line is
+        # painted cell by cell because QTreeWidget delegates receive one cell
+        # rect at a time.
+        painter.save()
+        painter.setPen(QColor("#64748b"))
+        rect = option.rect
+        painter.drawLine(rect.left(), rect.top(), rect.right(), rect.top())
+        painter.drawLine(rect.left(), rect.bottom(), rect.right(), rect.bottom())
+        if index.column() == 0:
+            painter.drawLine(rect.left(), rect.top(), rect.left(), rect.bottom())
+        last_column = index.model().columnCount() - 1
+        view = self.parent()
+        if view is not None and hasattr(view, "isColumnHidden"):
+            while last_column > 0 and view.isColumnHidden(last_column):
+                last_column -= 1
+        if index.column() == last_column:
+            painter.drawLine(rect.right(), rect.top(), rect.right(), rect.bottom())
+        painter.restore()
 
 from roll_terminal_qt.app_icon import apply_qt_window_icon
 from roll_terminal_qt.option_roll_window import OptionRollQtDialog
@@ -2700,9 +2738,9 @@ class AccountPositionsHomeWidget(QWidget):
                 "QTreeView::item { height: 21px; }"
                 # Only change the selection background.  Leaving out the
                 # foreground color preserves per-cell buy/sell/PnL colors.
-                "QTreeView::item:selected { background: #e8f1ff; }"
-                "QTreeView::item:selected:active { background: #e8f1ff; }"
-                "QTreeView::item:selected:!active { background: #e8f1ff; }"
+                "QTreeView::item:selected { background: transparent; }"
+                "QTreeView::item:selected:active { background: transparent; }"
+                "QTreeView::item:selected:!active { background: transparent; }"
             )
         if hasattr(self, "_position_tree"):
             self._apply_position_tree_font_mode(persist=False)
@@ -2866,6 +2904,7 @@ class AccountPositionsHomeWidget(QWidget):
         self._position_tree.setAlternatingRowColors(True)
         self._position_tree.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self._position_tree.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self._position_tree.setItemDelegate(_PositionTreeDelegate(self._position_tree))
         self._position_tree.itemSelectionChanged.connect(self._on_position_selected)
         self._position_tree.itemDoubleClicked.connect(self._on_position_tree_clicked)
         self._position_tree.itemExpanded.connect(self._on_tree_item_expanded)
@@ -4044,9 +4083,9 @@ class AccountPositionsHomeWidget(QWidget):
             f"QHeaderView::section {{ font-size: {header_size}pt; }}"
             # Do not set a selection foreground here: each cell carries its
             # own buy/sell/profit/loss color in Qt's foreground role.
-            "QTreeView::item:selected { background: #e8f1ff; }"
-            "QTreeView::item:selected:active { background: #e8f1ff; }"
-            "QTreeView::item:selected:!active { background: #e8f1ff; }"
+            "QTreeView::item:selected { background: transparent; }"
+            "QTreeView::item:selected:active { background: transparent; }"
+            "QTreeView::item:selected:!active { background: transparent; }"
         )
         button = getattr(self, "_position_font_button", None)
         if button is not None:
