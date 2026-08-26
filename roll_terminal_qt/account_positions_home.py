@@ -2698,9 +2698,11 @@ class AccountPositionsHomeWidget(QWidget):
         for tree in self.findChildren(QTreeWidget):
             tree.setStyleSheet(
                 "QTreeView::item { height: 21px; }"
-                "QTreeView::item:selected { background: #e8f1ff; color: #111827; }"
-                "QTreeView::item:selected:active { background: #e8f1ff; color: #111827; }"
-                "QTreeView::item:selected:!active { background: #e8f1ff; color: #111827; }"
+                # Only change the selection background.  Leaving out the
+                # foreground color preserves per-cell buy/sell/PnL colors.
+                "QTreeView::item:selected { background: #e8f1ff; }"
+                "QTreeView::item:selected:active { background: #e8f1ff; }"
+                "QTreeView::item:selected:!active { background: #e8f1ff; }"
             )
         if hasattr(self, "_position_tree"):
             self._apply_position_tree_font_mode(persist=False)
@@ -4040,9 +4042,11 @@ class AccountPositionsHomeWidget(QWidget):
             f"QTreeWidget::item {{ font-size: {font_size}pt; height: {row_height}px; }}"
             f"QHeaderView {{ font-size: {header_size}pt; }}"
             f"QHeaderView::section {{ font-size: {header_size}pt; }}"
-            "QTreeView::item:selected { background: #e8f1ff; color: #111827; }"
-            "QTreeView::item:selected:active { background: #e8f1ff; color: #111827; }"
-            "QTreeView::item:selected:!active { background: #e8f1ff; color: #111827; }"
+            # Do not set a selection foreground here: each cell carries its
+            # own buy/sell/profit/loss color in Qt's foreground role.
+            "QTreeView::item:selected { background: #e8f1ff; }"
+            "QTreeView::item:selected:active { background: #e8f1ff; }"
+            "QTreeView::item:selected:!active { background: #e8f1ff; }"
         )
         button = getattr(self, "_position_font_button", None)
         if button is not None:
