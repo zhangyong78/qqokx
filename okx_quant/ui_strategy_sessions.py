@@ -4478,9 +4478,7 @@ class UiStrategySessionsMixin:
             symbol=session_symbol,
             api_name=api_name,
         ).resolve()
-        session_notifier = (
-            self._build_session_notifier(config, session_id, api_name) if notifier is not None else None
-        )
+        session_notifier = self._build_session_notifier(config, session_id, api_name)
         engine = self._create_session_engine(
             strategy_id=definition.strategy_id,
             strategy_name=definition.name,
@@ -4515,6 +4513,9 @@ class UiStrategySessionsMixin:
         )
 
         self.sessions[session_id] = session
+        set_notifier_logger = getattr(session_notifier, "set_logger", None)
+        if callable(set_notifier_logger):
+            set_notifier_logger(self._session_email_logger(session))
         self._upsert_session_row(session)
         try:
             engine.start(credentials, config)
@@ -6344,6 +6345,43 @@ class UiStrategySessionsMixin:
                 session_enabled=bool(getattr(session, "email_notifications_enabled", True)),
             )
 
+    def _session_email_logger(self, session: StrategySession):
+        return self._make_session_logger(
+            session.session_id,
+            session.strategy_name,
+            session.symbol,
+            session.api_name,
+            session.log_file_path,
+        )
+
+    def _refresh_running_session_email_notifiers(self) -> None:
+        """Hot-apply sender/recipient settings without restarting strategies."""
+        for session in list(getattr(self, "sessions", {}).values()):
+            try:
+                config = self._collect_notification_config(
+                    validate_if_enabled=False,
+                    api_profile_name=session.api_name,
+                )
+            except Exception as exc:
+                self._enqueue_log(f"会话 {session.session_id} 邮件配置热更新失败：{exc}")
+                continue
+            logger = self._session_email_logger(session)
+            engine = getattr(session, "engine", None)
+            notifier = getattr(engine, "_notifier", None)
+            if isinstance(notifier, EmailNotifier):
+                notifier.update_config(config, logger=logger)
+                continue
+            setter = getattr(engine, "set_notifier", None)
+            if not callable(setter):
+                continue
+            setter(
+                EmailNotifier(
+                    config,
+                    logger=logger,
+                    delivery_policy=lambda kind, sid=session.session_id: self._session_email_runtime_enabled(sid, kind),
+                )
+            )
+
     def _session_email_runtime_enabled(self, session_id: str, kind: str) -> bool:
         normalized_session_id = str(session_id or "").strip()
         cache = getattr(self, "_email_runtime_policy_by_session", None)
@@ -6419,8 +6457,6 @@ class UiStrategySessionsMixin:
             validate_if_enabled=True,
             api_profile_name=api_profile_name,
         )
-        if not notification_config.enabled:
-            return None
         self._set_session_email_runtime_policy(session_id)
         return EmailNotifier(
             notification_config,
@@ -6438,8 +6474,16 @@ class UiStrategySessionsMixin:
         smtp_port = self._parse_optional_port(self.smtp_port.get())
         recipients = tuple(self._split_recipients(self.recipient_emails.get()))
         sender_email = self.sender_email.get().strip()
-        if not use_global_sender:
-            sender_email = self._resolved_api_sender_email_override(api_profile_name) or sender_email
+        # Keep the legacy setting name for compatibility with settings.json,
+        # but treat its value as an additional recipient. The authenticated
+        # mailbox remains the sole sender for every API profile.
+        api_recipient = "" if use_global_sender else self._resolved_api_sender_email_override(api_profile_name)
+        if api_recipient:
+            known_recipients = {item.casefold() for item in recipients}
+            for recipient in self._split_recipients(api_recipient):
+                if recipient.casefold() not in known_recipients:
+                    recipients += (recipient,)
+                    known_recipients.add(recipient.casefold())
         config = EmailNotificationConfig(
             enabled=self.notify_enabled.get(),
             smtp_host=self.smtp_host.get().strip(),
@@ -9521,11 +9565,7 @@ class UiStrategySessionsMixin:
             except Exception:
                 continue
             notifier = self._build_notifier(config, record.api_name)
-            session_notifier = (
-                self._build_session_notifier(config, record.session_id, record.api_name)
-                if notifier is not None
-                else None
-            )
+            session_notifier = self._build_session_notifier(config, record.session_id, record.api_name)
             session_symbol = record.symbol or self._format_strategy_symbol_display(config.inst_id, config.trade_inst_id)
             engine = self._create_session_engine(
                 strategy_id=record.strategy_id,
@@ -9559,6 +9599,9 @@ class UiStrategySessionsMixin:
                 recovery_supported=self._strategy_session_supports_recovery(config),
             )
             self.sessions[record.session_id] = session
+            set_notifier_logger = getattr(session_notifier, "set_logger", None)
+            if callable(set_notifier_logger):
+                set_notifier_logger(self._session_email_logger(session))
             self._update_session_counter_from_session_id(record.session_id)
             self._refresh_session_financials_from_trade_ledger(session)
 

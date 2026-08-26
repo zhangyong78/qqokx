@@ -9464,7 +9464,7 @@ class CredentialProfileEnvironmentTest(TestCase):
         self.assertEqual(app._credential_save_job, "job-1")
         self.assertEqual(app._settings_save_job, "job-2")
 
-    def test_collect_notification_config_prefers_api_sender_override(self) -> None:
+    def test_collect_notification_config_adds_api_recipient_without_changing_sender(self) -> None:
         app = SimpleNamespace(
             smtp_port=_Var("465"),
             recipient_emails=_Var("ops@example.com"),
@@ -9489,8 +9489,10 @@ class CredentialProfileEnvironmentTest(TestCase):
         overridden = QuantApp._collect_notification_config(app, validate_if_enabled=True, api_profile_name="api2")
         fallback = QuantApp._collect_notification_config(app, validate_if_enabled=True, api_profile_name="api1")
 
-        self.assertEqual(overridden.sender_email, "api2@example.com")
+        self.assertEqual(overridden.sender_email, "global@example.com")
+        self.assertEqual(overridden.recipient_emails, ("ops@example.com", "api2@example.com"))
         self.assertEqual(fallback.sender_email, "global@example.com")
+        self.assertEqual(fallback.recipient_emails, ("ops@example.com",))
 
     def test_collect_notification_config_can_force_global_sender(self) -> None:
         app = SimpleNamespace(

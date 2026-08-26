@@ -7493,11 +7493,11 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         ttk.Entry(mail_frame, textvariable=self.recipient_emails).grid(row=row, column=3, sticky="ew", pady=(12, 0))
 
         row += 1
-        ttk.Label(mail_frame, text="当前 API 专属发件邮箱").grid(row=row, column=0, sticky="w", pady=(12, 0))
+        ttk.Label(mail_frame, text="当前 API 专属收件邮箱").grid(row=row, column=0, sticky="w", pady=(12, 0))
         ttk.Entry(mail_frame, textvariable=self.api_sender_email_override).grid(
             row=row, column=1, sticky="ew", padx=(0, 16), pady=(12, 0)
         )
-        ttk.Label(mail_frame, text="留空则使用全局发件邮箱", justify="left").grid(
+        ttk.Label(mail_frame, text="留空则只发送到全局收件邮箱", justify="left").grid(
             row=row, column=2, columnspan=2, sticky="w", pady=(12, 0)
         )
 
@@ -9252,6 +9252,7 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         if not self._settings_watch_enabled:
             return
         self._refresh_email_runtime_policy_cache()
+        self._refresh_running_session_email_notifiers()
         self._refresh_global_email_toggle_text()
         self._refresh_running_session_tree()
         self._refresh_selected_session_details()

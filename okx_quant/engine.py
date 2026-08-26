@@ -492,6 +492,11 @@ class StrategyEngine:
         self._retry_policy = EngineRetryPolicy(self)
         self._order_service = EngineOrderService(self)
 
+    def set_notifier(self, notifier: EmailNotifier | None) -> None:
+        """Replace the email notifier without restarting the strategy engine."""
+        with self._lock:
+            self._notifier = notifier
+
     @property
     def is_running(self) -> bool:
         return self._session_runner.is_running

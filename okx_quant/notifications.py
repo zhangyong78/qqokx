@@ -25,6 +25,15 @@ class EmailNotifier:
         self._logger = logger
         self._delivery_policy = delivery_policy
 
+    def update_config(self, config: EmailNotificationConfig, *, logger: Logger | None = None) -> None:
+        """Apply the latest UI email settings to an existing notifier."""
+        self._config = config
+        if logger is not None:
+            self._logger = logger
+
+    def set_logger(self, logger: Logger | None) -> None:
+        self._logger = logger
+
     @property
     def enabled(self) -> bool:
         return self._config.enabled and bool(self._config.smtp_host.strip()) and bool(self._recipients())
@@ -428,8 +437,9 @@ class EmailNotifier:
         ).start()
 
     def _send(self, subject: str, body: str, html_body: str | None = None) -> None:
-        sender = (self._config.sender_email or self._config.smtp_username).strip()
-        recipients = self._recipients()
+        config = self._config
+        sender = (config.sender_email or config.smtp_username).strip()
+        recipients = self._recipients(config)
         if not sender or not recipients:
             self._log(f"邮件发送失败 | {subject} | 原因=发件邮箱或收件邮箱为空")
             return
@@ -443,15 +453,15 @@ class EmailNotifier:
             message.add_alternative(html_body, subtype="html")
 
         try:
-            if self._config.use_ssl:
-                with smtplib.SMTP_SSL(self._config.smtp_host, self._config.smtp_port, timeout=20) as smtp:
-                    self._login_and_send(smtp, sender, recipients, message)
+            if config.use_ssl:
+                with smtplib.SMTP_SSL(config.smtp_host, config.smtp_port, timeout=20) as smtp:
+                    self._login_and_send(smtp, sender, recipients, message, config=config)
             else:
-                with smtplib.SMTP(self._config.smtp_host, self._config.smtp_port, timeout=20) as smtp:
+                with smtplib.SMTP(config.smtp_host, config.smtp_port, timeout=20) as smtp:
                     smtp.ehlo()
                     smtp.starttls()
                     smtp.ehlo()
-                    self._login_and_send(smtp, sender, recipients, message)
+                    self._login_and_send(smtp, sender, recipients, message, config=config)
             self._log(f"邮件已发送 | {subject}")
         except smtplib.SMTPAuthenticationError as exc:
             self._log(f"邮件发送失败 | {subject} | {self._format_auth_error(exc, sender)}")
@@ -464,10 +474,13 @@ class EmailNotifier:
         sender: str,
         recipients: list[str],
         message: EmailMessage,
+        *,
+        config: EmailNotificationConfig | None = None,
     ) -> None:
-        login_username = (self._config.smtp_username or sender).strip()
-        if login_username and self._config.smtp_password:
-            smtp.login(login_username, self._config.smtp_password)
+        current_config = config or self._config
+        login_username = (current_config.smtp_username or sender).strip()
+        if login_username and current_config.smtp_password:
+            smtp.login(login_username, current_config.smtp_password)
         smtp.send_message(message, from_addr=sender, to_addrs=recipients)
 
     @staticmethod
@@ -505,8 +518,9 @@ class EmailNotifier:
             f"，发件邮箱={self._mask_mailbox(sender)}"
         )
 
-    def _recipients(self) -> list[str]:
-        return [item.strip() for item in self._config.recipient_emails if item.strip()]
+    def _recipients(self, config: EmailNotificationConfig | None = None) -> list[str]:
+        current_config = config or self._config
+        return [item.strip() for item in current_config.recipient_emails if item.strip()]
 
     def _log(self, message: str) -> None:
         if self._logger is not None:
