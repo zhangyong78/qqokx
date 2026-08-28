@@ -235,7 +235,7 @@ def _raise_order_error_with_request(exc: OkxApiError, order: dict[str, Any]) -> 
     if "请求=" in msg:
         raise exc
     req = _okx_trade_order_request_log_fragment(order)
-    raise OkxApiError(f"{msg} | 请求={req}", code=exc.code) from exc
+    raise OkxApiError(f"{msg} | 请求={req}", code=exc.code, status=exc.status) from exc
 
 
 @dataclass

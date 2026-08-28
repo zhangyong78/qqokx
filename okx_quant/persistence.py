@@ -638,6 +638,7 @@ def load_account_positions_home_view_prefs(path: Path | None = None) -> dict[str
     except Exception:
         position_kline_window_height = 760
     return {
+        "version": int(payload.get("version", 1) or 1),
         "visible_columns": visible_columns,
         "tree_column_widths": tree_column_widths,
         "position_kline_bar": raw_position_kline_bar or "1H",
@@ -672,7 +673,7 @@ def save_account_positions_home_view_prefs(
         if normalized_value > 0:
             normalized_tree_column_widths[normalized_key] = normalized_value
     payload = {
-        "version": 1,
+        "version": 2,
         "visible_columns": normalized_visible_columns,
         "tree_column_widths": normalized_tree_column_widths,
         "position_kline_bar": str(position_kline_bar or "1H").strip() or "1H",

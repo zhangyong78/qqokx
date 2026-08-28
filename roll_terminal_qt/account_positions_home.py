@@ -9,7 +9,7 @@ import threading
 import time
 import traceback
 from datetime import datetime, timedelta
-from decimal import Decimal
+from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Callable
@@ -115,7 +115,7 @@ from okx_quant.position_protection import (
     infer_protection_profit_on_rise,
     normalize_spot_inst_id,
 )
-from okx_quant.pricing import format_decimal, snap_to_increment
+from okx_quant.pricing import format_decimal, format_decimal_fixed, snap_to_increment
 from okx_quant.ui_shell import (
     _aggregate_position_metrics,
     _asset_group_row_id,
@@ -446,6 +446,7 @@ POSITION_COLUMNS: tuple[tuple[str, str, int, Qt.AlignmentFlag], ...] = (
     ("upl_usdt", "浮盈≈USDT", 108, Qt.AlignmentFlag.AlignRight),
     ("realized", "已实现盈亏", 118, Qt.AlignmentFlag.AlignRight),
     ("realized_usdt", "已实现≈USDT", 108, Qt.AlignmentFlag.AlignRight),
+    ("estimated_close_fee", "预估平仓手续费", 150, Qt.AlignmentFlag.AlignRight),
     ("market_value", "市值", 160, Qt.AlignmentFlag.AlignRight),
     ("liq", "强平价", 92, Qt.AlignmentFlag.AlignRight),
     ("mgn_ratio", "保证金率", 88, Qt.AlignmentFlag.AlignRight),
@@ -516,12 +517,139 @@ def _position_is_short(position: object) -> bool:
 
 
 def _break_even_taker_fee_rate(profile: dict[str, str], *, inst_type: str) -> Decimal:
-    del inst_type
-    raw = str(profile.get("futures_taker_fee_rate") or "0.0360").strip()
+    is_option = str(inst_type or "").strip().upper() == "OPTION"
+    fee_key = "option_taker_fee_rate" if is_option else "futures_taker_fee_rate"
+    configured = profile.get(fee_key)
+    # Older API profiles did not store a separate option fee. Keep their
+    # existing futures-rate fallback while using the option rate whenever it
+    # is configured.
+    if is_option and not str(configured or "").strip():
+        configured = profile.get("futures_taker_fee_rate")
+    default_rate = "0.0300" if is_option else "0.0360"
+    raw = str(configured or default_rate).strip()
     try:
         return max(Decimal(raw) / Decimal("100"), Decimal("0"))
     except Exception:
-        return Decimal("0.00036")
+        return Decimal("0.00030") if is_option else Decimal("0.00036")
+
+
+def _position_close_price(position: OkxPosition, ticker: object | None) -> Decimal | None:
+    """Estimate the execution price using the quote on the side needed to close."""
+    if ticker is not None:
+        quote = getattr(ticker, "ask" if _position_is_short(position) else "bid", None)
+        if isinstance(quote, Decimal) and quote > 0:
+            return quote
+    for candidate in (position.mark_price, position.last_price, position.avg_price):
+        if isinstance(candidate, Decimal) and candidate > 0:
+            return candidate
+    return None
+
+
+def _position_estimated_close_fee_snapshot(
+    position: OkxPosition,
+    instrument: Instrument | None,
+    ticker: object | None,
+    *,
+    fee_rate: Decimal,
+) -> tuple[Decimal | None, str | None]:
+    """Return estimated closing fee in the instrument's fee currency.
+
+    For options this follows OKX's rule:
+    min(fee rate * contract value, 7% * option premium * contract value).
+    """
+    if position.position == 0:
+        return None, None
+    contract_value, contract_currency = _position_contract_value_snapshot(position, instrument)
+    if contract_value is None or contract_value <= 0 or not contract_currency:
+        return None, None
+    multiplier = AccountPositionsHomeWidget._position_contract_multiplier(instrument)
+    contracts = abs(position.position)
+    notional = contracts * contract_value * multiplier
+    if notional <= 0:
+        return None, None
+    rate = max(fee_rate, Decimal("0"))
+    currency = contract_currency.strip().upper()
+
+    if position.inst_type == "OPTION":
+        close_price = _position_close_price(position, ticker)
+        if close_price is None:
+            return None, None
+        rate_fee = rate * notional
+        premium_cap_fee = Decimal("0.07") * close_price * notional
+        return min(rate_fee, premium_cap_fee), currency
+
+    # Inverse USD-margined contracts charge the fee in the underlying coin.
+    close_price = _position_close_price(position, ticker)
+    if currency == "USD" and position.inst_type in {"SWAP", "FUTURES"}:
+        if close_price is None:
+            return None, None
+        asset_symbol = str(position.inst_id or "").strip().upper().split("-", 1)[0] or "币"
+        return rate * notional / close_price, asset_symbol
+    return rate * notional, currency
+
+
+def _format_estimated_close_fee_amount(value: Decimal) -> str:
+    """Display fee amounts with at most eight decimal places."""
+    rounded = value.quantize(Decimal("0.00000001"), rounding=ROUND_HALF_UP)
+    return format_decimal(rounded)
+
+
+def _format_estimated_close_fee(
+    position: OkxPosition,
+    instrument: Instrument | None,
+    ticker: object | None,
+    upl_usdt_prices: dict[str, Decimal],
+    *,
+    fee_rate: Decimal,
+) -> str:
+    fee, currency = _position_estimated_close_fee_snapshot(
+        position,
+        instrument,
+        ticker,
+        fee_rate=fee_rate,
+    )
+    if fee is None or currency is None:
+        return "-"
+    native_text = f"{_format_estimated_close_fee_amount(fee)} {currency}"
+    if currency in {"USDT", "USD", "USDC"}:
+        return native_text
+    conversion = upl_usdt_prices.get(currency)
+    if conversion is None or conversion <= 0:
+        return native_text
+    usdt_text = _format_estimated_close_fee_amount(fee * conversion)
+    return f"{native_text}（≈{usdt_text} USDT）"
+
+
+def _format_group_estimated_close_fee(
+    positions: list[OkxPosition],
+    position_instruments: dict[str, Instrument],
+    position_tickers: dict[str, object],
+    upl_usdt_prices: dict[str, Decimal],
+    *,
+    fee_rate_for: Callable[[str], Decimal],
+) -> str:
+    totals: dict[str, Decimal] = {}
+    for position in positions:
+        fee, currency = _position_estimated_close_fee_snapshot(
+            position,
+            position_instruments.get(position.inst_id),
+            position_tickers.get(position.inst_id),
+            fee_rate=fee_rate_for(position.inst_type),
+        )
+        if fee is not None and currency:
+            totals[currency] = totals.get(currency, Decimal("0")) + fee
+    if not totals:
+        return "-"
+    parts: list[str] = []
+    for currency in sorted(totals):
+        fee = totals[currency]
+        text = f"{_format_estimated_close_fee_amount(fee)} {currency}"
+        if currency not in {"USDT", "USD", "USDC"}:
+            conversion = upl_usdt_prices.get(currency)
+            if conversion is not None and conversion > 0:
+                text = f"{text}（≈{_format_estimated_close_fee_amount(fee * conversion)} USDT）"
+        parts.append(text)
+    return " / ".join(parts)
 
 
 def _position_break_even_price(
@@ -569,6 +697,7 @@ def _position_break_even_price(
 def _group_row_values_with_break_even(group_type: str, metrics: dict[str, object]) -> tuple[str, ...]:
     values = list(_build_group_row_values(group_type, metrics))
     values.insert(15, "--")
+    values.insert(22, str(metrics.get("estimated_close_fee") or "--"))
     return tuple(values)
 
 DEFAULT_VISIBLE_COLUMNS: tuple[str, ...] = (
@@ -620,6 +749,7 @@ DEFAULT_VISIBLE_COLUMNS: tuple[str, ...] = (
     "option_side",
     "pos",
     "realized",
+    "estimated_close_fee",
     "theta",
     "theta_usdt",
     "time_value",
@@ -652,6 +782,7 @@ DEFAULT_TREE_COLUMN_WIDTHS: dict[str, int] = {
     "upl_usdt": 81,
     "realized": 102,
     "realized_usdt": 81,
+    "estimated_close_fee": 150,
     "market_value": 196,
     "mgn_ratio": 64,
     "delta": 109,
@@ -3540,9 +3671,46 @@ class AccountPositionsHomeWidget(QWidget):
     def _finish_selected_position_manual_flatten_error(self, exc: Exception) -> None:
         self._selected_position_manual_flatten_running = False
         self._status_badge.setText("失败")
-        self._summary_label.setText(f"平仓失败：{exc}")
-        self._log_selected_position_manual_flatten(f"失败 | {exc}")
-        QMessageBox.critical(self, "平仓失败", str(exc))
+        message = self._selected_position_manual_flatten_exception_message(exc)
+        self._summary_label.setText(message.splitlines()[0])
+        # The worker already records the full traceback. Keep this final
+        # status line short so the normal operation log stays readable.
+        self._log_selected_position_manual_flatten(
+            f"失败 | {type(exc).__name__} | {str(exc).splitlines()[0]}"
+        )
+        QMessageBox.warning(self, "平仓失败", message)
+
+    def _selected_position_manual_flatten_exception_message(self, exc: Exception) -> str:
+        raw = str(exc or "").strip()
+        lowered = raw.lower()
+        code = str(getattr(exc, "code", "") or "").strip()
+        status = getattr(exc, "status", None)
+
+        if code == "50120" or "50120" in raw or "doesn't have permission to use this function" in lowered:
+            return (
+                "API 权限不足，平仓订单未提交。\n\n"
+                "OKX 返回：HTTP 401 / code 50120\n"
+                "当前 API Key 没有使用交易下单功能的权限。\n\n"
+                "请检查：\n"
+                "1. API Key 是否开启 Trade/交易权限\n"
+                "2. 实盘/模拟盘环境是否匹配\n"
+                "3. API IP 白名单是否包含当前机器\n"
+                "4. 当前账号或子账户是否具备期权交易权限\n\n"
+                "本次没有创建订单，不需要重复点击平仓。详细技术信息已写入日志。"
+            )
+        if status == 401 or "http 401" in lowered:
+            return (
+                "API 授权失败，平仓订单未提交。\n\n"
+                "请检查 API Key、Secret、Passphrase、Trade 权限、实盘/模拟盘环境及 IP 白名单。\n"
+                "详细技术信息已写入日志。"
+            )
+        if "网络错误" in raw or "timed out" in lowered or "connection" in lowered:
+            return f"网络请求失败，平仓订单状态未确认。\n\n{_format_network_error_message(raw)}"
+        return (
+            "平仓请求失败，订单未确认提交。\n\n"
+            f"{_format_network_error_message(raw)}\n\n"
+            "详细技术信息已写入日志。"
+        )
 
     def _selected_position_manual_flatten_result_failed(self, result: OkxOrderResult) -> bool:
         return str(result.s_code or "").strip() not in {"", "0"}
@@ -3769,8 +3937,16 @@ class AccountPositionsHomeWidget(QWidget):
                 import traceback
 
                 self._log_selected_position_manual_flatten(
-                    f"线程异常 | instId={position.inst_id} | mode={flatten_mode} | error={exc}\n{traceback.format_exc()}"
+                    f"线程异常 | instId={position.inst_id} | mode={flatten_mode} | error={exc}"
                 )
+                trace_text = traceback.format_exc().strip()
+                if trace_text:
+                    try:
+                        append_log_line(
+                            f"[manual_flatten] traceback | instId={position.inst_id} | mode={flatten_mode}\n{trace_text}"
+                        )
+                    except Exception:
+                        pass
                 self._selected_position_manual_flatten_after(
                     0,
                     lambda exc=exc: self._finish_selected_position_manual_flatten_error(exc),
@@ -4008,6 +4184,12 @@ class AccountPositionsHomeWidget(QWidget):
                 for item in raw_visible_columns
                 if str(item).strip() in {column_id for column_id, *_rest in POSITION_COLUMNS}
             }
+            try:
+                prefs_version = int(snapshot.get("version", 1) or 1)
+            except (TypeError, ValueError):
+                prefs_version = 1
+            if prefs_version < 2:
+                loaded_visible_columns.add("estimated_close_fee")
             if loaded_visible_columns:
                 self._visible_column_ids = loaded_visible_columns
         raw_tree_column_widths = snapshot.get("tree_column_widths")
@@ -4151,11 +4333,22 @@ class AccountPositionsHomeWidget(QWidget):
         groups = _group_positions_for_tree(self._visible_positions)
         bold_font = QFont()
         bold_font.setBold(True)
+        current_profile = self._profile_snapshots.get(self._last_profile_name, {})
+
+        def fee_rate_for(inst_type: str) -> Decimal:
+            return _break_even_taker_fee_rate(current_profile, inst_type=inst_type)
 
         for asset_label, buckets in groups.items():
             asset_id = _asset_group_row_id(asset_label)
             asset_positions = [item for bucket in buckets.values() for item in bucket]
             asset_metrics = _aggregate_position_metrics(asset_positions, self._upl_usdt_prices, self._position_instruments)
+            asset_metrics["estimated_close_fee"] = _format_group_estimated_close_fee(
+                asset_positions,
+                self._position_instruments,
+                self._position_tickers,
+                self._upl_usdt_prices,
+                fee_rate_for=fee_rate_for,
+            )
             asset_item = self._make_tree_item(
                 row_key=asset_id,
                 label=f"{asset_label} 风险单元",
@@ -4178,6 +4371,13 @@ class AccountPositionsHomeWidget(QWidget):
                     bucket_positions,
                     self._upl_usdt_prices,
                     self._position_instruments,
+                )
+                bucket_metrics["estimated_close_fee"] = _format_group_estimated_close_fee(
+                    bucket_positions,
+                    self._position_instruments,
+                    self._position_tickers,
+                    self._upl_usdt_prices,
+                    fee_rate_for=fee_rate_for,
                 )
                 bucket_item = self._make_tree_item(
                     row_key=bucket_id,
@@ -4265,6 +4465,16 @@ class AccountPositionsHomeWidget(QWidget):
             _format_optional_usdt(_position_unrealized_pnl_usdt(position, self._upl_usdt_prices)),
             _format_position_realized_pnl(position),
             _format_optional_usdt(_position_realized_pnl_usdt(position, self._upl_usdt_prices)),
+            _format_estimated_close_fee(
+                position,
+                self._position_instruments.get(position.inst_id),
+                self._position_tickers.get(position.inst_id),
+                self._upl_usdt_prices,
+                fee_rate=_break_even_taker_fee_rate(
+                    self._profile_snapshots.get(self._last_profile_name, {}),
+                    inst_type=position.inst_type,
+                ),
+            ),
             _format_position_market_value(position, self._position_instruments, self._upl_usdt_prices),
             _format_optional_decimal(position.liquidation_price),
             _format_ratio(position.margin_ratio, places=2),
@@ -4299,7 +4509,7 @@ class AccountPositionsHomeWidget(QWidget):
             mark_price_text=values[10],
             avg_price_text=values[12],
             break_even_text=values[15],
-            market_value_text=values[22],
+            market_value_text=values[23],
             unrealized_pnl=position.unrealized_pnl,
         ).items():
             item.setForeground(_POSITION_TREE_COLUMN_INDEX[column_id], color)
