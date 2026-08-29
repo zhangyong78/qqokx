@@ -12,6 +12,30 @@ from okx_quant.okx_client import OkxApiError, OkxOrderStatus, OkxRestClient, Okx
 
 
 class OkxClientOrderRequestTest(TestCase):
+    def test_get_option_tick_bands_parses_live_price_ranges(self) -> None:
+        client = OkxRestClient()
+        client._request = MagicMock(
+            return_value={
+                "data": [
+                    {
+                        "instFamily": "BTC-USD",
+                        "instType": "OPTION",
+                        "tickBand": [
+                            {"minPx": "0", "maxPx": "0.005", "tickSz": "0.0001"},
+                            {"minPx": "0.005", "maxPx": "10000000", "tickSz": "0.0005"},
+                        ],
+                    }
+                ]
+            }
+        )
+
+        bands = client.get_option_tick_bands("BTC-USD")
+
+        self.assertEqual([(band.min_price, band.max_price, band.tick_size) for band in bands], [
+            (Decimal("0"), Decimal("0.005"), Decimal("0.0001")),
+            (Decimal("0.005"), Decimal("10000000"), Decimal("0.0005")),
+        ])
+
     @staticmethod
     def _strategy_config(inst_id: str) -> StrategyConfig:
         return StrategyConfig(

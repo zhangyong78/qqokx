@@ -24,7 +24,7 @@ from okx_quant.candle_cache import (
     save_candle_cache,
 )
 from okx_quant.client_order_id import OKX_BROKER_TAG, new_custom_order_id
-from okx_quant.models import Candle, Credentials, Instrument, OrderPlan, StrategyConfig, TriggerPriceType
+from okx_quant.models import Candle, Credentials, Instrument, OptionTickBand, OrderPlan, StrategyConfig, TriggerPriceType
 from okx_quant.okx_algo_ws import OkxAlgoWsConnection, OkxAlgoWsConnectionUnavailable
 from okx_quant.okx_candle_ws import CandleStreamKey, OkxCandleWsConnection, OkxCandleWsConnectionUnavailable
 from okx_quant.okx_private_ws import OkxPrivateWsConnection, OkxPrivateWsConnectionUnavailable
@@ -589,6 +589,42 @@ class OkxRestClient:
 
     def get_option_instruments(self, *, uly: str | None = None, inst_family: str | None = None) -> list[Instrument]:
         return self.get_instruments("OPTION", uly=uly, inst_family=inst_family)
+
+    def get_option_tick_bands(self, inst_family: str) -> list[OptionTickBand]:
+        """Return the live OKX price bands required for option order prices."""
+        normalized_family = str(inst_family or "").strip().upper()
+        if not re.fullmatch(r"[A-Z0-9]+-[A-Z0-9]+", normalized_family):
+            raise ValueError("期权价格分档缺少有效的 instFamily。")
+        payload = self._request(
+            "GET",
+            "/api/v5/public/instrument-tick-bands",
+            params={"instType": "OPTION", "instFamily": normalized_family},
+        )
+        data = payload.get("data")
+        if not isinstance(data, list) or not data or not isinstance(data[0], dict):
+            raise OkxApiError(f"{normalized_family} 未返回期权价格分档。")
+        raw_bands = data[0].get("tickBand")
+        if not isinstance(raw_bands, list) or not raw_bands:
+            raise OkxApiError(f"{normalized_family} 未返回有效的期权价格分档。")
+        bands: list[OptionTickBand] = []
+        for raw_band in raw_bands:
+            if not isinstance(raw_band, dict):
+                continue
+            tick_size = _to_decimal(raw_band.get("tickSz"))
+            min_price = _to_decimal(raw_band.get("minPx"))
+            max_price = _to_decimal(raw_band.get("maxPx"))
+            if tick_size is None or tick_size <= 0 or min_price is None or min_price < 0:
+                continue
+            bands.append(
+                OptionTickBand(
+                    min_price=min_price,
+                    max_price=max_price if max_price is not None and max_price > min_price else None,
+                    tick_size=tick_size,
+                )
+            )
+        if not bands:
+            raise OkxApiError(f"{normalized_family} 的期权价格分档格式无效。")
+        return sorted(bands, key=lambda band: band.min_price)
 
     def get_spot_instruments(self) -> list[Instrument]:
         return self.get_instruments("SPOT")

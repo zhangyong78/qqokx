@@ -339,6 +339,15 @@ class Instrument:
 
 
 @dataclass(frozen=True)
+class OptionTickBand:
+    """One OKX option premium range and its permitted price increment."""
+
+    min_price: Decimal
+    max_price: Decimal | None
+    tick_size: Decimal
+
+
+@dataclass(frozen=True)
 class Credentials:
     api_key: str
     secret_key: str

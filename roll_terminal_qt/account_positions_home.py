@@ -87,7 +87,7 @@ from roll_terminal_qt.app_icon import apply_qt_window_icon
 from roll_terminal_qt.option_roll_window import OptionRollQtDialog
 from okx_quant.log_utils import append_log_line
 from okx_quant.app_paths import data_root
-from okx_quant.models import Candle, Credentials, EmailNotificationConfig, Instrument, StrategyConfig
+from okx_quant.models import Candle, Credentials, EmailNotificationConfig, Instrument, OptionTickBand, StrategyConfig
 from okx_quant.notifications import EmailNotifier
 from okx_quant.option_roll import is_short_option_position
 from okx_quant.okx_client import (
@@ -532,6 +532,101 @@ def _break_even_taker_fee_rate(profile: dict[str, str], *, inst_type: str) -> De
         return max(Decimal(raw) / Decimal("100"), Decimal("0"))
     except Exception:
         return Decimal("0.00030") if is_option else Decimal("0.00036")
+
+
+_OPTION_PREMIUM_FEE_CAP_RATE = Decimal("0.07")
+
+
+def _option_fee_per_premium_unit(premium: Decimal, fee_rate: Decimal) -> Decimal:
+    """Return the OKX option fee expressed as premium per underlying unit.
+
+    OKX charges min(fee rate, 7% * option premium) before multiplying it by
+    the contract multiplier, contract value, and contract count.
+    """
+    if premium <= 0:
+        return Decimal("0")
+    return min(max(fee_rate, Decimal("0")), _OPTION_PREMIUM_FEE_CAP_RATE * premium)
+
+
+def _option_premium_before_close_fee(required_after_close_fee: Decimal, fee_rate: Decimal) -> Decimal:
+    """Invert ``premium + option_fee(premium)`` using OKX's 7% fee cap."""
+    if required_after_close_fee <= 0:
+        raise ValueError("扣除开仓手续费后的目标金额不大于 0。")
+    normalized_rate = max(fee_rate, Decimal("0"))
+    if normalized_rate <= 0:
+        return required_after_close_fee
+    capped_candidate = required_after_close_fee / (Decimal("1") + _OPTION_PREMIUM_FEE_CAP_RATE)
+    if _OPTION_PREMIUM_FEE_CAP_RATE * capped_candidate <= normalized_rate:
+        return capped_candidate
+    return required_after_close_fee - normalized_rate
+
+
+def _option_premium_after_close_fee_reserve(required_before_close_fee: Decimal, fee_rate: Decimal) -> Decimal:
+    """Invert ``premium - option_fee(premium)`` using OKX's 7% fee cap.
+
+    A long option close is a sell.  The premium received after the closing fee
+    must still cover the requested target plus the opening fee already paid.
+    """
+    if required_before_close_fee <= 0:
+        raise ValueError("扣除平仓手续费前的目标金额不大于 0。")
+    normalized_rate = max(fee_rate, Decimal("0"))
+    if normalized_rate <= 0:
+        return required_before_close_fee
+    capped_candidate = required_before_close_fee / (Decimal("1") - _OPTION_PREMIUM_FEE_CAP_RATE)
+    if _OPTION_PREMIUM_FEE_CAP_RATE * capped_candidate <= normalized_rate:
+        return capped_candidate
+    return required_before_close_fee + normalized_rate
+
+
+def _snap_option_price_to_tick_bands(
+    price: Decimal,
+    tick_bands: list[OptionTickBand],
+    rounding: str,
+) -> Decimal:
+    """Round an option premium by the live OKX tick band that contains it."""
+    if price <= 0:
+        raise ValueError("期权委托价格必须大于 0。")
+    ordered_bands = sorted(tick_bands, key=lambda band: band.min_price)
+    if not ordered_bands:
+        raise ValueError("OKX 未返回有效的期权最小变动价格分档。")
+    for index, band in enumerate(ordered_bands):
+        is_last_band = index == len(ordered_bands) - 1
+        if price < band.min_price:
+            continue
+        if band.max_price is None or price <= band.max_price or is_last_band:
+            rounded = snap_to_increment(price, band.tick_size, rounding)
+            if rounded <= 0:
+                raise ValueError("按 OKX 期权最小变动价格取整后委托价不大于 0。")
+            return rounded
+    raise ValueError(f"委托价 {format_decimal(price)} 未落入 OKX 返回的期权价格分档。")
+
+
+def _option_position_premium_notional(position: OkxPosition, instrument: Instrument | None) -> Decimal | None:
+    if position.inst_type != "OPTION" or instrument is None:
+        return None
+    contract_value, _contract_currency = _position_contract_value_snapshot(position, instrument)
+    if contract_value is None or contract_value <= 0:
+        return None
+    multiplier = instrument.ct_mult if instrument.ct_mult is not None and instrument.ct_mult > 0 else Decimal("1")
+    contracts = abs(position.position)
+    notional = contracts * contract_value * multiplier
+    return notional if notional > 0 else None
+
+
+def _option_open_fee_per_premium_unit(
+    position: OkxPosition,
+    instrument: Instrument | None,
+    *,
+    open_price: Decimal,
+    fallback_fee_rate: Decimal,
+) -> Decimal:
+    """Use OKX's actual position fee when available, otherwise its fee rule."""
+    raw = position.raw if isinstance(position.raw, dict) else {}
+    actual_fee = _current_order_raw_decimal(raw, "fee")
+    notional = _option_position_premium_notional(position, instrument)
+    if actual_fee is not None and actual_fee != 0 and notional is not None:
+        return abs(actual_fee) / notional
+    return _option_fee_per_premium_unit(open_price, fallback_fee_rate)
 
 
 def _position_close_price(position: OkxPosition, ticker: object | None) -> Decimal | None:
@@ -3387,7 +3482,7 @@ class AccountPositionsHomeWidget(QWidget):
         normalized = AccountPositionsHomeWidget._normalize_position_manual_flatten_mode(flatten_mode)
         if normalized == "best_quote_fee":
             multiple = fee_multiple if isinstance(fee_multiple, Decimal) and fee_multiple > 0 else Decimal("1")
-            return f"挂买一/卖一+{format_decimal(multiple)}倍双向手续费"
+            return f"买方赚{format_decimal(multiple)}倍+双向手续费"
         if normalized == "short_profit_fee":
             percent = profit_percent if isinstance(profit_percent, Decimal) and profit_percent > 0 else Decimal("50")
             return f"卖方扣双向手续费赚{format_decimal(percent)}%平仓"
@@ -3525,6 +3620,18 @@ class AccountPositionsHomeWidget(QWidget):
 
     def _selected_position_flatten_instrument(self, position: OkxPosition) -> Instrument:
         inst_id = str(position.inst_id or "").strip().upper()
+        # A manual option close must use the current OKX tick size. Do not let
+        # a stale position snapshot decide the order price increment.
+        if position.inst_type == "OPTION":
+            try:
+                return self._shared_client.get_instrument(inst_id, prefer_cached=False)
+            except TypeError:
+                try:
+                    return self._shared_client.get_instrument(inst_id)
+                except Exception:
+                    pass
+            except Exception:
+                pass
         cached = self._position_instruments.get(inst_id)
         if isinstance(cached, Instrument):
             return cached
@@ -3552,11 +3659,30 @@ class AccountPositionsHomeWidget(QWidget):
             raw_price = order_book.bids[0][0] if order_book is not None and order_book.bids else ticker.bid
             if raw_price is None or raw_price <= 0:
                 raise ValueError(f"{instrument.inst_id} 当前缺少买一价，无法按买一挂平空单。")
-            return snap_to_increment(raw_price, instrument.tick_size, "down")
+            return self._snap_selected_position_flatten_price(instrument, raw_price, rounding="down")
         raw_price = order_book.asks[0][0] if order_book is not None and order_book.asks else ticker.ask
         if raw_price is None or raw_price <= 0:
             raise ValueError(f"{instrument.inst_id} 当前缺少卖一价，无法按卖一挂平多单。")
-        return snap_to_increment(raw_price, instrument.tick_size, "up")
+        return self._snap_selected_position_flatten_price(instrument, raw_price, rounding="up")
+
+    def _snap_selected_position_flatten_price(
+        self,
+        instrument: Instrument,
+        price: Decimal,
+        *,
+        rounding: str,
+    ) -> Decimal:
+        if instrument.inst_type != "OPTION":
+            return snap_to_increment(price, instrument.tick_size, rounding)
+        family = str(instrument.inst_family or "").strip().upper()
+        if not family:
+            parts = instrument.inst_id.strip().upper().split("-")
+            if len(parts) >= 2:
+                family = f"{parts[0]}-{parts[1]}"
+        if not family:
+            raise ValueError(f"{instrument.inst_id} 缺少期权系列，无法获取 OKX 最小变动价格分档。")
+        tick_bands = self._shared_client.get_option_tick_bands(family)
+        return _snap_option_price_to_tick_bands(price, tick_bands, rounding)
 
     def _resolve_fee_adjusted_flatten_price(
         self,
@@ -3566,20 +3692,32 @@ class AccountPositionsHomeWidget(QWidget):
         side: str,
         fee_multiple: Decimal,
     ) -> Decimal:
-        base_price = self._resolve_best_quote_flatten_price(instrument, side=side)
+        """Calculate the buyer's target price from opening cost plus profit and fees."""
+        if side != "sell":
+            raise ValueError("买方盈利倍数平仓只适用于买方开仓的多头持仓。")
+        reference_price = position.avg_price
+        if reference_price is None or reference_price <= 0:
+            raise ValueError("当前持仓缺少有效开仓均价，无法计算双向手续费挂单价。")
         fee_rate = _break_even_taker_fee_rate(
             self._profile_snapshots.get(self._last_profile_name, {}),
             inst_type=position.inst_type,
         )
-        reference_price = position.avg_price or base_price
-        if reference_price <= 0 or fee_rate <= 0 or fee_multiple <= 0:
-            return base_price
-        offset = abs(reference_price) * fee_rate * Decimal("2") * fee_multiple
-        adjusted_price = base_price + offset if side == "sell" else base_price - offset
+        if fee_multiple <= 0:
+            return self._snap_selected_position_flatten_price(instrument, reference_price, rounding="up")
+        profit_target = reference_price * (Decimal("1") + fee_multiple)
+        if position.inst_type == "OPTION":
+            opening_fee = _option_open_fee_per_premium_unit(
+                position,
+                instrument,
+                open_price=reference_price,
+                fallback_fee_rate=fee_rate,
+            )
+            adjusted_price = _option_premium_after_close_fee_reserve(profit_target + opening_fee, fee_rate)
+        else:
+            adjusted_price = profit_target + abs(reference_price) * fee_rate * Decimal("2")
         if adjusted_price <= 0:
-            raise ValueError("手续费偏移后的挂单价不大于 0，请降低 N 倍数或检查当前价格。")
-        rounding = "up" if side == "sell" else "down"
-        return snap_to_increment(adjusted_price, instrument.tick_size, rounding)
+            raise ValueError("买方目标平仓价不大于 0，请检查盈利倍数或开仓价。")
+        return self._snap_selected_position_flatten_price(instrument, adjusted_price, rounding="up")
 
     def _resolve_short_profit_flatten_price(
         self,
@@ -3600,13 +3738,23 @@ class AccountPositionsHomeWidget(QWidget):
             self._profile_snapshots.get(self._last_profile_name, {}),
             inst_type=position.inst_type,
         )
-        target_price = (
-            reference_price * (Decimal("1") - profit_percent / Decimal("100"))
-            - abs(reference_price) * fee_rate * Decimal("2")
-        )
+        profit_ratio = profit_percent / Decimal("100")
+        if position.inst_type == "OPTION":
+            opening_fee = _option_open_fee_per_premium_unit(
+                position,
+                instrument,
+                open_price=reference_price,
+                fallback_fee_rate=fee_rate,
+            )
+            target_price = _option_premium_before_close_fee(
+                reference_price * (Decimal("1") - profit_ratio) - opening_fee,
+                fee_rate,
+            )
+        else:
+            target_price = reference_price * (Decimal("1") - profit_ratio) - abs(reference_price) * fee_rate * Decimal("2")
         if target_price <= 0:
             raise ValueError("卖方目标平仓价不大于 0，请降低盈利比例或检查开仓价/手续费。")
-        return snap_to_increment(target_price, instrument.tick_size, "down")
+        return self._snap_selected_position_flatten_price(instrument, target_price, rounding="down")
 
     @staticmethod
     def _derive_total_equity_btc(
@@ -4011,9 +4159,9 @@ class AccountPositionsHomeWidget(QWidget):
                     "2. 挂买一/卖一平仓会先挂单，未成交前持仓不会消失。",
                     "3. 平多按卖一挂单，平空按买一挂单。",
                     (
-                        "4. 当前是买方开仓（多头）：可按开仓价预留 N 倍双向手续费后挂卖单。"
+                        "4. 当前是买方开仓（多头）：按开仓成本赚 N 倍，并按 OKX 权利金手续费规则补足双向手续费后挂卖单。"
                         if is_long_position
-                        else "4. 当前是卖方开仓（空头）：可按扣除双向手续费后的目标盈利比例挂买单。"
+                        else "4. 当前是卖方开仓（空头）：按 OKX 权利金手续费规则，挂出扣除双向手续费后赚 N% 的买单。"
                     ),
                 ]
             )
@@ -4026,8 +4174,8 @@ class AccountPositionsHomeWidget(QWidget):
         short_profit_n_button = None
         action_buttons = {market_button, best_quote_button}
         if is_long_position:
-            fee_one_button = dialog.addButton("挂单+1倍双向手续费", QMessageBox.ButtonRole.ActionRole)
-            fee_n_button = dialog.addButton("挂单+N倍双向手续费", QMessageBox.ButtonRole.ActionRole)
+            fee_one_button = dialog.addButton("买方赚1倍+双向手续费", QMessageBox.ButtonRole.ActionRole)
+            fee_n_button = dialog.addButton("买方赚N倍+双向手续费", QMessageBox.ButtonRole.ActionRole)
             action_buttons.update({fee_one_button, fee_n_button})
         else:
             short_profit_50_button = dialog.addButton("卖方扣双向费赚50%平仓", QMessageBox.ButtonRole.ActionRole)
@@ -4036,7 +4184,7 @@ class AccountPositionsHomeWidget(QWidget):
         dialog.addButton(QMessageBox.StandardButton.Cancel)
         button_widths = [(market_button, 120), (best_quote_button, 150)]
         if is_long_position:
-            button_widths.extend([(fee_one_button, 210), (fee_n_button, 210)])
+            button_widths.extend([(fee_one_button, 250), (fee_n_button, 250)])
         else:
             button_widths.extend([(short_profit_50_button, 230), (short_profit_n_button, 230)])
         for button, minimum_width in button_widths:
@@ -4055,14 +4203,15 @@ class AccountPositionsHomeWidget(QWidget):
             flatten_mode = "best_quote_fee"
             fee_multiple = Decimal("1")
         elif is_long_position and clicked is fee_n_button:
+            fee_multiple_decimals = 1
             value, ok = QInputDialog.getDouble(
                 self,
-                "双向手续费倍数",
-                "请输入 N 倍数：",
+                "买方盈利倍数",
+                "请输入买方盈利 N 倍数：",
                 2.0,
                 0.01,
                 1000000.0,
-                4,
+                fee_multiple_decimals,
             )
             if not ok:
                 return
@@ -4087,7 +4236,7 @@ class AccountPositionsHomeWidget(QWidget):
             flatten_mode = "short_profit_fee"
         self._log_selected_position_manual_flatten(
             f"用户确认平仓 | instId={position.inst_id} | direction={direction_label} | closeSide={close_side_label} | "
-            f"mode={flatten_mode} | feeMultiple={format_decimal(fee_multiple)} | "
+            f"mode={flatten_mode} | profitMultiple={format_decimal(fee_multiple)} | "
             f"profitPercent={format_decimal(profit_percent)} | submit={submit_amount_text} | orderSize={order_size_text}"
         )
 
@@ -4098,7 +4247,7 @@ class AccountPositionsHomeWidget(QWidget):
             try:
                 self._log_selected_position_manual_flatten(
                     f"线程开始 | instId={position.inst_id} | mode={flatten_mode} | closeSizeInput={requested_close_size} | "
-                    f"feeMultiple={format_decimal(fee_multiple)} | profitPercent={format_decimal(profit_percent)} | "
+                    f"profitMultiple={format_decimal(fee_multiple)} | profitPercent={format_decimal(profit_percent)} | "
                     f"submit={submit_amount_text} | orderSize={order_size_text}"
                 )
                 result, price, normalized_mode = self._submit_selected_position_manual_flatten(
