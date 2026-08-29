@@ -746,6 +746,22 @@ class RollTerminalQtWindowHelperTests(QtWidgetTestCase):
         finally:
             self.__class__.dispose_widget(window)
 
+    def test_kline_left_panel_is_hidden_by_default_and_can_be_expanded(self) -> None:
+        window = KlineAnalysisWindow(embedded=True)
+        try:
+            self.assertTrue(window._left_panel_hidden)
+            self.assertTrue(window._toggle_left_panel_btn.isChecked())
+            self.assertEqual(window._toggle_left_panel_btn.text(), "显示左栏")
+            self.assertTrue(window._control_scroll.isHidden())
+
+            window._toggle_left_panel_btn.setChecked(False)
+
+            self.assertFalse(window._left_panel_hidden)
+            self.assertEqual(window._toggle_left_panel_btn.text(), "隐藏左栏")
+            self.assertFalse(window._control_scroll.isHidden())
+        finally:
+            self.__class__.dispose_widget(window)
+
     def test_kline_embedded_collapses_pattern_controls_into_settings_menu(self) -> None:
         window = KlineAnalysisWindow(embedded=True)
         try:
@@ -2750,7 +2766,7 @@ class RollTerminalQtWindowHelperTests(QtWidgetTestCase):
             finally:
                 self.__class__.dispose_widget(window)
 
-    def test_kline_window_prefers_moni_api_runtime_context_when_available(self) -> None:
+    def test_kline_window_prefers_159_api_runtime_context_when_available(self) -> None:
         runtime_api1 = ArbitrageTradeRuntime(
             credentials=SimpleNamespace(profile_name="api1"),
             environment="live",
@@ -2758,32 +2774,32 @@ class RollTerminalQtWindowHelperTests(QtWidgetTestCase):
             position_mode="net",
             credential_profile_name="api1",
         )
-        runtime_moni = ArbitrageTradeRuntime(
-            credentials=SimpleNamespace(profile_name="moni"),
+        runtime_159 = ArbitrageTradeRuntime(
+            credentials=SimpleNamespace(profile_name="159"),
             environment="demo",
             trade_mode="cross",
             position_mode="net",
-            credential_profile_name="moni",
+            credential_profile_name="159",
         )
         with (
-            patch("roll_terminal_qt.kline_analysis_window.profile_names", return_value=["api1", "moni"]),
+            patch("roll_terminal_qt.kline_analysis_window.profile_names", return_value=["api1", "159"]),
             patch(
                 "roll_terminal_qt.kline_analysis_window.load_runtime",
-                side_effect=lambda profile_name=None: runtime_moni if profile_name == "moni" else runtime_api1,
+                side_effect=lambda profile_name=None: runtime_159 if profile_name == "159" else runtime_api1,
             ),
         ):
             window = KlineAnalysisWindow()
             try:
-                self.assertEqual(window._api_profile_combo.currentText(), "moni")
-                self.assertEqual(window._runtime, runtime_moni)
-                self.assertEqual(window._active_profile_name(), "moni")
+                self.assertEqual(window._api_profile_combo.currentText(), "159")
+                self.assertEqual(window._runtime, runtime_159)
+                self.assertEqual(window._active_profile_name(), "159")
                 self.assertEqual(window._active_environment(), "demo")
-                self.assertIn("moni", window._account_context.text())
+                self.assertIn("159", window._account_context.text())
                 self.assertIn("demo", window._account_context.text())
             finally:
                 self.__class__.dispose_widget(window)
 
-    def test_kline_window_prefers_moni_over_current_global_runtime_when_available(self) -> None:
+    def test_kline_window_prefers_159_over_current_global_runtime_when_available(self) -> None:
         runtime_reapai = ArbitrageTradeRuntime(
             credentials=SimpleNamespace(profile_name="ReapAI"),
             environment="live",
@@ -2791,25 +2807,25 @@ class RollTerminalQtWindowHelperTests(QtWidgetTestCase):
             position_mode="net",
             credential_profile_name="ReapAI",
         )
-        runtime_moni = ArbitrageTradeRuntime(
-            credentials=SimpleNamespace(profile_name="moni"),
+        runtime_159 = ArbitrageTradeRuntime(
+            credentials=SimpleNamespace(profile_name="159"),
             environment="demo",
             trade_mode="cross",
             position_mode="net",
-            credential_profile_name="moni",
+            credential_profile_name="159",
         )
         with (
-            patch("roll_terminal_qt.kline_analysis_window.profile_names", return_value=["moni", "ReapAI"]),
+            patch("roll_terminal_qt.kline_analysis_window.profile_names", return_value=["159", "ReapAI"]),
             patch(
                 "roll_terminal_qt.kline_analysis_window.load_runtime",
-                side_effect=lambda profile_name=None: runtime_moni if profile_name == "moni" else runtime_reapai,
+                side_effect=lambda profile_name=None: runtime_159 if profile_name == "159" else runtime_reapai,
             ),
         ):
             window = KlineAnalysisWindow()
             try:
-                self.assertEqual(window._api_profile_combo.currentText(), "moni")
-                self.assertEqual(window._runtime, runtime_moni)
-                self.assertIn("moni", window._account_context.text())
+                self.assertEqual(window._api_profile_combo.currentText(), "159")
+                self.assertEqual(window._runtime, runtime_159)
+                self.assertIn("159", window._account_context.text())
                 self.assertIn("demo", window._account_context.text())
             finally:
                 self.__class__.dispose_widget(window)

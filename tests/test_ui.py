@@ -9250,11 +9250,11 @@ class _AfterRoot:
 
 
 class CredentialProfileEnvironmentTest(TestCase):
-    def test_startup_credential_profile_name_prefers_moni_and_otherwise_falls_back(self) -> None:
-        app = SimpleNamespace(_credential_profiles={"real": {}, "moni": {}})
+    def test_startup_credential_profile_name_prefers_159_and_otherwise_falls_back(self) -> None:
+        app = SimpleNamespace(_credential_profiles={"real": {}, "159": {}})
         app._credential_profile_names = lambda: QuantApp._credential_profile_names(app)
 
-        self.assertEqual(QuantApp._startup_credential_profile_name(app, "real"), "moni")
+        self.assertEqual(QuantApp._startup_credential_profile_name(app, "real"), "159")
 
         fallback_app = SimpleNamespace(_credential_profiles={"real": {}, "trade": {}})
         fallback_app._credential_profile_names = lambda: QuantApp._credential_profile_names(fallback_app)

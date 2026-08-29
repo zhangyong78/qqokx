@@ -5414,13 +5414,13 @@ class KlineAnalysisWindow(QMainWindow):
         self._account_drawer: KlineAccountDrawer | None = None
         self._orders_drawer_button: QPushButton | None = None
         self._positions_drawer_button: QPushButton | None = None
-        self._left_panel_hidden = False
+        self._left_panel_hidden = True
         self._secondary_volatility_loader: SecondaryVolatilityDataLoader | None = None
         self._syncing_chart_range = False
         self._pending_reload_after_load = False
         self._primary_chart_status_text = ""
         self._secondary_chart_status_text = ""
-        self._runtime = load_runtime("moni") or load_runtime()
+        self._runtime = load_runtime("159") or load_runtime()
         self._market_client = OkxRestClient()
         self._realtime_candle_key: CandleStreamKey | None = None
         self._realtime_candle_unsubscribe: Callable[[], None] | None = None
@@ -5447,6 +5447,7 @@ class KlineAnalysisWindow(QMainWindow):
 
         self._build_header(main_layout)
         self._build_body(main_layout)
+        self._toggle_left_panel(self._left_panel_hidden)
         self._sync_primary_period_buttons()
         self._refresh_chart_mode_cycle_button()
         self._refresh_chart_view_range_button()
@@ -5673,9 +5674,10 @@ class KlineAnalysisWindow(QMainWindow):
             period_toolbar_layout.addWidget(button)
         top_row.addWidget(period_toolbar, 0)
 
-        self._toggle_left_panel_btn = QPushButton("隐藏左栏")
+        self._toggle_left_panel_btn = QPushButton("显示左栏")
         self._toggle_left_panel_btn.setCheckable(True)
         self._toggle_left_panel_btn.toggled.connect(self._toggle_left_panel)
+        self._toggle_left_panel_btn.setChecked(self._left_panel_hidden)
         top_row.addWidget(self._toggle_left_panel_btn, 0)
 
         top_row.addSpacing(10)
@@ -6398,6 +6400,13 @@ class KlineAnalysisWindow(QMainWindow):
         if splitter is None or self._splitter_default_applied:
             return
         available_width = splitter.width() or self.width() or 1680
+        if self._left_panel_hidden:
+            control = self._control_scroll or self._control_panel
+            if control is not None:
+                control.setVisible(False)
+            splitter.setSizes([0, available_width])
+            self._splitter_default_applied = True
+            return
         left_width, right_width = _default_kline_splitter_sizes(available_width)
         splitter.setSizes([left_width, right_width])
         self._splitter_default_applied = True
@@ -6989,7 +6998,7 @@ class KlineAnalysisWindow(QMainWindow):
         self._profile_snapshots, selected_profile = load_profile_snapshots()
         self._suppress_api_profile_change = True
         try:
-            runtime = self._runtime if self._runtime is not None else load_runtime("moni") or load_runtime()
+            runtime = self._runtime if self._runtime is not None else load_runtime("159") or load_runtime()
             runtime_profile = ""
             if runtime is not None:
                 self._runtime = runtime

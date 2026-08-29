@@ -85,13 +85,13 @@ class WorkspaceShellQtTests(QtWidgetTestCase):
         self.assertTrue(trading_tools_button.isChecked())
         self.assertFalse(header._page_buttons["roll"].isChecked())
 
-    def test_preferred_profile_uses_moni_before_saved_selection(self) -> None:
+    def test_preferred_profile_uses_159_before_saved_selection(self) -> None:
         self.assertEqual(
-            workspace_shell.preferred_profile_name(["api2", "moni", "api1"], selected="api2"),
-            "moni",
+            workspace_shell.preferred_profile_name(["api2", "159", "api1"], selected="api2"),
+            "159",
         )
         self.assertEqual(
-            workspace_shell.preferred_profile_name(["api2", "moni"], current="api2", selected="moni"),
+            workspace_shell.preferred_profile_name(["api2", "159"], current="api2", selected="159"),
             "api2",
         )
 

@@ -595,6 +595,12 @@ def _format_estimated_close_fee_amount(value: Decimal) -> str:
     return format_decimal(rounded)
 
 
+def _format_estimated_close_fee_usdt_amount(value: Decimal) -> str:
+    """Display the USDT equivalent in the holdings table with two decimals."""
+    rounded = value.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    return format_decimal_fixed(rounded, places=2)
+
+
 def _format_estimated_close_fee(
     position: OkxPosition,
     instrument: Instrument | None,
@@ -611,13 +617,18 @@ def _format_estimated_close_fee(
     )
     if fee is None or currency is None:
         return "-"
-    native_text = f"{_format_estimated_close_fee_amount(fee)} {currency}"
+    native_amount = (
+        _format_estimated_close_fee_usdt_amount(fee)
+        if currency == "USDT"
+        else _format_estimated_close_fee_amount(fee)
+    )
+    native_text = f"{native_amount} {currency}"
     if currency in {"USDT", "USD", "USDC"}:
         return native_text
     conversion = upl_usdt_prices.get(currency)
     if conversion is None or conversion <= 0:
         return native_text
-    usdt_text = _format_estimated_close_fee_amount(fee * conversion)
+    usdt_text = _format_estimated_close_fee_usdt_amount(fee * conversion)
     return f"{native_text}（≈{usdt_text} USDT）"
 
 
@@ -644,11 +655,16 @@ def _format_group_estimated_close_fee(
     parts: list[str] = []
     for currency in sorted(totals):
         fee = totals[currency]
-        text = f"{_format_estimated_close_fee_amount(fee)} {currency}"
+        native_amount = (
+            _format_estimated_close_fee_usdt_amount(fee)
+            if currency == "USDT"
+            else _format_estimated_close_fee_amount(fee)
+        )
+        text = f"{native_amount} {currency}"
         if currency not in {"USDT", "USD", "USDC"}:
             conversion = upl_usdt_prices.get(currency)
             if conversion is not None and conversion > 0:
-                text = f"{text}（≈{_format_estimated_close_fee_amount(fee * conversion)} USDT）"
+                text = f"{text}（≈{_format_estimated_close_fee_usdt_amount(fee * conversion)} USDT）"
         parts.append(text)
     return " / ".join(parts)
 
@@ -2079,7 +2095,7 @@ class AccountPositionsHomeWidget(QWidget):
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        self._runtime = load_runtime("moni") or load_runtime()
+        self._runtime = load_runtime("159") or load_runtime()
         self._profile_snapshots: dict[str, dict[str, str]] = {}
         self._unlocked_profiles: set[str] = set()
         self._last_profile_name = self._runtime.credential_profile_name if self._runtime is not None else ""
@@ -3348,6 +3364,8 @@ class AccountPositionsHomeWidget(QWidget):
         normalized = str(flatten_mode or "").strip().lower()
         if normalized in {"best_quote_fee", "best_quote_with_fee"}:
             return "best_quote_fee"
+        if normalized in {"short_profit_fee", "seller_profit_fee"}:
+            return "short_profit_fee"
         return "best_quote" if normalized == "best_quote" else "market"
 
     @staticmethod
@@ -3364,11 +3382,15 @@ class AccountPositionsHomeWidget(QWidget):
     def _position_manual_flatten_mode_label(
         flatten_mode: str,
         fee_multiple: Decimal | None = None,
+        profit_percent: Decimal | None = None,
     ) -> str:
         normalized = AccountPositionsHomeWidget._normalize_position_manual_flatten_mode(flatten_mode)
         if normalized == "best_quote_fee":
             multiple = fee_multiple if isinstance(fee_multiple, Decimal) and fee_multiple > 0 else Decimal("1")
             return f"挂买一/卖一+{format_decimal(multiple)}倍双向手续费"
+        if normalized == "short_profit_fee":
+            percent = profit_percent if isinstance(profit_percent, Decimal) and profit_percent > 0 else Decimal("50")
+            return f"卖方扣双向手续费赚{format_decimal(percent)}%平仓"
         return "挂买一/卖一平仓" if normalized == "best_quote" else "市价平仓"
 
     def _build_selected_position_manual_flatten_config(self, position: OkxPosition) -> StrategyConfig:
@@ -3559,6 +3581,33 @@ class AccountPositionsHomeWidget(QWidget):
         rounding = "up" if side == "sell" else "down"
         return snap_to_increment(adjusted_price, instrument.tick_size, rounding)
 
+    def _resolve_short_profit_flatten_price(
+        self,
+        position: OkxPosition,
+        instrument: Instrument,
+        *,
+        side: str,
+        profit_percent: Decimal,
+    ) -> Decimal:
+        if side != "buy":
+            raise ValueError("卖方盈利比例平仓只适用于卖方开仓的空头持仓。")
+        if not isinstance(profit_percent, Decimal) or profit_percent <= 0 or profit_percent >= 100:
+            raise ValueError("卖方盈利比例必须大于 0 且小于 100。")
+        reference_price = position.avg_price
+        if reference_price is None or reference_price <= 0:
+            raise ValueError("当前持仓缺少有效开仓均价，无法计算卖方盈利比例平仓价。")
+        fee_rate = _break_even_taker_fee_rate(
+            self._profile_snapshots.get(self._last_profile_name, {}),
+            inst_type=position.inst_type,
+        )
+        target_price = (
+            reference_price * (Decimal("1") - profit_percent / Decimal("100"))
+            - abs(reference_price) * fee_rate * Decimal("2")
+        )
+        if target_price <= 0:
+            raise ValueError("卖方目标平仓价不大于 0，请降低盈利比例或检查开仓价/手续费。")
+        return snap_to_increment(target_price, instrument.tick_size, "down")
+
     @staticmethod
     def _derive_total_equity_btc(
         total_equity: Decimal | None,
@@ -3623,6 +3672,7 @@ class AccountPositionsHomeWidget(QWidget):
         *,
         close_size: Decimal | None = None,
         fee_multiple: Decimal | None = None,
+        profit_percent: Decimal | None = None,
     ) -> tuple[OkxOrderResult, Decimal | None, str]:
         credentials, config, instrument, closeable_size, close_side, pos_side, _direction, normalized_mode = (
             self._prepare_selected_position_manual_flatten(position, flatten_mode, close_size=close_size)
@@ -3637,7 +3687,7 @@ class AccountPositionsHomeWidget(QWidget):
                 pos_side=None,
             )
             return result, None, normalized_mode
-        if normalized_mode in {"best_quote", "best_quote_fee"}:
+        if normalized_mode in {"best_quote", "best_quote_fee", "short_profit_fee"}:
             if normalized_mode == "best_quote_fee":
                 effective_fee_multiple = fee_multiple if isinstance(fee_multiple, Decimal) and fee_multiple > 0 else Decimal("1")
                 price = self._resolve_fee_adjusted_flatten_price(
@@ -3645,6 +3695,18 @@ class AccountPositionsHomeWidget(QWidget):
                     instrument,
                     side=close_side,
                     fee_multiple=effective_fee_multiple,
+                )
+            elif normalized_mode == "short_profit_fee":
+                effective_profit_percent = (
+                    profit_percent
+                    if isinstance(profit_percent, Decimal) and profit_percent > 0
+                    else Decimal("50")
+                )
+                price = self._resolve_short_profit_flatten_price(
+                    position,
+                    instrument,
+                    side=close_side,
+                    profit_percent=effective_profit_percent,
                 )
             else:
                 price = self._resolve_best_quote_flatten_price(instrument, side=close_side)
@@ -3674,7 +3736,7 @@ class AccountPositionsHomeWidget(QWidget):
 
     def _schedule_selected_position_manual_flatten_follow_up_refresh(self, flatten_mode: str) -> None:
         normalized_mode = self._normalize_position_manual_flatten_mode(flatten_mode)
-        if normalized_mode in {"best_quote", "best_quote_fee"}:
+        if normalized_mode in {"best_quote", "best_quote_fee", "short_profit_fee"}:
             QTimer.singleShot(450, self.refresh_view)
             QTimer.singleShot(1800, self.refresh_view)
             return
@@ -3811,10 +3873,15 @@ class AccountPositionsHomeWidget(QWidget):
         submit_size_text: str,
         order_size_text: str | None = None,
         fee_multiple: Decimal | None = None,
+        profit_percent: Decimal | None = None,
     ) -> None:
         self._selected_position_manual_flatten_running = False
         self._status_badge.setText("正常")
-        mode_label = self._position_manual_flatten_mode_label(normalized_flatten_mode, fee_multiple)
+        mode_label = self._position_manual_flatten_mode_label(
+            normalized_flatten_mode,
+            fee_multiple,
+            profit_percent,
+        )
         order_id = (result.ord_id or "-").strip() or "-"
         client_order_id = (result.cl_ord_id or "-").strip() or "-"
         self._log_selected_position_manual_flatten(
@@ -3834,7 +3901,7 @@ class AccountPositionsHomeWidget(QWidget):
         )
         if order_size_text:
             message = f"{message}\n实际下单量：{order_size_text}"
-        if normalized_flatten_mode in {"best_quote", "best_quote_fee"} and price is not None:
+        if normalized_flatten_mode in {"best_quote", "best_quote_fee", "short_profit_fee"} and price is not None:
             message = f"{message}\n挂单价：{format_decimal(price)}"
         QMessageBox.information(self, "平仓已提交", message)
         self._schedule_selected_position_manual_flatten_follow_up_refresh(normalized_flatten_mode)
@@ -3884,6 +3951,7 @@ class AccountPositionsHomeWidget(QWidget):
             )
         )
         order_size_text = self._selected_position_order_size_text(position, instrument, preview_close_size)
+        is_long_position = preview_direction == "long"
         size_dialog = QuantityInputDialog(
             title="平仓币数",
             prompt=f"输入本次平仓币数（默认可平全部，单位：{closeable_unit}）",
@@ -3942,35 +4010,51 @@ class AccountPositionsHomeWidget(QWidget):
                     "1. 市价平仓会立刻按市场可成交价格报单。",
                     "2. 挂买一/卖一平仓会先挂单，未成交前持仓不会消失。",
                     "3. 平多按卖一挂单，平空按买一挂单。",
-                    "4. 手续费挂单会按开仓价预留 N 倍双向手续费：平多上调卖单价，平空下调买单价。",
+                    (
+                        "4. 当前是买方开仓（多头）：可按开仓价预留 N 倍双向手续费后挂卖单。"
+                        if is_long_position
+                        else "4. 当前是卖方开仓（空头）：可按扣除双向手续费后的目标盈利比例挂买单。"
+                    ),
                 ]
             )
         )
         market_button = dialog.addButton("市价平仓", QMessageBox.ButtonRole.AcceptRole)
         best_quote_button = dialog.addButton("挂买一/卖一", QMessageBox.ButtonRole.ActionRole)
-        fee_one_button = dialog.addButton("挂单+1倍双向手续费", QMessageBox.ButtonRole.ActionRole)
-        fee_n_button = dialog.addButton("挂单+N倍双向手续费", QMessageBox.ButtonRole.ActionRole)
+        fee_one_button = None
+        fee_n_button = None
+        short_profit_50_button = None
+        short_profit_n_button = None
+        action_buttons = {market_button, best_quote_button}
+        if is_long_position:
+            fee_one_button = dialog.addButton("挂单+1倍双向手续费", QMessageBox.ButtonRole.ActionRole)
+            fee_n_button = dialog.addButton("挂单+N倍双向手续费", QMessageBox.ButtonRole.ActionRole)
+            action_buttons.update({fee_one_button, fee_n_button})
+        else:
+            short_profit_50_button = dialog.addButton("卖方扣双向费赚50%平仓", QMessageBox.ButtonRole.ActionRole)
+            short_profit_n_button = dialog.addButton("卖方扣双向费赚N%平仓", QMessageBox.ButtonRole.ActionRole)
+            action_buttons.update({short_profit_50_button, short_profit_n_button})
         dialog.addButton(QMessageBox.StandardButton.Cancel)
-        for button, minimum_width in (
-            (market_button, 120),
-            (best_quote_button, 150),
-            (fee_one_button, 210),
-            (fee_n_button, 210),
-        ):
+        button_widths = [(market_button, 120), (best_quote_button, 150)]
+        if is_long_position:
+            button_widths.extend([(fee_one_button, 210), (fee_n_button, 210)])
+        else:
+            button_widths.extend([(short_profit_50_button, 230), (short_profit_n_button, 230)])
+        for button, minimum_width in button_widths:
             button.setMinimumWidth(minimum_width)
         dialog.setMinimumWidth(980)
         dialog.exec()
         clicked = dialog.clickedButton()
-        if clicked not in {market_button, best_quote_button, fee_one_button, fee_n_button}:
+        if clicked not in action_buttons:
             return
         flatten_mode = "market"
         fee_multiple = Decimal("0")
+        profit_percent = Decimal("0")
         if clicked is best_quote_button:
             flatten_mode = "best_quote"
-        elif clicked is fee_one_button:
+        elif is_long_position and clicked is fee_one_button:
             flatten_mode = "best_quote_fee"
             fee_multiple = Decimal("1")
-        elif clicked is fee_n_button:
+        elif is_long_position and clicked is fee_n_button:
             value, ok = QInputDialog.getDouble(
                 self,
                 "双向手续费倍数",
@@ -3984,9 +4068,27 @@ class AccountPositionsHomeWidget(QWidget):
                 return
             fee_multiple = Decimal(str(value))
             flatten_mode = "best_quote_fee"
+        elif not is_long_position and clicked is short_profit_50_button:
+            flatten_mode = "short_profit_fee"
+            profit_percent = Decimal("50")
+        elif not is_long_position and clicked is short_profit_n_button:
+            value, ok = QInputDialog.getDouble(
+                self,
+                "卖方盈利比例",
+                "请输入扣除双向手续费后的盈利比例（%）：",
+                50.0,
+                0.01,
+                99.99,
+                2,
+            )
+            if not ok:
+                return
+            profit_percent = Decimal(str(value))
+            flatten_mode = "short_profit_fee"
         self._log_selected_position_manual_flatten(
             f"用户确认平仓 | instId={position.inst_id} | direction={direction_label} | closeSide={close_side_label} | "
-            f"mode={flatten_mode} | feeMultiple={format_decimal(fee_multiple)} | submit={submit_amount_text} | orderSize={order_size_text}"
+            f"mode={flatten_mode} | feeMultiple={format_decimal(fee_multiple)} | "
+            f"profitPercent={format_decimal(profit_percent)} | submit={submit_amount_text} | orderSize={order_size_text}"
         )
 
         self._selected_position_manual_flatten_running = True
@@ -3996,13 +4098,15 @@ class AccountPositionsHomeWidget(QWidget):
             try:
                 self._log_selected_position_manual_flatten(
                     f"线程开始 | instId={position.inst_id} | mode={flatten_mode} | closeSizeInput={requested_close_size} | "
-                    f"feeMultiple={format_decimal(fee_multiple)} | submit={submit_amount_text} | orderSize={order_size_text}"
+                    f"feeMultiple={format_decimal(fee_multiple)} | profitPercent={format_decimal(profit_percent)} | "
+                    f"submit={submit_amount_text} | orderSize={order_size_text}"
                 )
                 result, price, normalized_mode = self._submit_selected_position_manual_flatten(
                     position,
                     flatten_mode,
                     close_size=requested_close_size,
                     fee_multiple=fee_multiple,
+                    profit_percent=profit_percent,
                 )
                 self._log_selected_position_manual_flatten(
                     f"交易所返回 | instId={position.inst_id} | mode={normalized_mode} | ordId={result.ord_id or '-'} | "
@@ -4045,7 +4149,7 @@ class AccountPositionsHomeWidget(QWidget):
                 return
             self._selected_position_manual_flatten_after(
                 0,
-                lambda result=result, price=price, normalized_mode=normalized_mode, fee_multiple=fee_multiple: self._finish_selected_position_manual_flatten_success(
+                lambda result=result, price=price, normalized_mode=normalized_mode, fee_multiple=fee_multiple, profit_percent=profit_percent: self._finish_selected_position_manual_flatten_success(
                     position=position,
                     result=result,
                     price=price,
@@ -4055,6 +4159,7 @@ class AccountPositionsHomeWidget(QWidget):
                     submit_size_text=submit_amount_text,
                     order_size_text=order_size_text,
                     fee_multiple=fee_multiple,
+                    profit_percent=profit_percent,
                 ),
             )
 

@@ -19,6 +19,7 @@ from roll_terminal_qt.account_positions_home import (
     _current_order_view_cancel_reference,
     _current_order_view_program_owner_label,
     _current_order_view_to_trade_order_item,
+    _format_estimated_close_fee,
     _position_display_foreground_colors,
 )
 from okx_quant.okx_client import Instrument, OkxOrderResult
@@ -29,6 +30,39 @@ from roll_terminal_qt.shared_order_store import SharedOrderSnapshot
 
 
 class PositionDisplayForegroundColorsTest(TestCase):
+    def test_estimated_close_fee_formats_usdt_equivalent_with_two_decimals(self) -> None:
+        position = SimpleNamespace(
+            position=Decimal("1"),
+            inst_id="BTC-USD-SWAP",
+            inst_type="SWAP",
+            avg_price=Decimal("60000"),
+            mark_price=Decimal("60000"),
+            last_price=Decimal("60000"),
+            pos_side="long",
+        )
+        instrument = Instrument(
+            inst_id="BTC-USD-SWAP",
+            inst_type="SWAP",
+            tick_size=Decimal("0.1"),
+            lot_size=Decimal("1"),
+            min_size=Decimal("1"),
+            state="live",
+            ct_val=Decimal("100"),
+            ct_mult=Decimal("1"),
+            ct_val_ccy="USD",
+        )
+        ticker = SimpleNamespace(bid=Decimal("60000"), ask=Decimal("60000"))
+
+        text = _format_estimated_close_fee(
+            position,
+            instrument,
+            ticker,
+            {"BTC": Decimal("60000")},
+            fee_rate=Decimal("0.0003"),
+        )
+
+        self.assertEqual(text, "0.0000005 BTC（≈0.03 USDT）")
+
     def test_history_position_kline_markers_use_open_and_close_timestamps(self) -> None:
         history_item = SimpleNamespace(
             update_time=1_752_300_600_000,
@@ -1096,6 +1130,66 @@ class AccountPositionsHomeQtHelpersTest(TestCase):
         value = AccountPositionsHomeWidget._parse_positive_decimal("1.25", "平仓币数")
 
         self.assertEqual(value, Decimal("1.25"))
+
+    def test_short_profit_flatten_price_reserves_both_sides_fee(self) -> None:
+        position = SimpleNamespace(
+            inst_type="SWAP",
+            avg_price=Decimal("0.010000"),
+        )
+        instrument = Instrument(
+            inst_id="BTC-USDT-SWAP",
+            inst_type="SWAP",
+            tick_size=Decimal("0.000001"),
+            lot_size=Decimal("1"),
+            min_size=Decimal("1"),
+            state="live",
+        )
+        app = SimpleNamespace(
+            _profile_snapshots={"159": {"futures_taker_fee_rate": "0.03"}},
+            _last_profile_name="159",
+        )
+
+        price = AccountPositionsHomeWidget._resolve_short_profit_flatten_price(
+            app,
+            position,
+            instrument,
+            side="buy",
+            profit_percent=Decimal("50"),
+        )
+
+        self.assertEqual(price, Decimal("0.004994"))
+
+    def test_short_profit_flatten_price_rejects_long_close_side(self) -> None:
+        app = SimpleNamespace(
+            _profile_snapshots={},
+            _last_profile_name="159",
+        )
+        position = SimpleNamespace(inst_type="SWAP", avg_price=Decimal("0.01"))
+        instrument = Instrument(
+            inst_id="BTC-USDT-SWAP",
+            inst_type="SWAP",
+            tick_size=Decimal("0.000001"),
+            lot_size=Decimal("1"),
+            min_size=Decimal("1"),
+            state="live",
+        )
+
+        with self.assertRaisesRegex(ValueError, "只适用于卖方开仓"):
+            AccountPositionsHomeWidget._resolve_short_profit_flatten_price(
+                app,
+                position,
+                instrument,
+                side="sell",
+                profit_percent=Decimal("50"),
+            )
+
+    def test_manual_flatten_mode_label_includes_seller_profit_percent(self) -> None:
+        label = AccountPositionsHomeWidget._position_manual_flatten_mode_label(
+            "short_profit_fee",
+            profit_percent=Decimal("70"),
+        )
+
+        self.assertEqual(label, "卖方扣双向手续费赚70%平仓")
 
     def test_selected_position_close_display_amount_uses_coin_for_linear_swap(self) -> None:
         position = SimpleNamespace(
