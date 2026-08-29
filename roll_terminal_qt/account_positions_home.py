@@ -27,6 +27,7 @@ from PySide6.QtWidgets import (
     QGridLayout,
     QHBoxLayout,
     QHeaderView,
+    QInputDialog,
     QLabel,
     QLineEdit,
     QMenu,
@@ -3345,6 +3346,8 @@ class AccountPositionsHomeWidget(QWidget):
     @staticmethod
     def _normalize_position_manual_flatten_mode(flatten_mode: str) -> str:
         normalized = str(flatten_mode or "").strip().lower()
+        if normalized in {"best_quote_fee", "best_quote_with_fee"}:
+            return "best_quote_fee"
         return "best_quote" if normalized == "best_quote" else "market"
 
     @staticmethod
@@ -3358,8 +3361,15 @@ class AccountPositionsHomeWidget(QWidget):
         return value
 
     @staticmethod
-    def _position_manual_flatten_mode_label(flatten_mode: str) -> str:
-        return "挂买一/卖一平仓" if AccountPositionsHomeWidget._normalize_position_manual_flatten_mode(flatten_mode) == "best_quote" else "市价平仓"
+    def _position_manual_flatten_mode_label(
+        flatten_mode: str,
+        fee_multiple: Decimal | None = None,
+    ) -> str:
+        normalized = AccountPositionsHomeWidget._normalize_position_manual_flatten_mode(flatten_mode)
+        if normalized == "best_quote_fee":
+            multiple = fee_multiple if isinstance(fee_multiple, Decimal) and fee_multiple > 0 else Decimal("1")
+            return f"挂买一/卖一+{format_decimal(multiple)}倍双向手续费"
+        return "挂买一/卖一平仓" if normalized == "best_quote" else "市价平仓"
 
     def _build_selected_position_manual_flatten_config(self, position: OkxPosition) -> StrategyConfig:
         runtime = self._runtime
@@ -3526,6 +3536,29 @@ class AccountPositionsHomeWidget(QWidget):
             raise ValueError(f"{instrument.inst_id} 当前缺少卖一价，无法按卖一挂平多单。")
         return snap_to_increment(raw_price, instrument.tick_size, "up")
 
+    def _resolve_fee_adjusted_flatten_price(
+        self,
+        position: OkxPosition,
+        instrument: Instrument,
+        *,
+        side: str,
+        fee_multiple: Decimal,
+    ) -> Decimal:
+        base_price = self._resolve_best_quote_flatten_price(instrument, side=side)
+        fee_rate = _break_even_taker_fee_rate(
+            self._profile_snapshots.get(self._last_profile_name, {}),
+            inst_type=position.inst_type,
+        )
+        reference_price = position.avg_price or base_price
+        if reference_price <= 0 or fee_rate <= 0 or fee_multiple <= 0:
+            return base_price
+        offset = abs(reference_price) * fee_rate * Decimal("2") * fee_multiple
+        adjusted_price = base_price + offset if side == "sell" else base_price - offset
+        if adjusted_price <= 0:
+            raise ValueError("手续费偏移后的挂单价不大于 0，请降低 N 倍数或检查当前价格。")
+        rounding = "up" if side == "sell" else "down"
+        return snap_to_increment(adjusted_price, instrument.tick_size, rounding)
+
     @staticmethod
     def _derive_total_equity_btc(
         total_equity: Decimal | None,
@@ -3589,6 +3622,7 @@ class AccountPositionsHomeWidget(QWidget):
         flatten_mode: str,
         *,
         close_size: Decimal | None = None,
+        fee_multiple: Decimal | None = None,
     ) -> tuple[OkxOrderResult, Decimal | None, str]:
         credentials, config, instrument, closeable_size, close_side, pos_side, _direction, normalized_mode = (
             self._prepare_selected_position_manual_flatten(position, flatten_mode, close_size=close_size)
@@ -3603,8 +3637,17 @@ class AccountPositionsHomeWidget(QWidget):
                 pos_side=None,
             )
             return result, None, normalized_mode
-        if normalized_mode == "best_quote":
-            price = self._resolve_best_quote_flatten_price(instrument, side=close_side)
+        if normalized_mode in {"best_quote", "best_quote_fee"}:
+            if normalized_mode == "best_quote_fee":
+                effective_fee_multiple = fee_multiple if isinstance(fee_multiple, Decimal) and fee_multiple > 0 else Decimal("1")
+                price = self._resolve_fee_adjusted_flatten_price(
+                    position,
+                    instrument,
+                    side=close_side,
+                    fee_multiple=effective_fee_multiple,
+                )
+            else:
+                price = self._resolve_best_quote_flatten_price(instrument, side=close_side)
             result = self._shared_client.place_simple_order(
                 credentials,
                 config,
@@ -3631,7 +3674,7 @@ class AccountPositionsHomeWidget(QWidget):
 
     def _schedule_selected_position_manual_flatten_follow_up_refresh(self, flatten_mode: str) -> None:
         normalized_mode = self._normalize_position_manual_flatten_mode(flatten_mode)
-        if normalized_mode == "best_quote":
+        if normalized_mode in {"best_quote", "best_quote_fee"}:
             QTimer.singleShot(450, self.refresh_view)
             QTimer.singleShot(1800, self.refresh_view)
             return
@@ -3767,10 +3810,11 @@ class AccountPositionsHomeWidget(QWidget):
         close_side_label: str,
         submit_size_text: str,
         order_size_text: str | None = None,
+        fee_multiple: Decimal | None = None,
     ) -> None:
         self._selected_position_manual_flatten_running = False
         self._status_badge.setText("正常")
-        mode_label = self._position_manual_flatten_mode_label(normalized_flatten_mode)
+        mode_label = self._position_manual_flatten_mode_label(normalized_flatten_mode, fee_multiple)
         order_id = (result.ord_id or "-").strip() or "-"
         client_order_id = (result.cl_ord_id or "-").strip() or "-"
         self._log_selected_position_manual_flatten(
@@ -3790,7 +3834,7 @@ class AccountPositionsHomeWidget(QWidget):
         )
         if order_size_text:
             message = f"{message}\n实际下单量：{order_size_text}"
-        if normalized_flatten_mode == "best_quote" and price is not None:
+        if normalized_flatten_mode in {"best_quote", "best_quote_fee"} and price is not None:
             message = f"{message}\n挂单价：{format_decimal(price)}"
         QMessageBox.information(self, "平仓已提交", message)
         self._schedule_selected_position_manual_flatten_follow_up_refresh(normalized_flatten_mode)
@@ -3898,20 +3942,51 @@ class AccountPositionsHomeWidget(QWidget):
                     "1. 市价平仓会立刻按市场可成交价格报单。",
                     "2. 挂买一/卖一平仓会先挂单，未成交前持仓不会消失。",
                     "3. 平多按卖一挂单，平空按买一挂单。",
+                    "4. 手续费挂单会按开仓价预留 N 倍双向手续费：平多上调卖单价，平空下调买单价。",
                 ]
             )
         )
         market_button = dialog.addButton("市价平仓", QMessageBox.ButtonRole.AcceptRole)
         best_quote_button = dialog.addButton("挂买一/卖一", QMessageBox.ButtonRole.ActionRole)
+        fee_one_button = dialog.addButton("挂单+1倍双向手续费", QMessageBox.ButtonRole.ActionRole)
+        fee_n_button = dialog.addButton("挂单+N倍双向手续费", QMessageBox.ButtonRole.ActionRole)
         dialog.addButton(QMessageBox.StandardButton.Cancel)
+        for button, minimum_width in (
+            (market_button, 120),
+            (best_quote_button, 150),
+            (fee_one_button, 210),
+            (fee_n_button, 210),
+        ):
+            button.setMinimumWidth(minimum_width)
+        dialog.setMinimumWidth(980)
         dialog.exec()
         clicked = dialog.clickedButton()
-        if clicked not in {market_button, best_quote_button}:
+        if clicked not in {market_button, best_quote_button, fee_one_button, fee_n_button}:
             return
-        flatten_mode = "market" if clicked is market_button else "best_quote"
+        flatten_mode = "market"
+        fee_multiple = Decimal("0")
+        if clicked is best_quote_button:
+            flatten_mode = "best_quote"
+        elif clicked is fee_one_button:
+            flatten_mode = "best_quote_fee"
+            fee_multiple = Decimal("1")
+        elif clicked is fee_n_button:
+            value, ok = QInputDialog.getDouble(
+                self,
+                "双向手续费倍数",
+                "请输入 N 倍数：",
+                2.0,
+                0.01,
+                1000000.0,
+                4,
+            )
+            if not ok:
+                return
+            fee_multiple = Decimal(str(value))
+            flatten_mode = "best_quote_fee"
         self._log_selected_position_manual_flatten(
             f"用户确认平仓 | instId={position.inst_id} | direction={direction_label} | closeSide={close_side_label} | "
-            f"mode={flatten_mode} | submit={submit_amount_text} | orderSize={order_size_text}"
+            f"mode={flatten_mode} | feeMultiple={format_decimal(fee_multiple)} | submit={submit_amount_text} | orderSize={order_size_text}"
         )
 
         self._selected_position_manual_flatten_running = True
@@ -3921,12 +3996,13 @@ class AccountPositionsHomeWidget(QWidget):
             try:
                 self._log_selected_position_manual_flatten(
                     f"线程开始 | instId={position.inst_id} | mode={flatten_mode} | closeSizeInput={requested_close_size} | "
-                    f"submit={submit_amount_text} | orderSize={order_size_text}"
+                    f"feeMultiple={format_decimal(fee_multiple)} | submit={submit_amount_text} | orderSize={order_size_text}"
                 )
                 result, price, normalized_mode = self._submit_selected_position_manual_flatten(
                     position,
                     flatten_mode,
                     close_size=requested_close_size,
+                    fee_multiple=fee_multiple,
                 )
                 self._log_selected_position_manual_flatten(
                     f"交易所返回 | instId={position.inst_id} | mode={normalized_mode} | ordId={result.ord_id or '-'} | "
@@ -3969,7 +4045,7 @@ class AccountPositionsHomeWidget(QWidget):
                 return
             self._selected_position_manual_flatten_after(
                 0,
-                lambda result=result, price=price, normalized_mode=normalized_mode: self._finish_selected_position_manual_flatten_success(
+                lambda result=result, price=price, normalized_mode=normalized_mode, fee_multiple=fee_multiple: self._finish_selected_position_manual_flatten_success(
                     position=position,
                     result=result,
                     price=price,
@@ -3978,6 +4054,7 @@ class AccountPositionsHomeWidget(QWidget):
                     close_side_label=close_side_label,
                     submit_size_text=submit_amount_text,
                     order_size_text=order_size_text,
+                    fee_multiple=fee_multiple,
                 ),
             )
 

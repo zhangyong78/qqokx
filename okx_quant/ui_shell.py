@@ -3930,6 +3930,7 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         self.status_text = StringVar(value="运行中策略：0")
         self._watch_mode_button_text = StringVar(value="退出盯盘")
         self._launcher_manual_toggle_text = StringVar(value="展开手动参数")
+        self._launcher_panel_toggle_text = StringVar(value="显示左栏")
         self.session_summary_text = StringVar(value="多策略合计：当前没有运行中的策略。")
         self.session_quick_actions_text = StringVar(
             value="快捷操作：会话=双击日志 | 交易员=双击打开管理台 | 邮件=双击切换 | 标的=双击K线"
@@ -3976,6 +3977,7 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         self.position_detail_text = StringVar(value=self._default_position_detail_text())
         self._watch_mode_enabled = True
         self._launcher_manual_visible = False
+        self._launcher_panel_visible = False
         self.account_info_summary_text = StringVar(value="尚未读取账户信息。")
         self._account_info_api_switch_badge_text = StringVar(value="")
         self._account_info_refresh_badge_text = StringVar(value="未读")
@@ -4613,6 +4615,11 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
             textvariable=self.status_text,
             font=("Microsoft YaHei UI", 10, "bold"),
         ).grid(row=0, column=3, sticky="e", padx=(12, 0))
+        ttk.Button(
+            summary_row,
+            textvariable=self._launcher_panel_toggle_text,
+            command=self.toggle_launcher_panel,
+        ).grid(row=0, column=4, sticky="e", padx=(12, 0))
 
         body = ttk.Panedwindow(self.root, orient="horizontal")
         body.grid(row=1, column=0, sticky="nsew", padx=16, pady=(0, 10))
@@ -5898,6 +5905,31 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
     def _apply_initial_detail_visibility(self) -> None:
         self._apply_launcher_manual_visibility()
         self._apply_watch_mode_layout()
+        self._apply_launcher_panel_visibility()
+
+    def toggle_launcher_panel(self) -> None:
+        self._launcher_panel_visible = not self._launcher_panel_visible
+        self._apply_launcher_panel_visibility()
+        self._apply_layout_sash_positions()
+
+    def _apply_launcher_panel_visibility(self) -> None:
+        pane = self._main_body_pane
+        launcher_frame = self._launcher_frame
+        if pane is None or launcher_frame is None:
+            return
+        try:
+            panes = tuple(str(item) for item in pane.panes())
+            launcher_id = str(launcher_frame)
+            if self._launcher_panel_visible:
+                if launcher_id not in panes:
+                    pane.insert(0, launcher_frame, weight=1)
+                self._launcher_panel_toggle_text.set("隐藏左栏")
+            else:
+                if launcher_id in panes:
+                    pane.forget(launcher_frame)
+                self._launcher_panel_toggle_text.set("显示左栏")
+        except Exception:
+            return
 
     def toggle_launcher_manual_controls(self) -> None:
         self._launcher_manual_visible = not self._launcher_manual_visible
@@ -5970,7 +6002,11 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         except Exception:
             pass
         try:
-            if self._main_body_pane is not None and self._main_body_pane.winfo_exists():
+            if (
+                getattr(self, "_launcher_panel_visible", True)
+                and self._main_body_pane is not None
+                and self._main_body_pane.winfo_exists()
+            ):
                 total_width = self._main_body_pane.winfo_width()
                 if total_width > 1200:
                     if self._watch_mode_enabled:
