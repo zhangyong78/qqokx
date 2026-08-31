@@ -20,7 +20,6 @@ from types import FunctionType
 import tkinter.font as tkfont
 from tkinter import BooleanVar, Canvas, END, Label, Listbox, Menu, StringVar, Text, TclError, Tk, Toplevel, filedialog, simpledialog
 from tkinter import messagebox, ttk
-from unicodedata import east_asian_width
 
 from okx_quant.app_paths import configured_data_root, data_root
 from okx_quant.client_order_id import CUSTOM_ORDER_ID_PREFIX, strategy_order_identity, with_custom_order_id_prefix
@@ -1021,6 +1020,10 @@ class AccountEquityCurveWindowState:
     canvas: Canvas
     summary_text: StringVar
     range_var: StringVar
+    event_mode_var: StringVar
+    detail_text: StringVar
+    selected_trade_record_ids: tuple[str, ...] = ()
+    symbol_colors: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -6283,6 +6286,100 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
             return None
         return min(points, key=lambda item: abs((item[0] - event_time).total_seconds()))
 
+    @staticmethod
+    def _account_equity_curve_symbol_palette() -> tuple[str, ...]:
+        return (
+            "#2563eb",
+            "#d97706",
+            "#16803a",
+            "#7c3aed",
+            "#db2777",
+            "#0891b2",
+            "#b45309",
+            "#4f46e5",
+            "#be123c",
+            "#0f766e",
+            "#9333ea",
+            "#4d7c0f",
+        )
+
+    @classmethod
+    def _account_equity_curve_symbol_color(cls, symbol: str) -> str:
+        """Return the preferred stable color for one instrument."""
+
+        palette = cls._account_equity_curve_symbol_palette()
+        normalized = str(symbol or "-").strip().upper()
+        index = sum((position + 1) * ord(char) for position, char in enumerate(normalized)) % len(palette)
+        return palette[index]
+
+    def _account_equity_curve_symbol_colors(
+        self,
+        state: AccountEquityCurveWindowState,
+        symbols: list[str],
+    ) -> dict[str, str]:
+        """Give simultaneous instruments distinct colors while retaining earlier assignments."""
+
+        palette = self._account_equity_curve_symbol_palette()
+        active_symbols = sorted({str(symbol or "-").strip() or "-" for symbol in symbols})
+        used_colors = set(state.symbol_colors.values())
+        for symbol in active_symbols:
+            if symbol in state.symbol_colors:
+                continue
+            preferred = self._account_equity_curve_symbol_color(symbol)
+            start_index = palette.index(preferred)
+            color = next((palette[(start_index + offset) % len(palette)] for offset in range(len(palette)) if palette[(start_index + offset) % len(palette)] not in used_colors), preferred)
+            state.symbol_colors[symbol] = color
+            used_colors.add(color)
+        return {symbol: state.symbol_colors[symbol] for symbol in active_symbols}
+
+    def _set_account_equity_curve_event_mode(self, key: tuple[str, str]) -> None:
+        state = self._account_equity_curve_windows.get(key)
+        if state is None:
+            return
+        state.selected_trade_record_ids = ()
+        self._render_account_equity_curve_window(key)
+
+    def _select_account_equity_curve_trades(self, key: tuple[str, str], record_ids: tuple[str, ...]) -> None:
+        state = self._account_equity_curve_windows.get(key)
+        if state is None:
+            return
+        state.selected_trade_record_ids = tuple(dict.fromkeys(record_ids))
+        self._render_account_equity_curve_window(key)
+
+    def _account_equity_curve_selected_detail_text(
+        self,
+        records: list[StrategyTradeLedgerRecord],
+        points: list[tuple[datetime, Decimal]],
+        selected_record_ids: tuple[str, ...],
+    ) -> str:
+        if not selected_record_ids:
+            return "提示：点击平仓点查看策略、品种、本轮盈亏和持仓期间的账户权益变化。"
+        by_id = {record.record_id: record for record in records}
+        selected = [by_id[record_id] for record_id in selected_record_ids if record_id in by_id]
+        if not selected:
+            return "提示：点击平仓点查看策略、品种、本轮盈亏和持仓期间的账户权益变化。"
+        if len(selected) > 1:
+            brief = "；".join(f"{record.symbol} {record.session_id}" for record in selected[:4])
+            suffix = "……" if len(selected) > 4 else ""
+            return f"已选 {len(selected)} 笔相邻平仓：{brief}{suffix}。可切换到较短时间范围查看单笔详情。"
+
+        record = selected[0]
+        opened_at = self._account_equity_event_time_utc(record.opened_at)
+        closed_at = self._account_equity_event_time_utc(record.closed_at)
+        open_point = self._account_equity_curve_nearest_point(points, opened_at) if opened_at is not None else None
+        close_point = self._account_equity_curve_nearest_point(points, closed_at) if closed_at is not None else None
+        pnl_text = "本轮盈亏 -"
+        if record.net_pnl is not None:
+            pnl = record.net_pnl.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+            pnl_text = f"本轮盈亏 {('+' if pnl > 0 else '')}{pnl:.2f}U"
+        stage_text = "同期权益 -"
+        if open_point is not None and close_point is not None:
+            delta = (close_point[1] - open_point[1]).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+            stage_text = f"同期权益 {('+' if delta > 0 else '')}{delta:.2f}U"
+        closed_text = closed_at.astimezone().strftime("%m-%d %H:%M") if closed_at is not None else "-"
+        strategy_name = str(record.strategy_name or "-").strip() or "-"
+        return f"已选 {record.symbol} | {record.session_id} | {strategy_name} | 平仓 {closed_text} | {pnl_text} | {stage_text}"
+
     def _draw_account_equity_curve_trade_impacts(
         self,
         canvas: Canvas,
@@ -6297,136 +6394,135 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         top: float,
         right: float,
         bottom: float,
+        event_mode: str,
+        selected_record_ids: tuple[str, ...],
+        symbol_colors: dict[str, str],
     ) -> None:
-        """Overlay locally settled strategy rounds without issuing another account/API request."""
+        """Draw local strategy events compactly; details appear only after a click."""
 
         if not points:
             return
         records = self._account_equity_curve_trade_records(key, start_time=start_time, end_time=end_time)
-        seen_openings: set[tuple[str, str]] = set()
+        selected_ids = set(selected_record_ids)
 
-        def _short_text(value: str, limit: int) -> str:
-            text = str(value or "").strip() or "-"
-            return text if len(text) <= limit else f"{text[: max(1, limit - 1)]}…"
+        def _color_for_symbol(symbol: str) -> str:
+            normalized = str(symbol or "-").strip() or "-"
+            return symbol_colors.get(normalized, self._account_equity_curve_symbol_color(normalized))
 
-        def _draw_dot(x: float, y: float, *, color: str, close: bool) -> None:
-            if close:
-                canvas.create_polygon(x, y - 5, x + 5, y, x, y + 5, x - 5, y, outline=color, fill="#ffffff", width=2)
-            else:
-                canvas.create_oval(x - 4, y - 4, x + 4, y + 4, outline=color, fill="#ffffff", width=2)
-
-        def _draw_label(x: float, y: float, text: str, *, color: str, row: int) -> None:
-            lines = text.splitlines() or [""]
-            text_width = max(sum(14 if east_asian_width(char) in {"F", "W"} else 7 for char in line) for line in lines)
-            box_width = min(max(text_width + 14, 112), 270)
-            box_height = max(len(lines) * 15 + 8, 24)
-            box_y = top + 8 + (row % 4) * (box_height + 5)
-            if x + box_width + 8 <= right:
-                box_x = x + 8
-            else:
-                box_x = max(left, x - box_width - 8)
-            canvas.create_rectangle(box_x, box_y, box_x + box_width, box_y + box_height, outline=color, fill="#ffffff")
-            canvas.create_text(
-                box_x + 6,
-                box_y + 4,
-                text=text,
-                anchor="nw",
-                fill=color,
-                font=("Microsoft YaHei UI", 8),
+        def _bind_select(item_ids: tuple[int, ...], record_ids: tuple[str, ...]) -> None:
+            tag = f"account-equity-trade:{'|'.join(record_ids)}"
+            for item_id in item_ids:
+                canvas.addtag_withtag(tag, item_id)
+            canvas.tag_bind(
+                tag,
+                "<Button-1>",
+                lambda _event, target_key=key, target_ids=record_ids: self._select_account_equity_curve_trades(target_key, target_ids),
             )
 
-        close_row = 0
+        def _draw_close_marker(x: float, y: float, *, color: str, result: Decimal | None, selected: bool) -> tuple[int, ...]:
+            radius = 7 if selected else 5
+            fill = color if selected else "#ffffff"
+            if result is not None and result > 0:
+                marker = canvas.create_polygon(x, y - radius, x + radius, y + radius, x - radius, y + radius, outline=color, fill=fill, width=2)
+            elif result is not None and result < 0:
+                marker = canvas.create_polygon(x - radius, y - radius, x + radius, y - radius, x, y + radius, outline=color, fill=fill, width=2)
+            else:
+                marker = canvas.create_polygon(x, y - radius, x + radius, y, x, y + radius, x - radius, y, outline=color, fill=fill, width=2)
+            return (marker,)
+
+        close_events: list[dict[str, object]] = []
         for record in records:
-            opened_at = self._account_equity_event_time_utc(record.opened_at)
             closed_at = self._account_equity_event_time_utc(record.closed_at)
-            if closed_at is None:
+            if closed_at is None or not (start_time <= closed_at <= end_time):
                 continue
-            open_point = self._account_equity_curve_nearest_point(points, opened_at) if opened_at is not None else None
             close_point = self._account_equity_curve_nearest_point(points, closed_at)
             if close_point is None:
                 continue
-            result = record.net_pnl
-            result_color = "#1a7f37" if result is not None and result > 0 else "#cf222e" if result is not None and result < 0 else "#6e7781"
+            close_events.append({"record": record, "x": float(x_for_time(closed_at)), "y": float(y_for_value(close_point[1]))})
 
-            if opened_at is not None and start_time <= opened_at <= end_time and open_point is not None:
-                open_x = float(x_for_time(opened_at))
-                open_y = float(y_for_value(open_point[1]))
-                opening_key = (record.session_id, record.round_id or record.record_id)
-                if opening_key not in seen_openings:
-                    seen_openings.add(opening_key)
-                    canvas.create_line(open_x, top, open_x, open_y - 6, fill="#7c3aed", dash=(3, 3))
-                    _draw_dot(open_x, open_y, color="#7c3aed", close=False)
-                    canvas.create_text(
-                        min(open_x + 6, right - 72),
-                        min(open_y + 7, bottom - 18),
-                        text=f"开 {_short_text(record.symbol, 18)} | {record.session_id}",
-                        anchor="nw",
-                        fill="#7c3aed",
-                        font=("Microsoft YaHei UI", 8),
-                    )
+        # Group only points that would otherwise overlap on the current canvas.
+        clusters: list[list[dict[str, object]]] = []
+        for event in sorted(close_events, key=lambda item: (float(item["x"]), float(item["y"]))):
+            if clusters:
+                last_cluster = clusters[-1]
+                center_x = sum(float(item["x"]) for item in last_cluster) / len(last_cluster)
+                center_y = sum(float(item["y"]) for item in last_cluster) / len(last_cluster)
+                if abs(float(event["x"]) - center_x) <= 14 and abs(float(event["y"]) - center_y) <= 14:
+                    last_cluster.append(event)
+                    continue
+            clusters.append([event])
 
-            if open_point is not None and opened_at is not None:
-                segment_start = max(opened_at, start_time)
-                segment_end = min(closed_at, end_time)
-                if segment_start <= segment_end:
-                    segment_open_point = self._account_equity_curve_nearest_point(points, segment_start)
-                    segment_close_point = self._account_equity_curve_nearest_point(points, segment_end)
-                    if segment_open_point is not None and segment_close_point is not None:
-                        canvas.create_line(
-                            float(x_for_time(segment_start)),
-                            float(y_for_value(segment_open_point[1])),
-                            float(x_for_time(segment_end)),
-                            float(y_for_value(segment_close_point[1])),
-                            fill=result_color,
-                            width=2,
-                            dash=(5, 3),
-                        )
-
-            if not (start_time <= closed_at <= end_time):
+        # A selected trade alone reveals its holding segment and opening point.
+        for record in records:
+            if record.record_id not in selected_ids:
                 continue
-            close_x = float(x_for_time(closed_at))
-            close_y = float(y_for_value(close_point[1]))
-            canvas.create_line(close_x, top, close_x, close_y - 6, fill=result_color, dash=(5, 3))
-            _draw_dot(close_x, close_y, color=result_color, close=True)
-            pnl_text = "本轮 -"
-            if result is not None:
-                pnl_text = f"本轮 {('+' if result > 0 else '')}{result.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP):.2f}U"
-            stage_text = ""
-            if open_point is not None:
-                stage_delta = close_point[1] - open_point[1]
-                stage_text = f" | 同期权益 {('+' if stage_delta > 0 else '')}{stage_delta.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP):.2f}U"
-            label = (
-                f"平 {_short_text(record.symbol, 22)} | {record.session_id}\n"
-                f"{_short_text(record.strategy_name, 24)} | {pnl_text}{stage_text}"
+            opened_at = self._account_equity_event_time_utc(record.opened_at)
+            closed_at = self._account_equity_event_time_utc(record.closed_at)
+            if opened_at is None or closed_at is None:
+                continue
+            segment_start = max(opened_at, start_time)
+            segment_end = min(closed_at, end_time)
+            if segment_start > segment_end:
+                continue
+            open_point = self._account_equity_curve_nearest_point(points, segment_start)
+            close_point = self._account_equity_curve_nearest_point(points, segment_end)
+            if open_point is None or close_point is None:
+                continue
+            color = _color_for_symbol(record.symbol)
+            canvas.create_line(
+                float(x_for_time(segment_start)),
+                float(y_for_value(open_point[1])),
+                float(x_for_time(segment_end)),
+                float(y_for_value(close_point[1])),
+                fill=color,
+                width=2,
+                dash=(5, 3),
             )
-            _draw_label(close_x, close_y, label, color=result_color, row=close_row)
-            close_row += 1
+            if start_time <= opened_at <= end_time:
+                x = float(x_for_time(opened_at))
+                y = float(y_for_value(open_point[1]))
+                canvas.create_oval(x - 5, y - 5, x + 5, y + 5, outline=color, fill="#ffffff", width=2)
 
-        # A running round has no settled ledger record yet; still show its opening on the account curve.
-        for session in self.sessions.values():
-            if self._session_account_overview_key(session) != key or session.active_trade is None:
+        if event_mode == "both":
+            for record in records:
+                opened_at = self._account_equity_event_time_utc(record.opened_at)
+                if opened_at is None or not (start_time <= opened_at <= end_time):
+                    continue
+                point = self._account_equity_curve_nearest_point(points, opened_at)
+                if point is None:
+                    continue
+                x = float(x_for_time(opened_at))
+                y = float(y_for_value(point[1]))
+                color = _color_for_symbol(record.symbol)
+                marker = canvas.create_oval(x - 4, y - 4, x + 4, y + 4, outline=color, fill="#ffffff", width=2)
+                _bind_select((marker,), (record.record_id,))
+
+        if event_mode == "off":
+            return
+        for cluster in clusters:
+            cluster_records = [item["record"] for item in cluster]
+            record_ids = tuple(record.record_id for record in cluster_records)
+            x = sum(float(item["x"]) for item in cluster) / len(cluster)
+            y = sum(float(item["y"]) for item in cluster) / len(cluster)
+            if len(cluster) == 1:
+                record = cluster_records[0]
+                items = _draw_close_marker(
+                    x,
+                    y,
+                    color=_color_for_symbol(record.symbol),
+                    result=record.net_pnl,
+                    selected=record.record_id in selected_ids,
+                )
+                _bind_select(items, record_ids)
                 continue
-            opened_at = self._account_equity_event_time_utc(session.active_trade.opened_logged_at)
-            if opened_at is None or not (start_time <= opened_at <= end_time):
-                continue
-            opening_key = (session.session_id, session.active_trade.round_id)
-            if opening_key in seen_openings:
-                continue
-            point = self._account_equity_curve_nearest_point(points, opened_at)
-            if point is None:
-                continue
-            open_x = float(x_for_time(opened_at))
-            open_y = float(y_for_value(point[1]))
-            canvas.create_line(open_x, top, open_x, open_y - 6, fill="#7c3aed", dash=(3, 3))
-            _draw_dot(open_x, open_y, color="#7c3aed", close=False)
-            canvas.create_text(
-                min(open_x + 6, right - 72),
-                min(open_y + 7, bottom - 18),
-                text=f"开 {_short_text(_session_trade_inst_id(session) or session.symbol, 18)} | {session.session_id}",
-                anchor="nw",
-                fill="#7c3aed",
-                font=("Microsoft YaHei UI", 8),
-            )
+
+            selected = bool(selected_ids.intersection(record_ids))
+            radius = 10 if selected else 9
+            fill = "#374151" if selected else "#ffffff"
+            marker = canvas.create_oval(x - radius, y - radius, x + radius, y + radius, outline="#374151", fill=fill, width=2)
+            count = canvas.create_text(x, y, text=str(len(cluster)), fill="#ffffff" if selected else "#374151", font=("Microsoft YaHei UI", 8, "bold"))
+            _bind_select((marker, count), record_ids)
+
 
     def _maybe_record_account_equity_curve_sample(
         self,
@@ -6674,6 +6770,16 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
                 variable=range_var,
                 command=lambda target_key=key: self._render_account_equity_curve_window(target_key),
             ).grid(row=0, column=index, padx=(0, 6) if index < 3 else (0, 0))
+        event_mode_var = StringVar(value="close")
+        ttk.Label(tools, text="标记").grid(row=0, column=4, padx=(12, 3))
+        for index, (label, value) in enumerate((("仅平仓", "close"), ("开平仓", "both"), ("关闭", "off"))):
+            ttk.Radiobutton(
+                tools,
+                text=label,
+                value=value,
+                variable=event_mode_var,
+                command=lambda target_key=key: self._set_account_equity_curve_event_mode(target_key),
+            ).grid(row=0, column=5 + index, padx=(0, 5) if index < 2 else (0, 0))
         ttk.Button(
             tools,
             text="刷新",
@@ -6681,10 +6787,18 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
                 force=True,
                 target_keys=(target_key,),
             ),
-        ).grid(row=0, column=4, padx=(8, 6))
+        ).grid(row=0, column=8, padx=(12, 6))
         ttk.Button(tools, text="关闭", command=lambda target_key=key: self._close_account_equity_curve_window(target_key)).grid(
             row=0,
-            column=5,
+            column=9,
+        )
+        detail_text = StringVar(value="提示：点击平仓点查看策略、品种、本轮盈亏和持仓期间的账户权益变化。")
+        ttk.Label(header, textvariable=detail_text, anchor="w", justify="left", foreground="#4b5563").grid(
+            row=1,
+            column=0,
+            columnspan=2,
+            sticky="ew",
+            pady=(4, 0),
         )
 
         canvas = Canvas(container, background="#ffffff", highlightthickness=0, width=980, height=460)
@@ -6696,6 +6810,8 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
             canvas=canvas,
             summary_text=summary_text,
             range_var=range_var,
+            event_mode_var=event_mode_var,
+            detail_text=detail_text,
         )
         self._account_equity_curve_windows[key] = state
         window.protocol("WM_DELETE_WINDOW", lambda target_key=key: self._close_account_equity_curve_window(target_key))
@@ -6787,7 +6903,7 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
             return
 
         left = 72
-        top = 28
+        top = 46
         right = max(left + 120, width - 24)
         bottom = max(top + 120, height - 52)
         min_value = min(value for _, value in points)
@@ -6829,6 +6945,16 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
             y = _y(value)
             canvas.create_oval(x - 3, y - 3, x + 3, y + 3, fill="#2563eb", outline="")
 
+        visible_records = self._account_equity_curve_trade_records(key, start_time=start_time, end_time=end_time)
+        visible_record_ids = {record.record_id for record in visible_records}
+        selected_record_ids = tuple(record_id for record_id in state.selected_trade_record_ids if record_id in visible_record_ids)
+        if selected_record_ids != state.selected_trade_record_ids:
+            state.selected_trade_record_ids = selected_record_ids
+        state.detail_text.set(
+            self._account_equity_curve_selected_detail_text(visible_records, points, state.selected_trade_record_ids)
+        )
+        visible_symbols = sorted({str(record.symbol or "-").strip() or "-" for record in visible_records})
+        symbol_colors = self._account_equity_curve_symbol_colors(state, visible_symbols)
         self._draw_account_equity_curve_trade_impacts(
             canvas,
             key,
@@ -6841,7 +6967,29 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
             top=top,
             right=right,
             bottom=bottom,
+            event_mode=str(state.event_mode_var.get() or "close").strip().lower(),
+            selected_record_ids=state.selected_trade_record_ids,
+            symbol_colors=symbol_colors,
         )
+
+        legend_x = left
+        legend_y = 16
+        result_legend_width = 116
+        canvas.create_text(legend_x, legend_y, text="品种", anchor="w", fill="#6b7280", font=("Microsoft YaHei UI", 8))
+        legend_x += 30
+        max_legend_items = 7
+        for index, symbol in enumerate(visible_symbols[:max_legend_items]):
+            symbol_label = str(symbol).split("-", 1)[0] or symbol
+            item_width = 18 + len(symbol_label) * 7
+            if legend_x + item_width > right - result_legend_width:
+                remaining = len(visible_symbols) - index
+                canvas.create_text(legend_x, legend_y, text=f"+{remaining}种", anchor="w", fill="#6b7280", font=("Microsoft YaHei UI", 8))
+                break
+            color = symbol_colors[symbol]
+            canvas.create_oval(legend_x, legend_y - 4, legend_x + 8, legend_y + 4, outline=color, fill=color)
+            canvas.create_text(legend_x + 12, legend_y, text=symbol_label, anchor="w", fill=color, font=("Microsoft YaHei UI", 8))
+            legend_x += item_width
+        canvas.create_text(right, legend_y, text="▲盈利  ▼亏损  ◇未知", anchor="e", fill="#6b7280", font=("Microsoft YaHei UI", 8))
 
         canvas.create_text(left, top - 10, text=_format_optional_usdt_precise(Decimal(str(max_plot)), places=2, with_sign=False), anchor="w", fill="#374151", font=("Microsoft YaHei UI", 9))
         canvas.create_text(left, bottom + 10, text=_format_optional_usdt_precise(Decimal(str(min_plot)), places=2, with_sign=False), anchor="w", fill="#374151", font=("Microsoft YaHei UI", 9))

@@ -2488,6 +2488,25 @@ HTTP 502: <!DOCTYPE html>
 
         self.assertEqual([record.record_id for record in records], ["visible"])
 
+    def test_account_equity_curve_assigns_distinct_stable_colors_to_visible_symbols(self) -> None:
+        app = QuantApp.__new__(QuantApp)
+        state = SimpleNamespace(symbol_colors={})
+
+        first = QuantApp._account_equity_curve_symbol_colors(
+            app,
+            state,
+            ["SOL-USDT-SWAP", "ETH-USDT-SWAP", "BTC-USDT-SWAP"],
+        )
+        second = QuantApp._account_equity_curve_symbol_colors(
+            app,
+            state,
+            ["BTC-USDT-SWAP", "SOL-USDT-SWAP"],
+        )
+
+        self.assertEqual(len(set(first.values())), 3)
+        self.assertEqual(second["BTC-USDT-SWAP"], first["BTC-USDT-SWAP"])
+        self.assertEqual(second["SOL-USDT-SWAP"], first["SOL-USDT-SWAP"])
+
     def test_strategy_live_chart_event_time_markers_ignore_unrelated_fills_after_closed_round(self) -> None:
         opened_at = datetime(2026, 4, 28, 9, 0)
         closed_at = datetime(2026, 4, 28, 10, 15)
