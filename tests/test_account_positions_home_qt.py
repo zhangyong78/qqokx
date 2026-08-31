@@ -74,6 +74,35 @@ class PositionDisplayForegroundColorsTest(TestCase):
 
         self.assertEqual(markers, (("开仓", 1_752_210_000_000), ("平仓", 1_752_300_600_000)))
 
+    def test_history_position_kline_price_markers_keep_actual_prices_and_direction(self) -> None:
+        history_item = SimpleNamespace(
+            update_time=1_752_300_600_000,
+            pos_side="short",
+            direction=None,
+            open_avg_price=Decimal("0.0250"),
+            close_avg_price=Decimal("0.0125"),
+            raw={"cTime": "1752210000000", "uTime": "1752300600000"},
+        )
+
+        markers = account_positions_module._position_history_kline_price_markers(history_item)
+
+        self.assertEqual(len(markers), 2)
+        self.assertEqual((markers[0].kind, markers[0].timestamp, markers[0].price, markers[0].direction), ("entry", 1_752_210_000_000, Decimal("0.0250"), "short"))
+        self.assertEqual((markers[1].kind, markers[1].timestamp, markers[1].price, markers[1].direction), ("exit", 1_752_300_600_000, Decimal("0.0125"), "short"))
+
+    def test_current_position_kline_price_marker_uses_current_open_price_only(self) -> None:
+        position = SimpleNamespace(
+            position=Decimal("0.5"),
+            pos_side="long",
+            avg_price=Decimal("0.0185"),
+            raw={"cTime": "1752210000000"},
+        )
+
+        markers = account_positions_module._current_position_kline_price_markers(position)
+
+        self.assertEqual(len(markers), 1)
+        self.assertEqual((markers[0].kind, markers[0].price, markers[0].direction), ("entry", Decimal("0.0185"), "long"))
+
     def test_history_kline_limit_covers_the_oldest_time_marker(self) -> None:
         now_ms = 1_752_300_600_000
         markers = (("开仓", now_ms - (300 * 60 * 60 * 1000)), ("平仓", now_ms))
@@ -1148,6 +1177,9 @@ class AccountPositionsHomeQtHelpersTest(TestCase):
         app = SimpleNamespace(
             _profile_snapshots={"159": {"futures_taker_fee_rate": "0.03"}},
             _last_profile_name="159",
+            _snap_selected_position_flatten_price=lambda _instrument, price, *, rounding: price.quantize(
+                Decimal("0.000001")
+            ),
         )
 
         price = AccountPositionsHomeWidget._resolve_short_profit_flatten_price(
@@ -1277,6 +1309,71 @@ class AccountPositionsHomeQtHelpersTest(TestCase):
         )
 
         self.assertEqual(price, Decimal("0.0055"))
+
+    def test_flatten_preview_uses_loaded_instrument_without_network(self) -> None:
+        instrument = Instrument(
+            inst_id="BTC-USD-260830-76500-P",
+            inst_type="OPTION",
+            tick_size=Decimal("0.0001"),
+            lot_size=Decimal("1"),
+            min_size=Decimal("1"),
+            state="live",
+        )
+        client = SimpleNamespace(
+            get_cached_instrument=MagicMock(),
+            get_instrument=MagicMock(side_effect=AssertionError("preview must not use network")),
+        )
+        app = SimpleNamespace(
+            _position_instruments={instrument.inst_id: instrument},
+            _shared_client=client,
+        )
+
+        resolved = AccountPositionsHomeWidget._selected_position_flatten_instrument(
+            app,
+            SimpleNamespace(inst_id=instrument.inst_id, inst_type="OPTION"),
+            allow_network=False,
+        )
+
+        self.assertIs(resolved, instrument)
+        client.get_cached_instrument.assert_not_called()
+        client.get_instrument.assert_not_called()
+
+    def test_best_quote_flatten_skips_ticker_when_order_book_has_quote(self) -> None:
+        client = SimpleNamespace(
+            get_order_book=MagicMock(
+                return_value=SimpleNamespace(
+                    bids=[(Decimal("0.0555"), Decimal("1"))],
+                    asks=[(Decimal("0.0560"), Decimal("1"))],
+                )
+            ),
+            get_ticker=MagicMock(side_effect=AssertionError("ticker fallback should not run")),
+        )
+        app = SimpleNamespace(
+            _shared_client=client,
+            _snap_selected_position_flatten_price=lambda _instrument, price, *, rounding: price,
+        )
+        instrument = Instrument(
+            inst_id="BTC-USD-260911-71000-C",
+            inst_type="OPTION",
+            tick_size=Decimal("0.0001"),
+            lot_size=Decimal("1"),
+            min_size=Decimal("1"),
+            state="live",
+        )
+
+        price = AccountPositionsHomeWidget._resolve_best_quote_flatten_price(app, instrument, side="buy")
+
+        self.assertEqual(price, Decimal("0.0555"))
+        client.get_order_book.assert_called_once_with(instrument.inst_id, depth=5)
+        client.get_ticker.assert_not_called()
+
+    def test_manual_flatten_reconcile_does_not_restart_realtime_store(self) -> None:
+        realtime_store = SimpleNamespace(request_reconcile=MagicMock())
+        app = SimpleNamespace(_realtime_store=realtime_store)
+
+        AccountPositionsHomeWidget._reconcile_after_selected_position_manual_flatten(app)
+
+        realtime_store.request_reconcile.assert_called_once_with("manual_flatten")
 
     def test_short_profit_flatten_price_rejects_long_close_side(self) -> None:
         app = SimpleNamespace(

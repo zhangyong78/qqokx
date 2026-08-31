@@ -7,7 +7,7 @@ from unittest import TestCase
 from unittest.mock import MagicMock, patch
 
 from okx_quant.client_order_id import CUSTOM_ORDER_ID_PREFIX, OKX_BROKER_TAG
-from okx_quant.models import Credentials, OrderPlan, StrategyConfig
+from okx_quant.models import Credentials, Instrument, OrderPlan, StrategyConfig
 from okx_quant.okx_client import OkxApiError, OkxOrderStatus, OkxRestClient, OkxTicker, _okx_trade_order_request_log_fragment
 
 
@@ -35,6 +35,59 @@ class OkxClientOrderRequestTest(TestCase):
             (Decimal("0"), Decimal("0.005"), Decimal("0.0001")),
             (Decimal("0.005"), Decimal("10000000"), Decimal("0.0005")),
         ])
+
+    def test_get_option_tick_bands_reuses_recent_cache(self) -> None:
+        client = OkxRestClient()
+        client._request = MagicMock(
+            return_value={
+                "data": [
+                    {
+                        "tickBand": [
+                            {"minPx": "0", "maxPx": "0.005", "tickSz": "0.0001"},
+                            {"minPx": "0.005", "maxPx": "10000000", "tickSz": "0.0005"},
+                        ]
+                    }
+                ]
+            }
+        )
+
+        first = client.get_option_tick_bands("ETH-USD")
+        second = client.get_option_tick_bands("ETH-USD")
+
+        self.assertEqual(first, second)
+        client._request.assert_called_once()
+
+    def test_place_simple_order_reuses_supplied_instrument(self) -> None:
+        client = OkxRestClient()
+        client.get_instrument = MagicMock(side_effect=AssertionError("supplied instrument must be reused"))  # type: ignore[method-assign]
+        client._request = MagicMock(
+            return_value={"data": [{"ordId": "ord-1", "clOrdId": "client-1", "sCode": "0", "sMsg": ""}]}
+        )
+        instrument = Instrument(
+            inst_id="BTC-USD-260830-76500-P",
+            inst_type="OPTION",
+            tick_size=Decimal("0.0001"),
+            lot_size=Decimal("1"),
+            min_size=Decimal("1"),
+            state="live",
+            ct_val=Decimal("1"),
+            ct_mult=Decimal("0.01"),
+            ct_val_ccy="BTC",
+        )
+
+        result = client.place_simple_order(
+            Credentials(api_key="key", secret_key="secret", passphrase="pass", profile_name="159"),
+            self._strategy_config(instrument.inst_id),
+            inst_id=instrument.inst_id,
+            side="sell",
+            size=Decimal("1"),
+            ord_type="limit",
+            price=Decimal("0.0018"),
+            instrument=instrument,
+        )
+
+        self.assertEqual(result.ord_id, "ord-1")
+        client.get_instrument.assert_not_called()
 
     @staticmethod
     def _strategy_config(inst_id: str) -> StrategyConfig:

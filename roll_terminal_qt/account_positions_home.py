@@ -203,7 +203,7 @@ from okx_quant.ui_shell import (
 from roll_terminal_qt.account_service import AccountFeedThread
 from roll_terminal_qt.history_service import FillHistoryFeedThread, OrderHistoryFeedThread, PositionHistoryFeedThread
 from roll_terminal_qt.incremental_views import keyed_row_delta
-from roll_terminal_qt.option_strategy_window import CandlestickChartView
+from roll_terminal_qt.option_strategy_window import CandlestickChartView, PositionPriceMarker
 from roll_terminal_qt.order_service import OrderFeedThread, OrderStatusView
 from roll_terminal_qt.perf_metrics import measure_ui_step
 from roll_terminal_qt.profile_access import ensure_profile_unlocked, load_profile_snapshots, profile_requires_password
@@ -1023,6 +1023,54 @@ def _position_kline_timestamp(*values: object) -> int | None:
     return None
 
 
+def _position_kline_positive_decimal(value: object) -> Decimal | None:
+    try:
+        parsed = Decimal(str(value or "").strip())
+    except Exception:
+        return None
+    return parsed if parsed > 0 else None
+
+
+def _position_history_kline_direction(item: OkxPositionHistoryItem) -> str | None:
+    for value in (getattr(item, "pos_side", None), getattr(item, "direction", None)):
+        direction = str(value or "").strip().lower()
+        if direction in {"long", "short"}:
+            return direction
+    return None
+
+
+def _position_history_kline_price_markers(item: OkxPositionHistoryItem) -> tuple[PositionPriceMarker, ...]:
+    raw = item.raw if isinstance(item.raw, dict) else {}
+    direction = _position_history_kline_direction(item)
+    if direction is None:
+        return ()
+    opened_at = _position_kline_timestamp(raw.get("openTime"), raw.get("openTs"), raw.get("cTime"), raw.get("createdTime"))
+    closed_at = _position_kline_timestamp(raw.get("closeTime"), raw.get("closeTs"), raw.get("uTime"), raw.get("updateTime"), item.update_time)
+    markers: list[PositionPriceMarker] = []
+    open_price = _position_kline_positive_decimal(getattr(item, "open_avg_price", None))
+    close_price = _position_kline_positive_decimal(getattr(item, "close_avg_price", None))
+    if opened_at is not None and open_price is not None:
+        markers.append(PositionPriceMarker("entry", opened_at, open_price, direction))
+    if closed_at is not None and close_price is not None:
+        markers.append(PositionPriceMarker("exit", closed_at, close_price, direction))
+    return tuple(markers)
+
+
+def _current_position_kline_price_markers(position: OkxPosition) -> tuple[PositionPriceMarker, ...]:
+    raw = position.raw if isinstance(position.raw, dict) else {}
+    opened_at = _position_kline_timestamp(
+        raw.get("openTime"),
+        raw.get("openTs"),
+        raw.get("cTime"),
+        raw.get("createdTime"),
+    )
+    price = _position_kline_positive_decimal(getattr(position, "avg_price", None))
+    if opened_at is None or price is None:
+        return ()
+    direction = "short" if _position_is_short(position) else "long"
+    return (PositionPriceMarker("entry", opened_at, price, direction),)
+
+
 def _position_history_kline_time_markers(item: OkxPositionHistoryItem) -> tuple[tuple[str, int], ...]:
     raw = item.raw if isinstance(item.raw, dict) else {}
 
@@ -1254,6 +1302,7 @@ class InstrumentKlineDialog(QDialog):
         self._underlying_usdt_basis = ""
         self._option_entry_price: Decimal | None = None
         self._time_markers: tuple[tuple[str, int], ...] = ()
+        self._position_price_markers: tuple[PositionPriceMarker, ...] = ()
         self._current_bar = initial_bar if initial_bar in {bar for _text, bar in POSITION_KLINE_BAR_OPTIONS} else "1H"
         self._load_thread: InstrumentKlineLoadThread | None = None
         self._loading_older_candles = False
@@ -1304,6 +1353,7 @@ class InstrumentKlineDialog(QDialog):
         underlying_usdt_basis: str = "",
         option_entry_price: Decimal | None = None,
         time_markers: tuple[tuple[str, int], ...] = (),
+        position_price_markers: tuple[PositionPriceMarker, ...] = (),
     ) -> None:
         self._inst_id = inst_id.strip().upper()
         self._inst_type = inst_type.strip().upper()
@@ -1311,6 +1361,7 @@ class InstrumentKlineDialog(QDialog):
         self._underlying_usdt_basis = underlying_usdt_basis.strip() if self._underlying_usdt_price is not None else ""
         self._option_entry_price = option_entry_price if option_entry_price is not None and option_entry_price > 0 else None
         self._time_markers = tuple(time_markers)
+        self._position_price_markers = tuple(position_price_markers)
         self._no_more_older_candles = False
         self._update_title()
         self._load_current_bar()
@@ -1429,6 +1480,7 @@ class InstrumentKlineDialog(QDialog):
                 tooltip_close_usdt_basis=self._underlying_usdt_basis if inst_type == "OPTION" else "",
                 tooltip_entry_price=self._option_entry_price if inst_type == "OPTION" else None,
                 time_markers=self._time_markers,
+                position_price_markers=self._position_price_markers,
             )
         latest = candles[-1] if candles else None
         latest_text = ""
@@ -3618,20 +3670,13 @@ class AccountPositionsHomeWidget(QWidget):
 
         return snap_to_increment(raw_size, instrument.lot_size, "down")
 
-    def _selected_position_flatten_instrument(self, position: OkxPosition) -> Instrument:
+    def _selected_position_flatten_instrument(
+        self,
+        position: OkxPosition,
+        *,
+        allow_network: bool = True,
+    ) -> Instrument:
         inst_id = str(position.inst_id or "").strip().upper()
-        # A manual option close must use the current OKX tick size. Do not let
-        # a stale position snapshot decide the order price increment.
-        if position.inst_type == "OPTION":
-            try:
-                return self._shared_client.get_instrument(inst_id, prefer_cached=False)
-            except TypeError:
-                try:
-                    return self._shared_client.get_instrument(inst_id)
-                except Exception:
-                    pass
-            except Exception:
-                pass
         cached = self._position_instruments.get(inst_id)
         if isinstance(cached, Instrument):
             return cached
@@ -3643,8 +3688,10 @@ class AccountPositionsHomeWidget(QWidget):
                 cached = None
             if isinstance(cached, Instrument):
                 return cached
+        if not allow_network:
+            raise ValueError(f"{inst_id} 的合约资料尚未加载完成，请刷新持仓后重试。")
         try:
-            return self._shared_client.get_instrument(inst_id, prefer_cached=True)
+            return self._shared_client.get_instrument(inst_id, prefer_cached=False)
         except TypeError:
             return self._shared_client.get_instrument(inst_id)
 
@@ -3654,13 +3701,16 @@ class AccountPositionsHomeWidget(QWidget):
             order_book = self._shared_client.get_order_book(instrument.inst_id, depth=5)
         except Exception:
             order_book = None
-        ticker = self._shared_client.get_ticker(instrument.inst_id)
         if side == "buy":
-            raw_price = order_book.bids[0][0] if order_book is not None and order_book.bids else ticker.bid
+            raw_price = order_book.bids[0][0] if order_book is not None and order_book.bids else None
+            if raw_price is None or raw_price <= 0:
+                raw_price = self._shared_client.get_ticker(instrument.inst_id).bid
             if raw_price is None or raw_price <= 0:
                 raise ValueError(f"{instrument.inst_id} 当前缺少买一价，无法按买一挂平空单。")
             return self._snap_selected_position_flatten_price(instrument, raw_price, rounding="down")
-        raw_price = order_book.asks[0][0] if order_book is not None and order_book.asks else ticker.ask
+        raw_price = order_book.asks[0][0] if order_book is not None and order_book.asks else None
+        if raw_price is None or raw_price <= 0:
+            raw_price = self._shared_client.get_ticker(instrument.inst_id).ask
         if raw_price is None or raw_price <= 0:
             raise ValueError(f"{instrument.inst_id} 当前缺少卖一价，无法按卖一挂平多单。")
         return self._snap_selected_position_flatten_price(instrument, raw_price, rounding="up")
@@ -3782,13 +3832,14 @@ class AccountPositionsHomeWidget(QWidget):
         flatten_mode: str,
         *,
         close_size: Decimal | None = None,
+        instrument: Instrument | None = None,
     ) -> tuple[Credentials, StrategyConfig, Instrument, Decimal, str, str | None, str, str]:
         runtime = self._runtime
         if runtime is None:
             raise ValueError("当前没有可用的 API 运行时，无法执行平仓。")
         credentials = runtime.credentials
         config = self._build_selected_position_manual_flatten_config(position)
-        instrument = self._selected_position_flatten_instrument(position)
+        instrument = instrument or self._selected_position_flatten_instrument(position)
         max_close = snap_to_increment(self._selected_position_close_size(position), instrument.lot_size, "down")
         if max_close < instrument.min_size:
             raise ValueError("当前选中持仓的可平数量不足最小下单量，无法直接平仓。")
@@ -3821,9 +3872,13 @@ class AccountPositionsHomeWidget(QWidget):
         close_size: Decimal | None = None,
         fee_multiple: Decimal | None = None,
         profit_percent: Decimal | None = None,
+        instrument: Instrument | None = None,
     ) -> tuple[OkxOrderResult, Decimal | None, str]:
+        prepare_kwargs: dict[str, object] = {"close_size": close_size}
+        if instrument is not None:
+            prepare_kwargs["instrument"] = instrument
         credentials, config, instrument, closeable_size, close_side, pos_side, _direction, normalized_mode = (
-            self._prepare_selected_position_manual_flatten(position, flatten_mode, close_size=close_size)
+            self._prepare_selected_position_manual_flatten(position, flatten_mode, **prepare_kwargs)
         )
         if normalized_mode == "market" and instrument.inst_type == "OPTION":
             result = self._shared_client.place_aggressive_limit_order(
@@ -3868,6 +3923,7 @@ class AccountPositionsHomeWidget(QWidget):
                 pos_side=pos_side,
                 price=price,
                 reduce_only=True,
+                instrument=instrument,
             )
             return result, price, normalized_mode
         result = self._shared_client.place_simple_order(
@@ -3879,16 +3935,19 @@ class AccountPositionsHomeWidget(QWidget):
             ord_type="market",
             pos_side=pos_side,
             reduce_only=True,
+            instrument=instrument,
         )
         return result, None, normalized_mode
 
     def _schedule_selected_position_manual_flatten_follow_up_refresh(self, flatten_mode: str) -> None:
-        normalized_mode = self._normalize_position_manual_flatten_mode(flatten_mode)
-        if normalized_mode in {"best_quote", "best_quote_fee", "short_profit_fee"}:
-            QTimer.singleShot(450, self.refresh_view)
-            QTimer.singleShot(1800, self.refresh_view)
-            return
-        QTimer.singleShot(650, self.refresh_view)
+        _ = self._normalize_position_manual_flatten_mode(flatten_mode)
+        QTimer.singleShot(900, self._reconcile_after_selected_position_manual_flatten)
+
+    def _reconcile_after_selected_position_manual_flatten(self) -> None:
+        realtime_store = getattr(self, "_realtime_store", None)
+        request_reconcile = getattr(realtime_store, "request_reconcile", None)
+        if callable(request_reconcile):
+            request_reconcile("manual_flatten")
 
     def _selected_position_manual_flatten_after(self, delay_ms: int, callback) -> None:
         if delay_ms <= 0:
@@ -4051,10 +4110,11 @@ class AccountPositionsHomeWidget(QWidget):
             message = f"{message}\n实际下单量：{order_size_text}"
         if normalized_flatten_mode in {"best_quote", "best_quote_fee", "short_profit_fee"} and price is not None:
             message = f"{message}\n挂单价：{format_decimal(price)}"
-        QMessageBox.information(self, "平仓已提交", message)
         self._schedule_selected_position_manual_flatten_follow_up_refresh(normalized_flatten_mode)
+        QMessageBox.information(self, "平仓已提交", message)
 
     def flatten_selected_position(self) -> None:
+        flow_started_at = time.perf_counter()
         if not self._ensure_runtime_ready(force_unlock=True):
             return
         if self._selected_position_manual_flatten_running:
@@ -4065,6 +4125,7 @@ class AccountPositionsHomeWidget(QWidget):
             QMessageBox.information(self, "平仓", "请先在当前持仓里选中一条具体持仓。")
             return
         try:
+            instrument = self._selected_position_flatten_instrument(position, allow_network=False)
             (
                 _credentials,
                 _config,
@@ -4074,14 +4135,13 @@ class AccountPositionsHomeWidget(QWidget):
                 _pos_side,
                 preview_direction,
                 _normalized_mode,
-            ) = self._prepare_selected_position_manual_flatten(position, "market")
+            ) = self._prepare_selected_position_manual_flatten(position, "market", instrument=instrument)
         except Exception as exc:
             QMessageBox.critical(self, "平仓失败", str(exc))
             return
 
         direction_label = "多头" if preview_direction == "long" else "空头"
         close_side_label = "SELL 卖出平仓" if preview_close_side == "sell" else "BUY 买入平仓"
-        instrument = self._selected_position_flatten_instrument(position)
         hold_amount_text = self._format_amount_with_unit(
             *self._selected_position_contract_size_to_display_amount(
                 position,
@@ -4125,6 +4185,7 @@ class AccountPositionsHomeWidget(QWidget):
                 position,
                 "market",
                 close_size=requested_close_size,
+                instrument=instrument,
             )
             submit_amount_text = self._format_amount_with_unit(
                 *self._selected_position_contract_size_to_display_amount(
@@ -4237,13 +4298,15 @@ class AccountPositionsHomeWidget(QWidget):
         self._log_selected_position_manual_flatten(
             f"用户确认平仓 | instId={position.inst_id} | direction={direction_label} | closeSide={close_side_label} | "
             f"mode={flatten_mode} | profitMultiple={format_decimal(fee_multiple)} | "
-            f"profitPercent={format_decimal(profit_percent)} | submit={submit_amount_text} | orderSize={order_size_text}"
+            f"profitPercent={format_decimal(profit_percent)} | submit={submit_amount_text} | orderSize={order_size_text} | "
+            f"previewElapsedMs={(time.perf_counter() - flow_started_at) * 1000:.1f}"
         )
 
         self._selected_position_manual_flatten_running = True
         self._status_badge.setText("平仓提交中...")
 
         def _worker() -> None:
+            worker_started_at = time.perf_counter()
             try:
                 self._log_selected_position_manual_flatten(
                     f"线程开始 | instId={position.inst_id} | mode={flatten_mode} | closeSizeInput={requested_close_size} | "
@@ -4256,11 +4319,13 @@ class AccountPositionsHomeWidget(QWidget):
                     close_size=requested_close_size,
                     fee_multiple=fee_multiple,
                     profit_percent=profit_percent,
+                    instrument=instrument,
                 )
                 self._log_selected_position_manual_flatten(
                     f"交易所返回 | instId={position.inst_id} | mode={normalized_mode} | ordId={result.ord_id or '-'} | "
                     f"clOrdId={result.cl_ord_id or '-'} | sCode={result.s_code or '-'} | sMsg={result.s_msg or '-'} | "
-                    f"price={format_decimal(price) if price is not None else '-'}"
+                    f"price={format_decimal(price) if price is not None else '-'} | "
+                    f"workerElapsedMs={(time.perf_counter() - worker_started_at) * 1000:.1f}"
                 )
             except Exception as exc:
                 import traceback
@@ -5416,7 +5481,13 @@ class AccountPositionsHomeWidget(QWidget):
             return
         self._open_position_kline(position)
 
-    def _open_position_kline(self, position: OkxPosition, *, time_markers: tuple[tuple[str, int], ...] = ()) -> None:
+    def _open_position_kline(
+        self,
+        position: OkxPosition,
+        *,
+        time_markers: tuple[tuple[str, int], ...] = (),
+        position_price_markers: tuple[PositionPriceMarker, ...] | None = None,
+    ) -> None:
         if self._instrument_kline_dialog is None:
             self._instrument_kline_dialog = InstrumentKlineDialog(
                 initial_bar=self._position_kline_last_bar,
@@ -5427,6 +5498,8 @@ class AccountPositionsHomeWidget(QWidget):
             )
         if not time_markers:
             time_markers = _current_position_kline_time_markers(position, self._position_history_items)
+        if position_price_markers is None:
+            position_price_markers = _current_position_kline_price_markers(position)
         underlying_usdt_price: Decimal | None = None
         underlying_usdt_basis = ""
         option_entry_price: Decimal | None = None
@@ -5455,6 +5528,7 @@ class AccountPositionsHomeWidget(QWidget):
             underlying_usdt_basis=underlying_usdt_basis,
             option_entry_price=option_entry_price,
             time_markers=time_markers,
+            position_price_markers=position_price_markers,
         )
 
     @Slot(int, int)
@@ -5472,9 +5546,12 @@ class AccountPositionsHomeWidget(QWidget):
                 inst_id=item.inst_id,
                 inst_type=item.inst_type,
                 avg_price=item.open_avg_price,
+                pos_side=getattr(item, "pos_side", None),
+                direction=getattr(item, "direction", None),
                 raw=item.raw,
             ),
             time_markers=_position_history_kline_time_markers(item),
+            position_price_markers=_position_history_kline_price_markers(item),
         )
 
     def _on_position_kline_prefs_changed(self, bar: str, width: int, height: int) -> None:

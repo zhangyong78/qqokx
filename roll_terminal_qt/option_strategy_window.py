@@ -945,6 +945,16 @@ def _build_moving_average_series(candles: list[Candle]) -> tuple[list[Decimal], 
     return ema15_values, sma50_values
 
 
+@dataclass(frozen=True)
+class PositionPriceMarker:
+    """One actual opening or closing price displayed on a position K-line chart."""
+
+    kind: str
+    timestamp: int
+    price: Decimal
+    direction: str
+
+
 class CandlestickChartView(QChartView):
     hover_changed = Signal(int, float)
     hover_cleared = Signal()
@@ -964,6 +974,7 @@ class CandlestickChartView(QChartView):
         self._tooltip_close_usdt_basis = ""
         self._tooltip_entry_price: Decimal | None = None
         self._time_markers: tuple[tuple[str, int], ...] = ()
+        self._position_price_markers: tuple[PositionPriceMarker, ...] = ()
         self._hover_pos: QPointF | None = None
         self._value_min = 0.0
         self._value_max = 1.0
@@ -1002,6 +1013,7 @@ class CandlestickChartView(QChartView):
         self._tooltip_close_usdt_basis = ""
         self._tooltip_entry_price = None
         self._time_markers = ()
+        self._position_price_markers = ()
         self._hover_pos = None
         self._pan_anchor_x = None
         self._linked_hover_index = None
@@ -1020,6 +1032,7 @@ class CandlestickChartView(QChartView):
         tooltip_close_usdt_basis: str = "",
         tooltip_entry_price: Decimal | None = None,
         time_markers: tuple[tuple[str, int], ...] = (),
+        position_price_markers: tuple[PositionPriceMarker, ...] = (),
     ) -> None:
         if not candles:
             self.show_message(title)
@@ -1035,6 +1048,15 @@ class CandlestickChartView(QChartView):
             (str(label).strip(), int(timestamp))
             for label, timestamp in time_markers
             if str(label).strip() and int(timestamp) > 0
+        )
+        self._position_price_markers = tuple(
+            item
+            for item in position_price_markers
+            if isinstance(item, PositionPriceMarker)
+            and item.timestamp > 0
+            and item.price > 0
+            and item.direction in {"long", "short"}
+            and item.kind in {"entry", "exit"}
         )
         if tooltip_close_usdt_rate is not None and tooltip_close_usdt_rate > 0:
             self._tooltip_close_usdt_rate = tooltip_close_usdt_rate
@@ -1165,6 +1187,7 @@ class CandlestickChartView(QChartView):
             tooltip_close_usdt_basis=self._tooltip_close_usdt_basis,
             tooltip_entry_price=self._tooltip_entry_price,
             time_markers=self._time_markers,
+            position_price_markers=self._position_price_markers,
         )
         if self._axis_x is not None:
             if current_min <= old_full_min + 1.0:
@@ -1195,6 +1218,7 @@ class CandlestickChartView(QChartView):
             tooltip_close_usdt_basis=self._tooltip_close_usdt_basis,
             tooltip_entry_price=self._tooltip_entry_price,
             time_markers=self._time_markers,
+            position_price_markers=self._position_price_markers,
         )
 
     def wheelEvent(self, event) -> None:  # type: ignore[override]
@@ -1301,6 +1325,7 @@ class CandlestickChartView(QChartView):
             plot_area = self.chart().plotArea()
             painter = QPainter(self.viewport())
             painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+            self._draw_position_price_markers(painter, plot_area)
             self._draw_time_markers(painter, plot_area)
             hover_context = self._resolve_hover_context(plot_area)
             if hover_context is None:
@@ -1362,7 +1387,10 @@ class CandlestickChartView(QChartView):
             return
 
     def _draw_time_markers(self, painter: QPainter, plot_area: QRectF) -> None:
-        if not self._time_markers or plot_area.isEmpty():
+        # Position charts render their opening/closing time beside the actual
+        # price arrows below.  Keeping a second label at the chart top is both
+        # redundant and visually disconnected from the transaction price.
+        if self._position_price_markers or not self._time_markers or plot_area.isEmpty():
             return
         start_ts, end_ts = self._current_x_range()
         visible_index = 0
@@ -1374,7 +1402,20 @@ class CandlestickChartView(QChartView):
             pen.setStyle(Qt.PenStyle.DashLine)
             painter.setPen(pen)
             x = self._x_for_ts(timestamp, plot_area)
-            painter.drawLine(QPointF(x, plot_area.top()), QPointF(x, plot_area.bottom()))
+            arrow_top = plot_area.top() + 4.0
+            arrow_tip = arrow_top + 16.0
+            painter.drawLine(QPointF(x, arrow_top), QPointF(x, arrow_tip - 6.0))
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(color)
+            painter.drawPolygon(
+                QPolygonF(
+                    (
+                        QPointF(x - 4.0, arrow_tip - 6.0),
+                        QPointF(x + 4.0, arrow_tip - 6.0),
+                        QPointF(x, arrow_tip),
+                    )
+                )
+            )
             label_x = min(max(x + 6.0, plot_area.left() + 4.0), plot_area.right() - 116.0)
             label_y = plot_area.top() + 6.0 + ((visible_index % 2) * 34.0)
             label_text = f"{label}\n{QDateTime.fromMSecsSinceEpoch(timestamp).toString('yyyy-MM-dd HH:mm')}"
@@ -1385,6 +1426,118 @@ class CandlestickChartView(QChartView):
                 label_text,
             )
             visible_index += 1
+
+    def _draw_position_price_markers(self, painter: QPainter, plot_area: QRectF) -> None:
+        if not self._position_price_markers or plot_area.isEmpty():
+            return
+        start_ts, end_ts = self._current_x_range()
+        visible = [
+            marker
+            for marker in self._position_price_markers
+            if start_ts <= marker.timestamp <= end_ts
+        ]
+        if not visible:
+            return
+
+        pending_entries: dict[str, list[PositionPriceMarker]] = {"long": [], "short": []}
+        paired_entries: set[PositionPriceMarker] = set()
+        close_results: dict[PositionPriceMarker, tuple[QColor, Decimal]] = {}
+        for marker in sorted(self._position_price_markers, key=lambda item: item.timestamp):
+            if marker.kind == "entry":
+                pending_entries[marker.direction].append(marker)
+                continue
+            entries = pending_entries[marker.direction]
+            if not entries:
+                continue
+            entry = entries.pop(0)
+            paired_entries.add(entry)
+            result_percent = self._position_result_percent(entry, marker)
+            if result_percent > 0:
+                line_color = QColor("#1a7f37")
+            elif result_percent < 0:
+                line_color = QColor("#cf222e")
+            else:
+                line_color = QColor("#6e7781")
+            close_results[marker] = (line_color, result_percent)
+            if not (start_ts <= entry.timestamp <= end_ts and start_ts <= marker.timestamp <= end_ts):
+                continue
+            connector_color = QColor(line_color)
+            connector_color.setAlpha(185)
+            painter.setPen(QPen(connector_color, 2))
+            painter.drawLine(
+                QPointF(self._x_for_ts(entry.timestamp, plot_area), self._y_for_value(float(entry.price), plot_area)),
+                QPointF(self._x_for_ts(marker.timestamp, plot_area), self._y_for_value(float(marker.price), plot_area)),
+            )
+
+        for marker in visible:
+            x = self._x_for_ts(marker.timestamp, plot_area)
+            y = self._y_for_value(float(marker.price), plot_area)
+            is_down = (marker.kind == "entry" and marker.direction == "short") or (
+                marker.kind == "exit" and marker.direction == "long"
+            )
+            result = close_results.get(marker)
+            color = QColor("#0969da") if marker.kind == "entry" else QColor(result[0] if result is not None else "#cf222e")
+            arrow_length = 18.0
+            nearby_candle = min(self._candles, key=lambda candle: abs(float(candle.ts) - float(marker.timestamp)))
+            candle_top = self._y_for_value(float(nearby_candle.high), plot_area)
+            candle_bottom = self._y_for_value(float(nearby_candle.low), plot_area)
+            time_text = QDateTime.fromMSecsSinceEpoch(marker.timestamp).toString("MM-dd HH:mm")
+            label = "开仓" if marker.kind == "entry" else "平仓"
+            label_lines = [label, _format_compact_number(marker.price)]
+            if marker.kind == "exit" and result is not None:
+                result_percent = result[1]
+                label_lines.append(f"{result_percent:+.2f}%")
+            label_lines.append(time_text)
+            label_height = 16.0 * len(label_lines)
+            if is_down:
+                painter.setPen(QPen(color, 1.5))
+                painter.drawLine(QPointF(x, max(y - arrow_length, plot_area.top() + 3.0)), QPointF(x, y - 7.0))
+                triangle = QPolygonF((QPointF(x - 5.0, y - 7.0), QPointF(x + 5.0, y - 7.0), QPointF(x, y)))
+                label_y = max(plot_area.top() + 2.0, candle_top - label_height - 6.0)
+            else:
+                painter.setPen(QPen(color, 1.5))
+                painter.drawLine(QPointF(x, min(y + arrow_length, plot_area.bottom() - 3.0)), QPointF(x, y + 7.0))
+                triangle = QPolygonF((QPointF(x - 5.0, y + 7.0), QPointF(x + 5.0, y + 7.0), QPointF(x, y)))
+                label_y = min(plot_area.bottom() - label_height - 2.0, candle_bottom + 6.0)
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(color)
+            painter.drawPolygon(triangle)
+            label_x = min(max(x + 7.0, plot_area.left() + 3.0), plot_area.right() - 112.0)
+            painter.setPen(color)
+            painter.drawText(
+                QRectF(label_x, label_y, 108.0, label_height),
+                Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop,
+                "\n".join(label_lines),
+            )
+
+        for entry in pending_entries["long"] + pending_entries["short"]:
+            if entry not in visible or entry in paired_entries:
+                continue
+            color = QColor("#0969da")
+            color.setAlpha(145)
+            pen = QPen(color, 1)
+            pen.setStyle(Qt.PenStyle.DashLine)
+            painter.setPen(pen)
+            y = self._y_for_value(float(entry.price), plot_area)
+            if len(self._candles) > 1:
+                candle_step_ms = max(
+                    1.0,
+                    (float(self._candles[-1].ts) - float(self._candles[0].ts)) / float(len(self._candles) - 1),
+                )
+            else:
+                candle_step_ms = max(end_ts - start_ts, 1.0)
+            line_start_x = self._x_for_ts(entry.timestamp, plot_area)
+            line_end_x = self._x_for_ts(entry.timestamp + (candle_step_ms * 5.0), plot_area)
+            painter.drawLine(QPointF(line_start_x, y), QPointF(max(line_start_x, line_end_x), y))
+
+    @staticmethod
+    def _position_result_percent(entry: PositionPriceMarker, exit_marker: PositionPriceMarker) -> Decimal:
+        if entry.price <= 0:
+            return Decimal("0")
+        change = exit_marker.price - entry.price
+        if entry.direction == "short":
+            change = -change
+        return (change / entry.price) * Decimal("100")
 
     def _nearest_candle_for_x(self, x: float, plot_area: QRectF) -> Candle | None:
         if not self._candles:
@@ -1461,6 +1614,13 @@ class CandlestickChartView(QChartView):
         ]
         lows.extend(visible_moving_averages)
         highs.extend(visible_moving_averages)
+        visible_position_prices = [
+            float(marker.price)
+            for marker in self._position_price_markers
+            if start_ts <= float(marker.timestamp) <= end_ts
+        ]
+        lows.extend(visible_position_prices)
+        highs.extend(visible_position_prices)
         min_price = min(lows)
         max_price = max(highs)
         if min_price == max_price:

@@ -471,6 +471,7 @@ class OkxAccountConfig:
 
 class OkxRestClient:
     base_url = "https://www.okx.com"
+    _OPTION_TICK_BAND_CACHE_TTL_S = 600.0
 
     def __init__(self, *, logger: Callable[[str], None] | None = None) -> None:
         self._logger = logger or (lambda _message: None)
@@ -489,6 +490,8 @@ class OkxRestClient:
         self._instrument_cache_lock = threading.Lock()
         self._instrument_cache_loaded = False
         self._instrument_cache_by_id: dict[str, Instrument] = {}
+        self._option_tick_band_cache_lock = threading.Lock()
+        self._option_tick_band_cache: dict[str, tuple[tuple[OptionTickBand, ...], float]] = {}
 
     def close_profile_websockets(self, credentials: Credentials, *, environment: str) -> None:
         """Stop and forget private WS connections for one API profile.
@@ -590,16 +593,26 @@ class OkxRestClient:
     def get_option_instruments(self, *, uly: str | None = None, inst_family: str | None = None) -> list[Instrument]:
         return self.get_instruments("OPTION", uly=uly, inst_family=inst_family)
 
-    def get_option_tick_bands(self, inst_family: str) -> list[OptionTickBand]:
+    def get_option_tick_bands(self, inst_family: str, *, force_refresh: bool = False) -> list[OptionTickBand]:
         """Return the live OKX price bands required for option order prices."""
         normalized_family = str(inst_family or "").strip().upper()
         if not re.fullmatch(r"[A-Z0-9]+-[A-Z0-9]+", normalized_family):
             raise ValueError("期权价格分档缺少有效的 instFamily。")
-        payload = self._request(
-            "GET",
-            "/api/v5/public/instrument-tick-bands",
-            params={"instType": "OPTION", "instFamily": normalized_family},
-        )
+        now = time.monotonic()
+        with self._option_tick_band_cache_lock:
+            cached = self._option_tick_band_cache.get(normalized_family)
+        if cached is not None and not force_refresh and now - cached[1] < self._OPTION_TICK_BAND_CACHE_TTL_S:
+            return list(cached[0])
+        try:
+            payload = self._request(
+                "GET",
+                "/api/v5/public/instrument-tick-bands",
+                params={"instType": "OPTION", "instFamily": normalized_family},
+            )
+        except Exception:
+            if cached is not None:
+                return list(cached[0])
+            raise
         data = payload.get("data")
         if not isinstance(data, list) or not data or not isinstance(data[0], dict):
             raise OkxApiError(f"{normalized_family} 未返回期权价格分档。")
@@ -624,7 +637,10 @@ class OkxRestClient:
             )
         if not bands:
             raise OkxApiError(f"{normalized_family} 的期权价格分档格式无效。")
-        return sorted(bands, key=lambda band: band.min_price)
+        resolved = tuple(sorted(bands, key=lambda band: band.min_price))
+        with self._option_tick_band_cache_lock:
+            self._option_tick_band_cache[normalized_family] = (resolved, time.monotonic())
+        return list(resolved)
 
     def get_spot_instruments(self) -> list[Instrument]:
         return self.get_instruments("SPOT")
@@ -2818,14 +2834,16 @@ class OkxRestClient:
         price: Decimal | None = None,
         cl_ord_id: str | None = None,
         reduce_only: bool = False,
+        instrument: Instrument | None = None,
     ) -> OkxOrderResult:
         cl_ord_id = cl_ord_id or new_custom_order_id("ord")
         normalized_inst_id = inst_id.strip().upper()
-        inst: Instrument | None = None
-        try:
-            inst = self.get_instrument(normalized_inst_id)
-        except Exception:
-            inst = None
+        inst = instrument if instrument is not None and instrument.inst_id.strip().upper() == normalized_inst_id else None
+        if inst is None:
+            try:
+                inst = self.get_instrument(normalized_inst_id)
+            except Exception:
+                inst = None
         sz_txt = _format_exchange_contract_sz(inst, size) if inst is not None else format_decimal(size)
         order: dict[str, Any] = {
             "instId": normalized_inst_id,
@@ -2958,6 +2976,7 @@ class OkxRestClient:
             pos_side=pos_side,
             price=order_price,
             cl_ord_id=cl_ord_id,
+            instrument=instrument,
         )
 
     def get_order(

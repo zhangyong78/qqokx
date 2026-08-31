@@ -45,7 +45,7 @@ from roll_terminal_qt.line_trading_window import (
 from roll_terminal_qt.line_trading_core import LineAnnotation, RiskRewardAnnotation
 from roll_terminal_qt.profile_access import profile_requires_password
 from roll_terminal_qt.smart_order_window import _safe_text as smart_safe_text
-from roll_terminal_qt.option_strategy_window import CandlestickChartView, OptionStrategyQtWindow
+from roll_terminal_qt.option_strategy_window import CandlestickChartView, OptionStrategyQtWindow, PositionPriceMarker
 from okx_quant.option_strategy import OptionChainRow, OptionQuote
 from roll_terminal_qt.perf_metrics import measure_ui_step
 from roll_terminal_qt.kline_account_drawer import AccountDrawerLoadThread
@@ -128,6 +128,34 @@ class RollTerminalQtWindowHelperTests(QtWidgetTestCase):
             self.assertEqual(chart._time_markers, markers)
         finally:
             self.dispose_widget(chart)
+
+    def test_candlestick_chart_retains_position_price_markers_and_fits_their_prices(self) -> None:
+        chart = CandlestickChartView()
+        candles = [
+            Candle(1_752_210_000_000, Decimal("0.01"), Decimal("0.02"), Decimal("0.009"), Decimal("0.015"), Decimal("1"), True),
+            Candle(1_752_300_600_000, Decimal("0.015"), Decimal("0.021"), Decimal("0.014"), Decimal("0.018"), Decimal("1"), True),
+        ]
+        markers = (
+            PositionPriceMarker("entry", 1_752_210_000_000, Decimal("0.0125"), "long"),
+            PositionPriceMarker("exit", 1_752_300_600_000, Decimal("0.0300"), "long"),
+        )
+        try:
+            chart.set_candles(title="测试", candles=candles, position_price_markers=markers)
+            chart.set_moving_averages_visible(True)
+
+            self.assertEqual(chart._position_price_markers, markers)
+            self.assertGreaterEqual(chart._current_y_range()[1], 0.0300)
+        finally:
+            self.dispose_widget(chart)
+
+    def test_position_close_result_percent_respects_long_and_short_directions(self) -> None:
+        long_entry = PositionPriceMarker("entry", 1, Decimal("0.0100"), "long")
+        long_exit = PositionPriceMarker("exit", 2, Decimal("0.0125"), "long")
+        short_entry = PositionPriceMarker("entry", 1, Decimal("0.0100"), "short")
+        short_exit = PositionPriceMarker("exit", 2, Decimal("0.0080"), "short")
+
+        self.assertEqual(CandlestickChartView._position_result_percent(long_entry, long_exit), Decimal("25.00"))
+        self.assertEqual(CandlestickChartView._position_result_percent(short_entry, short_exit), Decimal("20.0"))
 
     def test_option_chain_mark_columns_resolve_the_matching_contract(self) -> None:
         instrument_kwargs = {
