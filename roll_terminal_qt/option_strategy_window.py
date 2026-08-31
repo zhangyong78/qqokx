@@ -953,6 +953,9 @@ class PositionPriceMarker:
     timestamp: int
     price: Decimal
     direction: str
+    realized_pnl: Decimal | None = None
+    pnl_currency: str = ""
+    realized_pnl_usdt: Decimal | None = None
 
 
 class CandlestickChartView(QChartView):
@@ -1464,20 +1467,35 @@ class CandlestickChartView(QChartView):
             connector_color = QColor(line_color)
             connector_color.setAlpha(185)
             painter.setPen(QPen(connector_color, 2))
+            # Keep a small gap between the trade-result connector and the
+            # opening/closing arrows.  The arrow remains dedicated to pointing
+            # at its K-line, while the connector stays visually independent.
+            connector_gap = 14.0
+            entry_x = self._x_for_ts(entry.timestamp, plot_area)
+            exit_x = self._x_for_ts(marker.timestamp, plot_area)
+            if exit_x >= entry_x:
+                entry_x += connector_gap
+                exit_x -= connector_gap
+            else:
+                entry_x -= connector_gap
+                exit_x += connector_gap
             painter.drawLine(
-                QPointF(self._x_for_ts(entry.timestamp, plot_area), self._y_for_value(float(entry.price), plot_area)),
-                QPointF(self._x_for_ts(marker.timestamp, plot_area), self._y_for_value(float(marker.price), plot_area)),
+                QPointF(entry_x, self._y_for_value(float(entry.price), plot_area)),
+                QPointF(exit_x, self._y_for_value(float(marker.price), plot_area)),
             )
 
         for marker in visible:
             x = self._x_for_ts(marker.timestamp, plot_area)
             y = self._y_for_value(float(marker.price), plot_area)
-            is_down = (marker.kind == "entry" and marker.direction == "short") or (
+            # Order arrows use the actual trade action rather than the P/L
+            # colour: buy is green, sell is red.  The P/L connector above
+            # remains independently green for profit and red for loss.
+            is_sell = (marker.kind == "entry" and marker.direction == "short") or (
                 marker.kind == "exit" and marker.direction == "long"
             )
             result = close_results.get(marker)
-            color = QColor("#0969da") if marker.kind == "entry" else QColor(result[0] if result is not None else "#cf222e")
-            arrow_length = 18.0
+            color = QColor("#cf222e" if is_sell else "#1a7f37")
+            arrow_length = 32.0
             nearby_candle = min(self._candles, key=lambda candle: abs(float(candle.ts) - float(marker.timestamp)))
             candle_top = self._y_for_value(float(nearby_candle.high), plot_area)
             candle_bottom = self._y_for_value(float(nearby_candle.low), plot_area)
@@ -1487,17 +1505,32 @@ class CandlestickChartView(QChartView):
             if marker.kind == "exit" and result is not None:
                 result_percent = result[1]
                 label_lines.append(f"{result_percent:+.2f}%")
+                label_lines.extend(self._position_marker_pnl_label_lines(marker))
             label_lines.append(time_text)
             label_height = 16.0 * len(label_lines)
-            if is_down:
+            # Point to the outside of the candle's wick, not to the order
+            # price inside its body.  This keeps the arrow shaft and head out
+            # of the K-line while still unambiguously identifying its candle.
+            arrow_tip = candle_top if is_sell else candle_bottom
+            if is_sell:
                 painter.setPen(QPen(color, 1.5))
-                painter.drawLine(QPointF(x, max(y - arrow_length, plot_area.top() + 3.0)), QPointF(x, y - 7.0))
-                triangle = QPolygonF((QPointF(x - 5.0, y - 7.0), QPointF(x + 5.0, y - 7.0), QPointF(x, y)))
+                painter.drawLine(
+                    QPointF(x, max(arrow_tip - arrow_length, plot_area.top() + 3.0)),
+                    QPointF(x, arrow_tip - 7.0),
+                )
+                triangle = QPolygonF(
+                    (QPointF(x - 5.0, arrow_tip - 7.0), QPointF(x + 5.0, arrow_tip - 7.0), QPointF(x, arrow_tip))
+                )
                 label_y = max(plot_area.top() + 2.0, candle_top - label_height - 6.0)
             else:
                 painter.setPen(QPen(color, 1.5))
-                painter.drawLine(QPointF(x, min(y + arrow_length, plot_area.bottom() - 3.0)), QPointF(x, y + 7.0))
-                triangle = QPolygonF((QPointF(x - 5.0, y + 7.0), QPointF(x + 5.0, y + 7.0), QPointF(x, y)))
+                painter.drawLine(
+                    QPointF(x, min(arrow_tip + arrow_length, plot_area.bottom() - 3.0)),
+                    QPointF(x, arrow_tip + 7.0),
+                )
+                triangle = QPolygonF(
+                    (QPointF(x - 5.0, arrow_tip + 7.0), QPointF(x + 5.0, arrow_tip + 7.0), QPointF(x, arrow_tip))
+                )
                 label_y = min(plot_area.bottom() - label_height - 2.0, candle_bottom + 6.0)
             painter.setPen(Qt.PenStyle.NoPen)
             painter.setBrush(color)
@@ -1538,6 +1571,23 @@ class CandlestickChartView(QChartView):
         if entry.direction == "short":
             change = -change
         return (change / entry.price) * Decimal("100")
+
+    @staticmethod
+    def _position_marker_pnl_label_lines(marker: PositionPriceMarker) -> tuple[str, ...]:
+        """Format OKX's actual realized P/L for a closed-position chart label."""
+        value = marker.realized_pnl
+        if value is None:
+            return ()
+        currency = marker.pnl_currency.strip().upper()
+        places = 2 if currency in {"USDT", "USD", "USDC"} else 8
+        sign = "+" if value > 0 else ""
+        value_text = f"{sign}{format_decimal_fixed(value, places)}"
+        actual_text = f"盈亏 {value_text} {currency}".strip()
+        if currency in {"USDT", "USD", "USDC"} or marker.realized_pnl_usdt is None:
+            return (actual_text,)
+        usdt_value = marker.realized_pnl_usdt
+        usdt_sign = "+" if usdt_value > 0 else ""
+        return (actual_text, f"≈ {usdt_sign}{format_decimal_fixed(usdt_value, 2)} USDT")
 
     def _nearest_candle_for_x(self, x: float, plot_area: QRectF) -> Candle | None:
         if not self._candles:

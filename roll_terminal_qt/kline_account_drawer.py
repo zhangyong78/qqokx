@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from typing import Iterable
 
-from PySide6.QtCore import QThread, Qt, Signal
+from PySide6.QtCore import QThread, QTimer, Qt, Signal
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -314,6 +314,13 @@ class KlineAccountDrawer(QWidget):
         self._symbol = ""
         self._request_generation = 0
         self._refresh_pending = False
+        self._active_table_refresh_pending = False
+        self._active_table_refresh_timer = QTimer(self)
+        self._active_table_refresh_timer.setSingleShot(True)
+        self._active_table_refresh_timer.timeout.connect(self._refresh_active_table)
+        self._refresh_data_timer = QTimer(self)
+        self._refresh_data_timer.setSingleShot(True)
+        self._refresh_data_timer.timeout.connect(self.refresh_data)
         self._snapshot = AccountDrawerSnapshot()
         self._visible_orders: list[object] = []
         self._load_thread: AccountDrawerLoadThread | None = None
@@ -337,7 +344,7 @@ class KlineAccountDrawer(QWidget):
         self._scope_combo = QComboBox()
         self._scope_combo.addItem("当前交易对", "symbol")
         self._scope_combo.addItem("全部", "all")
-        self._scope_combo.currentIndexChanged.connect(self._refresh_tables)
+        self._scope_combo.currentIndexChanged.connect(self._schedule_active_table_refresh)
         toolbar.addWidget(self._scope_combo, 0)
 
         self._refresh_button = QPushButton("刷新")
@@ -354,6 +361,7 @@ class KlineAccountDrawer(QWidget):
         layout.addLayout(toolbar)
 
         self._tabs = QTabWidget()
+        self._tabs.currentChanged.connect(self._schedule_active_table_refresh)
         layout.addWidget(self._tabs, 1)
 
         self._orders_table = self._create_table(
@@ -521,6 +529,42 @@ class KlineAccountDrawer(QWidget):
         self._populate_positions_table(filtered_positions)
         self._populate_history_orders_table(filtered_order_history)
         self._sync_cancel_button_state()
+
+    def _schedule_active_table_refresh(self, *_args: object) -> None:
+        """Coalesce visible-tab table work so showing the drawer can paint first."""
+        if not self.isVisible() or self._active_table_refresh_pending:
+            return
+        self._active_table_refresh_pending = True
+        self._active_table_refresh_timer.start(0)
+
+    def schedule_refresh_data(self) -> None:
+        """Queue a refresh with drawer-owned lifetime protection."""
+        if self._runtime is None:
+            return
+        self._refresh_data_timer.start(0)
+
+    def _refresh_active_table(self) -> None:
+        self._active_table_refresh_pending = False
+        if not self.isVisible():
+            return
+        scope = str(self._scope_combo.currentData() or "symbol")
+        current_tab = self._tabs.currentIndex()
+        if current_tab == 0:
+            self._populate_orders_table(
+                filter_account_items(self._snapshot.orders, scope=scope, symbol=self._symbol)
+            )
+            self._sync_cancel_button_state()
+            return
+        if current_tab == 1:
+            self._populate_positions_table(
+                filter_account_items(self._snapshot.positions, scope=scope, symbol=self._symbol)
+            )
+            self._cancel_button.setEnabled(False)
+            return
+        self._populate_history_orders_table(
+            filter_account_items(self._snapshot.order_history, scope=scope, symbol=self._symbol)
+        )
+        self._cancel_button.setEnabled(False)
 
     def _populate_orders_table(self, orders: list[object]) -> None:
         self._visible_orders = list(orders)
@@ -702,7 +746,9 @@ def _shared_set_context(
         )
         if realtime_snapshot is not None:
             self._apply_realtime_snapshot(realtime_snapshot)
-        self._refresh_tables()
+        # The hidden drawer only needs the data snapshot.  Building all three
+        # wide tables here delays the next click on the holdings button.
+        self._schedule_active_table_refresh()
     if changed and refresh_if_visible and self.isVisible():
         self.refresh_data()
 
@@ -711,6 +757,10 @@ def _shared_refresh_data(self: KlineAccountDrawer) -> None:
     if self._runtime is None:
         self._status_label.setText("未连接账户")
         return
+    # The visible tab is filled from the cached snapshot on the next event
+    # loop pass, so the drawer itself can become visible without waiting for
+    # any table construction or network reconciliation.
+    self._schedule_active_table_refresh()
     self._shared_order_store.request_refresh(runtime=self._runtime, profile_name=self._profile_name)
     self._realtime_store.start_if_needed(self._runtime)
     self._realtime_store.request_reconcile("drawer")
@@ -728,7 +778,7 @@ def _shared_apply_snapshot(self: KlineAccountDrawer, generation: int, snapshot: 
         position_tickers=dict(snapshot.position_tickers or {}),
     )
     self._status_label.setText(f"委托 {len(self._snapshot.orders)} | 持仓 {len(self._snapshot.positions)}")
-    self._refresh_tables()
+    self._schedule_active_table_refresh()
 
 
 def _shared_load_shared_order_snapshot(self: KlineAccountDrawer) -> None:
@@ -759,7 +809,7 @@ def _shared_apply_shared_order_snapshot(
         order_history=tuple(snapshot.history_orders),
     )
     self._status_label.setText(f"委托 {len(self._snapshot.orders)} | 持仓 {len(self._snapshot.positions)}")
-    self._refresh_tables()
+    self._schedule_active_table_refresh()
 
 
 def _shared_apply_realtime_snapshot(self: KlineAccountDrawer, snapshot: object) -> None:
@@ -775,7 +825,9 @@ def _shared_apply_realtime_snapshot(self: KlineAccountDrawer, snapshot: object) 
         upl_usdt_prices=dict(snapshot.upl_usdt_prices),
     )
     self._status_label.setText(f"委托 {len(self._snapshot.orders)} | 持仓 {len(self._snapshot.positions)}")
-    self._refresh_tables()
+    # Avoid constructing any wide tables while the drawer is collapsed; when
+    # visible, coalesce updates and repaint the selected tab only.
+    self._schedule_active_table_refresh()
 
 
 def _shared_apply_shared_order_refresh_error(

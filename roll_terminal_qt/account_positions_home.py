@@ -177,6 +177,8 @@ from okx_quant.ui_shell import (
     _format_position_history_price,
     _format_position_history_size,
     _format_position_history_trade_side,
+    _infer_position_history_pnl_currency,
+    _position_history_realized_pnl_usdt,
     _build_position_history_detail_text,
     _position_history_note_key,
     _position_history_note_summary_text,
@@ -1039,7 +1041,11 @@ def _position_history_kline_direction(item: OkxPositionHistoryItem) -> str | Non
     return None
 
 
-def _position_history_kline_price_markers(item: OkxPositionHistoryItem) -> tuple[PositionPriceMarker, ...]:
+def _position_history_kline_price_markers(
+    item: OkxPositionHistoryItem,
+    *,
+    usdt_prices: dict[str, Decimal] | None = None,
+) -> tuple[PositionPriceMarker, ...]:
     raw = item.raw if isinstance(item.raw, dict) else {}
     direction = _position_history_kline_direction(item)
     if direction is None:
@@ -1049,10 +1055,27 @@ def _position_history_kline_price_markers(item: OkxPositionHistoryItem) -> tuple
     markers: list[PositionPriceMarker] = []
     open_price = _position_kline_positive_decimal(getattr(item, "open_avg_price", None))
     close_price = _position_kline_positive_decimal(getattr(item, "close_avg_price", None))
+    realized_pnl = getattr(item, "realized_pnl", None)
+    pnl_currency = ""
+    realized_pnl_usdt: Decimal | None = None
+    if isinstance(realized_pnl, Decimal):
+        pnl_currency = _infer_position_history_pnl_currency(item)
+        if usdt_prices:
+            realized_pnl_usdt = _position_history_realized_pnl_usdt(item, usdt_prices)
     if opened_at is not None and open_price is not None:
         markers.append(PositionPriceMarker("entry", opened_at, open_price, direction))
     if closed_at is not None and close_price is not None:
-        markers.append(PositionPriceMarker("exit", closed_at, close_price, direction))
+        markers.append(
+            PositionPriceMarker(
+                "exit",
+                closed_at,
+                close_price,
+                direction,
+                realized_pnl=realized_pnl if isinstance(realized_pnl, Decimal) else None,
+                pnl_currency=pnl_currency,
+                realized_pnl_usdt=realized_pnl_usdt,
+            )
+        )
     return tuple(markers)
 
 
@@ -5551,7 +5574,10 @@ class AccountPositionsHomeWidget(QWidget):
                 raw=item.raw,
             ),
             time_markers=_position_history_kline_time_markers(item),
-            position_price_markers=_position_history_kline_price_markers(item),
+            position_price_markers=_position_history_kline_price_markers(
+                item,
+                usdt_prices=self._position_history_usdt_prices,
+            ),
         )
 
     def _on_position_kline_prefs_changed(self, bar: str, width: int, height: int) -> None:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+import threading
 from types import SimpleNamespace
 
 from PySide6.QtWidgets import QApplication
@@ -121,3 +122,33 @@ def test_store_stop_unsubscribes_and_keeps_profiles_isolated() -> None:
 
     assert client._private_listeners == []
     assert client._algo_listeners == []
+
+
+def test_profile_switch_detaches_slow_websockets_without_blocking_ui_thread() -> None:
+    stopped = threading.Event()
+    release = threading.Event()
+
+    class SlowConnection:
+        def stop(self) -> None:
+            stopped.set()
+            release.wait(timeout=1.0)
+
+    class SlowDisconnectClient(_FakeRealtimeClient):
+        def detach_profile_websockets(self, credentials, *, environment):  # noqa: ANN001
+            if credentials.profile_name == "one" and environment == "demo":
+                return (SlowConnection(),)
+            return ()
+
+    client = SlowDisconnectClient()
+    store = RealtimeAccountStore(client=client, coalesce_ms=0, reconcile_seconds=60)
+    store.start(_runtime("one", "demo"))
+    _drain_qt_events()
+
+    started_at = time.monotonic()
+    store.start(_runtime("two", "live"))
+    elapsed = time.monotonic() - started_at
+
+    assert elapsed < 0.2
+    assert stopped.wait(timeout=0.5)
+    release.set()
+    store.stop()

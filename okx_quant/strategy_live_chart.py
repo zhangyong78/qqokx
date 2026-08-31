@@ -93,6 +93,10 @@ class StrategyLiveChartTimeMarker:
     dash: tuple[int, ...] = ()
     width: int = 1
     vertical_anchor: str = ""
+    event: str = ""
+    price: Decimal | None = None
+    direction: str = ""
+    net_pnl: Decimal | None = None
 
 
 @dataclass(frozen=True)
@@ -735,8 +739,17 @@ def render_strategy_live_chart(
             font=("Microsoft YaHei UI", 9),
         )
 
+    visible_time_markers = tuple(
+        marker for marker in snapshot.time_markers if _time_marker_is_in_candle_range(marker, snapshot)
+    )
+    trade_time_markers = tuple(
+        marker
+        for marker in visible_time_markers
+        if marker.event in {"open", "close"}
+    )
+    generic_time_markers = tuple(marker for marker in visible_time_markers if marker not in trade_time_markers)
     time_marker_layouts = _layout_time_marker_label_positions(
-        snapshot.time_markers,
+        generic_time_markers,
         snapshot,
         bounds,
         candle_step,
@@ -855,6 +868,16 @@ def render_strategy_live_chart(
 
     for point_overlay in snapshot.point_overlays:
         _draw_point_overlay(canvas, point_overlay, lower, upper, bounds, candle_step)
+
+    _draw_trade_time_markers(
+        canvas,
+        trade_time_markers,
+        snapshot,
+        lower,
+        upper,
+        bounds,
+        candle_step,
+    )
 
     marker_layouts = _layout_marker_label_positions(
         snapshot.markers,
@@ -1221,6 +1244,165 @@ def _nearest_time_marker_candle_index(
         range(len(snapshot.candles)),
         key=lambda index: abs(snapshot.candles[index].ts - target_ms),
     )
+
+
+def _time_marker_is_in_candle_range(
+    marker: StrategyLiveChartTimeMarker,
+    snapshot: StrategyLiveChartSnapshot,
+) -> bool:
+    """Keep event markers inside the K-line window instead of clamping old events to the left edge."""
+
+    if not snapshot.candles:
+        return True
+    target_ms = marker.at.timestamp() * 1000
+    first_ts = snapshot.candles[0].ts
+    last_ts = snapshot.candles[-1].ts
+    if len(snapshot.candles) > 1:
+        candle_span_ms = max(1, snapshot.candles[-1].ts - snapshot.candles[-2].ts)
+    else:
+        candle_span_ms = 1
+    return first_ts <= target_ms < last_ts + candle_span_ms
+
+
+def _trade_marker_action_is_sell(marker: StrategyLiveChartTimeMarker) -> bool:
+    direction = str(marker.direction or "").strip().lower()
+    return (marker.event == "open" and direction == "short") or (
+        marker.event == "close" and direction == "long"
+    )
+
+
+def _trade_marker_result(
+    entry: StrategyLiveChartTimeMarker,
+    close: StrategyLiveChartTimeMarker,
+) -> Decimal:
+    if entry.price is not None and close.price is not None:
+        change = close.price - entry.price
+        if str(entry.direction or "").strip().lower() == "short":
+            change = -change
+        return change
+    return close.net_pnl or Decimal("0")
+
+
+def _trade_marker_compact_label(
+    marker: StrategyLiveChartTimeMarker,
+    *,
+    result_percent: Decimal | None = None,
+) -> str:
+    action = "开仓" if marker.event == "open" else "平仓"
+    parts = [action]
+    if marker.price is not None:
+        parts.append(format_decimal(marker.price))
+    if marker.event == "close" and result_percent is not None:
+        parts.append(f"{result_percent:+.2f}%")
+    if marker.event == "close" and marker.net_pnl is not None:
+        rounded = marker.net_pnl.quantize(Decimal("0.01"))
+        parts.append(f"本轮 {('+' if rounded > 0 else '')}{rounded:.2f}U")
+    parts.append(marker.at.strftime("%m-%d %H:%M"))
+    return "\n".join(parts)
+
+
+def _draw_trade_time_markers(
+    canvas: Canvas,
+    markers: tuple[StrategyLiveChartTimeMarker, ...],
+    snapshot: StrategyLiveChartSnapshot,
+    lower: Decimal,
+    upper: Decimal,
+    bounds: _ChartBounds,
+    candle_step: float,
+) -> None:
+    """Draw actual entry/exit arrows using the same buy/sell and result-colour rules as the latest Qt K-line."""
+
+    if not markers:
+        return
+
+    ordered = sorted(markers, key=lambda item: (item.at.timestamp(), item.key))
+    pending_entries: dict[str, list[StrategyLiveChartTimeMarker]] = {"long": [], "short": []}
+    pairs: list[tuple[StrategyLiveChartTimeMarker, StrategyLiveChartTimeMarker, Decimal]] = []
+    close_result_percent: dict[str, Decimal] = {}
+    for marker in ordered:
+        direction = str(marker.direction or "").strip().lower()
+        if direction not in pending_entries:
+            continue
+        if marker.event == "open":
+            pending_entries[direction].append(marker)
+            continue
+        entries = pending_entries[direction]
+        if entries:
+            entry = entries.pop(0)
+            result = _trade_marker_result(entry, marker)
+            pairs.append((entry, marker, result))
+            if entry.price is not None and entry.price > 0:
+                close_result_percent[marker.key] = (result / entry.price) * Decimal("100")
+
+    for entry, close, result in pairs:
+        if entry.price is None or close.price is None:
+            continue
+        entry_x = _time_marker_x(entry.at, snapshot, bounds, candle_step)
+        close_x = _time_marker_x(close.at, snapshot, bounds, candle_step)
+        entry_y = _price_to_y(entry.price, lower, upper, bounds)
+        close_y = _price_to_y(close.price, lower, upper, bounds)
+        connector_color = "#1a7f37" if result > 0 else "#cf222e" if result < 0 else "#6e7781"
+        gap = min(14.0, max(candle_step * 0.35, 3.0))
+        if close_x >= entry_x:
+            entry_x += gap
+            close_x -= gap
+        else:
+            entry_x -= gap
+            close_x += gap
+        canvas.create_line(entry_x, entry_y, close_x, close_y, fill=connector_color, width=2)
+
+    for index, marker in enumerate(ordered):
+        candle_index = _nearest_time_marker_candle_index(marker, snapshot)
+        if candle_index is None:
+            continue
+        candle = snapshot.candles[candle_index]
+        x = bounds.left + (candle_index + 0.5) * candle_step
+        is_sell = _trade_marker_action_is_sell(marker)
+        color = "#cf222e" if is_sell else "#1a7f37"
+        candle_edge_y = _price_to_y(candle.high if is_sell else candle.low, lower, upper, bounds)
+        arrow_length = 28.0
+        if is_sell:
+            shaft_start = max(bounds.top + 3.0, candle_edge_y - arrow_length)
+            canvas.create_line(x, shaft_start, x, candle_edge_y - 7.0, fill=color, width=2)
+            canvas.create_polygon(
+                x - 5.0,
+                candle_edge_y - 7.0,
+                x + 5.0,
+                candle_edge_y - 7.0,
+                x,
+                candle_edge_y,
+                outline=color,
+                fill=color,
+            )
+            label_y = max(bounds.top + 2.0, shaft_start - 2.0)
+            anchor = "sw"
+        else:
+            shaft_end = min(bounds.bottom - 3.0, candle_edge_y + arrow_length)
+            canvas.create_line(x, shaft_end, x, candle_edge_y + 7.0, fill=color, width=2)
+            canvas.create_polygon(
+                x - 5.0,
+                candle_edge_y + 7.0,
+                x + 5.0,
+                candle_edge_y + 7.0,
+                x,
+                candle_edge_y,
+                outline=color,
+                fill=color,
+            )
+            label_y = min(bounds.bottom - 2.0, shaft_end + 2.0)
+            anchor = "nw"
+        label_x = min(max(x + 7.0, bounds.left + 3.0), bounds.right - 86.0)
+        # Alternate labels that share nearly the same candle so they stay readable.
+        if index % 2:
+            label_x = max(bounds.left + 3.0, label_x - 72.0)
+        canvas.create_text(
+            label_x,
+            label_y,
+            text=_trade_marker_compact_label(marker, result_percent=close_result_percent.get(marker.key)),
+            fill=color,
+            anchor=anchor,
+            font=("Microsoft YaHei UI", 8),
+        )
 
 
 def _layout_time_marker_line_segments(

@@ -2607,6 +2607,7 @@ class UiStrategySessionsMixin:
 
         for ledger in ledger_records:
             open_anchor, close_anchor = self._strategy_live_chart_event_anchors(ledger.direction_label)
+            marker_direction = "short" if open_anchor == "above" else "long" if open_anchor == "below" else ""
             if ledger.opened_at is not None:
                 markers.append(
                     StrategyLiveChartTimeMarker(
@@ -2617,6 +2618,9 @@ class UiStrategySessionsMixin:
                         dash=(4, 3),
                         width=2,
                         vertical_anchor=open_anchor,
+                        event="open",
+                        price=ledger.entry_price,
+                        direction=marker_direction,
                     )
                 )
             if ledger.opened_at and ledger.closed_at and ledger.closed_at >= ledger.opened_at:
@@ -2632,6 +2636,10 @@ class UiStrategySessionsMixin:
                         dash=(6, 3),
                         width=2,
                         vertical_anchor=close_anchor,
+                        event="close",
+                        price=ledger.exit_price,
+                        direction=marker_direction,
+                        net_pnl=ledger.net_pnl,
                     )
                 )
 
@@ -2650,6 +2658,9 @@ class UiStrategySessionsMixin:
                     dash=(4, 3),
                     width=2,
                     vertical_anchor=open_anchor,
+                    event="open",
+                    price=trade.entry_price,
+                    direction="short" if open_anchor == "above" else "long" if open_anchor == "below" else "",
                 )
             )
 

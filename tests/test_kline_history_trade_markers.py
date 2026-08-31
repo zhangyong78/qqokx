@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 from decimal import Decimal
+from types import SimpleNamespace
 from unittest import TestCase
 
 from okx_quant.okx_client import OkxPosition, OkxPositionHistoryItem
 from roll_terminal_qt.kline_analysis_window import (
+    KlineAnalysisWindow,
     _best_parameter_indicator_specs,
     _build_kline_current_position_markers,
     _build_kline_history_trade_markers,
@@ -70,6 +72,17 @@ def _current_position(*, inst_id: str, opened_at: int, price: str, pos_side: str
 
 
 class KlineHistoryTradeMarkersTest(TestCase):
+    def test_history_trades_are_available_on_one_hour_only(self) -> None:
+        one_hour_window = SimpleNamespace(
+            _period_combo=SimpleNamespace(currentText=lambda: "1H"),
+        )
+        four_hour_window = SimpleNamespace(
+            _period_combo=SimpleNamespace(currentText=lambda: "4H"),
+        )
+
+        self.assertTrue(KlineAnalysisWindow._history_trades_supported(one_hour_window))
+        self.assertFalse(KlineAnalysisWindow._history_trades_supported(four_hour_window))
+
     def test_current_positions_fill_unclosed_openings_and_merge_duplicate_history(self) -> None:
         history = _build_kline_history_trade_markers(
             [_position(

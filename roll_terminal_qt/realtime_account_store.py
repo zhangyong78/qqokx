@@ -103,18 +103,48 @@ class RealtimeAccountStore(QObject):
                 pass
         self._unsubscribers.clear()
         if runtime is not None:
-            close_profile_websockets = getattr(self._client, "close_profile_websockets", None)
-            if callable(close_profile_websockets):
-                try:
-                    close_profile_websockets(
-                        getattr(runtime, "credentials"),
-                        environment=str(getattr(runtime, "environment", "") or ""),
-                    )
-                except Exception as exc:  # noqa: BLE001
-                    self.status_changed.emit(f"关闭旧 API WS 失败：{exc}")
+            self._stop_profile_websockets_in_background(runtime)
         self._runtime = None
         self._profile_name = ""
         self._environment = ""
+
+    def _stop_profile_websockets_in_background(self, runtime: object) -> None:
+        credentials = getattr(runtime, "credentials", None)
+        environment = str(getattr(runtime, "environment", "") or "")
+        if credentials is None:
+            return
+        detach_profile_websockets = getattr(self._client, "detach_profile_websockets", None)
+        try:
+            if callable(detach_profile_websockets):
+                connections = tuple(detach_profile_websockets(credentials, environment=environment) or ())
+                if connections:
+                    threading.Thread(
+                        target=self._stop_detached_websockets,
+                        args=(connections,),
+                        daemon=True,
+                        name="qt-account-ws-stop",
+                    ).start()
+                return
+            close_profile_websockets = getattr(self._client, "close_profile_websockets", None)
+            if callable(close_profile_websockets):
+                threading.Thread(
+                    target=close_profile_websockets,
+                    kwargs={"credentials": credentials, "environment": environment},
+                    daemon=True,
+                    name="qt-account-ws-stop",
+                ).start()
+        except Exception as exc:  # noqa: BLE001
+            self.status_changed.emit(f"关闭旧 API WS 失败：{exc}")
+
+    @staticmethod
+    def _stop_detached_websockets(connections: tuple[object, ...]) -> None:
+        for connection in connections:
+            try:
+                stop = getattr(connection, "stop", None)
+                if callable(stop):
+                    stop()
+            except Exception:
+                continue
 
     def start_if_needed(self, runtime: ArbitrageTradeRuntime | object) -> None:
         profile_name = str(getattr(getattr(runtime, "credentials", None), "profile_name", "") or "").strip()

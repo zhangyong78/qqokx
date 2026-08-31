@@ -493,11 +493,12 @@ class OkxRestClient:
         self._option_tick_band_cache_lock = threading.Lock()
         self._option_tick_band_cache: dict[str, tuple[tuple[OptionTickBand, ...], float]] = {}
 
-    def close_profile_websockets(self, credentials: Credentials, *, environment: str) -> None:
-        """Stop and forget private WS connections for one API profile.
+    def detach_profile_websockets(self, credentials: Credentials, *, environment: str) -> tuple[object, ...]:
+        """Detach private WS connections for one API profile without waiting for them.
 
-        Account/profile switching must not leave the old profile's asyncio
-        threads running while the new profile is being started.
+        The returned connections are already removed from this client's maps,
+        so they can be stopped in a background worker while a new API profile
+        is brought online immediately.
         """
         profile_name = (credentials.profile_name or "").strip()
         key = (credentials.api_key, profile_name, environment)
@@ -512,6 +513,11 @@ class OkxRestClient:
             if connection is not None:
                 connections.append(connection)
             self._algo_ws_error_once.discard(key)
+        return tuple(connections)
+
+    def close_profile_websockets(self, credentials: Credentials, *, environment: str) -> None:
+        """Stop and forget private WS connections for one API profile."""
+        connections = self.detach_profile_websockets(credentials, environment=environment)
         for connection in connections:
             try:
                 connection.stop()  # type: ignore[attr-defined]

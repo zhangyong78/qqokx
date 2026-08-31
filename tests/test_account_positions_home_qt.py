@@ -90,6 +90,28 @@ class PositionDisplayForegroundColorsTest(TestCase):
         self.assertEqual((markers[0].kind, markers[0].timestamp, markers[0].price, markers[0].direction), ("entry", 1_752_210_000_000, Decimal("0.0250"), "short"))
         self.assertEqual((markers[1].kind, markers[1].timestamp, markers[1].price, markers[1].direction), ("exit", 1_752_300_600_000, Decimal("0.0125"), "short"))
 
+    def test_history_position_kline_close_marker_keeps_actual_pnl_and_current_usdt_value(self) -> None:
+        history_item = SimpleNamespace(
+            update_time=1_752_300_600_000,
+            inst_id="BTC-USD-260828-81000-C",
+            inst_type="OPTION",
+            pos_side="long",
+            direction=None,
+            open_avg_price=Decimal("0.0100"),
+            close_avg_price=Decimal("0.0125"),
+            realized_pnl=Decimal("0.00125"),
+            raw={"cTime": "1752210000000", "uTime": "1752300600000", "pnlCcy": "BTC"},
+        )
+
+        markers = account_positions_module._position_history_kline_price_markers(
+            history_item,
+            usdt_prices={"BTC": Decimal("80000")},
+        )
+
+        self.assertEqual(markers[1].realized_pnl, Decimal("0.00125"))
+        self.assertEqual(markers[1].pnl_currency, "BTC")
+        self.assertEqual(markers[1].realized_pnl_usdt, Decimal("100.00"))
+
     def test_current_position_kline_price_marker_uses_current_open_price_only(self) -> None:
         position = SimpleNamespace(
             position=Decimal("0.5"),

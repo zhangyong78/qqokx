@@ -87,6 +87,47 @@ class KlineAccountDrawerWidgetTests(QtWidgetTestCase):
         finally:
             self.dispose_widget(drawer)
 
+    def test_hidden_drawer_keeps_realtime_snapshot_without_populating_tables(self) -> None:
+        drawer = KlineAccountDrawer()
+        try:
+            drawer._profile_name = "moni"
+            drawer._environment = "demo"
+            drawer._refresh_tables = Mock()
+            snapshot = AccountRealtimeSnapshot(
+                profile_name="moni",
+                environment="demo",
+                positions=(SimpleNamespace(inst_id="BTC-USDT-SWAP"),),
+                orders=(),
+                account=None,
+                generation=1,
+                source="rest",
+            )
+
+            drawer._apply_realtime_snapshot(snapshot)
+
+            self.assertEqual(drawer._snapshot.positions, snapshot.positions)
+            drawer._refresh_tables.assert_not_called()
+        finally:
+            self.dispose_widget(drawer)
+
+    def test_visible_drawer_refreshes_only_the_active_positions_tab(self) -> None:
+        drawer = KlineAccountDrawer()
+        try:
+            drawer.show()
+            drawer._tabs.setCurrentIndex(1)
+            self._app.processEvents()
+            drawer._populate_orders_table = Mock()
+            drawer._populate_positions_table = Mock()
+            drawer._populate_history_orders_table = Mock()
+
+            drawer._refresh_active_table()
+
+            drawer._populate_positions_table.assert_called_once()
+            drawer._populate_orders_table.assert_not_called()
+            drawer._populate_history_orders_table.assert_not_called()
+        finally:
+            self.dispose_widget(drawer)
+
     def test_positions_table_uses_the_holdings_page_column_definition(self) -> None:
         drawer = KlineAccountDrawer()
         try:
@@ -384,6 +425,8 @@ class KlineAccountDrawerWidgetTests(QtWidgetTestCase):
             drawer._profile_name = "moni"
             drawer._environment = "demo"
             drawer._symbol = "BTC-USDT-SWAP"
+            drawer.show()
+            self._app.processEvents()
 
             drawer._apply_shared_order_snapshot(
                 "moni",
@@ -394,9 +437,13 @@ class KlineAccountDrawerWidgetTests(QtWidgetTestCase):
                 ),
             )
 
+            self._app.processEvents()
             self.assertEqual(drawer._orders_table.rowCount(), 1)
-            self.assertEqual(drawer._history_orders_table.rowCount(), 1)
             self.assertEqual(drawer._orders_table.item(0, 0).text(), "BTC-USDT-SWAP")
+
+            drawer._tabs.setCurrentIndex(2)
+            self._app.processEvents()
+            self.assertEqual(drawer._history_orders_table.rowCount(), 1)
             self.assertEqual(drawer._history_orders_table.item(0, 0).text(), "BTC-USDT-SWAP")
         finally:
             self.dispose_widget(drawer)
@@ -494,6 +541,24 @@ class KlineAccountDrawerCancelTests(QtWidgetTestCase):
 
 
 class KlineAnalysisWindowAccountDrawerTests(QtWidgetTestCase):
+    def test_account_prefetch_starts_after_chart_render_without_showing_drawer(self) -> None:
+        realtime_store = Mock()
+        drawer = SimpleNamespace(_realtime_store=realtime_store)
+        window = SimpleNamespace(
+            _account_drawer=drawer,
+            _runtime=object(),
+            _account_prefetch_context=None,
+            _active_profile_name=lambda: "159",
+            _active_environment=lambda: "live",
+            _sync_account_drawer_context=Mock(),
+        )
+
+        KlineAnalysisWindow._prefetch_account_drawer_after_chart_ready(window)
+
+        self.assertEqual(window._account_prefetch_context, ("159", "live"))
+        window._sync_account_drawer_context.assert_called_once_with(refresh_if_visible=False)
+        realtime_store.request_reconcile.assert_called_once_with("kline-prefetch")
+
     def test_kline_window_has_collapsed_account_drawer_and_two_entry_buttons(self) -> None:
         with (
             patch("roll_terminal_qt.kline_analysis_window.QTimer.singleShot", return_value=None),

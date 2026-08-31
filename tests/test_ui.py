@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import inspect
 from decimal import Decimal
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
@@ -2425,6 +2425,68 @@ HTTP 502: <!DOCTYPE html>
                 ("close:L01", "平仓 07-17 07:20 | 价格=63771\n本次盈亏=-13.88 USDT"),
             ],
         )
+        self.assertEqual(
+            [(marker.event, marker.price, marker.direction, marker.net_pnl) for marker in markers],
+            [
+                ("open", Decimal("64937.00"), "short", None),
+                ("close", Decimal("63771.00"), "short", Decimal("-13.879740197042042")),
+            ],
+        )
+
+    def test_account_equity_curve_trade_records_match_api_environment_and_visible_range(self) -> None:
+        app = QuantApp.__new__(QuantApp)
+        app._strategy_trade_ledger_records = [
+            StrategyTradeLedgerRecord(
+                record_id="visible",
+                history_record_id="H1",
+                session_id="S1",
+                api_name="ReapAi",
+                strategy_id="ema",
+                strategy_name="EMA",
+                symbol="SOL-USDT-SWAP",
+                direction_label="只做多",
+                run_mode_label="交易并下单",
+                environment="live",
+                opened_at=datetime(2026, 8, 30, 1, tzinfo=timezone.utc),
+                closed_at=datetime(2026, 8, 30, 3, tzinfo=timezone.utc),
+                net_pnl=Decimal("12.34"),
+            ),
+            StrategyTradeLedgerRecord(
+                record_id="other-api",
+                history_record_id="H2",
+                session_id="S2",
+                api_name="xhb",
+                strategy_id="ema",
+                strategy_name="EMA",
+                symbol="BTC-USDT-SWAP",
+                direction_label="只做多",
+                run_mode_label="交易并下单",
+                environment="live",
+                closed_at=datetime(2026, 8, 30, 4, tzinfo=timezone.utc),
+            ),
+            StrategyTradeLedgerRecord(
+                record_id="old",
+                history_record_id="H3",
+                session_id="S3",
+                api_name="ReapAi",
+                strategy_id="ema",
+                strategy_name="EMA",
+                symbol="ETH-USDT-SWAP",
+                direction_label="只做多",
+                run_mode_label="交易并下单",
+                environment="live",
+                closed_at=datetime(2026, 8, 20, 4, tzinfo=timezone.utc),
+            ),
+        ]
+
+        records = QuantApp._account_equity_curve_trade_records(
+            app,
+            ("ReapAi", "live"),
+            start_time=datetime(2026, 8, 29, tzinfo=timezone.utc),
+            end_time=datetime(2026, 8, 31, tzinfo=timezone.utc),
+        )
+
+        self.assertEqual([record.record_id for record in records], ["visible"])
 
     def test_strategy_live_chart_event_time_markers_ignore_unrelated_fills_after_closed_round(self) -> None:
         opened_at = datetime(2026, 4, 28, 9, 0)

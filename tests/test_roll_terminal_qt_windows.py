@@ -157,6 +157,22 @@ class RollTerminalQtWindowHelperTests(QtWidgetTestCase):
         self.assertEqual(CandlestickChartView._position_result_percent(long_entry, long_exit), Decimal("25.00"))
         self.assertEqual(CandlestickChartView._position_result_percent(short_entry, short_exit), Decimal("20.0"))
 
+    def test_position_close_marker_label_includes_actual_coin_pnl_and_usdt_equivalent(self) -> None:
+        marker = PositionPriceMarker(
+            "exit",
+            2,
+            Decimal("0.0125"),
+            "long",
+            realized_pnl=Decimal("0.00125"),
+            pnl_currency="BTC",
+            realized_pnl_usdt=Decimal("100"),
+        )
+
+        self.assertEqual(
+            CandlestickChartView._position_marker_pnl_label_lines(marker),
+            ("盈亏 +0.00125000 BTC", "≈ +100.00 USDT"),
+        )
+
     def test_option_chain_mark_columns_resolve_the_matching_contract(self) -> None:
         instrument_kwargs = {
             "inst_type": "OPTION",

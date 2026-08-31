@@ -14,7 +14,7 @@ from typing import Any, Callable
 from uuid import uuid4
 
 from PySide6.QtCore import QDateTime, QMargins, QObject, QPointF, QRectF, QTimer, Qt, QThread, Signal, Slot
-from PySide6.QtGui import QAction, QColor, QPainter, QPen
+from PySide6.QtGui import QAction, QColor, QPainter, QPen, QPolygonF
 try:
     from PySide6.QtCharts import QCandlestickSeries, QCandlestickSet, QChart, QChartView, QDateTimeAxis, QLineSeries, QValueAxis
 except Exception:  # pragma: no cover - fallback for environments without QtCharts
@@ -2672,6 +2672,7 @@ class KlineHistoryTradeMarker:
     direction: str
     event: str
     realized_pnl: Decimal | None = None
+    pnl_currency: str = ""
 
 
 def _history_position_direction(item: OkxPositionHistoryItem) -> str:
@@ -2773,6 +2774,8 @@ def _build_kline_history_trade_markers(
         realized_pnl = getattr(item, "realized_pnl", None)
         if realized_pnl is None:
             realized_pnl = getattr(item, "pnl", None)
+        raw = item.raw if isinstance(item.raw, dict) else {}
+        pnl_currency = str(raw.get("ccy") or raw.get("pnlCcy") or raw.get("settleCcy") or "").strip().upper()
         markers.append(
             KlineHistoryTradeMarker(
                 at_seconds=closed_at,
@@ -2780,6 +2783,7 @@ def _build_kline_history_trade_markers(
                 direction=direction,
                 event="close",
                 realized_pnl=realized_pnl if isinstance(realized_pnl, Decimal) else None,
+                pnl_currency=pnl_currency,
             )
         )
     markers.sort(key=lambda item: (item.at_seconds, item.direction, item.event, item.price))
@@ -2887,6 +2891,9 @@ def _history_trade_markers_for_candles(
                 "price": marker.price,
                 "direction": marker.direction,
                 "event": marker.event,
+                "timestamp": marker.at_seconds,
+                "realized_pnl": marker.realized_pnl,
+                "pnl_currency": marker.pnl_currency,
                 "label": f"{'开' if is_open else '平'}{'多' if is_long else '空'}{pnl_text}",
                 "color": _HISTORY_TRADE_OPEN_COLOR if is_open else _HISTORY_TRADE_CLOSE_COLOR,
             }
@@ -4096,8 +4103,49 @@ if QChartView is not None:
             font.setBold(True)
             painter.setFont(font)
             metrics = painter.fontMetrics()
+            def marker_timestamp(marker: dict[str, Any]) -> int:
+                try:
+                    return int(marker.get("timestamp", 0) or 0)
+                except (TypeError, ValueError):
+                    return 0
+
+            def marker_result_percent(entry: dict[str, Any], exit_marker: dict[str, Any]) -> float:
+                try:
+                    entry_price = float(entry.get("logical_price", entry.get("price", 0.0)) or 0.0)
+                    exit_price = float(exit_marker.get("logical_price", exit_marker.get("price", 0.0)) or 0.0)
+                except (TypeError, ValueError):
+                    return 0.0
+                if entry_price <= 0.0:
+                    return 0.0
+                change = exit_price - entry_price
+                if str(entry.get("direction", "") or "").strip().lower() == "short":
+                    change = -change
+                return (change / entry_price) * 100.0
+
+            ordered_markers = sorted(
+                (item for item in self._history_trade_markers if isinstance(item, dict)),
+                key=lambda item: (
+                    marker_timestamp(item),
+                    str(item.get("event", "") or "").strip().lower() != "open",
+                ),
+            )
+            pending_entries: dict[str, list[dict[str, Any]]] = {"long": [], "short": []}
+            exit_results: dict[int, tuple[dict[str, Any], float]] = {}
+            for marker in ordered_markers:
+                direction = str(marker.get("direction", "") or "").strip().lower()
+                event = str(marker.get("event", "") or "").strip().lower()
+                if direction not in pending_entries:
+                    continue
+                if event == "open":
+                    pending_entries[direction].append(marker)
+                    continue
+                if event != "close" or not pending_entries[direction]:
+                    continue
+                entry = pending_entries[direction].pop(0)
+                exit_results[id(marker)] = (entry, marker_result_percent(entry, marker))
+
             visible_markers: list[tuple[int, float, dict[str, Any]]] = []
-            for marker in self._history_trade_markers:
+            for marker in ordered_markers:
                 index = int(marker.get("index", -1))
                 if index < left_index or index > right_index or index >= len(self._candles):
                     continue
@@ -4108,105 +4156,154 @@ if QChartView is not None:
                 if price > 0.0:
                     visible_markers.append((index, price, marker))
 
-            # Labels from nearby trades often share the same price area.  Track their
-            # occupied rectangles and choose another side/level before drawing one.
-            visible_markers.sort(
-                key=lambda item: (
-                    item[0],
-                    str(item[2].get("event", "") or "").strip().lower() != "close",
-                    item[1],
+            # Connect each matched opening and closing trade with profit/loss colour.
+            for exit_id, (entry, result_percent) in exit_results.items():
+                exit_marker = next((item for item in ordered_markers if id(item) == exit_id), None)
+                if exit_marker is None:
+                    continue
+                entry_index = int(entry.get("index", -1))
+                exit_index = int(exit_marker.get("index", -1))
+                if not (left_index <= entry_index <= right_index and left_index <= exit_index <= right_index):
+                    continue
+                try:
+                    entry_price = float(entry.get("price", 0.0) or 0.0)
+                    exit_price = float(exit_marker.get("price", 0.0) or 0.0)
+                except (TypeError, ValueError):
+                    continue
+                if entry_price <= 0.0 or exit_price <= 0.0:
+                    continue
+                connector_color = QColor("#22c55e" if result_percent > 0.0 else "#ef4444" if result_percent < 0.0 else "#94a3b8")
+                connector_color.setAlpha(190)
+                painter.setPen(QPen(connector_color, 2))
+                entry_x = self._x_for_index(entry_index, plot_area)
+                exit_x = self._x_for_index(exit_index, plot_area)
+                gap = 10.0
+                if exit_x >= entry_x:
+                    entry_x += gap
+                    exit_x -= gap
+                else:
+                    entry_x -= gap
+                    exit_x += gap
+                painter.drawLine(
+                    QPointF(entry_x, self._y_for_value(entry_price, plot_area)),
+                    QPointF(exit_x, self._y_for_value(exit_price, plot_area)),
                 )
-            )
+
+            # An unmatched opening is still held.  Retain the latest local rule: a
+            # short blue dashed price guide rather than inventing a closing result.
+            for direction in ("long", "short"):
+                for entry in pending_entries[direction]:
+                    index = int(entry.get("index", -1))
+                    if not left_index <= index <= right_index:
+                        continue
+                    try:
+                        price = float(entry.get("price", 0.0) or 0.0)
+                    except (TypeError, ValueError):
+                        continue
+                    if price <= 0.0:
+                        continue
+                    guide_color = QColor("#38bdf8")
+                    guide_color.setAlpha(155)
+                    guide_pen = QPen(guide_color, 1)
+                    guide_pen.setStyle(Qt.PenStyle.DashLine)
+                    painter.setPen(guide_pen)
+                    start_x = self._x_for_index(index, plot_area)
+                    end_x = self._x_for_index(min(index + 5, len(self._candles) - 1), plot_area)
+                    painter.drawLine(QPointF(start_x, self._y_for_value(price, plot_area)), QPointF(max(start_x, end_x), self._y_for_value(price, plot_area)))
+
             occupied_label_rects: list[QRectF] = []
             text_height = float(metrics.height())
             text_ascent = float(metrics.ascent())
-            tag_horizontal_padding = 6.0
-            tag_vertical_padding = 4.0
-            tag_height = text_height + (tag_vertical_padding * 2.0)
-            top_limit = float(plot_area.top()) + (tag_height / 2.0) + 3.0
-            bottom_limit = float(plot_area.bottom()) - (tag_height / 2.0) - 3.0
+            padding_x = 6.0
+            padding_y = 3.0
             for index, price, marker in visible_markers:
-                x_center = self._x_for_index(index, plot_area)
-                y_center = self._y_for_value(price, plot_area)
                 event = str(marker.get("event", "") or "").strip().lower()
-                is_open = event == "open"
-                color = QColor(
-                    str(marker.get("color", _HISTORY_TRADE_OPEN_COLOR if is_open else _HISTORY_TRADE_CLOSE_COLOR))
-                )
-                label = str(marker.get("label", "") or "")
-                if label:
-                    text_width = float(metrics.horizontalAdvance(label))
-                    label_rect: QRectF | None = None
-                    label_center_y = y_center
-                    draw_below = is_open
-                    text_x = x_center + 7.0
-                    # Entries prefer below their price and exits above it.  If another
-                    # label occupies that space, try the opposite side and then widen
-                    # the vertical gap progressively.
-                    for side in (1 if is_open else -1, -1 if is_open else 1):
+                direction = str(marker.get("direction", "") or "").strip().lower()
+                is_sell = (event == "open" and direction == "short") or (event == "close" and direction == "long")
+                color = QColor("#ef4444" if is_sell else "#22c55e")
+                candle = self._candles[index]
+                candle_top = self._y_for_value(float(candle["high"]), plot_area)
+                candle_bottom = self._y_for_value(float(candle["low"]), plot_area)
+                x_center = self._x_for_index(index, plot_area)
+                time_text = QDateTime.fromSecsSinceEpoch(marker_timestamp(marker)).toString("MM-dd HH:mm")
+                label_lines = ["开仓" if event == "open" else "平仓", self._format_hover_value(price)]
+                result = exit_results.get(id(marker))
+                if event == "close" and result is not None:
+                    label_lines.append(f"{result[1]:+.2f}%")
+                    pnl = marker.get("realized_pnl")
+                    try:
+                        pnl_value = float(pnl) if pnl is not None else None
+                    except (TypeError, ValueError):
+                        pnl_value = None
+                    if pnl_value is not None:
+                        currency = str(marker.get("pnl_currency", "") or "").strip().upper()
+                        label_lines.append(f"盈亏 {pnl_value:+.2f}{(' ' + currency) if currency else ''}")
+                label_lines.append(time_text)
+                label_width = max(float(metrics.horizontalAdvance(line)) for line in label_lines) + (padding_x * 2.0)
+                label_height = (text_height * len(label_lines)) + (padding_y * 2.0)
+                arrow_tip = candle_top if is_sell else candle_bottom
+                arrow_length = 26.0
+                if is_sell:
+                    painter.setPen(QPen(color, 1.5))
+                    painter.drawLine(QPointF(x_center, max(arrow_tip - arrow_length, float(plot_area.top()) + 3.0)), QPointF(x_center, arrow_tip - 7.0))
+                    triangle = QPolygonF((QPointF(x_center - 5.0, arrow_tip - 7.0), QPointF(x_center + 5.0, arrow_tip - 7.0), QPointF(x_center, arrow_tip)))
+                else:
+                    painter.setPen(QPen(color, 1.5))
+                    painter.drawLine(QPointF(x_center, min(arrow_tip + arrow_length, float(plot_area.bottom()) - 3.0)), QPointF(x_center, arrow_tip + 7.0))
+                    triangle = QPolygonF((QPointF(x_center - 5.0, arrow_tip + 7.0), QPointF(x_center + 5.0, arrow_tip + 7.0), QPointF(x_center, arrow_tip)))
+                painter.setPen(Qt.PenStyle.NoPen)
+                painter.setBrush(color)
+                painter.drawPolygon(triangle)
+
+                label_rect: QRectF | None = None
+                text_x = x_center + 8.0
+                for side in (-1 if is_sell else 1, 1 if is_sell else -1):
+                    for level in range(12):
+                        candidate_top = (
+                            arrow_tip - 6.0 - label_height - (level * (label_height + 8.0))
+                            if side < 0
+                            else arrow_tip + 6.0 + (level * (label_height + 8.0))
+                        )
+                        candidate_top = _clamp(
+                            candidate_top,
+                            float(plot_area.top()) + 2.0,
+                            float(plot_area.bottom()) - label_height - 2.0,
+                        )
+                        for candidate_x in (
+                            _clamp(x_center + 8.0, float(plot_area.left()) + 2.0, float(plot_area.right()) - label_width - 2.0),
+                            _clamp(x_center - label_width - 8.0, float(plot_area.left()) + 2.0, float(plot_area.right()) - label_width - 2.0),
+                        ):
+                            candidate = QRectF(candidate_x, candidate_top, label_width, label_height)
+                            if any(candidate.intersects(existing) for existing in occupied_label_rects):
+                                continue
+                            label_rect = candidate
+                            text_x = candidate_x + padding_x
+                            break
                         if label_rect is not None:
                             break
-                        for level in range(12):
-                            candidate_center_y = _clamp(
-                                y_center + (side * (22.0 + (level * (tag_height + 10.0)))),
-                                top_limit,
-                                bottom_limit,
-                            )
-                            right_x = _clamp(
-                                x_center + 10.0,
-                                float(plot_area.left()) + 2.0,
-                                float(plot_area.right()) - text_width - 2.0,
-                            )
-                            left_x = _clamp(
-                                x_center - text_width - 10.0,
-                                float(plot_area.left()) + 2.0,
-                                float(plot_area.right()) - text_width - 2.0,
-                            )
-                            for candidate_x in (right_x, left_x):
-                                candidate_rect = QRectF(
-                                    candidate_x - tag_horizontal_padding,
-                                    candidate_center_y - (tag_height / 2.0),
-                                    text_width + (tag_horizontal_padding * 2.0),
-                                    tag_height,
-                                )
-                                if any(candidate_rect.intersects(rect) for rect in occupied_label_rects):
-                                    continue
-                                label_rect = candidate_rect
-                                label_center_y = candidate_center_y
-                                draw_below = side > 0
-                                text_x = candidate_x
-                                break
-                            if label_rect is not None:
-                                break
-                    if label_rect is None:
-                        label_center_y = _clamp(y_center + (22.0 if is_open else -22.0), top_limit, bottom_limit)
-                        text_x = _clamp(
-                            x_center + 10.0,
-                            float(plot_area.left()) + 2.0,
-                            float(plot_area.right()) - text_width - 2.0,
-                        )
-                        label_rect = QRectF(
-                            text_x - tag_horizontal_padding,
-                            label_center_y - (tag_height / 2.0),
-                            text_width + (tag_horizontal_padding * 2.0),
-                            tag_height,
-                        )
-                    occupied_label_rects.append(label_rect)
-                    painter.setPen(QPen(color, 1))
-                    painter.drawLine(
-                        QPointF(x_center, y_center + (4.5 if draw_below else -4.5)),
-                        QPointF(x_center, float(label_rect.top()) if draw_below else float(label_rect.bottom())),
+                    if label_rect is not None:
+                        break
+                if label_rect is None:
+                    fallback_top = _clamp(
+                        arrow_tip - 6.0 - label_height if is_sell else arrow_tip + 6.0,
+                        float(plot_area.top()) + 2.0,
+                        float(plot_area.bottom()) - label_height - 2.0,
                     )
-                    painter.setBrush(QColor(_CHART_BACKGROUND_COLOR))
-                    painter.drawRoundedRect(label_rect, 3.0, 3.0)
-                    painter.setPen(color)
+                    fallback_x = _clamp(x_center + 8.0, float(plot_area.left()) + 2.0, float(plot_area.right()) - label_width - 2.0)
+                    label_rect = QRectF(fallback_x, fallback_top, label_width, label_height)
+                    text_x = fallback_x + padding_x
+                occupied_label_rects.append(label_rect)
+                background = QColor(_CHART_BACKGROUND_COLOR)
+                background.setAlpha(218)
+                painter.setPen(QPen(color, 1))
+                painter.setBrush(background)
+                painter.drawRoundedRect(label_rect, 3.0, 3.0)
+                painter.setPen(color)
+                for line_index, line in enumerate(label_lines):
                     painter.drawText(
-                        QPointF(text_x, float(label_rect.top()) + tag_vertical_padding + text_ascent),
-                        label,
+                        QPointF(text_x, float(label_rect.top()) + padding_y + text_ascent + (line_index * text_height)),
+                        line,
                     )
-                painter.setPen(QPen(color, 2))
-                painter.setBrush(color if is_open else QColor(_CHART_BACKGROUND_COLOR))
-                painter.drawEllipse(QPointF(x_center, y_center), 4.5, 4.5)
 
         def _draw_channel_overlays(self, painter: QPainter, plot_area: QRectF) -> None:
             if not self._channel_overlays or not self._candles:
@@ -5414,6 +5511,10 @@ class KlineAnalysisWindow(QMainWindow):
         self._account_drawer: KlineAccountDrawer | None = None
         self._orders_drawer_button: QPushButton | None = None
         self._positions_drawer_button: QPushButton | None = None
+        self._account_prefetch_context: tuple[str, str] | None = None
+        self._account_prefetch_timer = QTimer(self)
+        self._account_prefetch_timer.setSingleShot(True)
+        self._account_prefetch_timer.timeout.connect(self._prefetch_account_drawer_after_chart_ready)
         self._left_panel_hidden = True
         self._secondary_volatility_loader: SecondaryVolatilityDataLoader | None = None
         self._syncing_chart_range = False
@@ -5448,6 +5549,7 @@ class KlineAnalysisWindow(QMainWindow):
         self._build_header(main_layout)
         self._build_body(main_layout)
         self._toggle_left_panel(self._left_panel_hidden)
+        self._refresh_history_trade_availability()
         self._sync_primary_period_buttons()
         self._refresh_chart_mode_cycle_button()
         self._refresh_chart_view_range_button()
@@ -5716,9 +5818,9 @@ class KlineAnalysisWindow(QMainWindow):
         self._best_parameter_indicators_check.toggled.connect(self._on_best_parameter_indicators_changed)
         top_row.addWidget(self._best_parameter_indicators_check, 0)
 
-        history_trade_group = QFrame()
-        history_trade_group.setObjectName("ToolbarGroup")
-        history_trade_group.setStyleSheet(
+        self._history_trade_group = QFrame()
+        self._history_trade_group.setObjectName("ToolbarGroup")
+        self._history_trade_group.setStyleSheet(
             """
             QFrame#ToolbarGroup {
                 background: #f8fafc;
@@ -5727,7 +5829,7 @@ class KlineAnalysisWindow(QMainWindow):
             }
             """
         )
-        history_trade_layout = QHBoxLayout(history_trade_group)
+        history_trade_layout = QHBoxLayout(self._history_trade_group)
         history_trade_layout.setContentsMargins(10, 3, 10, 3)
         history_trade_layout.setSpacing(6)
         self._show_history_trades_check = QCheckBox("历史交易")
@@ -5746,7 +5848,7 @@ class KlineAnalysisWindow(QMainWindow):
         self._sync_history_trades_button.setToolTip("重新从 OKX 同步当前品种的历史仓位开仓、平仓记录。")
         self._sync_history_trades_button.clicked.connect(lambda: self._load_history_trades(force=True))
         history_trade_layout.addWidget(self._sync_history_trades_button)
-        top_row.addWidget(history_trade_group, 0)
+        top_row.addWidget(self._history_trade_group, 0)
 
         shape_signal_tooltip = (
             "形态说明：1H/4H/1D 显示核心标志K触发的形态信号。\n"
@@ -7090,10 +7192,20 @@ class KlineAnalysisWindow(QMainWindow):
         )
 
     def _visible_history_trade_markers(self) -> list[KlineHistoryTradeMarker]:
+        if not self._history_trades_supported():
+            return []
         if not hasattr(self, "_show_history_trades_check") or not self._show_history_trades_check.isChecked():
             return []
         markers = self._history_trade_markers_by_context.get(self._history_trade_context_key(), ())
         return _filter_kline_history_trade_markers(markers, direction_filter=self._history_trade_direction_filter())
+
+    def _history_trades_supported(self) -> bool:
+        return self._period_combo.currentText().strip().upper() == "1H"
+
+    def _refresh_history_trade_availability(self) -> None:
+        if not hasattr(self, "_history_trade_group"):
+            return
+        self._history_trade_group.setVisible(self._history_trades_supported())
 
     def _history_trade_direction_filter(self) -> str:
         if not hasattr(self, "_history_trade_direction_combo"):
@@ -7101,6 +7213,8 @@ class KlineAnalysisWindow(QMainWindow):
         return str(self._history_trade_direction_combo.currentData() or "all").strip().lower()
 
     def _load_history_trades(self, *, force: bool = False) -> None:
+        if not self._history_trades_supported():
+            return
         if not hasattr(self, "_show_history_trades_check") or not self._show_history_trades_check.isChecked():
             return
         context_key = self._history_trade_context_key()
@@ -7160,7 +7274,7 @@ class KlineAnalysisWindow(QMainWindow):
     def _on_history_trade_visibility_changed(self, enabled: bool) -> None:
         self._history_trade_direction_combo.setEnabled(enabled)
         self._sync_history_trades_button.setEnabled(enabled)
-        if enabled:
+        if enabled and self._history_trades_supported():
             self._load_history_trades()
         self._sync_chart_options()
 
@@ -7201,6 +7315,27 @@ class KlineAnalysisWindow(QMainWindow):
             symbol=self._selected_symbol(),
             refresh_if_visible=refresh_if_visible,
         )
+
+    def _schedule_account_drawer_prefetch_after_chart_render(self) -> None:
+        if self._account_drawer is None or self._runtime is None:
+            return
+        context = (self._active_profile_name(), self._active_environment())
+        if not all(context) or context == self._account_prefetch_context or self._account_prefetch_timer.isActive():
+            return
+        # Give the first K-line paint priority.  The account request itself is
+        # performed by RealtimeAccountStore on a background thread.
+        self._account_prefetch_timer.start(350)
+
+    @Slot()
+    def _prefetch_account_drawer_after_chart_ready(self) -> None:
+        if self._account_drawer is None or self._runtime is None:
+            return
+        context = (self._active_profile_name(), self._active_environment())
+        if not all(context) or context == self._account_prefetch_context:
+            return
+        self._account_prefetch_context = context
+        self._sync_account_drawer_context(refresh_if_visible=False)
+        self._account_drawer._realtime_store.request_reconcile("kline-prefetch")
 
     def _instrument_for_symbol(self, symbol: str | None = None) -> object | None:
         normalized = (symbol or self._selected_symbol()).strip().upper()
@@ -7509,6 +7644,7 @@ class KlineAnalysisWindow(QMainWindow):
     def _load_data(self) -> None:
         symbol = self._selected_symbol()
         period = self._period_combo.currentText()
+        self._refresh_history_trade_availability()
         _debug_log(f"[kline] _load_data begin | symbol={symbol or '-'} | period={period or '-'}")
         if not symbol:
             self._set_status("请输入交易对")
@@ -7714,14 +7850,20 @@ class KlineAnalysisWindow(QMainWindow):
         if not self._account_drawer.isHidden() and current_tab == target_tab:
             self._collapse_account_drawer()
             return
-        self._account_drawer.show()
-        self._account_drawer.show_tab(target_tab)
+        # Swap in the current cached account snapshot while hidden.  Rendering
+        # the wide data grid inside this click handler delays the drawer show.
         self._sync_account_drawer_context(refresh_if_visible=False)
+        self._account_drawer.show_tab(target_tab)
+        self._account_drawer.show()
         total_height = max(self._chart_account_splitter.size().height(), 1)
         drawer_height = max(int(total_height * 0.28), 180)
         chart_height = max(total_height - drawer_height, 240)
         self._chart_account_splitter.setSizes([chart_height, drawer_height])
-        self._account_drawer.refresh_data()
+        # First return to the event loop so the drawer and splitter can paint.
+        # The cached active tab then renders, while the latest account check
+        # continues in the existing background realtime store.
+        self._account_drawer._schedule_active_table_refresh()
+        self._account_drawer.schedule_refresh_data()
 
     def _collapse_account_drawer(self) -> None:
         if self._account_drawer is None or self._chart_account_splitter is None:
@@ -7732,6 +7874,7 @@ class KlineAnalysisWindow(QMainWindow):
 
     @Slot(str)
     def _on_period_changed(self, _value: str) -> None:
+        self._refresh_history_trade_availability()
         self._sync_primary_period_buttons()
         self._refresh_timer.setInterval(self._auto_refresh_interval_ms(_value))
         self._reload_workspace_view()
@@ -8331,6 +8474,7 @@ class KlineAnalysisWindow(QMainWindow):
     def _render_loaded_payload(self, payload: KlineChartPayload) -> None:
         if not self._use_native_chart:
             self._render_to_chart(payload)
+            self._schedule_account_drawer_prefetch_after_chart_render()
             return
         if self._should_stage_native_bootstrap(payload):
             preview_payload = _slice_chart_payload_tail(payload, _NATIVE_BOOTSTRAP_RENDER_BARS)
@@ -8338,6 +8482,7 @@ class KlineAnalysisWindow(QMainWindow):
             self._deferred_chart_payload = payload
             self._deferred_chart_request_id = self._active_request_id
             self._deferred_chart_render_timer.start(_NATIVE_BOOTSTRAP_RENDER_DELAY_MS)
+            self._schedule_account_drawer_prefetch_after_chart_render()
             return
         if self._deferred_chart_render_timer.isActive():
             self._deferred_chart_render_timer.stop()
@@ -8345,6 +8490,7 @@ class KlineAnalysisWindow(QMainWindow):
         self._deferred_chart_request_id = 0
         self._render_to_native_chart(payload)
         self._native_chart_bootstrap_complete = True
+        self._schedule_account_drawer_prefetch_after_chart_render()
 
     @Slot()
     def _render_deferred_full_chart(self) -> None:
@@ -8638,9 +8784,11 @@ class KlineAnalysisWindow(QMainWindow):
             )
             logical_payload = source_payload or payload
             for marker in history_trade_markers:
+                logical_price = float(marker.get("price", 0.0) or 0.0)
+                marker["logical_price"] = logical_price
                 marker["price"] = self._display_price_from_logical(
                     logical_payload,
-                    float(marker.get("price", 0.0) or 0.0),
+                    logical_price,
                     is_secondary=False,
                 )
 

@@ -12,6 +12,23 @@ from okx_quant.okx_client import OkxApiError, OkxOrderStatus, OkxRestClient, Okx
 
 
 class OkxClientOrderRequestTest(TestCase):
+    def test_detach_profile_websockets_removes_connections_before_they_stop(self) -> None:
+        client = OkxRestClient()
+        credentials = Credentials(api_key="key", secret_key="secret", passphrase="pass", profile_name="159")
+        key = (credentials.api_key, credentials.profile_name, "live")
+        private_connection = MagicMock()
+        algo_connection = MagicMock()
+        client._private_ws_connections[key] = private_connection
+        client._algo_ws_connections[key] = algo_connection
+
+        detached = client.detach_profile_websockets(credentials, environment="live")
+
+        self.assertEqual(detached, (private_connection, algo_connection))
+        self.assertNotIn(key, client._private_ws_connections)
+        self.assertNotIn(key, client._algo_ws_connections)
+        private_connection.stop.assert_not_called()
+        algo_connection.stop.assert_not_called()
+
     def test_get_option_tick_bands_parses_live_price_ranges(self) -> None:
         client = OkxRestClient()
         client._request = MagicMock(

@@ -18,6 +18,9 @@ from okx_quant.strategy_live_chart import (
     _layout_marker_label_positions,
     _layout_time_marker_line_segments,
     _layout_time_marker_label_positions,
+    _time_marker_is_in_candle_range,
+    _trade_marker_action_is_sell,
+    _trade_marker_result,
     append_candles_to_snapshot,
     build_auto_channel_live_chart_snapshot,
     build_strategy_live_chart_snapshot,
@@ -294,6 +297,72 @@ class StrategyLiveChartHelpersTest(TestCase):
 
         self.assertEqual(len(snapshot.time_markers), 1)
         self.assertEqual(snapshot.time_markers[0].label, "平仓 04-29 10:00")
+
+    def test_time_marker_range_excludes_old_events_instead_of_clamping_them_left(self) -> None:
+        candles = tuple(
+            Candle(
+                ts=1_714_330_800_000 + index * 3_600_000,
+                open=Decimal("100"),
+                high=Decimal("101"),
+                low=Decimal("99"),
+                close=Decimal("100"),
+                volume=Decimal("1"),
+                confirmed=True,
+            )
+            for index in range(3)
+        )
+        snapshot = StrategyLiveChartSnapshot(session_id="S01", candles=candles)
+        old_marker = StrategyLiveChartTimeMarker(
+            key="old",
+            label="旧平仓",
+            at=datetime.fromtimestamp((candles[0].ts - 3_600_000) / 1000),
+            color="#cf222e",
+        )
+        current_marker = StrategyLiveChartTimeMarker(
+            key="current",
+            label="当前平仓",
+            at=datetime.fromtimestamp((candles[-1].ts + 1_800_000) / 1000),
+            color="#cf222e",
+        )
+
+        self.assertFalse(_time_marker_is_in_candle_range(old_marker, snapshot))
+        self.assertTrue(_time_marker_is_in_candle_range(current_marker, snapshot))
+
+    def test_trade_marker_uses_actual_buy_sell_action_and_ledger_result(self) -> None:
+        opened_at = datetime(2026, 8, 30, 9)
+        long_open = StrategyLiveChartTimeMarker(
+            key="open",
+            label="开仓",
+            at=opened_at,
+            color="#1a7f37",
+            event="open",
+            price=Decimal("100"),
+            direction="long",
+        )
+        long_close = StrategyLiveChartTimeMarker(
+            key="close",
+            label="平仓",
+            at=opened_at,
+            color="#cf222e",
+            event="close",
+            price=Decimal("110"),
+            direction="long",
+            net_pnl=Decimal("8.5"),
+        )
+        short_open = StrategyLiveChartTimeMarker(
+            key="short-open",
+            label="开仓",
+            at=opened_at,
+            color="#cf222e",
+            event="open",
+            price=Decimal("100"),
+            direction="short",
+        )
+
+        self.assertFalse(_trade_marker_action_is_sell(long_open))
+        self.assertTrue(_trade_marker_action_is_sell(long_close))
+        self.assertTrue(_trade_marker_action_is_sell(short_open))
+        self.assertEqual(_trade_marker_result(long_open, long_close), Decimal("10"))
 
     def test_slice_with_desk_right_pad_fills_visible_width(self) -> None:
         candles = [
