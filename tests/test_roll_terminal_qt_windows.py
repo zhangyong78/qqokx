@@ -5980,6 +5980,21 @@ class RollTerminalQtWindowHelperTests(QtWidgetTestCase):
             finally:
                 self.__class__.dispose_widget(window)
 
+    def test_dual_chart_defaults_to_side_by_side_layout(self) -> None:
+        with patch("roll_terminal_qt.kline_analysis_window.QTimer.singleShot", return_value=None):
+            window = KlineAnalysisWindow()
+            try:
+                window._chart_stack_splitter = QSplitter()
+                window._secondary_layout_mode_value = "vertical"
+
+                with patch.object(window, "_load_data"):
+                    window._secondary_chart_check.setChecked(True)
+
+                self.assertEqual(window._secondary_layout_mode(), "horizontal")
+                self.assertEqual(window._chart_stack_splitter.orientation(), Qt.Orientation.Horizontal)
+            finally:
+                self.__class__.dispose_widget(window)
+
     def test_triple_chart_controls_show_only_when_enabled(self) -> None:
         with patch("roll_terminal_qt.kline_analysis_window.QTimer.singleShot", return_value=None):
             window = KlineAnalysisWindow()

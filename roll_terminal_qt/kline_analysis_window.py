@@ -5494,7 +5494,8 @@ class KlineAnalysisWindow(QMainWindow):
         self._secondary_layout_cycle_btn: QPushButton | None = None
         self._secondary_chart_kind_btn: QPushButton | None = None
         self._secondary_sync_period_btn: QPushButton | None = None
-        self._secondary_layout_mode_value = "vertical"
+        # 双图联动默认左右并排，便于同时比较两个周期/交易对。
+        self._secondary_layout_mode_value = "horizontal"
         self._secondary_chart_kind_mode = "kline"
         self._shape_signal_size_metric = "body"
         self._initial_load_requested = False
@@ -6521,8 +6522,8 @@ class KlineAnalysisWindow(QMainWindow):
         return bool(self._tertiary_chart_check.isChecked())
 
     def _secondary_layout_mode(self) -> str:
-        value = str(self._secondary_layout_mode_value or "vertical").strip().lower()
-        return value if value in {"vertical", "horizontal"} else "vertical"
+        value = str(self._secondary_layout_mode_value or "horizontal").strip().lower()
+        return value if value in {"vertical", "horizontal"} else "horizontal"
 
     def _refresh_secondary_layout_button(self) -> None:
         if self._secondary_layout_cycle_btn is None:
@@ -6803,7 +6804,7 @@ class KlineAnalysisWindow(QMainWindow):
     def _on_chart_mode_cycle_clicked(self) -> None:
         next_enabled = not self._secondary_chart_check.isChecked()
         if next_enabled:
-            self._secondary_layout_mode_value = "vertical"
+            self._secondary_layout_mode_value = "horizontal"
             self._refresh_secondary_layout_button()
         self._secondary_chart_check.setChecked(next_enabled)
 
@@ -7888,6 +7889,8 @@ class KlineAnalysisWindow(QMainWindow):
             self._tertiary_chart_check.blockSignals(True)
             self._tertiary_chart_check.setChecked(False)
             self._tertiary_chart_check.blockSignals(False)
+        if enabled and not self._triple_chart_enabled():
+            self._secondary_layout_mode_value = "horizontal"
         primary_average_secondary_normal_was_enabled = self._primary_average_secondary_normal_check.isChecked()
         self._apply_secondary_chart_visibility()
         self._apply_chart_mode_period_defaults(dual_enabled=enabled)
