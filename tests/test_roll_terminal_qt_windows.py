@@ -5995,6 +5995,35 @@ class RollTerminalQtWindowHelperTests(QtWidgetTestCase):
             finally:
                 self.__class__.dispose_widget(window)
 
+    def test_chart_fullscreen_hides_controls_and_restores_layout(self) -> None:
+        with patch("roll_terminal_qt.kline_analysis_window.QTimer.singleShot", return_value=None):
+            window = KlineAnalysisWindow()
+            try:
+                header = window._header_panel
+                body_splitter = window._body_splitter
+                self.assertIsNotNone(header)
+                self.assertIsNotNone(body_splitter)
+                original_sizes = body_splitter.sizes()
+
+                with (
+                    patch.object(window, "showMaximized") as show_maximized,
+                    patch.object(window, "showNormal") as show_normal,
+                ):
+                    window._set_chart_fullscreen(True)
+                    self.assertTrue(window._chart_fullscreen_enabled)
+                    self.assertTrue(header.isHidden())
+                    self.assertEqual(body_splitter.sizes()[0], 0)
+                    show_maximized.assert_called_once()
+
+                    window._set_chart_fullscreen(False)
+
+                self.assertFalse(window._chart_fullscreen_enabled)
+                self.assertFalse(header.isHidden())
+                self.assertEqual(body_splitter.sizes(), original_sizes)
+                show_normal.assert_called_once()
+            finally:
+                self.__class__.dispose_widget(window)
+
     def test_triple_chart_controls_show_only_when_enabled(self) -> None:
         with patch("roll_terminal_qt.kline_analysis_window.QTimer.singleShot", return_value=None):
             window = KlineAnalysisWindow()

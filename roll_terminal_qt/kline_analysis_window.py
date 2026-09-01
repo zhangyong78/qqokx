@@ -5506,12 +5506,28 @@ class KlineAnalysisWindow(QMainWindow):
         self._body_splitter: QSplitter | None = None
         self._chart_account_splitter: QSplitter | None = None
         self._chart_host: QWidget | None = None
+        self._chart_host_layout: QVBoxLayout | None = None
         self._chart_frame: QFrame | None = None
+        self._header_panel: QFrame | None = None
         self._control_panel: QFrame | None = None
         self._control_scroll: QScrollArea | None = None
         self._account_drawer: KlineAccountDrawer | None = None
         self._orders_drawer_button: QPushButton | None = None
         self._positions_drawer_button: QPushButton | None = None
+        self._chart_fullscreen_button: QPushButton | None = None
+        self._chart_fullscreen_enabled = False
+        self._chart_fullscreen_restore_body_sizes: list[int] = []
+        self._chart_fullscreen_restore_account_sizes: list[int] = []
+        self._chart_fullscreen_restore_header_visible = True
+        self._chart_fullscreen_restore_control_visible = True
+        self._chart_fullscreen_restore_drawer_visible = False
+        self._chart_fullscreen_restore_workspace_header: QWidget | None = None
+        self._chart_fullscreen_restore_workspace_header_visible = False
+        self._chart_fullscreen_restore_main_margins = (10, 10, 10, 10)
+        self._chart_fullscreen_restore_main_spacing = 10
+        self._chart_fullscreen_window_target: QWidget | None = None
+        self._chart_fullscreen_restore_window_maximized = False
+        self._chart_fullscreen_owns_window_state = False
         self._account_prefetch_context: tuple[str, str] | None = None
         self._account_prefetch_timer = QTimer(self)
         self._account_prefetch_timer.setSingleShot(True)
@@ -5546,6 +5562,7 @@ class KlineAnalysisWindow(QMainWindow):
         main_layout = QVBoxLayout(root)
         main_layout.setContentsMargins(10, 10, 10, 10)
         main_layout.setSpacing(10)
+        self._main_layout = main_layout
 
         self._build_header(main_layout)
         self._build_body(main_layout)
@@ -5718,6 +5735,7 @@ class KlineAnalysisWindow(QMainWindow):
 
     def _build_header(self, parent_layout: QVBoxLayout) -> None:
         header = QFrame()
+        self._header_panel = header
         header.setObjectName("Panel")
         header_layout = QVBoxLayout(header)
         header_layout.setContentsMargins(12, 8, 12, 8)
@@ -6054,6 +6072,11 @@ class KlineAnalysisWindow(QMainWindow):
         self._hide_chart_btn.setCheckable(True)
         self._hide_chart_btn.toggled.connect(self._toggle_chart_visibility)
         action_row.addWidget(self._hide_chart_btn)
+
+        self._chart_fullscreen_button = QPushButton("全屏图表")
+        self._chart_fullscreen_button.setToolTip("最大化显示当前 K 线布局并保留窗口标题栏；按 F11 切换，Esc 退出。")
+        self._chart_fullscreen_button.clicked.connect(self._toggle_chart_fullscreen)
+        action_row.addWidget(self._chart_fullscreen_button)
 
         self._orders_drawer_button = QPushButton("委托")
         self._orders_drawer_button.clicked.connect(lambda: self._show_account_drawer("orders"))
@@ -6412,6 +6435,7 @@ class KlineAnalysisWindow(QMainWindow):
         self._chart_host = chart_host
         chart_host.setObjectName("Panel")
         chart_layout = QVBoxLayout(chart_host)
+        self._chart_host_layout = chart_layout
         chart_layout.setContentsMargins(8, 8, 8, 8)
         chart_layout.setSpacing(0)
 
@@ -6718,6 +6742,140 @@ class KlineAnalysisWindow(QMainWindow):
             drawer_height = max(int(total_height * 0.28), 180)
             splitter.setSizes([max(total_height - drawer_height, 240), drawer_height])
         self._hide_chart_btn.setText("显示图表" if hidden else "隐藏图表")
+
+    @Slot()
+    def _toggle_chart_fullscreen(self) -> None:
+        self._set_chart_fullscreen(not self._chart_fullscreen_enabled)
+
+    def _set_chart_fullscreen(self, enabled: bool) -> None:
+        enabled = bool(enabled)
+        if enabled == self._chart_fullscreen_enabled:
+            return
+
+        if enabled:
+            self._enter_chart_fullscreen()
+        else:
+            self._exit_chart_fullscreen()
+
+    def _enter_chart_fullscreen(self) -> None:
+        header = self._header_panel
+        control = self._control_scroll or self._control_panel
+        drawer = self._account_drawer
+        body_splitter = self._body_splitter
+        account_splitter = self._chart_account_splitter
+        chart_layout = self._chart_host_layout
+
+        self._chart_fullscreen_restore_header_visible = bool(header is not None and not header.isHidden())
+        self._chart_fullscreen_restore_control_visible = bool(control is not None and not control.isHidden())
+        self._chart_fullscreen_restore_drawer_visible = bool(drawer is not None and not drawer.isHidden())
+        self._chart_fullscreen_restore_body_sizes = list(body_splitter.sizes()) if body_splitter is not None else []
+        self._chart_fullscreen_restore_account_sizes = (
+            list(account_splitter.sizes()) if account_splitter is not None else []
+        )
+        if chart_layout is not None:
+            margins = chart_layout.contentsMargins()
+            self._chart_fullscreen_restore_main_margins = (
+                margins.left(),
+                margins.top(),
+                margins.right(),
+                margins.bottom(),
+            )
+            self._chart_fullscreen_restore_main_spacing = chart_layout.spacing()
+            chart_layout.setContentsMargins(0, 0, 0, 0)
+            chart_layout.setSpacing(0)
+
+        main_layout = getattr(self, "_main_layout", None)
+        if isinstance(main_layout, QVBoxLayout):
+            margins = main_layout.contentsMargins()
+            self._chart_fullscreen_restore_outer_margins = (
+                margins.left(),
+                margins.top(),
+                margins.right(),
+                margins.bottom(),
+            )
+            self._chart_fullscreen_restore_outer_spacing = main_layout.spacing()
+            main_layout.setContentsMargins(0, 0, 0, 0)
+            main_layout.setSpacing(0)
+
+        window_target = self.window()
+        self._chart_fullscreen_window_target = window_target
+        self._chart_fullscreen_restore_window_maximized = bool(window_target.isMaximized())
+        self._chart_fullscreen_owns_window_state = not (
+            window_target.isMaximized() or window_target.isFullScreen()
+        )
+
+        workspace_header = getattr(window_target, "_workspace_header", None)
+        if isinstance(workspace_header, QWidget):
+            self._chart_fullscreen_restore_workspace_header = workspace_header
+            self._chart_fullscreen_restore_workspace_header_visible = not workspace_header.isHidden()
+            workspace_header.hide()
+        else:
+            self._chart_fullscreen_restore_workspace_header = None
+            self._chart_fullscreen_restore_workspace_header_visible = False
+
+        if header is not None:
+            header.hide()
+        if control is not None:
+            control.hide()
+        if drawer is not None:
+            drawer.hide()
+        if body_splitter is not None:
+            body_splitter.setSizes([0, max(body_splitter.width(), self.width(), 1)])
+        if account_splitter is not None:
+            account_splitter.setSizes([max(account_splitter.height(), self.height(), 1), 0])
+
+        self._chart_fullscreen_enabled = True
+        if self._chart_fullscreen_button is not None:
+            self._chart_fullscreen_button.setText("退出全屏")
+        if self._chart_fullscreen_owns_window_state:
+            # 保留 Windows 标题栏，方便最小化、最大化和关闭。
+            window_target.showMaximized()
+        self._schedule_chart_layout_refresh(0)
+
+    def _exit_chart_fullscreen(self) -> None:
+        header = self._header_panel
+        control = self._control_scroll or self._control_panel
+        drawer = self._account_drawer
+        body_splitter = self._body_splitter
+        account_splitter = self._chart_account_splitter
+        chart_layout = self._chart_host_layout
+
+        if header is not None:
+            header.setVisible(self._chart_fullscreen_restore_header_visible)
+        if control is not None:
+            control.setVisible(self._chart_fullscreen_restore_control_visible)
+        if drawer is not None:
+            drawer.setVisible(self._chart_fullscreen_restore_drawer_visible)
+        if body_splitter is not None and self._chart_fullscreen_restore_body_sizes:
+            body_splitter.setSizes(self._chart_fullscreen_restore_body_sizes)
+        if account_splitter is not None and self._chart_fullscreen_restore_account_sizes:
+            account_splitter.setSizes(self._chart_fullscreen_restore_account_sizes)
+        if chart_layout is not None:
+            chart_layout.setContentsMargins(*self._chart_fullscreen_restore_main_margins)
+            chart_layout.setSpacing(self._chart_fullscreen_restore_main_spacing)
+
+        main_layout = getattr(self, "_main_layout", None)
+        if isinstance(main_layout, QVBoxLayout):
+            outer_margins = getattr(self, "_chart_fullscreen_restore_outer_margins", (10, 10, 10, 10))
+            main_layout.setContentsMargins(*outer_margins)
+            main_layout.setSpacing(getattr(self, "_chart_fullscreen_restore_outer_spacing", 10))
+
+        workspace_header = self._chart_fullscreen_restore_workspace_header
+        if workspace_header is not None:
+            workspace_header.setVisible(self._chart_fullscreen_restore_workspace_header_visible)
+        window_target = self._chart_fullscreen_window_target
+        if window_target is not None and self._chart_fullscreen_owns_window_state:
+            if self._chart_fullscreen_restore_window_maximized:
+                window_target.showMaximized()
+            else:
+                window_target.showNormal()
+
+        self._chart_fullscreen_enabled = False
+        self._chart_fullscreen_owns_window_state = False
+        self._chart_fullscreen_window_target = None
+        if self._chart_fullscreen_button is not None:
+            self._chart_fullscreen_button.setText("全屏图表")
+        self._schedule_chart_layout_refresh(0)
 
     def _update_secondary_controls_state(self) -> None:
         enabled = bool(self._secondary_chart_check.isChecked())
@@ -7076,6 +7234,14 @@ class KlineAnalysisWindow(QMainWindow):
         super().closeEvent(event)
 
     def keyPressEvent(self, event) -> None:  # noqa: ANN001
+        if event.key() == Qt.Key.Key_F11:
+            self._toggle_chart_fullscreen()
+            event.accept()
+            return
+        if event.key() == Qt.Key.Key_Escape and self._chart_fullscreen_enabled:
+            self._set_chart_fullscreen(False)
+            event.accept()
+            return
         if event.key() == Qt.Key.Key_Escape and self._draw_tool != "none":
             self._set_draw_tool("none")
             event.accept()
