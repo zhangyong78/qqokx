@@ -5995,6 +5995,27 @@ class RollTerminalQtWindowHelperTests(QtWidgetTestCase):
             finally:
                 self.__class__.dispose_widget(window)
 
+    def test_dynamic_chart_controls_do_not_expand_window_minimum_width(self) -> None:
+        with patch("roll_terminal_qt.kline_analysis_window.QTimer.singleShot", return_value=None):
+            window = KlineAnalysisWindow()
+            try:
+                initial_minimum_width = window.minimumSizeHint().width()
+
+                with patch.object(window, "_load_data"):
+                    window._secondary_chart_check.setChecked(True)
+                    dual_minimum_width = window.minimumSizeHint().width()
+                    window._tertiary_chart_check.setChecked(True)
+                    triple_minimum_width = window.minimumSizeHint().width()
+
+                self.assertEqual(dual_minimum_width, initial_minimum_width)
+                self.assertEqual(triple_minimum_width, initial_minimum_width)
+                self.assertEqual(
+                    window._header_panel.sizePolicy().horizontalPolicy(),
+                    QSizePolicy.Policy.Ignored,
+                )
+            finally:
+                self.__class__.dispose_widget(window)
+
     def test_chart_fullscreen_hides_controls_and_restores_layout(self) -> None:
         with patch("roll_terminal_qt.kline_analysis_window.QTimer.singleShot", return_value=None):
             window = KlineAnalysisWindow()

@@ -14,7 +14,7 @@ from typing import Any, Callable
 from uuid import uuid4
 
 from PySide6.QtCore import QDateTime, QMargins, QObject, QPointF, QRectF, QTimer, Qt, QThread, Signal, Slot
-from PySide6.QtGui import QAction, QColor, QPainter, QPen, QPolygonF
+from PySide6.QtGui import QAction, QColor, QGuiApplication, QPainter, QPen, QPolygonF
 try:
     from PySide6.QtCharts import QCandlestickSeries, QCandlestickSet, QChart, QChartView, QDateTimeAxis, QLineSeries, QValueAxis
 except Exception:  # pragma: no cover - fallback for environments without QtCharts
@@ -5587,6 +5587,7 @@ class KlineAnalysisWindow(QMainWindow):
         self._layout_refresh_timer = QTimer(self)
         self._layout_refresh_timer.setSingleShot(True)
         self._layout_refresh_timer.timeout.connect(self._refresh_chart_layout_after_window_change)
+        self._clamping_window_to_screen = False
         _debug_log("[kline] __init__ ready")
 
     def showEvent(self, event) -> None:  # noqa: ANN001
@@ -5737,6 +5738,9 @@ class KlineAnalysisWindow(QMainWindow):
         header = QFrame()
         self._header_panel = header
         header.setObjectName("Panel")
+        # Dynamic dual/triple-chart controls must not propagate their combined
+        # horizontal minimum width to the top-level window.
+        header.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         header_layout = QVBoxLayout(header)
         header_layout.setContentsMargins(12, 8, 12, 8)
         header_layout.setSpacing(6)
@@ -5956,14 +5960,14 @@ class KlineAnalysisWindow(QMainWindow):
         top_row.addWidget(self._status, 3, Qt.AlignmentFlag.AlignRight)
         header_layout.addLayout(top_row)
 
-        action_row = QHBoxLayout()
-        action_row.setSpacing(10)
+        linkage_row = QHBoxLayout()
+        linkage_row.setSpacing(10)
         self._secondary_chart_check = QCheckBox("双图联动")
         self._secondary_chart_check.toggled.connect(self._on_secondary_chart_toggled)
-        action_row.addWidget(self._secondary_chart_check)
+        linkage_row.addWidget(self._secondary_chart_check)
 
         self._secondary_symbol_label = QLabel("副图交易对")
-        action_row.addWidget(self._secondary_symbol_label)
+        linkage_row.addWidget(self._secondary_symbol_label)
         self._secondary_symbol_combo = QComboBox()
         self._secondary_symbol_combo.addItems(KLINE_SYMBOL_OPTIONS)
         self._secondary_symbol_combo.setMinimumWidth(_HEADER_SYMBOL_INPUT_MIN_WIDTH)
@@ -5972,14 +5976,14 @@ class KlineAnalysisWindow(QMainWindow):
         self._secondary_symbol_combo.setEnabled(False)
         self._secondary_symbol_combo.hide()
         self._secondary_symbol_combo.currentTextChanged.connect(self._on_secondary_symbol_changed)
-        action_row.addWidget(self._secondary_symbol_combo, 0)
+        linkage_row.addWidget(self._secondary_symbol_combo, 0)
         self._secondary_symbol_label.hide()
 
         self._tertiary_chart_check = QCheckBox("三图联动")
         self._tertiary_chart_check.toggled.connect(self._on_tertiary_chart_toggled)
-        action_row.addWidget(self._tertiary_chart_check)
+        linkage_row.addWidget(self._tertiary_chart_check)
         self._tertiary_symbol_label = QLabel("第三图交易对")
-        action_row.addWidget(self._tertiary_symbol_label)
+        linkage_row.addWidget(self._tertiary_symbol_label)
         self._tertiary_symbol_combo = QComboBox()
         self._tertiary_symbol_combo.addItems(KLINE_SYMBOL_OPTIONS)
         self._tertiary_symbol_combo.setMinimumWidth(_HEADER_SYMBOL_INPUT_MIN_WIDTH)
@@ -5988,21 +5992,21 @@ class KlineAnalysisWindow(QMainWindow):
         self._tertiary_symbol_combo.setEnabled(False)
         self._tertiary_symbol_combo.hide()
         self._tertiary_symbol_combo.currentTextChanged.connect(self._on_tertiary_symbol_changed)
-        action_row.addWidget(self._tertiary_symbol_combo, 0)
+        linkage_row.addWidget(self._tertiary_symbol_combo, 0)
         self._tertiary_symbol_label.hide()
         self._tertiary_period_label = QLabel("第三图周期")
-        action_row.addWidget(self._tertiary_period_label)
+        linkage_row.addWidget(self._tertiary_period_label)
         self._tertiary_period_combo = QComboBox()
         self._tertiary_period_combo.addItems([period for _, period in _PRIMARY_PERIOD_OPTIONS])
         self._tertiary_period_combo.setCurrentText(_DEFAULT_DUAL_SECONDARY_PERIOD)
         self._tertiary_period_combo.setEnabled(False)
         self._tertiary_period_combo.hide()
         self._tertiary_period_combo.currentTextChanged.connect(self._on_tertiary_period_changed)
-        action_row.addWidget(self._tertiary_period_combo, 0)
+        linkage_row.addWidget(self._tertiary_period_combo, 0)
         self._tertiary_period_label.hide()
 
         self._secondary_period_label = QLabel("副图周期")
-        action_row.addWidget(self._secondary_period_label)
+        linkage_row.addWidget(self._secondary_period_label)
         self._secondary_period_combo = QComboBox()
         self._secondary_period_combo.addItems([period for _, period in _PRIMARY_PERIOD_OPTIONS])
         self._secondary_period_combo.addItem("1Dutc")
@@ -6010,31 +6014,34 @@ class KlineAnalysisWindow(QMainWindow):
         self._secondary_period_combo.setEnabled(False)
         self._secondary_period_combo.hide()
         self._secondary_period_combo.currentTextChanged.connect(self._on_secondary_period_changed)
-        action_row.addWidget(self._secondary_period_combo, 0)
+        linkage_row.addWidget(self._secondary_period_combo, 0)
         self._secondary_period_label.hide()
 
         self._secondary_layout_cycle_btn = QPushButton("")
         self._secondary_layout_cycle_btn.setEnabled(False)
         self._secondary_layout_cycle_btn.clicked.connect(self._on_secondary_layout_cycle_clicked)
-        action_row.addWidget(self._secondary_layout_cycle_btn)
+        linkage_row.addWidget(self._secondary_layout_cycle_btn)
 
         self._secondary_chart_kind_btn = QPushButton("")
         self._secondary_chart_kind_btn.setEnabled(False)
         self._secondary_chart_kind_btn.clicked.connect(self._on_secondary_chart_kind_cycle_clicked)
-        action_row.addWidget(self._secondary_chart_kind_btn)
+        linkage_row.addWidget(self._secondary_chart_kind_btn)
 
         self._secondary_sync_period_btn = QPushButton("")
         self._secondary_sync_period_btn.setEnabled(False)
         self._secondary_sync_period_btn.setToolTip("副图为K线时：主图1D、副图4H并切换到最近视图")
         self._secondary_sync_period_btn.clicked.connect(self._on_secondary_sync_period_clicked)
-        action_row.addWidget(self._secondary_sync_period_btn)
+        linkage_row.addWidget(self._secondary_sync_period_btn)
 
         self._daily_timezone_compare_btn = QPushButton("UTC+8/UTC日线")
         self._daily_timezone_compare_btn.setToolTip("同一交易对左右比较：左图 UTC+8 日线，右图 UTC 日线")
         self._daily_timezone_compare_btn.clicked.connect(self._on_daily_timezone_compare_clicked)
-        action_row.addWidget(self._daily_timezone_compare_btn)
+        linkage_row.addWidget(self._daily_timezone_compare_btn)
+        linkage_row.addStretch(1)
+        header_layout.addLayout(linkage_row)
 
-        action_row.addSpacing(12)
+        action_row = QHBoxLayout()
+        action_row.setSpacing(10)
         action_row.addWidget(QLabel("数量"))
         self._limit_spin = QSpinBox()
         self._limit_spin.setRange(50, 5000)
@@ -6521,6 +6528,43 @@ class KlineAnalysisWindow(QMainWindow):
             self._secondary_native_chart_view.update()
         if isinstance(self._tertiary_native_chart_view, InteractiveKlineChartView):
             self._tertiary_native_chart_view.update()
+        self._keep_window_within_current_screen()
+
+    def _keep_window_within_current_screen(self) -> None:
+        """Prevent a layout recalculation from pushing a normal window off-screen."""
+        if self._clamping_window_to_screen:
+            return
+        window_target = self.window()
+        if (
+            window_target is None
+            or window_target.isMaximized()
+            or window_target.isFullScreen()
+            or window_target.isMinimized()
+        ):
+            return
+        screen = QGuiApplication.screenAt(window_target.frameGeometry().center())
+        if screen is None:
+            screen = window_target.screen() or QGuiApplication.primaryScreen()
+        if screen is None:
+            return
+        available = screen.availableGeometry()
+        frame = window_target.frameGeometry()
+        frame_extra_width = max(0, frame.width() - window_target.width())
+        frame_extra_height = max(0, frame.height() - window_target.height())
+        target_width = min(window_target.width(), max(320, available.width() - frame_extra_width))
+        target_height = min(window_target.height(), max(240, available.height() - frame_extra_height))
+
+        self._clamping_window_to_screen = True
+        try:
+            if target_width != window_target.width() or target_height != window_target.height():
+                window_target.resize(target_width, target_height)
+            frame = window_target.frameGeometry()
+            target_x = min(max(frame.x(), available.left()), available.right() - frame.width() + 1)
+            target_y = min(max(frame.y(), available.top()), available.bottom() - frame.height() + 1)
+            if target_x != frame.x() or target_y != frame.y():
+                window_target.move(target_x, target_y)
+        finally:
+            self._clamping_window_to_screen = False
 
     def _apply_default_splitter_sizes(self) -> None:
         splitter = self._body_splitter
@@ -7104,6 +7148,7 @@ class KlineAnalysisWindow(QMainWindow):
         self._update_secondary_controls_state()
         self._apply_secondary_chart_layout()
         self._refresh_chart_mode_cycle_button()
+        self._schedule_chart_layout_refresh(0)
 
     def _active_period_value(self) -> str:
         if self._active_chart_target == "secondary" and self._secondary_chart_check.isChecked():
