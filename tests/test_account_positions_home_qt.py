@@ -1259,6 +1259,51 @@ class AccountPositionsHomeQtHelpersTest(TestCase):
         # 0.001656 / (1 - 7%) rounds up to the current 0.0001 tick: 0.0018.
         self.assertEqual(price, Decimal("0.0018"))
 
+    def test_fee_adjusted_flatten_price_allocates_full_opening_fee_to_half_close(self) -> None:
+        position = SimpleNamespace(
+            inst_type="OPTION",
+            avg_price=Decimal("0.000800"),
+            position=Decimal("100"),
+            raw={"fee": "-0.000056"},
+        )
+        instrument = Instrument(
+            inst_id="BTC-USD-260830-76500-P",
+            inst_type="OPTION",
+            tick_size=Decimal("0.0001"),
+            lot_size=Decimal("1"),
+            min_size=Decimal("1"),
+            state="live",
+            ct_val=Decimal("1"),
+            ct_mult=Decimal("0.01"),
+            ct_val_ccy="BTC",
+        )
+        app = SimpleNamespace(
+            _profile_snapshots={"159": {"option_taker_fee_rate": "0.03"}},
+            _last_profile_name="159",
+            _shared_client=SimpleNamespace(
+                get_option_tick_bands=lambda _family: [
+                    OptionTickBand(Decimal("0"), Decimal("0.005"), Decimal("0.0001")),
+                    OptionTickBand(Decimal("0.005"), None, Decimal("0.0005")),
+                ]
+            ),
+        )
+        app._snap_selected_position_flatten_price = lambda item, value, *, rounding: (
+            AccountPositionsHomeWidget._snap_selected_position_flatten_price(app, item, value, rounding=rounding)
+        )
+
+        price = AccountPositionsHomeWidget._resolve_fee_adjusted_flatten_price(
+            app,
+            position,
+            instrument,
+            side="sell",
+            fee_multiple=Decimal("1"),
+            close_size=Decimal("50"),
+        )
+
+        # Half-close must recover the opening fee for all 100 contracts, not
+        # only the fee allocated to the 50 contracts being closed.
+        self.assertEqual(price, Decimal("0.0019"))
+
     def test_short_option_profit_flatten_price_uses_actual_fee_and_tick_size(self) -> None:
         position = SimpleNamespace(
             inst_type="OPTION",
@@ -1303,6 +1348,49 @@ class AccountPositionsHomeQtHelpersTest(TestCase):
         # 0.000075 BTC.  The 50% post-fee target is above 0.005, so it uses
         # the 0.0005 band and rounds down to 0.0555.
         self.assertEqual(price, Decimal("0.0555"))
+
+    def test_short_option_profit_flatten_price_allocates_full_opening_fee_to_partial_close(self) -> None:
+        position = SimpleNamespace(
+            inst_type="OPTION",
+            avg_price=Decimal("0.113"),
+            position=Decimal("-30"),
+            raw={"fee": "-0.000075"},
+        )
+        instrument = Instrument(
+            inst_id="BTC-USD-260911-71000-C",
+            inst_type="OPTION",
+            tick_size=Decimal("0.0001"),
+            lot_size=Decimal("1"),
+            min_size=Decimal("1"),
+            state="live",
+            ct_val=Decimal("1"),
+            ct_mult=Decimal("0.01"),
+            ct_val_ccy="BTC",
+        )
+        app = SimpleNamespace(
+            _profile_snapshots={"159": {"option_taker_fee_rate": "0.03"}},
+            _last_profile_name="159",
+            _shared_client=SimpleNamespace(
+                get_option_tick_bands=lambda _family: [
+                    OptionTickBand(Decimal("0"), Decimal("0.005"), Decimal("0.0001")),
+                    OptionTickBand(Decimal("0.005"), None, Decimal("0.0005")),
+                ]
+            ),
+        )
+        app._snap_selected_position_flatten_price = lambda item, value, *, rounding: (
+            AccountPositionsHomeWidget._snap_selected_position_flatten_price(app, item, value, rounding=rounding)
+        )
+
+        price = AccountPositionsHomeWidget._resolve_short_profit_flatten_price(
+            app,
+            position,
+            instrument,
+            side="buy",
+            profit_percent=Decimal("50"),
+            close_size=Decimal("7.5"),
+        )
+
+        self.assertEqual(price, Decimal("0.0550"))
 
     def test_option_flatten_price_uses_higher_tick_band_above_threshold(self) -> None:
         app = SimpleNamespace(

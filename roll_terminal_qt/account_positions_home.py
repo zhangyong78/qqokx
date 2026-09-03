@@ -580,6 +580,20 @@ def _option_premium_after_close_fee_reserve(required_before_close_fee: Decimal, 
     return required_before_close_fee + normalized_rate
 
 
+def _selected_position_close_fraction(position: OkxPosition, close_size: Decimal | None) -> Decimal:
+    """Return the fraction of the whole position that this order will close."""
+    raw_position = getattr(position, "position", None)
+    if raw_position is None:
+        return Decimal("1")
+    total_size = abs(raw_position)
+    if close_size is None or close_size <= 0 or total_size <= 0:
+        return Decimal("1")
+    fraction = close_size / total_size
+    if fraction <= 0:
+        return Decimal("1")
+    return min(fraction, Decimal("1"))
+
+
 def _snap_option_price_to_tick_bands(
     price: Decimal,
     tick_bands: list[OptionTickBand],
@@ -3764,6 +3778,7 @@ class AccountPositionsHomeWidget(QWidget):
         *,
         side: str,
         fee_multiple: Decimal,
+        close_size: Decimal | None = None,
     ) -> Decimal:
         """Calculate the buyer's target price from opening cost plus profit and fees."""
         if side != "sell":
@@ -3777,6 +3792,7 @@ class AccountPositionsHomeWidget(QWidget):
         )
         if fee_multiple <= 0:
             return self._snap_selected_position_flatten_price(instrument, reference_price, rounding="up")
+        close_fraction = _selected_position_close_fraction(position, close_size)
         profit_target = reference_price * (Decimal("1") + fee_multiple)
         if position.inst_type == "OPTION":
             opening_fee = _option_open_fee_per_premium_unit(
@@ -3785,9 +3801,14 @@ class AccountPositionsHomeWidget(QWidget):
                 open_price=reference_price,
                 fallback_fee_rate=fee_rate,
             )
-            adjusted_price = _option_premium_after_close_fee_reserve(profit_target + opening_fee, fee_rate)
+            adjusted_price = _option_premium_after_close_fee_reserve(
+                profit_target + opening_fee / close_fraction,
+                fee_rate,
+            )
         else:
-            adjusted_price = profit_target + abs(reference_price) * fee_rate * Decimal("2")
+            opening_fee = abs(reference_price) * fee_rate
+            closing_fee = abs(reference_price) * fee_rate
+            adjusted_price = profit_target + opening_fee / close_fraction + closing_fee
         if adjusted_price <= 0:
             raise ValueError("买方目标平仓价不大于 0，请检查盈利倍数或开仓价。")
         return self._snap_selected_position_flatten_price(instrument, adjusted_price, rounding="up")
@@ -3799,6 +3820,7 @@ class AccountPositionsHomeWidget(QWidget):
         *,
         side: str,
         profit_percent: Decimal,
+        close_size: Decimal | None = None,
     ) -> Decimal:
         if side != "buy":
             raise ValueError("卖方盈利比例平仓只适用于卖方开仓的空头持仓。")
@@ -3811,6 +3833,7 @@ class AccountPositionsHomeWidget(QWidget):
             self._profile_snapshots.get(self._last_profile_name, {}),
             inst_type=position.inst_type,
         )
+        close_fraction = _selected_position_close_fraction(position, close_size)
         profit_ratio = profit_percent / Decimal("100")
         if position.inst_type == "OPTION":
             opening_fee = _option_open_fee_per_premium_unit(
@@ -3820,11 +3843,17 @@ class AccountPositionsHomeWidget(QWidget):
                 fallback_fee_rate=fee_rate,
             )
             target_price = _option_premium_before_close_fee(
-                reference_price * (Decimal("1") - profit_ratio) - opening_fee,
+                reference_price * (Decimal("1") - profit_ratio) - opening_fee / close_fraction,
                 fee_rate,
             )
         else:
-            target_price = reference_price * (Decimal("1") - profit_ratio) - abs(reference_price) * fee_rate * Decimal("2")
+            opening_fee = abs(reference_price) * fee_rate
+            closing_fee = abs(reference_price) * fee_rate
+            target_price = (
+                reference_price * (Decimal("1") - profit_ratio)
+                - opening_fee / close_fraction
+                - closing_fee
+            )
         if target_price <= 0:
             raise ValueError("卖方目标平仓价不大于 0，请降低盈利比例或检查开仓价/手续费。")
         return self._snap_selected_position_flatten_price(instrument, target_price, rounding="down")
@@ -3921,6 +3950,7 @@ class AccountPositionsHomeWidget(QWidget):
                     instrument,
                     side=close_side,
                     fee_multiple=effective_fee_multiple,
+                    close_size=closeable_size,
                 )
             elif normalized_mode == "short_profit_fee":
                 effective_profit_percent = (
@@ -3933,6 +3963,7 @@ class AccountPositionsHomeWidget(QWidget):
                     instrument,
                     side=close_side,
                     profit_percent=effective_profit_percent,
+                    close_size=closeable_size,
                 )
             else:
                 price = self._resolve_best_quote_flatten_price(instrument, side=close_side)
