@@ -129,6 +129,48 @@ class RollTerminalQtWindowHelperTests(QtWidgetTestCase):
         finally:
             self.dispose_widget(chart)
 
+    def test_candlestick_chart_linked_viewport_keeps_the_given_time_range(self) -> None:
+        chart = CandlestickChartView()
+        candles = [
+            Candle(1_752_210_000_000, Decimal("0.01"), Decimal("0.02"), Decimal("0.009"), Decimal("0.015"), Decimal("1"), True),
+            Candle(1_752_213_600_000, Decimal("0.015"), Decimal("0.021"), Decimal("0.014"), Decimal("0.018"), Decimal("1"), True),
+        ]
+        try:
+            chart.set_candles(title="测试", candles=candles)
+            self.assertEqual(chart._full_x_max_ms, 1_752_217_200_000.0)
+            chart.set_linked_viewport(1_752_200_000_000, 1_752_220_000_000)
+
+            self.assertEqual(
+                chart._current_x_range(),
+                (1_752_200_000_000.0, 1_752_220_000_000.0),
+            )
+        finally:
+            self.dispose_widget(chart)
+
+    def test_candlestick_chart_linked_hover_uses_source_timestamp_for_crosshair(self) -> None:
+        chart = CandlestickChartView()
+        candles = [
+            Candle(1_752_210_000_000, Decimal("0.01"), Decimal("0.02"), Decimal("0.009"), Decimal("0.015"), Decimal("1"), True),
+            Candle(1_752_213_600_000, Decimal("0.015"), Decimal("0.021"), Decimal("0.014"), Decimal("0.018"), Decimal("1"), True),
+        ]
+        try:
+            chart.set_candles(title="测试", candles=candles)
+            observed_timestamps: list[int] = []
+            chart.hover_time_changed.connect(lambda timestamp, _ratio: observed_timestamps.append(int(timestamp)))
+            chart.hover_time_changed.emit(1_752_211_800_000, 0.5)
+            self.assertEqual(observed_timestamps, [1_752_211_800_000])
+            chart.set_linked_hover_time(1_752_211_800_000, 0.5)
+            plot = chart.chart().plotArea()
+
+            context = chart._resolve_hover_context(plot)
+
+            self.assertIsNotNone(context)
+            assert context is not None
+            self.assertEqual(context[0].ts, candles[0].ts)
+            self.assertAlmostEqual(context[1], chart._x_for_ts(1_752_211_800_000, plot))
+        finally:
+            self.dispose_widget(chart)
+
     def test_candlestick_chart_retains_position_price_markers_and_fits_their_prices(self) -> None:
         chart = CandlestickChartView()
         candles = [
@@ -189,7 +231,7 @@ class RollTerminalQtWindowHelperTests(QtWidgetTestCase):
         self.assertIs(OptionStrategyQtWindow._chain_quote_for_clicked_column(chain_row, 6), put)
         self.assertIsNone(OptionStrategyQtWindow._chain_quote_for_clicked_column(chain_row, 3))
 
-    def test_option_chain_mark_click_opens_the_matching_contract_chart(self) -> None:
+    def test_option_chain_mark_click_opens_the_linked_call_put_chart(self) -> None:
         call = OptionQuote(
             instrument=Instrument(
                 inst_id="BTC-USD-260728-62500-C",
@@ -200,15 +242,26 @@ class RollTerminalQtWindowHelperTests(QtWidgetTestCase):
                 state="live",
             )
         )
+        put = OptionQuote(
+            instrument=Instrument(
+                inst_id="BTC-USD-260728-62500-P",
+                inst_type="OPTION",
+                tick_size=Decimal("0.0001"),
+                lot_size=Decimal("1"),
+                min_size=Decimal("1"),
+                state="live",
+            )
+        )
+        chain_row = OptionChainRow(strike=Decimal("62500"), call_quote=call, put_quote=put)
         window = OptionStrategyQtWindow.__new__(OptionStrategyQtWindow)
-        window._chain_rows = [OptionChainRow(strike=Decimal("62500"), call_quote=call)]
-        window._open_chain_quote_kline = MagicMock()
+        window._chain_rows = [chain_row]
+        window._open_chain_linked_kline = MagicMock()
 
         window._on_chain_table_clicked(0, 0)
 
-        window._open_chain_quote_kline.assert_called_once_with(call)
+        window._open_chain_linked_kline.assert_called_once_with(chain_row)
 
-    def test_option_chain_chart_uses_the_position_kline_dialog(self) -> None:
+    def test_option_chain_chart_uses_the_linked_call_put_dialog(self) -> None:
         quote = OptionQuote(
             instrument=Instrument(
                 inst_id="BTC-USD-260728-62500-C",
@@ -219,19 +272,30 @@ class RollTerminalQtWindowHelperTests(QtWidgetTestCase):
                 state="live",
             )
         )
+        put = OptionQuote(
+            instrument=Instrument(
+                inst_id="BTC-USD-260728-62500-P",
+                inst_type="OPTION",
+                tick_size=Decimal("0.0001"),
+                lot_size=Decimal("1"),
+                min_size=Decimal("1"),
+                state="live",
+            )
+        )
+        chain_row = OptionChainRow(strike=Decimal("62500"), call_quote=quote, put_quote=put)
         window = OptionStrategyQtWindow.__new__(OptionStrategyQtWindow)
-        window._chain_kline_dialog = None
-        window._current_underlying_price = Decimal("62500")
+        window._chain_linked_chart_dialog = None
+        window._client = MagicMock()
+        window._bar_combo = SimpleNamespace(currentData=lambda: "1H", currentText=lambda: "1H")
 
-        with patch("roll_terminal_qt.account_positions_home.InstrumentKlineDialog") as dialog_type:
-            window._open_chain_quote_kline(quote)
+        with patch("roll_terminal_qt.option_strategy_window.OptionChainLinkedChartDialog") as dialog_type:
+            window._open_chain_linked_kline(chain_row)
 
-        dialog_type.assert_called_once_with(parent=window)
-        dialog_type.return_value.show_instrument.assert_called_once_with(
-            inst_id="BTC-USD-260728-62500-C",
-            inst_type="OPTION",
-            underlying_usdt_price=Decimal("62500"),
-            underlying_usdt_basis="BTC-USDT 62500（打开图时）",
+        dialog_type.assert_called_once_with(client=window._client, parent=window)
+        dialog_type.return_value.show_pair.assert_called_once_with(
+            call_quote=quote,
+            put_quote=put,
+            bar="1H",
         )
 
     def test_near_doji_uses_thicker_body_outline(self) -> None:

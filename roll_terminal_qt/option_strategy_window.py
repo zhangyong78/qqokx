@@ -159,6 +159,98 @@ class OverlaySnapshot:
     resolution_note: str
 
 
+@dataclass(frozen=True)
+class ChainLinkedChartSnapshot:
+    call_inst_id: str
+    put_inst_id: str
+    call_candles: tuple[Candle, ...]
+    put_candles: tuple[Candle, ...]
+    underlying_inst_id: str
+    underlying_candles: tuple[Candle, ...]
+    volatility_candles: tuple[Candle, ...]
+    volatility_currency: str
+    volatility_resolution_label: str
+    volatility_resolution_note: str
+    call_error: str = ""
+    put_error: str = ""
+    underlying_error: str = ""
+
+
+class _ChainLinkedChartThread(QThread):
+    snapshot_ready = Signal(int, object)
+    error_raised = Signal(int, str)
+
+    def __init__(
+        self,
+        *,
+        request_id: int,
+        call_inst_id: str,
+        put_inst_id: str,
+        bar: str,
+        candle_limit: int,
+        client: OkxRestClient,
+        parent: QObject | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self._request_id = request_id
+        self._call_inst_id = call_inst_id.strip().upper()
+        self._put_inst_id = put_inst_id.strip().upper()
+        self._bar = bar.strip() or "1H"
+        self._candle_limit = max(50, min(int(candle_limit), MAX_OPTION_COMBO_CANDLES))
+        self._client = client
+
+    def run(self) -> None:
+        try:
+            call_candles, call_error = self._load_option_candles(self._call_inst_id)
+            put_candles, put_error = self._load_option_candles(self._put_inst_id)
+            currency = (self._call_inst_id or self._put_inst_id).split("-", 1)[0].strip().upper()
+            underlying_inst_id = _spot_usdt_inst_id(currency) or ""
+            underlying_candles, underlying_error = self._load_underlying_candles(underlying_inst_id)
+            volatility_candles, resolution_label, resolution_note = _load_deribit_option_chart_candles(
+                currency,
+                bar=self._bar,
+                requested_limit=self._candle_limit,
+            )
+            self.snapshot_ready.emit(
+                self._request_id,
+                ChainLinkedChartSnapshot(
+                    call_inst_id=self._call_inst_id,
+                    put_inst_id=self._put_inst_id,
+                    call_candles=tuple(call_candles),
+                    put_candles=tuple(put_candles),
+                    underlying_inst_id=underlying_inst_id,
+                    underlying_candles=tuple(underlying_candles),
+                    volatility_candles=tuple(volatility_candles),
+                    volatility_currency=currency,
+                    volatility_resolution_label=resolution_label,
+                    volatility_resolution_note=resolution_note,
+                    call_error=call_error,
+                    put_error=put_error,
+                    underlying_error=underlying_error,
+                ),
+            )
+        except Exception as exc:  # noqa: BLE001
+            self.error_raised.emit(self._request_id, str(exc))
+
+    def _load_option_candles(self, inst_id: str) -> tuple[list[Candle], str]:
+        if not inst_id:
+            return [], "该行缺少对应期权合约。"
+        try:
+            candles = self._client.get_mark_price_candles(inst_id, self._bar, limit=self._candle_limit)
+            return [item for item in candles if item.confirmed], ""
+        except Exception as exc:  # noqa: BLE001
+            return [], str(exc)
+
+    def _load_underlying_candles(self, inst_id: str) -> tuple[list[Candle], str]:
+        if not inst_id:
+            return [], "该期权系列没有可映射的 USDT 标底。"
+        try:
+            candles = self._client.get_candles_history(inst_id, self._bar, limit=self._candle_limit)
+            return [item for item in candles if item.confirmed], ""
+        except Exception as exc:  # noqa: BLE001
+            return [], str(exc)
+
+
 class _OptionChainThread(QThread):
     snapshot_ready = Signal(int, object)
     error_raised = Signal(int, str)
@@ -960,7 +1052,11 @@ class PositionPriceMarker:
 
 class CandlestickChartView(QChartView):
     hover_changed = Signal(int, float)
+    # Millisecond Unix timestamps exceed Qt/PySide's 32-bit ``int`` signal
+    # range.  Keep them as Python objects so 64-bit timestamps are lossless.
+    hover_time_changed = Signal(object, float)
     hover_cleared = Signal()
+    viewport_changed = Signal(object, object)
     older_data_requested = Signal(int)
 
     def __init__(self, *, percent_axis: bool = False, parent: QWidget | None = None) -> None:
@@ -993,6 +1089,7 @@ class CandlestickChartView(QChartView):
         self._pan_anchor_x: float | None = None
         self._linked_hover_index: int | None = None
         self._linked_hover_y_ratio: float | None = None
+        self._linked_hover_timestamp: int | None = None
         self._price_badge = self._create_hover_label(multiline=False, center=True)
         self._time_badge = self._create_hover_label(multiline=False, center=True)
         self._tooltip_badge = self._create_hover_label(multiline=True, center=False)
@@ -1021,6 +1118,7 @@ class CandlestickChartView(QChartView):
         self._pan_anchor_x = None
         self._linked_hover_index = None
         self._linked_hover_y_ratio = None
+        self._linked_hover_timestamp = None
         self._hide_hover_overlays()
         self.viewport().update()
 
@@ -1106,9 +1204,18 @@ class CandlestickChartView(QChartView):
         axis_x = QDateTimeAxis()
         axis_x.setFormat("MM-dd HH:mm")
         axis_x.setTickCount(min(8, max(2, len(candles))))
+        candle_step_ms = (
+            max(1, int(candles[-1].ts - candles[-2].ts))
+            if len(candles) > 1
+            else 60_000
+        )
+        # Leave one bar of breathing room on the right.  Without this, the
+        # final candle is centered exactly on the axis boundary and its body or
+        # wick can be clipped, especially when several charts share a range.
+        display_x_max_ms = int(candles[-1].ts) + candle_step_ms
         axis_x.setRange(
             QDateTime.fromMSecsSinceEpoch(candles[0].ts),
-            QDateTime.fromMSecsSinceEpoch(candles[-1].ts),
+            QDateTime.fromMSecsSinceEpoch(display_x_max_ms),
         )
         min_price = min(float(item.low if not hide_wicks else min(item.open, item.close)) for item in candles)
         max_price = max(float(item.high if not hide_wicks else max(item.open, item.close)) for item in candles)
@@ -1150,7 +1257,7 @@ class CandlestickChartView(QChartView):
         self._axis_y = axis_y
         self._candles = list(candles)
         self._full_x_min_ms = float(candles[0].ts)
-        self._full_x_max_ms = float(candles[-1].ts)
+        self._full_x_max_ms = float(display_x_max_ms)
         self._full_y_min = float(min_price)
         self._full_y_max = float(max_price)
         self._fit_y_axis_to_visible_range()
@@ -1257,6 +1364,7 @@ class CandlestickChartView(QChartView):
             QDateTime.fromMSecsSinceEpoch(int(new_x_max)),
         )
         self._fit_y_axis_to_visible_range()
+        self._emit_viewport_changed()
         self.viewport().update()
         event.accept()
 
@@ -1277,11 +1385,37 @@ class CandlestickChartView(QChartView):
                 QDateTime.fromMSecsSinceEpoch(int(self._full_x_max_ms)),
             )
         self._fit_y_axis_to_visible_range()
+        self._emit_viewport_changed()
         self.viewport().update()
 
     def set_linked_hover(self, index: int | None, y_ratio: float | None) -> None:
         self._linked_hover_index = index
         self._linked_hover_y_ratio = y_ratio
+        self._linked_hover_timestamp = None
+        self.viewport().update()
+
+    def set_linked_hover_time(self, timestamp: int | None, y_ratio: float | None) -> None:
+        self._linked_hover_index = None
+        self._linked_hover_timestamp = int(timestamp) if timestamp is not None and int(timestamp) > 0 else None
+        self._linked_hover_y_ratio = y_ratio
+        self.viewport().update()
+
+    def set_linked_viewport(self, start_ms: int, end_ms: int) -> None:
+        axis_x = self._axis_x
+        if axis_x is None or not self._candles:
+            return
+        # Linked charts must keep the exact same real-world time range.  Do not
+        # clamp this pane to its own candles: an option can start later than
+        # DVOL, and clamping would make the three x-axes drift apart.
+        start = float(start_ms)
+        end = float(end_ms)
+        if end <= start:
+            return
+        axis_x.setRange(
+            QDateTime.fromMSecsSinceEpoch(int(start)),
+            QDateTime.fromMSecsSinceEpoch(int(end)),
+        )
+        self._fit_y_axis_to_visible_range()
         self.viewport().update()
 
     def mouseMoveEvent(self, event) -> None:  # type: ignore[override]
@@ -1304,6 +1438,7 @@ class CandlestickChartView(QChartView):
                     min(1.0, (float(event.position().y()) - float(plot_area.top())) / max(float(plot_area.height()), 1.0)),
                 )
                 self.hover_changed.emit(index, y_ratio)
+                self.hover_time_changed.emit(int(candle.ts), y_ratio)
         self.viewport().update()
         super().mouseMoveEvent(event)
 
@@ -1602,7 +1737,17 @@ class CandlestickChartView(QChartView):
 
     def _resolve_hover_context(self, plot_area: QRectF) -> tuple[Candle, float, float, float] | None:
         linked_index = self._linked_hover_index
+        linked_timestamp = self._linked_hover_timestamp
         linked_y_ratio = self._linked_hover_y_ratio
+        if linked_timestamp is not None and linked_y_ratio is not None and self._candles:
+            candle = min(self._candles, key=lambda item: abs(int(item.ts) - linked_timestamp))
+            hover_y = float(plot_area.top()) + (
+                min(max(float(linked_y_ratio), 0.0), 1.0) * float(max(plot_area.height(), 1.0))
+            )
+            # Use the source chart's timestamp for the vertical crosshair.  The
+            # nearest candle supplies O/H/L/C values only; using its timestamp
+            # here would shift the three crosshairs when a pane has a missing bar.
+            return candle, self._x_for_ts(linked_timestamp, plot_area), hover_y, self._value_for_y(hover_y, plot_area)
         if linked_index is not None and linked_y_ratio is not None and 0 <= linked_index < len(self._candles):
             candle = self._candles[linked_index]
             hover_y = float(plot_area.top()) + (
@@ -1704,8 +1849,13 @@ class CandlestickChartView(QChartView):
             QDateTime.fromMSecsSinceEpoch(int(new_x_max)),
         )
         self._fit_y_axis_to_visible_range()
+        self._emit_viewport_changed()
         if delta_px > 0 and new_x_min <= self._full_x_min_ms + 1.0:
             self.older_data_requested.emit(int(self._full_x_min_ms))
+
+    def _emit_viewport_changed(self) -> None:
+        start_ts, end_ts = self._current_x_range()
+        self.viewport_changed.emit(int(start_ts), int(end_ts))
 
     def _create_hover_label(self, *, multiline: bool, center: bool) -> QLabel:
         label = QLabel(self)
@@ -1899,6 +2049,259 @@ class CandlestickChartView(QChartView):
         painter.drawText(QPointF(text_x, text_y), text)
 
 
+class OptionChainLinkedChartDialog(QDialog):
+    """One shared-time view for the selected call, DVOL, and matching put."""
+
+    def __init__(self, *, client: OkxRestClient, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        apply_qt_window_icon(self)
+        self.setWindowFlag(Qt.WindowType.WindowMaximizeButtonHint, True)
+        self.setWindowFlag(Qt.WindowType.WindowCloseButtonHint, True)
+        self.setWindowTitle("期权链联动 K 线")
+        self.resize(1800, 780)
+        self._client = client
+        self._call_quote: OptionQuote | None = None
+        self._put_quote: OptionQuote | None = None
+        self._request_id = 0
+        self._load_thread: _ChainLinkedChartThread | None = None
+        self._current_bar = "1H"
+        self._syncing_viewport = False
+        self._bar_buttons: dict[str, QPushButton] = {}
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(8)
+        header = QHBoxLayout()
+        self._title_label = QLabel("选择期权链中的认购或认沽标记以查看联动 K 线。")
+        self._title_label.setObjectName("SectionTitle")
+        self._status_label = QLabel("")
+        self._status_label.setObjectName("Subtle")
+        header.addWidget(self._title_label, 2)
+        header.addWidget(self._status_label, 3)
+        layout.addLayout(header)
+
+        toolbar = QHBoxLayout()
+        toolbar.addWidget(QLabel("联动周期"))
+        for label, bar in (("1小时", "1H"), ("4小时", "4H"), ("1日", "1D")):
+            button = QPushButton(label)
+            button.setCheckable(True)
+            button.clicked.connect(lambda _checked=False, target=bar: self._select_bar(target))
+            self._bar_buttons[bar] = button
+            toolbar.addWidget(button)
+        toolbar.addStretch(1)
+        refresh_button = QPushButton("刷新")
+        refresh_button.clicked.connect(self._load_candles)
+        toolbar.addWidget(refresh_button)
+        layout.addLayout(toolbar)
+
+        self._call_chart = CandlestickChartView()
+        self._underlying_chart = CandlestickChartView()
+        self._volatility_chart = CandlestickChartView(percent_axis=True)
+        self._put_chart = CandlestickChartView()
+        self._charts = (self._call_chart, self._underlying_chart, self._volatility_chart, self._put_chart)
+        charts = QSplitter(Qt.Orientation.Horizontal)
+        charts.setChildrenCollapsible(False)
+        call_panel = QGroupBox("认购")
+        call_layout = QVBoxLayout(call_panel)
+        call_layout.setContentsMargins(6, 8, 6, 6)
+        call_layout.addWidget(self._call_chart)
+        charts.addWidget(call_panel)
+
+        underlying_vol_panel = QGroupBox("标底 / 波动率")
+        underlying_vol_layout = QVBoxLayout(underlying_vol_panel)
+        underlying_vol_layout.setContentsMargins(6, 8, 6, 6)
+        middle_splitter = QSplitter(Qt.Orientation.Vertical)
+        middle_splitter.setChildrenCollapsible(False)
+        middle_splitter.addWidget(self._underlying_chart)
+        middle_splitter.addWidget(self._volatility_chart)
+        middle_splitter.setSizes([380, 380])
+        underlying_vol_layout.addWidget(middle_splitter)
+        charts.addWidget(underlying_vol_panel)
+
+        put_panel = QGroupBox("认沽")
+        put_layout = QVBoxLayout(put_panel)
+        put_layout.setContentsMargins(6, 8, 6, 6)
+        put_layout.addWidget(self._put_chart)
+        charts.addWidget(put_panel)
+        charts.setSizes([600, 600, 600])
+        layout.addWidget(charts, 1)
+        for chart in self._charts:
+            chart.hover_time_changed.connect(lambda timestamp, ratio, source=chart: self._sync_hover(source, timestamp, ratio))
+            chart.hover_cleared.connect(self._clear_hover)
+            chart.viewport_changed.connect(lambda start, end, source=chart: self._sync_viewport(source, start, end))
+        self._sync_bar_buttons()
+        self._show_empty_messages()
+
+    def show_pair(self, *, call_quote: OptionQuote | None, put_quote: OptionQuote | None, bar: str = "1H") -> None:
+        self._call_quote = call_quote
+        self._put_quote = put_quote
+        normalized_bar = bar.strip().upper()
+        self._current_bar = normalized_bar if normalized_bar in self._bar_buttons else "1H"
+        call_id = call_quote.instrument.inst_id if call_quote is not None else "—"
+        put_id = put_quote.instrument.inst_id if put_quote is not None else "—"
+        self._title_label.setText(f"认购 {call_id}  ·  中间 Deribit DVOL  ·  认沽 {put_id}")
+        self._sync_bar_buttons()
+        self._load_candles()
+        self.show()
+        self.raise_()
+        self.activateWindow()
+
+    def closeEvent(self, event) -> None:  # noqa: ANN001
+        if self._load_thread is not None and self._load_thread.isRunning():
+            self._load_thread.requestInterruption()
+            self._load_thread.wait(1500)
+        super().closeEvent(event)
+
+    def _show_empty_messages(self) -> None:
+        self._call_chart.show_message("等待加载认购标记价格 K 线")
+        self._underlying_chart.show_message("等待加载标底 K 线")
+        self._volatility_chart.show_message("等待加载 Deribit DVOL K 线")
+        self._put_chart.show_message("等待加载认沽标记价格 K 线")
+
+    def _select_bar(self, bar: str) -> None:
+        if bar == self._current_bar:
+            return
+        self._current_bar = bar
+        self._sync_bar_buttons()
+        self._load_candles()
+
+    def _sync_bar_buttons(self) -> None:
+        for bar, button in self._bar_buttons.items():
+            checked = bar == self._current_bar
+            button.blockSignals(True)
+            button.setChecked(checked)
+            button.blockSignals(False)
+            button.setObjectName("Primary" if checked else "")
+            button.style().unpolish(button)
+            button.style().polish(button)
+
+    @Slot()
+    def _load_candles(self) -> None:
+        if self._load_thread is not None and self._load_thread.isRunning():
+            self._status_label.setText("正在加载上一轮数据，请稍候…")
+            return
+        call_id = self._call_quote.instrument.inst_id if self._call_quote is not None else ""
+        put_id = self._put_quote.instrument.inst_id if self._put_quote is not None else ""
+        if not call_id and not put_id:
+            return
+        self._request_id += 1
+        request_id = self._request_id
+        self._status_label.setText(f"正在加载 {self._current_bar} 认购、DVOL、认沽联动 K 线…")
+        thread = _ChainLinkedChartThread(
+            request_id=request_id,
+            call_inst_id=call_id,
+            put_inst_id=put_id,
+            bar=self._current_bar,
+            candle_limit=240,
+            client=self._client,
+            parent=self,
+        )
+        self._load_thread = thread
+        thread.snapshot_ready.connect(self._apply_snapshot)
+        thread.error_raised.connect(self._apply_load_error)
+        thread.finished.connect(self._clear_finished_thread)
+        thread.start()
+
+    @Slot(int, object)
+    def _apply_snapshot(self, request_id: int, payload: object) -> None:
+        if request_id != self._request_id or not isinstance(payload, ChainLinkedChartSnapshot):
+            return
+        self._set_option_chart(self._call_chart, payload.call_inst_id, payload.call_candles, payload.call_error, "认购")
+        self._set_option_chart(
+            self._underlying_chart,
+            payload.underlying_inst_id,
+            payload.underlying_candles,
+            payload.underlying_error,
+            "标底",
+        )
+        self._set_option_chart(self._put_chart, payload.put_inst_id, payload.put_candles, payload.put_error, "认沽")
+        if payload.volatility_candles:
+            note = f" | {payload.volatility_resolution_note}" if payload.volatility_resolution_note else ""
+            self._volatility_chart.set_candles(
+                title=f"Deribit {payload.volatility_currency} DVOL 波动率K线 | {payload.volatility_resolution_label}{note}",
+                candles=list(payload.volatility_candles),
+                show_moving_averages=True,
+            )
+        else:
+            self._volatility_chart.show_message(
+                f"Deribit {payload.volatility_currency or '—'} DVOL 暂无缓存；请先在“Deribit 波动率指数”页面同步数据。"
+            )
+        self._sync_initial_viewport()
+        counts = (
+            f"认购 {len(payload.call_candles)} / 标底 {len(payload.underlying_candles)} / "
+            f"波动率 {len(payload.volatility_candles)} / 认沽 {len(payload.put_candles)}"
+        )
+        self._status_label.setText(f"{self._current_bar} 联动 K 线已加载（{counts} 根）。")
+
+    @staticmethod
+    def _set_option_chart(
+        chart: CandlestickChartView,
+        inst_id: str,
+        candles: tuple[Candle, ...],
+        error: str,
+        side_label: str,
+    ) -> None:
+        if candles:
+            chart.set_candles(
+                title=f"{side_label} {inst_id} 标记价格K线",
+                candles=list(candles),
+                show_moving_averages=True,
+            )
+            return
+        detail = f"：{error}" if error else ""
+        chart.show_message(f"{side_label} {inst_id or '—'} 暂无可用标记价格 K 线{detail}")
+
+    @Slot(int, str)
+    def _apply_load_error(self, request_id: int, message: str) -> None:
+        if request_id != self._request_id:
+            return
+        self._status_label.setText(f"联动 K 线加载失败：{message}")
+        self._show_empty_messages()
+
+    @Slot()
+    def _clear_finished_thread(self) -> None:
+        if self._load_thread is not None:
+            self._load_thread.deleteLater()
+            self._load_thread = None
+
+    def _sync_initial_viewport(self) -> None:
+        populated = [chart for chart in self._charts if chart._candles]
+        if len(populated) < 2:
+            return
+        # Use the union instead of the intersection.  Every pane therefore has
+        # identical left/right time boundaries even when one option has fewer
+        # historical candles than its matching option or DVOL.
+        start = min(int(chart._full_x_min_ms) for chart in populated)
+        end = max(int(chart._full_x_max_ms) for chart in populated)
+        if end <= start:
+            return
+        for chart in populated:
+            chart.set_linked_viewport(start, end)
+
+    def _sync_hover(self, source: CandlestickChartView, timestamp: int, y_ratio: float) -> None:
+        for chart in self._charts:
+            if chart is source:
+                continue
+            chart.set_linked_hover_time(timestamp, y_ratio)
+
+    @Slot()
+    def _clear_hover(self) -> None:
+        for chart in self._charts:
+            chart.set_linked_hover_time(None, None)
+
+    def _sync_viewport(self, source: CandlestickChartView, start_ms: int, end_ms: int) -> None:
+        if self._syncing_viewport:
+            return
+        self._syncing_viewport = True
+        try:
+            for chart in self._charts:
+                if chart is source:
+                    continue
+                chart.set_linked_viewport(start_ms, end_ms)
+        finally:
+            self._syncing_viewport = False
+
+
 class OptionStrategyBigChartDialog(QDialog):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -2033,7 +2436,7 @@ class OptionStrategyQtWindow(QMainWindow):
         self._overlay_chart_request_id = 0
         self._worker_threads: dict[str, QThread] = {}
         self._big_dialog: OptionStrategyBigChartDialog | None = None
-        self._chain_kline_dialog: Any | None = None
+        self._chain_linked_chart_dialog: OptionChainLinkedChartDialog | None = None
         self._overlay_triples: list[tuple[Candle, Candle, Candle]] = []
         self._overlay_combo_ccy = ""
         self._overlay_spot_inst_id = ""
@@ -2450,23 +2853,18 @@ class OptionStrategyQtWindow(QMainWindow):
     def _on_chain_table_clicked(self, row: int, column: int) -> None:
         if row < 0 or row >= len(self._chain_rows):
             return
-        quote = self._chain_quote_for_clicked_column(self._chain_rows[row], column)
+        chain_row = self._chain_rows[row]
+        quote = self._chain_quote_for_clicked_column(chain_row, column)
         if quote is not None:
-            self._open_chain_quote_kline(quote)
+            self._open_chain_linked_kline(chain_row)
 
-    def _open_chain_quote_kline(self, quote: OptionQuote) -> None:
-        from roll_terminal_qt.account_positions_home import InstrumentKlineDialog
-
-        if self._chain_kline_dialog is None:
-            self._chain_kline_dialog = InstrumentKlineDialog(parent=self)
-        underlying = quote.instrument.inst_id.split("-", 1)[0].strip().upper()
-        underlying_price = quote.index_price or self._current_underlying_price
-        basis = f"{underlying}-USDT {underlying_price}（打开图时）" if underlying_price is not None else ""
-        self._chain_kline_dialog.show_instrument(
-            inst_id=quote.instrument.inst_id,
-            inst_type="OPTION",
-            underlying_usdt_price=underlying_price,
-            underlying_usdt_basis=basis,
+    def _open_chain_linked_kline(self, chain_row: OptionChainRow) -> None:
+        if self._chain_linked_chart_dialog is None:
+            self._chain_linked_chart_dialog = OptionChainLinkedChartDialog(client=self._client, parent=self)
+        self._chain_linked_chart_dialog.show_pair(
+            call_quote=chain_row.call_quote,
+            put_quote=chain_row.put_quote,
+            bar=str(self._bar_combo.currentData() or self._bar_combo.currentText() or "1H"),
         )
 
     def _selected_leg_index(self) -> int | None:
