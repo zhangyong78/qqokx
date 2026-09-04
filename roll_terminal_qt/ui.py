@@ -12,6 +12,8 @@ from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
     QComboBox,
+    QDialog,
+    QDialogButtonBox,
     QFrame,
     QGridLayout,
     QHeaderView,
@@ -58,7 +60,9 @@ from roll_terminal_qt.models import ArbitrageOpportunityView, LegMarket, MarketP
 from roll_terminal_qt.opportunity_service import (
     append_custom_opportunity,
     filter_opportunities,
+    is_manual_instrument_active,
     load_all_opportunities,
+    manual_instrument_label,
     remove_custom_opportunity,
 )
 from roll_terminal_qt.order_service import OrderFeedThread, OrderStatusView
@@ -171,6 +175,64 @@ class OrderBookPanel(QFrame):
             size_item.setForeground(color)
             self._table.setItem(row_index, 0, price_item)
             self._table.setItem(row_index, 1, size_item)
+
+
+class ManualOpportunityInstrumentDialog(QDialog):
+    def __init__(
+        self,
+        options: list[tuple[str, str]],
+        *,
+        left_default: str = "",
+        right_default: str = "",
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("选择套利交易对")
+        self.setMinimumWidth(520)
+
+        layout = QVBoxLayout(self)
+        hint = QLabel("仅列出 BTC-USDT 现货和 BTC-USD 币本位季度交割合约。")
+        hint.setObjectName("Hint")
+        layout.addWidget(hint)
+
+        self._left = QComboBox()
+        self._right = QComboBox()
+        for combo in (self._left, self._right):
+            for label, inst_id in options:
+                combo.addItem(label, inst_id)
+            combo.setMinimumWidth(480)
+        layout.addWidget(QLabel("左腿合约/现货："))
+        layout.addWidget(self._left)
+        layout.addWidget(QLabel("右腿合约/现货："))
+        layout.addWidget(self._right)
+
+        self._select_value(self._left, left_default)
+        self._select_value(self._right, right_default)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel,
+            parent=self,
+        )
+        buttons.button(QDialogButtonBox.StandardButton.Ok).setText("确定")
+        buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("取消")
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    @staticmethod
+    def _select_value(combo: QComboBox, value: str) -> None:
+        normalized = str(value or "").strip().upper()
+        if not normalized:
+            return
+        index = combo.findData(normalized)
+        if index >= 0:
+            combo.setCurrentIndex(index)
+
+    def selected_instrument_ids(self) -> tuple[str, str]:
+        return (
+            str(self._left.currentData() or "").strip().upper(),
+            str(self._right.currentData() or "").strip().upper(),
+        )
 
 
 class RollTerminalWindow(QMainWindow):
@@ -2059,30 +2121,19 @@ class RollTerminalWindow(QMainWindow):
 
     @Slot()
     def _add_custom_opportunity(self) -> None:
-        left_inst_id, ok = QInputDialog.getText(
-            self,
-            "手动添加套利对",
-            "左腿合约/现货 ID：",
-            text=self._current_inst_id() or "BTC-USD-260626",
+        options = self._manual_opportunity_instrument_options()
+        if len(options) < 2:
+            QMessageBox.warning(self, "读取失败", "暂时没有读取到可选的 BTC 现货/币本位交割合约。")
+            return
+        selector = ManualOpportunityInstrumentDialog(
+            options,
+            left_default=self._current_inst_id() or "BTC-USD-260626",
+            right_default=self._target.currentText().strip().upper() or "BTC-USDT",
+            parent=self,
         )
-        if not ok:
+        if selector.exec() != int(QDialog.DialogCode.Accepted):
             return
-        left_inst_id = left_inst_id.strip().upper()
-        if not left_inst_id:
-            QMessageBox.warning(self, "参数错误", "左腿合约/现货 ID 不能为空。")
-            return
-        right_inst_id, ok = QInputDialog.getText(
-            self,
-            "手动添加套利对",
-            "右腿合约/现货 ID：",
-            text=self._target.currentText().strip().upper() or "BTC-USDT",
-        )
-        if not ok:
-            return
-        right_inst_id = right_inst_id.strip().upper()
-        if not right_inst_id:
-            QMessageBox.warning(self, "参数错误", "右腿合约/现货 ID 不能为空。")
-            return
+        left_inst_id, right_inst_id = selector.selected_instrument_ids()
         if left_inst_id == right_inst_id:
             QMessageBox.warning(self, "参数错误", "左腿和右腿不能相同。")
             return
@@ -2125,6 +2176,46 @@ class RollTerminalWindow(QMainWindow):
         self._selected_opportunity = item
         self._reload_opportunity_list()
         self._set_status(f"已添加自定义套利对：{item.left_inst_id} / {item.right_inst_id}")
+
+    def _manual_opportunity_instrument_options(self) -> list[tuple[str, str]]:
+        client = OkxRestClient()
+        instruments = []
+        try:
+            instruments.extend(client.get_instruments("SPOT", prefer_cached=True))
+            instruments.extend(client.get_instruments("FUTURES", uly="BTC-USD", prefer_cached=True))
+        except Exception as exc:  # noqa: BLE001
+            self._set_status(f"读取 BTC 可选合约失败：{exc}")
+
+        options_by_id: dict[str, tuple[str, str]] = {}
+        for instrument in instruments:
+            inst_id = str(instrument.inst_id or "").strip().upper()
+            if not is_manual_instrument_active(inst_id, instrument.inst_type, instrument.uly, instrument.state):
+                continue
+            options_by_id[inst_id] = (
+                manual_instrument_label(inst_id, instrument.inst_type, instrument.uly),
+                inst_id,
+            )
+
+        known_ids = {
+            "BTC-USDT",
+            "BTC-USD-260626",
+            "BTC-USD-260925",
+            *[position.inst_id for position in self._positions],
+            self._current.currentText().strip().upper(),
+            self._target.currentText().strip().upper(),
+        }
+        for inst_id in known_ids:
+            if not is_manual_instrument_active(inst_id):
+                continue
+            options_by_id.setdefault(
+                inst_id,
+                (manual_instrument_label(inst_id), inst_id),
+            )
+
+        return sorted(
+            options_by_id.values(),
+            key=lambda item: (0 if len(item[1].split("-")) == 2 else 1, item[1]),
+        )
 
     @Slot()
     def _remove_selected_custom_opportunity(self) -> None:

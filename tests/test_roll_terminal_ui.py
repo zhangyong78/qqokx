@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+from datetime import date
 from decimal import Decimal
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -9,6 +10,12 @@ from okx_quant.models import Instrument
 from roll_terminal_qt.account_service import FuturesPositionView
 from roll_terminal_qt.execution_service import ProfessionalCloseExecutionPlan, ProfessionalOpenExecutionPlan
 from roll_terminal_qt.ui import RollTerminalWindow
+from roll_terminal_qt.opportunity_service import (
+    is_manual_instrument_active,
+    is_manual_instrument_allowed,
+    is_quarterly_expiry_code,
+    manual_instrument_label,
+)
 
 
 class _TextField:
@@ -130,6 +137,38 @@ class _RuntimeThreadStub:
 class RollTerminalUiTests(unittest.TestCase):
     def _build_window(self) -> RollTerminalWindow:
         return RollTerminalWindow.__new__(RollTerminalWindow)
+
+    def test_manual_instrument_filter_only_keeps_btc_spot_and_coin_margined_futures(self) -> None:
+        self.assertTrue(is_manual_instrument_allowed("BTC-USDT", "SPOT"))
+        self.assertTrue(is_manual_instrument_allowed("BTC-USD-260925", "FUTURES", "BTC-USD"))
+        self.assertFalse(is_manual_instrument_allowed("BTC-USDC", "SPOT"))
+        self.assertFalse(is_manual_instrument_allowed("ETH-USDT", "SPOT"))
+        self.assertFalse(is_manual_instrument_allowed("BTC-USDT-SWAP", "SWAP", "BTC-USDT"))
+        self.assertFalse(is_manual_instrument_allowed("BTC-USDT-260925", "FUTURES", "BTC-USDT"))
+        self.assertFalse(is_manual_instrument_allowed("BTC-USD-260717", "FUTURES", "BTC-USD"))
+        self.assertFalse(is_quarterly_expiry_code("260904"))
+        self.assertTrue(is_quarterly_expiry_code("260925"))
+        self.assertFalse(
+            is_manual_instrument_active(
+                "BTC-USD-260626",
+                "FUTURES",
+                "BTC-USD",
+                today=date(2026, 9, 4),
+            )
+        )
+        self.assertTrue(
+            is_manual_instrument_active(
+                "BTC-USD-260925",
+                "FUTURES",
+                "BTC-USD",
+                today=date(2026, 9, 4),
+            )
+        )
+        self.assertEqual(manual_instrument_label("BTC-USDT", "SPOT"), "BTC 现货 · BTC-USDT")
+        self.assertEqual(
+            manual_instrument_label("BTC-USD-260925", "FUTURES", "BTC-USD"),
+            "BTC-USD 币本位季度交割 · BTC-USD-260925",
+        )
 
     def test_runtime_thread_callback_ignores_stale_generation(self) -> None:
         window = self._build_window()

@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+import calendar
 import json
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from uuid import uuid4
 
 from okx_quant.app_paths import state_dir_path
@@ -9,6 +10,75 @@ from roll_terminal_qt.models import ArbitrageOpportunityView
 
 
 CUSTOM_OPPORTUNITIES_FILE_NAME = "roll_terminal_custom_opportunities.json"
+QUARTERLY_EXPIRY_MONTHS = {"03", "06", "09", "12"}
+
+
+def is_quarterly_expiry_code(expiry_code: str) -> bool:
+    """Return whether an OKX expiry code is the month's last Friday in a quarter."""
+    normalized = str(expiry_code or "").strip()
+    if len(normalized) != 6 or not normalized.isdigit() or normalized[2:4] not in QUARTERLY_EXPIRY_MONTHS:
+        return False
+    try:
+        expiry_date = datetime.strptime(normalized, "%y%m%d").date()
+    except ValueError:
+        return False
+    last_day = expiry_date.replace(day=calendar.monthrange(expiry_date.year, expiry_date.month)[1])
+    last_friday = last_day - timedelta(days=(last_day.weekday() - 4) % 7)
+    return expiry_date == last_friday
+
+
+def is_manual_instrument_allowed(inst_id: str, inst_type: str = "", uly: str = "") -> bool:
+    """Return whether an instrument belongs in the manual BTC pair picker."""
+    normalized_id = str(inst_id or "").strip().upper()
+    normalized_type = str(inst_type or "").strip().upper()
+    normalized_uly = str(uly or "").strip().upper()
+    parts = normalized_id.split("-")
+    if normalized_type == "SPOT" or (not normalized_type and len(parts) == 2):
+        return normalized_id == "BTC-USDT"
+    if normalized_type == "FUTURES" or (not normalized_type and len(parts) == 3):
+        return (
+            len(parts) == 3
+            and parts[0] == "BTC"
+            and parts[1] == "USD"
+            and len(parts[2]) == 6
+            and parts[2].isdigit()
+            and is_quarterly_expiry_code(parts[2])
+            and (not normalized_uly or normalized_uly == "BTC-USD")
+        )
+    return False
+
+
+def manual_instrument_label(inst_id: str, inst_type: str = "", uly: str = "") -> str:
+    """Build the user-facing label for an item in the manual BTC pair picker."""
+    normalized_id = str(inst_id or "").strip().upper()
+    normalized_type = str(inst_type or "").strip().upper()
+    if normalized_type == "SPOT" or (not normalized_type and len(normalized_id.split("-")) == 2):
+        return f"BTC 现货 · {normalized_id}"
+    return f"BTC-USD 币本位季度交割 · {normalized_id}"
+
+
+def is_manual_instrument_active(
+    inst_id: str,
+    inst_type: str = "",
+    uly: str = "",
+    state: str = "",
+    *,
+    today: date | None = None,
+) -> bool:
+    """Return whether a manual-picker instrument is still selectable today."""
+    if not is_manual_instrument_allowed(inst_id, inst_type, uly):
+        return False
+    normalized_state = str(state or "").strip().lower()
+    if normalized_state and normalized_state not in {"live", "preopen", "test"}:
+        return False
+    parts = str(inst_id or "").strip().upper().split("-")
+    if len(parts) != 3:
+        return True
+    try:
+        expiry_date = datetime.strptime(parts[2], "%y%m%d").date()
+    except ValueError:
+        return False
+    return expiry_date >= (today or datetime.now(timezone.utc).date())
 
 
 def default_opportunities() -> list[ArbitrageOpportunityView]:
