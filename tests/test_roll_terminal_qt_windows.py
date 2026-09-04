@@ -114,6 +114,18 @@ from roll_terminal_qt.workspace_shell import LocalTaskCount
 
 class RollTerminalQtWindowHelperTests(QtWidgetTestCase):
 
+    def test_candlestick_chart_can_request_older_data_with_64_bit_timestamp(self) -> None:
+        chart = CandlestickChartView()
+        timestamp = 1_787_904_000_000
+        observed_timestamps: list[int] = []
+        chart.older_data_requested.connect(lambda before_ts: observed_timestamps.append(int(before_ts)))
+        try:
+            chart.older_data_requested.emit(timestamp)
+
+            self.assertEqual(observed_timestamps, [timestamp])
+        finally:
+            self.dispose_widget(chart)
+
     def test_candlestick_chart_retains_time_markers_when_toggling_moving_averages(self) -> None:
         chart = CandlestickChartView()
         candles = [

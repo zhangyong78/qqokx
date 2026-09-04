@@ -1057,7 +1057,9 @@ class CandlestickChartView(QChartView):
     hover_time_changed = Signal(object, float)
     hover_cleared = Signal()
     viewport_changed = Signal(object, object)
-    older_data_requested = Signal(int)
+    # Millisecond Unix timestamps exceed PySide's 32-bit ``int`` signal
+    # range.  Keep this payload as a Python object, just like hover timestamps.
+    older_data_requested = Signal(object)
 
     def __init__(self, *, percent_axis: bool = False, parent: QWidget | None = None) -> None:
         chart = QChart()
