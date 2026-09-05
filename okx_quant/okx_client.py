@@ -2254,14 +2254,21 @@ class OkxRestClient:
         environment: str,
         inst_types: tuple[str, ...] = ("SWAP", "FUTURES", "OPTION"),
         limit: int = 100,
+        after_ms: int | None = None,
+        before_ms: int | None = None,
     ) -> list[OkxPositionHistoryItem]:
         items: list[OkxPositionHistoryItem] = []
         per_type_limit = max(1, min(limit, 100))
         for inst_type in inst_types:
+            params = {"instType": inst_type, "limit": str(per_type_limit)}
+            if after_ms is not None:
+                params["after"] = str(int(after_ms))
+            if before_ms is not None:
+                params["before"] = str(int(before_ms))
             payload = self._request(
                 "GET",
                 "/api/v5/account/positions-history",
-                params={"instType": inst_type, "limit": str(per_type_limit)},
+                params=params,
                 auth=True,
                 credentials=credentials,
                 simulated=environment == "demo",

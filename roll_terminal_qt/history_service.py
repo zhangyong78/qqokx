@@ -35,6 +35,26 @@ _FILL_HISTORY_DEDUP_FIELDS = (
 )
 
 
+def load_local_position_history(
+    profile_name: str,
+    environment: str,
+    *,
+    limit: int = 500,
+) -> list[OkxPositionHistoryItem]:
+    """Load the same local position-history cache used by the positions page."""
+    local_records = load_history_cache_records("positions", profile_name, environment)
+    collapsed_records = _collapse_position_history_records(local_records)
+    if collapsed_records != local_records:
+        save_history_cache_records("positions", profile_name, environment, collapsed_records)
+    items = [
+        item
+        for record in collapsed_records
+        if isinstance(record, dict) and (item := _position_history_item_from_cache(record)) is not None
+    ]
+    items.sort(key=lambda item: item.update_time or 0, reverse=True)
+    return items[: max(20, int(limit))]
+
+
 def load_cached_order_history(profile_name: str, environment: str, limit: int) -> list[OkxTradeOrderItem]:
     records = load_history_cache_records("orders", profile_name, environment)
     items = [item for record in records if (item := _order_item_from_cache(record)) is not None]
@@ -81,10 +101,19 @@ class PositionHistoryFeedThread(QThread):
     data_ready = Signal(object)
     status_changed = Signal(str)
 
-    def __init__(self, runtime: ArbitrageTradeRuntime | None, *, limit: int = 120) -> None:
+    def __init__(
+        self,
+        runtime: ArbitrageTradeRuntime | None,
+        *,
+        limit: int = 120,
+        after_ms: int | None = None,
+        before_ms: int | None = None,
+    ) -> None:
         super().__init__()
         self._runtime = runtime
         self._limit = max(20, int(limit))
+        self._after_ms = after_ms
+        self._before_ms = before_ms
         self._client = OkxRestClient()
         self._running = True
 
@@ -110,6 +139,8 @@ class PositionHistoryFeedThread(QThread):
                 self._runtime.credentials,
                 environment=environment,
                 limit=self._limit,
+                after_ms=self._after_ms,
+                before_ms=self._before_ms,
             )
             if not self._running:
                 return
@@ -135,17 +166,7 @@ class PositionHistoryFeedThread(QThread):
             self.status_changed.emit(f"历史仓位读取异常：{exc}")
 
     def _load_local_position_history(self, *, profile_name: str, environment: str) -> list[OkxPositionHistoryItem]:
-        local_records = load_history_cache_records("positions", profile_name, environment)
-        collapsed_records = _collapse_position_history_records(local_records)
-        if collapsed_records != local_records:
-            save_history_cache_records("positions", profile_name, environment, collapsed_records)
-        parsed_items = [
-            item
-            for record in collapsed_records
-            if isinstance(record, dict) and (item := _position_history_item_from_cache(record)) is not None
-        ]
-        parsed_items.sort(key=lambda item: item.update_time or 0, reverse=True)
-        return parsed_items[: self._limit]
+        return load_local_position_history(profile_name, environment, limit=self._limit)
 
     def _merge_position_history_cache(
         self,

@@ -28,6 +28,7 @@ from okx_quant.app_meta import APP_VERSION, build_version_info_text
 from okx_quant.app_paths import config_dir_path, data_root, logs_dir_path, state_dir_path
 from okx_quant.log_utils import append_log_line
 from roll_terminal_qt.account_positions_home import AccountPositionsHomeWidget
+from roll_terminal_qt.daily_trade_report_window import DailyTradeReportWidget
 from roll_terminal_qt.app_icon import apply_qt_application_identity, apply_qt_window_icon
 from roll_terminal_qt.auto_channel_window import AutoChannelWindow
 from roll_terminal_qt.deribit_volatility_window import DeribitVolatilityQtWindow
@@ -36,7 +37,7 @@ from roll_terminal_qt.module_overview import ModuleOverview, build_module_overvi
 from roll_terminal_qt.option_strategy_window import OptionStrategyQtWindow
 from roll_terminal_qt.kline_analysis_window import KlineAnalysisWindow
 from roll_terminal_qt.perf_metrics import measure_ui_step
-from roll_terminal_qt.profile_access import ensure_profile_unlocked, load_profile_snapshots
+from roll_terminal_qt.profile_access import load_profile_snapshots
 from roll_terminal_qt.runtime import load_runtime
 from roll_terminal_qt.smart_order_window import SmartOrderQtWindow
 from roll_terminal_qt.style import APP_STYLE
@@ -312,12 +313,7 @@ class LauncherWindow(QMainWindow):
             return
         self._profile_snapshots, _selected = load_profile_snapshots()
         runtime = load_runtime(target)
-        if runtime is None or not ensure_profile_unlocked(
-            self,
-            target,
-            self._profile_snapshots,
-            self._unlocked_profiles,
-        ):
+        if runtime is None:
             self._workspace_header.restore_profile(previous)
             return
         self._active_profile_name = target
@@ -343,6 +339,8 @@ class LauncherWindow(QMainWindow):
             set_workspace_managed = getattr(page, "set_workspace_managed", None)
             if callable(set_workspace_managed):
                 set_workspace_managed(True)
+        elif page_key == "daily-report":
+            page = DailyTradeReportWidget(self, profile_name=self._active_profile_name)
         elif page_key == "smart-order":
             page = SmartOrderQtWindow()
         else:
@@ -354,7 +352,7 @@ class LauncherWindow(QMainWindow):
         normalized = page_key.strip().lower()
         if normalized == "kline-analysis":
             normalized = "kline"
-        if normalized not in {"account", "kline", "roll", "smart-order"}:
+        if normalized not in {"account", "kline", "roll", "daily-report", "smart-order"}:
             raise KeyError(f"unknown page: {page_key}")
         page = self._pages.get(normalized)
         if page is None:

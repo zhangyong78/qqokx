@@ -616,7 +616,6 @@ class RollTerminalQtWindowHelperTests(QtWidgetTestCase):
                 side_effect=lambda name=None: runtimes[name or "api1"],
                 create=True,
             ),
-            patch("roll_terminal_qt.launcher.ensure_profile_unlocked", return_value=True, create=True) as unlock,
         ):
             launcher = LauncherWindow()
             try:
@@ -629,7 +628,6 @@ class RollTerminalQtWindowHelperTests(QtWidgetTestCase):
                 self.assertEqual(launcher._workspace_header.environment_label.text(), "实盘")
                 self.assertEqual(launcher._pages["kline"].applied_profiles[-1], "api2")
                 self.assertEqual(launcher._pages["account"].applied_profiles[-1], "api2")
-                unlock.assert_called_once()
             finally:
                 self.__class__.dispose_widget(launcher)
 
@@ -650,8 +648,11 @@ class RollTerminalQtWindowHelperTests(QtWidgetTestCase):
                 return_value=({"api1": {}, "api2": {}}, "api1"),
                 create=True,
             ),
-            patch("roll_terminal_qt.launcher.load_runtime", return_value=runtime, create=True),
-            patch("roll_terminal_qt.launcher.ensure_profile_unlocked", return_value=False, create=True),
+            patch(
+                "roll_terminal_qt.launcher.load_runtime",
+                side_effect=lambda name=None: runtime if (name or "api1") == "api1" else None,
+                create=True,
+            ),
         ):
             launcher = LauncherWindow()
             try:

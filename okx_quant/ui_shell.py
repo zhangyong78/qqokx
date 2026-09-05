@@ -46,6 +46,14 @@ from okx_quant.deribit_volatility_monitor_ui import DeribitVolatilityMonitorWind
 from okx_quant.deribit_volatility_ui import DeribitVolatilityWindow
 from okx_quant.email_schedule_manager_ui import EmailScheduleManagerWindow
 from okx_quant.daily_filters import daily_boundary_anchor_offset_ms
+from okx_quant.daily_trade_report import (
+    DailyTrade,
+    build_daily_trade_report,
+    daily_trade_from_strategy_ledger,
+    format_report_decimal,
+    report_to_csv,
+    report_to_html,
+)
 from okx_quant.engine import (
     DEFAULT_DEBUG_ATR_PERIOD,
     FilledPosition,
@@ -5584,8 +5592,11 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         ttk.Button(book_group, text="策略总账本", command=self.open_strategy_book_window).grid(
             row=0, column=1, padx=(8, 0)
         )
-        ttk.Button(book_group, text="导入最佳参数组合包", command=self.import_strategy_template_bundle).grid(
+        ttk.Button(book_group, text="API每日报表", command=self.open_daily_trade_report_window).grid(
             row=0, column=2, padx=(8, 0)
+        )
+        ttk.Button(book_group, text="导入最佳参数组合包", command=self.import_strategy_template_bundle).grid(
+            row=0, column=3, padx=(8, 0)
         )
 
         utility_group = ttk.LabelFrame(control_row, text="清理与模式", padding=(8, 6))

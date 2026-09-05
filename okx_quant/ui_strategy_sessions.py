@@ -12047,6 +12047,153 @@ class UiStrategySessionsMixin:
 
         self._refresh_strategy_book_window()
 
+    def _daily_trade_report_trades(self) -> list[DailyTrade]:
+        trades = [daily_trade_from_strategy_ledger(record) for record in self._strategy_trade_ledger_records]
+        for session in self.sessions.values():
+            active = getattr(session, "active_trade", None)
+            opened_at = getattr(active, "opened_logged_at", None) if active is not None else None
+            if active is None or opened_at is None:
+                continue
+            trades.append(
+                DailyTrade(
+                    trade_key=f"open:{session.session_id}:{getattr(active, 'round_id', '')}",
+                    api_name=session.api_name,
+                    environment="live",
+                    symbol=session.symbol,
+                    strategy_name=session.strategy_name,
+                    session_id=session.session_id,
+                    direction=session.direction_label,
+                    opened_at=opened_at,
+                    closed_at=None,
+                    entry_price=getattr(active, "entry_price", None),
+                    exit_price=None,
+                    size=getattr(active, "size", None),
+                    gross_pnl=None,
+                    fee=Decimal("0"),
+                    funding_fee=Decimal("0"),
+                    net_pnl=None,
+                    close_reason="-",
+                    status="持仓中",
+                    source="运行中策略",
+                )
+            )
+        return trades
+
+    def open_daily_trade_report_window(self) -> None:
+        existing = getattr(self, "_daily_trade_report_window", None)
+        if existing is not None and _widget_exists(existing):
+            existing.focus_force()
+            self._refresh_daily_trade_report_window()
+            return
+
+        window = Toplevel(self.root)
+        apply_window_icon(window)
+        window.title("API每日交易报表")
+        apply_adaptive_window_geometry(window, width_ratio=0.86, height_ratio=0.78, min_width=1180, min_height=680)
+        self._daily_trade_report_window = window
+        window.protocol("WM_DELETE_WINDOW", lambda: (window.destroy(), setattr(self, "_daily_trade_report_window", None)))
+
+        container = ttk.Frame(window, padding=12)
+        container.pack(fill="both", expand=True)
+        container.columnconfigure(0, weight=1)
+        container.rowconfigure(2, weight=1)
+        header = ttk.Frame(container)
+        header.grid(row=0, column=0, sticky="ew", pady=(0, 8))
+        header.columnconfigure(7, weight=1)
+        ttk.Label(header, text="API").grid(row=0, column=0, sticky="w")
+        self._daily_trade_report_api_var = StringVar(value="全部API")
+        api_values = ["全部API"] + sorted(
+            {record.api_name for record in self._strategy_trade_ledger_records if record.api_name}
+            | {session.api_name for session in self.sessions.values() if session.api_name},
+            key=str.casefold,
+        )
+        self._daily_trade_report_api_combo = ttk.Combobox(header, textvariable=self._daily_trade_report_api_var, values=api_values, state="readonly", width=14)
+        self._daily_trade_report_api_combo.grid(row=0, column=1, padx=(6, 14))
+        ttk.Label(header, text="开始日期").grid(row=0, column=2, sticky="w")
+        self._daily_trade_report_start_var = StringVar(value=(date.today() - timedelta(days=6)).isoformat())
+        ttk.Entry(header, textvariable=self._daily_trade_report_start_var, width=12).grid(row=0, column=3, padx=(6, 14))
+        ttk.Label(header, text="结束日期").grid(row=0, column=4, sticky="w")
+        self._daily_trade_report_end_var = StringVar(value=date.today().isoformat())
+        ttk.Entry(header, textvariable=self._daily_trade_report_end_var, width=12).grid(row=0, column=5, padx=(6, 14))
+        ttk.Button(header, text="刷新", command=self._refresh_daily_trade_report_window).grid(row=0, column=6, padx=(0, 6))
+        ttk.Button(header, text="导出 CSV", command=lambda: self._export_daily_trade_report("csv")).grid(row=0, column=7, sticky="w", padx=(0, 6))
+        ttk.Button(header, text="导出 HTML", command=lambda: self._export_daily_trade_report("html")).grid(row=0, column=8, sticky="w")
+
+        self._daily_trade_report_status_var = StringVar(value="按平仓日统计；未平仓单计入开仓日的未平仓数量。")
+        ttk.Label(container, textvariable=self._daily_trade_report_status_var, justify="left").grid(row=1, column=0, sticky="w", pady=(0, 8))
+        notebook = ttk.Notebook(container)
+        notebook.grid(row=2, column=0, sticky="nsew")
+        self._daily_trade_report_trees = {}
+        for key, title, columns in (
+            ("daily", "每日汇总", ("日期", "API", "开仓", "平仓", "盈利", "亏损", "毛盈亏", "手续费", "资金费", "净盈亏", "未平仓")),
+            ("symbol", "品种汇总", ("日期", "API", "品种", "平仓", "盈利", "亏损", "净盈亏")),
+            ("strategy", "策略汇总", ("日期", "API", "策略", "平仓", "盈利", "亏损", "净盈亏")),
+            ("detail", "交易明细", ("平仓时间", "API", "品种", "策略", "会话", "方向", "开仓时间", "开仓价", "平仓价", "数量", "净盈亏", "状态", "来源", "原因")),
+        ):
+            frame = ttk.Frame(notebook)
+            frame.rowconfigure(0, weight=1)
+            frame.columnconfigure(0, weight=1)
+            tree = ttk.Treeview(frame, columns=columns, show="headings", selectmode="browse")
+            for column in columns:
+                tree.heading(column, text=column)
+                tree.column(column, width=105, anchor="e" if column in {"开仓", "平仓", "盈利", "亏损", "毛盈亏", "手续费", "资金费", "净盈亏", "未平仓", "数量", "开仓价", "平仓价"} else "w")
+            tree.grid(row=0, column=0, sticky="nsew")
+            scrollbar = ttk.Scrollbar(frame, orient="vertical", command=tree.yview)
+            scrollbar.grid(row=0, column=1, sticky="ns")
+            tree.configure(yscrollcommand=scrollbar.set)
+            notebook.add(frame, text=title)
+            self._daily_trade_report_trees[key] = tree
+        self._refresh_daily_trade_report_window()
+
+    def _refresh_daily_trade_report_window(self) -> None:
+        window = getattr(self, "_daily_trade_report_window", None)
+        if window is None or not _widget_exists(window):
+            return
+        try:
+            start_date = date.fromisoformat(self._daily_trade_report_start_var.get().strip())
+            end_date = date.fromisoformat(self._daily_trade_report_end_var.get().strip())
+        except ValueError:
+            messagebox.showerror("日期格式错误", "日期请使用 YYYY-MM-DD 格式。", parent=window)
+            return
+        if start_date > end_date:
+            start_date, end_date = end_date, start_date
+        report = build_daily_trade_report(
+            self._daily_trade_report_trades(),
+            start_date=start_date,
+            end_date=end_date,
+            api_name=self._daily_trade_report_api_var.get() or "全部API",
+        )
+        self._daily_trade_report = report
+        trees = self._daily_trade_report_trees
+        daily_tree = trees["daily"]
+        daily_tree.delete(*daily_tree.get_children())
+        for row in report.daily:
+            daily_tree.insert("", "end", values=(row.report_date.isoformat(), row.api_name, row.opened_count, row.closed_count, row.win_count, row.loss_count, format_report_decimal(row.gross_pnl, signed=True), format_report_decimal(row.fee, signed=True), format_report_decimal(row.funding_fee, signed=True), format_report_decimal(row.net_pnl, signed=True), row.open_count))
+        for key, rows in (("symbol", report.by_symbol), ("strategy", report.by_strategy)):
+            tree = trees[key]
+            tree.delete(*tree.get_children())
+            for row in rows:
+                tree.insert("", "end", values=(row.report_date.isoformat(), row.api_name, row.group_name, row.closed_count, row.win_count, row.loss_count, format_report_decimal(row.net_pnl, signed=True)))
+        detail_tree = trees["detail"]
+        detail_tree.delete(*detail_tree.get_children())
+        for trade in report.trades:
+            detail_tree.insert("", "end", values=((trade.closed_at or trade.opened_at).strftime("%Y-%m-%d %H:%M") if (trade.closed_at or trade.opened_at) else "-", trade.api_name, trade.symbol, trade.strategy_name, trade.session_id, trade.direction, trade.opened_at.strftime("%Y-%m-%d %H:%M") if trade.opened_at else "-", trade.entry_price or "-", trade.exit_price or "-", trade.size or "-", format_report_decimal(trade.net_pnl, signed=True), trade.status, trade.source, trade.close_reason))
+        net = sum((row.net_pnl for row in report.daily), Decimal("0"))
+        self._daily_trade_report_status_var.set(f"{report.start_date} 至 {report.end_date} | 记录 {len(report.trades)} 条 | 已结算净盈亏 {format_report_decimal(net, signed=True)}")
+
+    def _export_daily_trade_report(self, kind: str) -> None:
+        report = getattr(self, "_daily_trade_report", None)
+        window = getattr(self, "_daily_trade_report_window", None)
+        if report is None or window is None:
+            messagebox.showinfo("暂无数据", "请先刷新日报。", parent=window)
+            return
+        suffix = ".csv" if kind == "csv" else ".html"
+        path = filedialog.asksaveasfilename(parent=window, title="导出 API 每日交易报表", defaultextension=suffix, filetypes=[("CSV", "*.csv"), ("HTML", "*.html")])
+        if not path:
+            return
+        Path(path).write_text(report_to_csv(report) if kind == "csv" else report_to_html(report), encoding="utf-8-sig" if kind == "csv" else "utf-8")
+        self._daily_trade_report_status_var.set(f"已导出：{path}")
+
     def _close_strategy_book_window(self) -> None:
         if self._strategy_book_window is not None and _widget_exists(self._strategy_book_window):
             self._strategy_book_window.destroy()

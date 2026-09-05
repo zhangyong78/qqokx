@@ -8,7 +8,7 @@ from PySide6.QtGui import QAction
 from PySide6.QtWidgets import QComboBox, QFrame, QHBoxLayout, QLabel, QMenu, QSizePolicy, QToolButton
 
 
-WorkspacePageKey = Literal["kline", "account", "roll", "smart-order"]
+WorkspacePageKey = Literal["kline", "account", "roll", "daily-report", "smart-order"]
 
 
 @dataclass(frozen=True)
@@ -78,6 +78,7 @@ class WorkspaceHeader(QFrame):
         ("page:kline", "K线"),
         ("page:account", "持仓"),
         ("page:roll", "专业套利"),
+        ("page:daily-report", "交易汇总"),
         ("tool:smart-order", "无限下单"),
         ("option:option-strategy", "期权策略计算器"),
         ("option:deribit-volatility", "Deribit 波动率"),
@@ -100,7 +101,7 @@ class WorkspaceHeader(QFrame):
         brand.setObjectName("WorkspaceBrand")
         layout.addWidget(brand)
 
-        for route_key, text in self._ROUTES[:3]:
+        for route_key, text in self._ROUTES[:4]:
             page_key = route_key.split(":", 1)[1]
             action = self._register_action(route_key, text)
             button = QToolButton(self)
@@ -111,13 +112,13 @@ class WorkspaceHeader(QFrame):
             self._page_buttons[page_key] = button
             layout.addWidget(button)
 
-        trading_tools_button = self._menu_button("交易工具", self._ROUTES[3:4])
+        trading_tools_button = self._menu_button("交易工具", self._ROUTES[4:5])
         trading_tools_button.setCheckable(True)
         trading_tools_button.setAutoExclusive(True)
         trading_tools_button.setObjectName("WorkspacePageButton")
         self._page_buttons["smart-order"] = trading_tools_button
         layout.addWidget(trading_tools_button)
-        layout.addWidget(self._menu_button("期权工具", self._ROUTES[4:6]))
+        layout.addWidget(self._menu_button("期权工具", self._ROUTES[5:7]))
         layout.addStretch(1)
 
         self.connection_label = QLabel("行情连接中", self)
@@ -140,7 +141,7 @@ class WorkspaceHeader(QFrame):
         self.task_button.clicked.connect(lambda: self.tool_requested.emit("rr-monitor"))
         layout.addWidget(self.task_button)
 
-        layout.addWidget(self._menu_button("⚙", self._ROUTES[6:]))
+        layout.addWidget(self._menu_button("⚙", self._ROUTES[7:]))
         self.setStyleSheet(
             """
             QFrame#WorkspaceHeader { background: #10273a; border: 0; }

@@ -565,6 +565,31 @@ def history_cache_dir_path(
     return root / HISTORY_CACHE_DIR_NAME / _normalize_history_profile_name(profile_name) / _normalize_history_environment(environment)
 
 
+def list_history_cache_scopes(*, base_dir: Path | None = None) -> list[tuple[str, str]]:
+    """Return profile/environment pairs that have a local history cache."""
+    root = (Path(base_dir) if base_dir is not None else state_dir_path()) / HISTORY_CACHE_DIR_NAME
+    if not root.exists():
+        return []
+    scopes: list[tuple[str, str]] = []
+    try:
+        profile_dirs = tuple(item for item in root.iterdir() if item.is_dir())
+    except OSError:
+        return []
+    for profile_dir in profile_dirs:
+        profile_name = profile_dir.name.strip()
+        if not profile_name:
+            continue
+        try:
+            environment_dirs = tuple(item for item in profile_dir.iterdir() if item.is_dir())
+        except OSError:
+            continue
+        for environment_dir in environment_dirs:
+            environment = environment_dir.name.strip().lower()
+            if environment in PROFILE_ENVIRONMENTS and (environment_dir / HISTORY_POSITIONS_FILE_NAME).exists():
+                scopes.append((profile_name, environment))
+    return sorted(scopes, key=lambda item: (item[0].casefold(), item[1]))
+
+
 def position_history_view_prefs_file_path(*, base_dir: Path | None = None) -> Path:
     root = Path(base_dir) if base_dir is not None else state_dir_path()
     return root / POSITION_HISTORY_VIEW_PREFS_FILE_NAME
