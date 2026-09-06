@@ -450,6 +450,17 @@ class _OptionTradeRecordThread(QThread):
                 inst_type="OPTION",
                 prefer_cache=False,
             )
+            option_positions = tuple(
+                sorted(
+                    (
+                        item
+                        for item in current_positions
+                        if str(getattr(item, "inst_type", "") or "").strip().upper() == "OPTION"
+                        and self._absolute_decimal(getattr(item, "position", None)) is not None
+                    ),
+                    key=lambda item: str(getattr(item, "inst_id", "") or "").strip().upper(),
+                )
+            )
             markers_by_inst_id: dict[str, list[PositionPriceMarker]] = {item: [] for item in self._inst_ids}
             seen_openings: set[tuple[str, str, int]] = set()
             for item in history:
@@ -530,6 +541,7 @@ class _OptionTradeRecordThread(QThread):
                 OptionTradeRecordSnapshot(
                     profile_name=str(getattr(runtime, "credential_profile_name", "") or self._profile_name),
                     markers_by_inst_id=normalized,
+                    option_positions=option_positions,
                 ),
             )
         except Exception as exc:  # noqa: BLE001
@@ -1343,6 +1355,7 @@ class OptionTradeRecordSnapshot:
 
     profile_name: str
     markers_by_inst_id: dict[str, tuple[PositionPriceMarker, ...]]
+    option_positions: tuple[OkxPosition, ...] = ()
 
 
 class CandlestickChartView(QChartView):
@@ -1469,6 +1482,12 @@ class CandlestickChartView(QChartView):
         down_series.setDecreasingColor(decreasing_color)
         down_series.setBodyOutlineVisible(False)
         down_series.setCapsVisible(False)
+        # A newly listed option can have only a handful of daily candles.
+        # Keep sparse daily bars readable instead of stretching each body to
+        # half of the time step across the whole chart.
+        candle_body_width = 0.32 if len(candles) <= 12 else 0.40 if len(candles) <= 24 else 0.50
+        up_series.setBodyWidth(candle_body_width)
+        down_series.setBodyWidth(candle_body_width)
         for candle in candles:
             high = candle.high
             low = candle.low
@@ -2418,6 +2437,7 @@ class OptionChainLinkedChartDialog(QDialog):
         self._trade_record_thread: _OptionTradeRecordThread | None = None
         self._pending_trade_record_reload = False
         self._trade_markers_by_inst_id: dict[str, tuple[PositionPriceMarker, ...]] = {}
+        self._option_positions: tuple[OkxPosition, ...] = ()
         self._side_instruments: dict[str, tuple[Instrument, ...]] = {"left": (), "right": ()}
         self._side_tickers_by_inst_id: dict[str, dict[str, OkxTicker]] = {"left": {}, "right": {}}
         self._pending_side_contract_loads: set[str] = set()
@@ -2426,6 +2446,7 @@ class OptionChainLinkedChartDialog(QDialog):
         self._side_expiry_combos: dict[str, QComboBox] = {}
         self._side_type_combos: dict[str, QComboBox] = {}
         self._side_strike_combos: dict[str, QComboBox] = {}
+        self._side_position_combos: dict[str, QComboBox] = {}
         self._current_bar = "1H"
         self._syncing_viewport = False
         self._bar_buttons: dict[str, QPushButton] = {}
@@ -2453,7 +2474,6 @@ class OptionChainLinkedChartDialog(QDialog):
         self._trade_records_button = QPushButton("开平仓记录：开")
         self._trade_records_button.setCheckable(True)
         self._trade_records_button.toggled.connect(self._on_trade_records_toggled)
-        self._trade_records_button.setChecked(True)
         toolbar.addWidget(self._trade_records_button)
         toolbar.addStretch(1)
         refresh_button = QPushButton("刷新")
@@ -2466,6 +2486,7 @@ class OptionChainLinkedChartDialog(QDialog):
         self._volatility_chart = CandlestickChartView(percent_axis=True)
         self._put_chart = CandlestickChartView()
         self._side_charts = {"left": self._call_chart, "right": self._put_chart}
+        self._trade_records_button.setChecked(True)
         self._charts = (self._call_chart, self._underlying_chart, self._volatility_chart, self._put_chart)
         charts = QSplitter(Qt.Orientation.Horizontal)
         charts.setChildrenCollapsible(False)
@@ -2511,7 +2532,16 @@ class OptionChainLinkedChartDialog(QDialog):
         option_type_combo.setMinimumWidth(72)
         strike_combo = QComboBox()
         strike_combo.setMinimumWidth(96)
-        for label, combo in (("到期日", expiry_combo), ("方向", option_type_combo), ("行权价", strike_combo)):
+        position_combo = QComboBox()
+        position_combo.setMinimumWidth(150)
+        position_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        position_combo.addItem("无期权持仓", "")
+        for label, combo in (
+            ("到期日", expiry_combo),
+            ("方向", option_type_combo),
+            ("行权价", strike_combo),
+            ("持仓", position_combo),
+        ):
             toolbar.addWidget(QLabel(label))
             toolbar.addWidget(combo)
             combo.setEnabled(False)
@@ -2519,9 +2549,11 @@ class OptionChainLinkedChartDialog(QDialog):
         expiry_combo.currentIndexChanged.connect(lambda _index, target=side: self._on_side_expiry_changed(target))
         option_type_combo.currentIndexChanged.connect(lambda _index, target=side: self._on_side_type_changed(target))
         strike_combo.currentIndexChanged.connect(lambda _index, target=side: self._on_side_strike_changed(target))
+        position_combo.currentIndexChanged.connect(lambda _index, target=side: self._on_side_position_changed(target))
         self._side_expiry_combos[side] = expiry_combo
         self._side_type_combos[side] = option_type_combo
         self._side_strike_combos[side] = strike_combo
+        self._side_position_combos[side] = position_combo
         panel_layout.addWidget(toolbar_widget)
         panel_layout.addWidget(chart, 1)
         return panel
@@ -2542,6 +2574,8 @@ class OptionChainLinkedChartDialog(QDialog):
     def show_pair(self, *, call_quote: OptionQuote | None, put_quote: OptionQuote | None, bar: str = "1H") -> None:
         self._call_quote = call_quote
         self._put_quote = put_quote
+        self._option_positions = ()
+        self._refresh_side_position_options()
         normalized_bar = bar.strip().upper()
         self._current_bar = normalized_bar if normalized_bar in self._bar_buttons else "1H"
         self._update_linked_title()
@@ -2571,6 +2605,8 @@ class OptionChainLinkedChartDialog(QDialog):
             return
         self._profile_name = target
         self._trade_markers_by_inst_id.clear()
+        self._option_positions = ()
+        self._refresh_side_position_options()
         self._clear_trade_record_markers()
         if self._trade_records_button.isChecked():
             self._load_trade_records()
@@ -2583,6 +2619,64 @@ class OptionChainLinkedChartDialog(QDialog):
                 if quote is not None and quote.instrument.inst_id.strip()
             )
         )
+
+    def _refresh_side_position_options(self) -> None:
+        """Show current option positions that belong to each linked chart family."""
+
+        for side in ("left", "right"):
+            combo = self._side_position_combos[side]
+            selected_inst_id = str(combo.currentData() or "").strip().upper()
+            quote = self._side_quote(side)
+            family = ""
+            if quote is not None:
+                family = str(quote.instrument.inst_family or "").strip().upper()
+                if not family:
+                    try:
+                        family = parse_option_contract(quote.instrument.inst_id).inst_family
+                    except ValueError:
+                        family = ""
+            choices: list[tuple[tuple[str, str, str, str], str, str]] = []
+            for position in self._option_positions:
+                if str(getattr(position, "inst_type", "") or "").strip().upper() != "OPTION":
+                    continue
+                try:
+                    quantity = abs(Decimal(str(position.position)))
+                    parsed = parse_option_contract(position.inst_id)
+                except (InvalidOperation, TypeError, ValueError):
+                    continue
+                if quantity <= 0 or (family and parsed.inst_family != family):
+                    continue
+                position_side, _quantity = _position_side_and_quantity(position)
+                direction = "多" if position_side == "buy" else "空"
+                inst_id = position.inst_id.strip().upper()
+                label = (
+                    f"{parsed.expiry_code} {format_decimal(parsed.strike)} "
+                    f"{'认购' if parsed.option_type == 'C' else '认沽'} | {direction} {format_decimal(quantity)}张"
+                )
+                choices.append(((parsed.expiry_code, str(parsed.strike), parsed.option_type, inst_id), inst_id, label))
+            choices.sort(key=lambda item: item[0])
+            combo.blockSignals(True)
+            try:
+                combo.clear()
+                combo.addItem("选择持仓" if choices else "无期权持仓", "")
+                for _key, inst_id, label in choices:
+                    combo.addItem(label, inst_id)
+                if selected_inst_id:
+                    index = combo.findData(selected_inst_id)
+                    if index >= 0:
+                        combo.setCurrentIndex(index)
+            finally:
+                combo.blockSignals(False)
+            combo.setEnabled(bool(choices) and bool(self._side_expiry_combos[side].count()))
+
+    def _clear_side_position_selection(self, side: str) -> None:
+        combo = self._side_position_combos[side]
+        if combo.currentIndex() > 0:
+            combo.blockSignals(True)
+            try:
+                combo.setCurrentIndex(0)
+            finally:
+                combo.blockSignals(False)
 
     def _option_chart_usdt_context(self, side: str) -> tuple[Decimal | None, str]:
         quote = self._side_quote(side)
@@ -2695,6 +2789,8 @@ class OptionChainLinkedChartDialog(QDialog):
         if request_id != self._active_trade_record_request_id or not isinstance(payload, OptionTradeRecordSnapshot):
             return
         self._trade_markers_by_inst_id = dict(payload.markers_by_inst_id)
+        self._option_positions = tuple(payload.option_positions)
+        self._refresh_side_position_options()
         if not self._trade_records_button.isChecked():
             return
         for side in ("left", "right"):
@@ -2729,6 +2825,8 @@ class OptionChainLinkedChartDialog(QDialog):
             self._side_strike_combos[side],
         ):
             combo.setEnabled(enabled)
+        position_combo = self._side_position_combos[side]
+        position_combo.setEnabled(enabled and position_combo.count() > 1)
 
     def _load_side_contract_options(self, side: str) -> None:
         source_quote = self._side_quote(side)
@@ -2818,7 +2916,7 @@ class OptionChainLinkedChartDialog(QDialog):
             try:
                 expiry_combo.clear()
                 for item in payload.expiries:
-                    expiry_combo.addItem(f"{item} ({format_option_expiry_label(item)})", item)
+                    expiry_combo.addItem(item, item)
                 expiry_combo.setCurrentIndex(expiry_combo.findData(expiry))
             finally:
                 expiry_combo.blockSignals(False)
@@ -2838,6 +2936,7 @@ class OptionChainLinkedChartDialog(QDialog):
             self._sync_side_strikes(side, preferred=current.strike if current is not None else payload.strike)
         finally:
             self._syncing_side_controls.discard(side)
+        self._refresh_side_position_options()
         self._set_side_controls_enabled(side, bool(payload.expiries))
         self._apply_side_selection(side)
 
@@ -2876,6 +2975,7 @@ class OptionChainLinkedChartDialog(QDialog):
     def _on_side_expiry_changed(self, side: str) -> None:
         if side in self._syncing_side_controls:
             return
+        self._clear_side_position_selection(side)
         previous = self._side_quote(side)
         preferred = previous.parsed.strike if previous is not None else None
         self._syncing_side_controls.add(side)
@@ -2902,6 +3002,7 @@ class OptionChainLinkedChartDialog(QDialog):
     def _on_side_type_changed(self, side: str) -> None:
         if side in self._syncing_side_controls:
             return
+        self._clear_side_position_selection(side)
         previous = self._side_quote(side)
         self._syncing_side_controls.add(side)
         try:
@@ -2912,7 +3013,38 @@ class OptionChainLinkedChartDialog(QDialog):
 
     def _on_side_strike_changed(self, side: str) -> None:
         if side not in self._syncing_side_controls:
+            self._clear_side_position_selection(side)
             self._apply_side_selection(side)
+
+    def _on_side_position_changed(self, side: str) -> None:
+        if side in self._syncing_side_controls:
+            return
+        inst_id = str(self._side_position_combos[side].currentData() or "").strip().upper()
+        if not inst_id:
+            return
+        try:
+            parsed = parse_option_contract(inst_id)
+        except ValueError:
+            return
+        if not any(
+            str(getattr(position, "inst_id", "") or "").strip().upper() == inst_id
+            for position in self._option_positions
+        ):
+            return
+        self._syncing_side_controls.add(side)
+        try:
+            expiry_combo = self._side_expiry_combos[side]
+            type_combo = self._side_type_combos[side]
+            expiry_index = expiry_combo.findData(parsed.expiry_code)
+            type_index = type_combo.findData(parsed.option_type)
+            if expiry_index < 0 or type_index < 0:
+                return
+            expiry_combo.setCurrentIndex(expiry_index)
+            type_combo.setCurrentIndex(type_index)
+            self._sync_side_strikes(side, preferred=parsed.strike)
+        finally:
+            self._syncing_side_controls.discard(side)
+        self._apply_side_selection(side)
 
     def _load_side_option_candles(self, side: str) -> None:
         quote = self._side_quote(side)
