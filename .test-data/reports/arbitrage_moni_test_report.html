@@ -1,0 +1,263 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>moni 账户套利测试报告</title>
+  <style>
+    :root {
+      --bg: #f5f7fb;
+      --paper: rgba(255, 255, 255, 0.96);
+      --ink: #1f2937;
+      --muted: #6b7280;
+      --line: #dde5ef;
+      --ok: #166534;
+      --ok-bg: #dcfce7;
+      --bad: #991b1b;
+      --bad-bg: #fee2e2;
+      --info: #075985;
+      --info-bg: #e0f2fe;
+      --shadow: 0 18px 40px rgba(31, 41, 55, 0.08);
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: "Microsoft YaHei UI", "PingFang SC", sans-serif;
+      color: var(--ink);
+      background:
+        radial-gradient(circle at top right, rgba(59, 130, 246, 0.08), transparent 26%),
+        radial-gradient(circle at left 20%, rgba(16, 185, 129, 0.08), transparent 22%),
+        var(--bg);
+      line-height: 1.65;
+    }
+    .page {
+      max-width: 1220px;
+      margin: 0 auto;
+      padding: 28px 18px 60px;
+    }
+    .hero, .section {
+      background: var(--paper);
+      border: 1px solid var(--line);
+      border-radius: 24px;
+      box-shadow: var(--shadow);
+      padding: 24px 26px;
+      margin-bottom: 18px;
+    }
+    .hero h1 {
+      margin: 0;
+      font-size: 36px;
+      line-height: 1.2;
+    }
+    .hero p {
+      margin: 10px 0 0;
+      color: var(--muted);
+    }
+    .chips {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      margin-top: 16px;
+    }
+    .chip {
+      padding: 8px 12px;
+      border-radius: 999px;
+      font-size: 13px;
+      font-weight: 700;
+      background: var(--info-bg);
+      color: var(--info);
+    }
+    .section h2 {
+      margin: 0 0 12px;
+      font-size: 24px;
+    }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 16px;
+      margin-top: 16px;
+    }
+    .card {
+      border: 1px solid var(--line);
+      border-radius: 18px;
+      padding: 16px;
+      background: #fff;
+    }
+    .head {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 12px;
+      margin-bottom: 10px;
+    }
+    .card h3 {
+      margin: 0;
+      font-size: 18px;
+    }
+    .status {
+      display: inline-block;
+      padding: 6px 10px;
+      border-radius: 999px;
+      font-size: 12px;
+      font-weight: 700;
+    }
+    .ok { color: var(--ok); background: var(--ok-bg); }
+    .bad { color: var(--bad); background: var(--bad-bg); }
+    pre {
+      margin: 0;
+      padding: 12px 14px;
+      border-radius: 14px;
+      border: 1px solid #e9eef5;
+      background: #f8fafc;
+      white-space: pre-wrap;
+      word-break: break-word;
+      font-size: 13px;
+      line-height: 1.6;
+    }
+    @media (max-width: 920px) {
+      .grid {
+        grid-template-columns: 1fr;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div class="page">
+    <section class="hero">
+      <h1>moni 账户套利功能测试报告</h1>
+      <p>账户：<strong>moni</strong> | 环境：<strong>demo</strong></p>
+      <p>覆盖范围：机会扫描、套利开仓三种数量单位、三种执行方式、套利平仓、自动开平仓、持仓配对平仓手动/自动链路。</p>
+      <div class="chips">
+        <span class="chip">开始：2026-07-07 16:38:18</span>
+        <span class="chip">结束：2026-07-07 16:46:33</span>
+        <span class="chip">开平仓现货：BTC-USDT</span>
+        <span class="chip">套利开平仓合约：BTC-USDT-SWAP</span>
+        <span class="chip">配对平仓合约：BTC-USD-260710</span>
+      </div>
+    </section>
+    <section class='section'><h2>测试前状态</h2><div class='grid'><article class='card'><div class='head'><h3>moni/demo 当前账户快照</h3><span class='status ok'>通过</span></div><pre>open_positions_count=1
+BTC-USD-260731-60000-P | OPTION | pos=1 | avail=1
+current_spread_abs_open=-32.9
+current_spread_abs_pair_close=-50.7</pre></article></div></section><section class='section'><h2>机会扫描</h2><div class='grid'><article class='card'><div class='head'><h3>套利机会扫描</h3><span class='status ok'>通过</span></div><pre>机会数量=224
+BTC | 现货+次季(USD) | BTC-USDT | BTC-USD-261225 | abs=1040.05 | net=3.296055143820883688747605986%
+BTC | 现货+当季(USD) | BTC-USDT | BTC-USD-260925 | abs=439 | net=2.964006609140587221531360434%
+BTC | 现货+次月(USD) | BTC-USDT | BTC-USD-260828 | abs=235.5 | net=2.393698364564114970943444933%
+ETH | 现货+次季(USD) | ETH-USDT | ETH-USD-261225 | abs=17.595 | net=1.902458368229181807407895569%
+BTC | 现货+当月(USD) | BTC-USDT | BTC-USD-260731 | abs=74.3 | net=1.567285084858748307590859005%
+ETH | 现货+当季(USD) | ETH-USDT | ETH-USD-260925 | abs=4.18 | net=0.8668313977408402401300590424%
+ETH | 现货+次月(USD) | ETH-USDT | ETH-USD-260828 | abs=1.185 | net=0.2426792831272487354389454473%
+KITE | 现货+永续 | KITE-USDT | KITE-USDT-SWAP | abs=0.00023 | net=-0.0923699582346381241389256722%
+ROBO | 现货+永续 | ROBO-USDT | ROBO-USDT-SWAP | abs=0.00003 | net=-0.1345855069140567774317033866%
+PROS | 现货+永续 | PROS-USDT | PROS-USDT-SWAP | abs=0.00045 | net=-0.1618609518609518609518609519%</pre></article></div></section><section class='section'><h2>套利开仓：三种数量单位</h2><div class='grid'><article class='card'><div class='head'><h3>投入数量=币数</h3><span class='status ok'>通过</span></div><pre>size=0.002 | unit=coin
+derivative_inst=BTC-USDT-SWAP
+open_execution_mode=dual_taker
+close_execution_mode=dual_taker
+preview_spot=0.002
+preview_contracts=0.2
+open_success=True
+open_message=开仓完成：现货 0.002，合约 0.2 张。
+entry_id=e269780f3418462984f75b7712232e8e
+spot_qty=0.002
+derivative_qty=0.2
+spot_inst=BTC-USDT
+derivative_inst=BTC-USDT-SWAP
+close_mode=full
+close_success=True
+close_message=已平仓 1 笔，合计盈亏约 -0.004185 USDT</pre></article><article class='card'><div class='head'><h3>投入数量=USDT金额</h3><span class='status ok'>通过</span></div><pre>size=150 | unit=usdt
+derivative_inst=BTC-USDT-SWAP
+open_execution_mode=dual_taker
+close_execution_mode=dual_taker
+preview_spot=0.00237713
+preview_contracts=0.23
+open_success=True
+open_message=开仓完成：现货 0.00237711，合约 0.23 张。
+entry_id=1e18ea89153b45d295bfeaeb0f834690
+spot_qty=0.0023
+derivative_qty=0.23
+spot_inst=BTC-USDT
+derivative_inst=BTC-USDT-SWAP
+close_mode=full
+close_success=True
+close_message=已平仓 1 笔，合计盈亏约 -0.00092 USDT</pre></article><article class='card'><div class='head'><h3>投入数量=合约张数</h3><span class='status ok'>通过</span></div><pre>size=3 | unit=contracts
+derivative_inst=BTC-USDT-SWAP
+open_execution_mode=dual_taker
+close_execution_mode=dual_taker
+preview_spot=0.03
+preview_contracts=3
+open_success=True
+open_message=开仓完成：现货 0.03，合约 3 张。
+entry_id=9d1945e72b254f9e930f5e2b5cc0c414
+spot_qty=0.03
+derivative_qty=3
+spot_inst=BTC-USDT
+derivative_inst=BTC-USDT-SWAP
+close_mode=full
+close_success=True
+close_message=已平仓 1 笔，合计盈亏约 -0.018 USDT</pre></article></div></section><section class='section'><h2>套利开平仓：三种执行方式</h2><div class='grid'><article class='card'><div class='head'><h3>执行方式=双腿吃单</h3><span class='status ok'>通过</span></div><pre>size=2 | unit=contracts
+derivative_inst=BTC-USDT-SWAP
+open_execution_mode=dual_taker
+close_execution_mode=dual_taker
+preview_spot=0.02
+preview_contracts=2
+open_success=True
+open_message=开仓完成：现货 0.02，合约 2 张。
+entry_id=5d20d10c948a406e9f2bbb6371c05e58
+spot_qty=0.02
+derivative_qty=2
+spot_inst=BTC-USDT
+derivative_inst=BTC-USDT-SWAP
+close_mode=full
+close_success=True
+close_message=已平仓 1 笔，合计盈亏约 0.226 USDT</pre></article><article class='card'><div class='head'><h3>执行方式=现货挂单/合约吃单</h3><span class='status ok'>通过</span></div><pre>size=2 | unit=contracts
+derivative_inst=BTC-USDT-SWAP
+open_execution_mode=spot_maker_derivative_taker
+close_execution_mode=spot_maker_derivative_taker
+preview_spot=0.02
+preview_contracts=2
+open_success=True
+open_message=开仓完成：现货 0.02，合约 2 张。
+entry_id=7b6fc860083547a4988c2e4b61974935
+spot_qty=0.02
+derivative_qty=2
+spot_inst=BTC-USDT
+derivative_inst=BTC-USDT-SWAP
+close_mode=full
+close_success=True
+close_message=已平仓 1 笔，合计盈亏约 -0.20172 USDT</pre></article></div></section><section class='section'><h2>套利平仓</h2><div class='grid'><article class='card'><div class='head'><h3>套利平仓：部分平仓</h3><span class='status ok'>通过</span></div><pre>entry_id=2b70e56be73a4398a7787b4018513f27
+derivative_inst=BTC-USDT-SWAP
+initial_derivative_qty=5.99
+partial_qty=2.9
+partial_message=已平仓 1 笔，合计盈亏约 -0.0130336780174303223 USDT
+remaining_after_partial=3.09
+final_close_message=已平仓 1 笔，合计盈亏约 0.20944302135384148125 USDT</pre></article></div></section><section class='section'><h2>套利脚本</h2><div class='grid'><article class='card'><div class='head'><h3>套利脚本：自动开平仓</h3><span class='status ok'>通过</span></div><pre>derivative_inst=BTC-USDT-SWAP
+spread_abs_at_start=-41.1
+auto_open_status=已完成
+open_message=开仓完成：现货 0.01999965，合约 1.99 张。
+entry_id=e341da0d877d47baaa5f79550f20bb50
+spot_qty=0.0199
+derivative_qty=1.99
+spot_inst=BTC-USDT
+derivative_inst=BTC-USDT-SWAP
+close_mode=full
+auto_close_status=已完成
+close_message=已平仓 1 笔，合计盈亏约 -0.3102105423457835561 USDT</pre></article></div></section><section class='section'><h2>持仓配对平仓</h2><div class='grid'><article class='card'><div class='head'><h3>持仓配对平仓：手动批次执行 | 双腿吃单</h3><span class='status ok'>通过</span></div><pre>open_contracts=4
+pair_close_qty=3.99
+derivative_inst=BTC-USDT-SWAP
+配对平仓完成：现货 BTC-USDT 累计 0.0399 | 合约 BTC-USDT-SWAP 累计 3.99 张
+第 1 批完成：合约 1.99 张 @ 63039.2537688442211057 | 现货 0.0199 @ 63062.871648592964824
+第 2 批完成：合约 2 张 @ 63024 | 现货 0.02 @ 63061.02070675
+remaining_positions=BTC-USDT-SWAP | pos=0.01 | avail=0.01 | side=short; BTC-USDT | pos=0.0000720047553066 | avail=0.0000720047553066 | side=net</pre></article><article class='card'><div class='head'><h3>持仓配对平仓：自动执行</h3><span class='status ok'>通过</span></div><pre>derivative_inst=BTC-USDT-SWAP
+status=配对平仓完成：现货 BTC-USDT 累计 0.0399 | 合约 BTC-USDT-SWAP 累计 3.99 张
+第 1 批完成：合约 1.99 张 @ 63075.2 | 现货 0.0199 @ 63105
+第 2 批完成：合约 2 张 @ 63064.8980000000000001 | 现货 0.02 @ 63092.801
+logs=
+已启动自动配对平仓监控 | 合约=BTC-USDT-SWAP 3.99 张 | 条件=绝对价差 | 分批=2
+条件满足，开始执行自动配对平仓…
+第 1 批完成：合约 1.99 张 @ 63075.2 | 现货 0.0199 @ 63105
+第 2 批完成：合约 2 张 @ 63064.8980000000000001 | 现货 0.02 @ 63092.801
+配对平仓完成：现货 BTC-USDT 累计 0.0399 | 合约 BTC-USDT-SWAP 累计 3.99 张
+第 1 批完成：合约 1.99 张 @ 63075.2 | 现货 0.0199 @ 63105
+第 2 批完成：合约 2 张 @ 63064.8980000000000001 | 现货 0.02 @ 63092.801
+remaining_positions=BTC-USDT-SWAP | pos=0.01 | avail=0.01 | side=short; BTC-USDT | pos=0.0000697863093066 | avail=0.0000697863093066 | side=net</pre></article></div></section>
+  </div>
+</body>
+</html>

@@ -5499,6 +5499,8 @@ class KlineAnalysisWindow(QMainWindow):
         self._secondary_chart_kind_mode = "kline"
         self._shape_signal_size_metric = "body"
         self._initial_load_requested = False
+        self._page_active = False
+        self._profile_reload_pending = False
         self._splitter_default_applied = False
         self._native_chart_bootstrap_complete = False
         self._deferred_chart_payload: KlineChartPayload | None = None
@@ -5587,11 +5589,15 @@ class KlineAnalysisWindow(QMainWindow):
         self._layout_refresh_timer = QTimer(self)
         self._layout_refresh_timer.setSingleShot(True)
         self._layout_refresh_timer.timeout.connect(self._refresh_chart_layout_after_window_change)
+        self._load_request_timer = QTimer(self)
+        self._load_request_timer.setSingleShot(True)
+        self._load_request_timer.timeout.connect(self._load_data)
         self._clamping_window_to_screen = False
         _debug_log("[kline] __init__ ready")
 
     def showEvent(self, event) -> None:  # noqa: ANN001
         super().showEvent(event)
+        self._page_active = True
         _debug_log("[kline] showEvent")
         self._apply_default_splitter_sizes()
         self._schedule_chart_layout_refresh(80)
@@ -5601,16 +5607,25 @@ class KlineAnalysisWindow(QMainWindow):
         if self._auto_refresh_btn.isChecked() and not self._refresh_timer.isActive():
             self._refresh_timer.start()
         self._set_status("窗口已就绪，正在加载首屏图表...")
-        QTimer.singleShot(_INITIAL_WINDOW_LOAD_DELAY_MS, self._load_data)
+        self._schedule_load_data(_INITIAL_WINDOW_LOAD_DELAY_MS)
 
     def set_page_active(self, active: bool) -> None:
+        self._page_active = bool(active)
         if not active:
             self._refresh_timer.stop()
+            if self._load_request_timer.isActive():
+                self._load_request_timer.stop()
             return
         if self._auto_refresh_btn.isChecked():
             self._refresh_timer.start()
         if self._pending_payload is not None and self._page_ready:
             self._render_loaded_payload(self._pending_payload)
+        if self._pending_reload_after_load and not self._has_active_loaders():
+            self._pending_reload_after_load = False
+            self._schedule_load_data(0)
+        if self._profile_reload_pending and not self._has_active_loaders():
+            self._profile_reload_pending = False
+            self._schedule_load_data(0)
 
     def workspace_profile_name(self) -> str:
         return self._active_profile_name()
@@ -5626,6 +5641,9 @@ class KlineAnalysisWindow(QMainWindow):
         self._last_profile_name = target
         self._sync_account_context()
         self._sync_account_drawer_context()
+        self._profile_reload_pending = True
+        if self._page_active:
+            self._profile_reload_pending = False
         self._load_data()
 
     def pattern_signals_enabled(self) -> bool:
@@ -5673,6 +5691,11 @@ class KlineAnalysisWindow(QMainWindow):
             if loader is not None and loader.isRunning():
                 loader.requestInterruption()
         KlineAnalysisWindow._poll_shutdown_loaders(self)
+
+    def _schedule_load_data(self, delay_ms: int = 0) -> None:
+        if bool(getattr(self, "_shutdown_requested", False)):
+            return
+        self._load_request_timer.start(max(0, int(delay_ms)))
 
     def _poll_shutdown_loaders(self) -> None:
         active = any(
@@ -7274,6 +7297,8 @@ class KlineAnalysisWindow(QMainWindow):
             self._deferred_chart_render_timer.stop()
         if self._layout_refresh_timer.isActive():
             self._layout_refresh_timer.stop()
+        if self._load_request_timer.isActive():
+            self._load_request_timer.stop()
         if self._refresh_timer.isActive():
             self._refresh_timer.stop()
         super().closeEvent(event)
@@ -7847,13 +7872,15 @@ class KlineAnalysisWindow(QMainWindow):
         return True
 
     def _schedule_pending_reload_if_ready(self) -> None:
-        if not self._pending_reload_after_load or self._has_active_loaders():
+        if not self._pending_reload_after_load or self._has_active_loaders() or not self._page_active:
             return
         self._pending_reload_after_load = False
-        QTimer.singleShot(10, self._load_data)
+        self._schedule_load_data(10)
 
     @Slot()
     def _load_data(self) -> None:
+        if bool(getattr(self, "_shutdown_requested", False)) or not self._page_active:
+            return
         symbol = self._selected_symbol()
         period = self._period_combo.currentText()
         self._refresh_history_trade_availability()
@@ -8164,6 +8191,8 @@ class KlineAnalysisWindow(QMainWindow):
     @Slot(int, KlineChartPayload)
     def _on_data_loaded(self, request_id: int, payload: KlineChartPayload) -> None:
         try:
+            if bool(getattr(self, "_shutdown_requested", False)):
+                return
             if request_id != self._active_request_id:
                 return
             if self._active_primary_request_key != self._current_primary_request_key():
@@ -8196,13 +8225,14 @@ class KlineAnalysisWindow(QMainWindow):
             if self._secondary_chart_status_text:
                 combined_status_parts.append(f"副图：{self._secondary_chart_status_text}")
             self._set_status(" | ".join(combined_status_parts))
-            if self._page_ready:
+            if self._page_ready and self._page_active:
                 self._render_loaded_payload(payload)
                 if self._secondary_chart_check.isChecked() and self._secondary_pending_payload is not None and self._use_native_chart:
                     self._sync_secondary_chart_range_from_primary()
-            self._apply_alert_snapshot(payload.alert_snapshot)
-            self._subscribe_realtime_candle()
-            self._update_refresh_hint()
+            if self._page_active:
+                self._apply_alert_snapshot(payload.alert_snapshot)
+                self._subscribe_realtime_candle()
+                self._update_refresh_hint()
         except Exception as exc:
             self._set_status(f"数据处理异常：{exc}")
 
@@ -8213,7 +8243,8 @@ class KlineAnalysisWindow(QMainWindow):
         payload = _merge_realtime_candle_payload(self._pending_payload, candle)
         self._pending_payload = payload
         self._remember_payload_cache(self._primary_payload_cache, self._loaded_primary_request_key, payload)
-        self._apply_realtime_candle_to_chart(payload)
+        if self._page_active and not bool(getattr(self, "_shutdown_requested", False)):
+            self._apply_realtime_candle_to_chart(payload)
 
     def _apply_realtime_candle_to_chart(self, payload: KlineChartPayload) -> None:
         if self._use_native_chart:
@@ -8310,6 +8341,8 @@ class KlineAnalysisWindow(QMainWindow):
 
     @Slot(int, KlineChartPayload)
     def _on_secondary_data_loaded(self, request_id: int, payload: KlineChartPayload) -> None:
+        if bool(getattr(self, "_shutdown_requested", False)):
+            return
         if request_id != self._active_secondary_request_id:
             return
         if self._active_secondary_request_key != self._current_secondary_request_key():
@@ -8339,7 +8372,7 @@ class KlineAnalysisWindow(QMainWindow):
                 combined_status_parts.append(f"副图：{self._secondary_chart_status_text}")
             if combined_status_parts:
                 self._set_status(" | ".join(combined_status_parts))
-        if self._secondary_chart_check.isChecked() and self._use_native_chart:
+        if self._page_active and self._secondary_chart_check.isChecked() and self._use_native_chart:
             self._render_secondary_chart(payload)
             self._sync_secondary_chart_range_from_primary()
         if (
@@ -8348,6 +8381,7 @@ class KlineAnalysisWindow(QMainWindow):
             and self._secondary_period_combo.currentText().strip().upper() == "1D"
             and self._pending_payload is not None
             and self._page_ready
+            and self._page_active
             and self._secondary_pending_payload is not None
             and self._use_native_chart
         ):
@@ -8355,6 +8389,8 @@ class KlineAnalysisWindow(QMainWindow):
 
     @Slot(int, KlineChartPayload)
     def _on_tertiary_data_loaded(self, request_id: int, payload: KlineChartPayload) -> None:
+        if bool(getattr(self, "_shutdown_requested", False)):
+            return
         if request_id != self._active_tertiary_request_id:
             return
         if self._active_tertiary_request_key != self._current_tertiary_request_key():
@@ -8363,32 +8399,38 @@ class KlineAnalysisWindow(QMainWindow):
         self._tertiary_pending_payload = payload
         self._loaded_tertiary_request_key = self._active_tertiary_request_key
         self._remember_payload_cache(self._tertiary_payload_cache, self._loaded_tertiary_request_key, payload)
-        if self._triple_chart_enabled() and self._use_native_chart:
+        if self._page_active and self._triple_chart_enabled() and self._use_native_chart:
             self._render_tertiary_chart(payload)
             self._sync_secondary_chart_range_from_primary()
 
     @Slot(int, str)
     def _on_data_failed(self, request_id: int, message: str) -> None:
+        if bool(getattr(self, "_shutdown_requested", False)):
+            return
         if request_id != self._active_request_id:
             return
         self._set_status(f"加载失败：{message}")
-        if self._use_native_chart and self._native_chart is not None:
+        if self._page_active and self._use_native_chart and self._native_chart is not None:
             self._native_chart.setTitle(f"加载失败：{message}")
-        else:
+        elif self._page_active:
             self._run_js("window.handleChartWarning(%s);" % json.dumps(message))
 
     @Slot(int, str)
     def _on_secondary_data_failed(self, request_id: int, message: str) -> None:
+        if bool(getattr(self, "_shutdown_requested", False)):
+            return
         if request_id != self._active_secondary_request_id:
             return
-        if self._secondary_native_chart is not None:
+        if self._page_active and self._secondary_native_chart is not None:
             self._secondary_native_chart.setTitle(f"副图加载失败：{message}")
 
     @Slot(int, str)
     def _on_tertiary_data_failed(self, request_id: int, message: str) -> None:
+        if bool(getattr(self, "_shutdown_requested", False)):
+            return
         if request_id != self._active_tertiary_request_id:
             return
-        if self._tertiary_native_chart is not None:
+        if self._page_active and self._tertiary_native_chart is not None:
             self._tertiary_native_chart.setTitle(f"第三图加载失败：{message}")
 
     @Slot(object)

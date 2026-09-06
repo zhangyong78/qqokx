@@ -37,7 +37,7 @@ from roll_terminal_qt.module_overview import ModuleOverview, build_module_overvi
 from roll_terminal_qt.option_strategy_window import OptionStrategyQtWindow
 from roll_terminal_qt.kline_analysis_window import KlineAnalysisWindow
 from roll_terminal_qt.perf_metrics import measure_ui_step
-from roll_terminal_qt.profile_access import load_profile_snapshots
+from roll_terminal_qt.profile_access import ensure_profile_unlocked, load_profile_snapshots
 from roll_terminal_qt.runtime import load_runtime
 from roll_terminal_qt.smart_order_window import SmartOrderQtWindow
 from roll_terminal_qt.style import APP_STYLE
@@ -258,9 +258,12 @@ class LauncherWindow(QMainWindow):
         self._home_widget: AccountPositionsHomeWidget | None = None
         self._pages: dict[str, QWidget] = {}
         self._active_page_key = ""
+        self._page_switch_in_progress = False
+        self._pending_page_key: str | None = None
         self._active_profile_name = ""
         self._profile_snapshots: dict[str, dict[str, str]] = {}
         self._unlocked_profiles: set[str] = set()
+        self._workspace_profile_serial = 0
         workspace_root = QWidget(self)
         workspace_layout = QVBoxLayout(workspace_root)
         workspace_layout.setContentsMargins(0, 0, 0, 0)
@@ -313,16 +316,42 @@ class LauncherWindow(QMainWindow):
             return
         self._profile_snapshots, _selected = load_profile_snapshots()
         runtime = load_runtime(target)
-        if runtime is None:
+        if runtime is None or not ensure_profile_unlocked(
+            self,
+            target,
+            self._profile_snapshots,
+            self._unlocked_profiles,
+        ):
             self._workspace_header.restore_profile(previous)
             return
         self._active_profile_name = target
         environment = str(getattr(runtime, "environment", "") or "").strip()
         self._workspace_header.set_profiles(list(self._profile_snapshots), target, environment)
-        for page in self._pages.values():
-            apply_profile = getattr(page, "apply_workspace_profile", None)
-            if callable(apply_profile):
-                apply_profile(target)
+        self._workspace_profile_serial += 1
+        serial = self._workspace_profile_serial
+        for page in tuple(self._pages.values()):
+            if self._is_chart_page(page):
+                QTimer.singleShot(
+                    0,
+                    lambda page=page, target=target, serial=serial: self._apply_page_workspace_profile(
+                        page, target, serial
+                    ),
+                )
+            else:
+                self._apply_page_workspace_profile(page, target, serial)
+
+    @staticmethod
+    def _is_chart_page(page: QWidget) -> bool:
+        return page.__class__.__name__ == "KlineAnalysisWindow"
+
+    def _apply_page_workspace_profile(self, page: QWidget, profile_name: str, serial: int) -> None:
+        if self._shutdown_in_progress or serial != self._workspace_profile_serial:
+            return
+        if page not in self._pages.values():
+            return
+        apply_profile = getattr(page, "apply_workspace_profile", None)
+        if callable(apply_profile):
+            apply_profile(profile_name)
 
     def _create_page(self, page_key: str) -> QWidget:
         if page_key == "kline":
@@ -354,27 +383,48 @@ class LauncherWindow(QMainWindow):
             normalized = "kline"
         if normalized not in {"account", "kline", "roll", "daily-report", "smart-order"}:
             raise KeyError(f"unknown page: {page_key}")
-        page = self._pages.get(normalized)
-        if page is None:
-            page = self._create_page(normalized)
-            self._pages[normalized] = page
-            self._page_stack.addWidget(page)
-            apply_profile = getattr(page, "apply_workspace_profile", None)
-            if self._active_profile_name and callable(apply_profile):
-                apply_profile(self._active_profile_name)
-        previous = self._pages.get(self._active_page_key)
-        if previous is not None and previous is not page:
-            set_active = getattr(previous, "set_page_active", None)
+        if self._shutdown_in_progress:
+            return
+        if self._page_switch_in_progress:
+            self._pending_page_key = normalized
+            return
+        self._page_switch_in_progress = True
+        newly_created = False
+        try:
+            page = self._pages.get(normalized)
+            if page is None:
+                page = self._create_page(normalized)
+                self._pages[normalized] = page
+                self._page_stack.addWidget(page)
+                newly_created = True
+            previous = self._pages.get(self._active_page_key)
+            if previous is not None and previous is not page:
+                set_active = getattr(previous, "set_page_active", None)
+                if callable(set_active):
+                    set_active(False)
+            self._page_stack.setCurrentWidget(page)
+            self._active_page_key = normalized
+            self._workspace_header.set_active_page(normalized)
+            set_active = getattr(page, "set_page_active", None)
             if callable(set_active):
-                set_active(False)
-        self._page_stack.setCurrentWidget(page)
-        self._active_page_key = normalized
-        self._workspace_header.set_active_page(normalized)
-        set_active = getattr(page, "set_page_active", None)
-        if callable(set_active):
-            set_active(True)
-        self._refresh_local_task_status()
-        self._refresh_workspace_connection_status()
+                set_active(True)
+            self._refresh_local_task_status()
+            self._refresh_workspace_connection_status()
+            if newly_created and self._active_profile_name:
+                if self._is_chart_page(page):
+                    QTimer.singleShot(
+                        0,
+                        lambda page=page, target=self._active_profile_name, serial=self._workspace_profile_serial:
+                        self._apply_page_workspace_profile(page, target, serial),
+                    )
+                else:
+                    self._apply_page_workspace_profile(page, self._active_profile_name, self._workspace_profile_serial)
+        finally:
+            self._page_switch_in_progress = False
+            pending = self._pending_page_key
+            self._pending_page_key = None
+            if pending is not None and pending != normalized:
+                QTimer.singleShot(0, lambda pending=pending: self.show_page(pending))
 
     def closeEvent(self, event) -> None:  # noqa: ANN001
         if self._shutdown_in_progress:

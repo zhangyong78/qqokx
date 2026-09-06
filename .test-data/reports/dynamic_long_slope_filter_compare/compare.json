@@ -1,0 +1,238 @@
+{
+  "BTC-USDT-SWAP": {
+    "profile_id": "dynamic_long_best_btc_v2",
+    "profile_name": "BTC 动态委托做多 最佳参数",
+    "symbol": "BTC-USDT-SWAP",
+    "range": {
+      "start_ts": 1576476000000,
+      "end_ts": 1782601200000,
+      "start_local": "2019-12-16 14:00:00",
+      "end_local": "2026-06-28 07:00:00",
+      "candles": 57258
+    },
+    "runs": {
+      "enabled": {
+        "symbol": "BTC-USDT-SWAP",
+        "profile_id": "dynamic_long_best_btc_v2",
+        "profile_name": "BTC 动态委托做多 最佳参数",
+        "slope_filter_enabled": true,
+        "start_local": "2019-12-16 14:00:00",
+        "end_local": "2026-06-28 07:00:00",
+        "candles": 57258,
+        "trades": 504,
+        "win_rate_pct": 17.261904761904763,
+        "total_pnl": 15874.08417528,
+        "total_return_pct": 158.7408417528,
+        "max_drawdown": 1432.1183444,
+        "max_drawdown_pct": 5.364828474472394,
+        "profit_factor": 1.6523585589713856,
+        "avg_r": 0.320734844303605,
+        "ending_equity": 25874.08417528
+      },
+      "disabled": {
+        "symbol": "BTC-USDT-SWAP",
+        "profile_id": "dynamic_long_best_btc_v2",
+        "profile_name": "BTC 动态委托做多 最佳参数",
+        "slope_filter_enabled": false,
+        "start_local": "2019-12-16 14:00:00",
+        "end_local": "2026-06-28 07:00:00",
+        "candles": 57258,
+        "trades": 514,
+        "win_rate_pct": 16.342412451361866,
+        "total_pnl": 16352.78919696,
+        "total_return_pct": 163.5278919696,
+        "max_drawdown": 1779.07627712,
+        "max_drawdown_pct": 6.411868384317356,
+        "profit_factor": 1.640485579437024,
+        "avg_r": 0.32151682901301104,
+        "ending_equity": 26352.78919696
+      }
+    },
+    "delta_disabled_minus_enabled": {
+      "trades": 10,
+      "win_rate_pct": -0.919492,
+      "total_pnl": 478.705022,
+      "total_return_pct": 4.78705,
+      "max_drawdown": 346.957933,
+      "max_drawdown_pct": 1.04704,
+      "avg_r": 0.000782
+    }
+  },
+  "ETH-USDT-SWAP": {
+    "profile_id": "dynamic_long_best_eth_v2",
+    "profile_name": "ETH 动态委托做多 最佳参数",
+    "symbol": "ETH-USDT-SWAP",
+    "range": {
+      "start_ts": 1577232000000,
+      "end_ts": 1782601200000,
+      "start_local": "2019-12-25 08:00:00",
+      "end_local": "2026-06-28 07:00:00",
+      "candles": 57048
+    },
+    "runs": {
+      "enabled": {
+        "symbol": "ETH-USDT-SWAP",
+        "profile_id": "dynamic_long_best_eth_v2",
+        "profile_name": "ETH 动态委托做多 最佳参数",
+        "slope_filter_enabled": true,
+        "start_local": "2019-12-25 08:00:00",
+        "end_local": "2026-06-28 07:00:00",
+        "candles": 57048,
+        "trades": 773,
+        "win_rate_pct": 13.583441138421733,
+        "total_pnl": 14530.090774948,
+        "total_return_pct": 145.30090774948,
+        "max_drawdown": 4948.54560922,
+        "max_drawdown_pct": 19.590671355952466,
+        "profit_factor": 1.349609835092012,
+        "avg_r": 0.18800549585559964,
+        "ending_equity": 24530.090774948
+      },
+      "disabled": {
+        "symbol": "ETH-USDT-SWAP",
+        "profile_id": "dynamic_long_best_eth_v2",
+        "profile_name": "ETH 动态委托做多 最佳参数",
+        "slope_filter_enabled": false,
+        "start_local": "2019-12-25 08:00:00",
+        "end_local": "2026-06-28 07:00:00",
+        "candles": 57048,
+        "trades": 781,
+        "win_rate_pct": 13.316261203585148,
+        "total_pnl": 14414.168209186,
+        "total_return_pct": 144.14168209186,
+        "max_drawdown": 5054.291614318,
+        "max_drawdown_pct": 20.017976066529144,
+        "profit_factor": 1.3441882880101053,
+        "avg_r": 0.18464974811728846,
+        "ending_equity": 24414.168209186
+      }
+    },
+    "delta_disabled_minus_enabled": {
+      "trades": 8,
+      "win_rate_pct": -0.26718,
+      "total_pnl": -115.922566,
+      "total_return_pct": -1.159226,
+      "max_drawdown": 105.746005,
+      "max_drawdown_pct": 0.427305,
+      "avg_r": -0.003356
+    }
+  },
+  "SOL-USDT-SWAP": {
+    "profile_id": "dynamic_long_best_sol_v2",
+    "profile_name": "SOL 动态委托做多 最佳参数",
+    "symbol": "SOL-USDT-SWAP",
+    "range": {
+      "start_ts": 1611295200000,
+      "end_ts": 1782601200000,
+      "start_local": "2021-01-22 14:00:00",
+      "end_local": "2026-06-28 07:00:00",
+      "candles": 47586
+    },
+    "runs": {
+      "enabled": {
+        "symbol": "SOL-USDT-SWAP",
+        "profile_id": "dynamic_long_best_sol_v2",
+        "profile_name": "SOL 动态委托做多 最佳参数",
+        "slope_filter_enabled": true,
+        "start_local": "2021-01-22 14:00:00",
+        "end_local": "2026-06-28 07:00:00",
+        "candles": 47586,
+        "trades": 870,
+        "win_rate_pct": 18.850574712643677,
+        "total_pnl": 21799.67712358,
+        "total_return_pct": 217.9967712358,
+        "max_drawdown": 6481.749076118,
+        "max_drawdown_pct": 17.72278953265517,
+        "profit_factor": 1.3693021374447645,
+        "avg_r": 0.2505791469516564,
+        "ending_equity": 31799.67712358
+      },
+      "disabled": {
+        "symbol": "SOL-USDT-SWAP",
+        "profile_id": "dynamic_long_best_sol_v2",
+        "profile_name": "SOL 动态委托做多 最佳参数",
+        "slope_filter_enabled": false,
+        "start_local": "2021-01-22 14:00:00",
+        "end_local": "2026-06-28 07:00:00",
+        "candles": 47586,
+        "trades": 920,
+        "win_rate_pct": 19.347826086956523,
+        "total_pnl": 24925.609883814,
+        "total_return_pct": 249.25609883814,
+        "max_drawdown": 4142.811327352,
+        "max_drawdown_pct": 11.09478427881188,
+        "profit_factor": 1.404188425768457,
+        "avg_r": 0.270938803942919,
+        "ending_equity": 34925.609883814
+      }
+    },
+    "delta_disabled_minus_enabled": {
+      "trades": 50,
+      "win_rate_pct": 0.497251,
+      "total_pnl": 3125.93276,
+      "total_return_pct": 31.259328,
+      "max_drawdown": -2338.937749,
+      "max_drawdown_pct": -6.628005,
+      "avg_r": 0.02036
+    }
+  },
+  "DOGE-USDT-SWAP": {
+    "profile_id": "dynamic_long_best_doge_v2",
+    "profile_name": "DOGE 动态委托做多 最佳参数",
+    "symbol": "DOGE-USDT-SWAP",
+    "range": {
+      "start_ts": 1594350000000,
+      "end_ts": 1782601200000,
+      "start_local": "2020-07-10 11:00:00",
+      "end_local": "2026-06-28 07:00:00",
+      "candles": 52293
+    },
+    "runs": {
+      "enabled": {
+        "symbol": "DOGE-USDT-SWAP",
+        "profile_id": "dynamic_long_best_doge_v2",
+        "profile_name": "DOGE 动态委托做多 最佳参数",
+        "slope_filter_enabled": true,
+        "start_local": "2020-07-10 11:00:00",
+        "end_local": "2026-06-28 07:00:00",
+        "candles": 52293,
+        "trades": 1536,
+        "win_rate_pct": 13.736979166666666,
+        "total_pnl": 13885.48860868484,
+        "total_return_pct": 138.8548860868484,
+        "max_drawdown": 12002.232098635435,
+        "max_drawdown_pct": 46.21991891794941,
+        "profit_factor": 1.1242364508447964,
+        "avg_r": 0.09040032744810307,
+        "ending_equity": 23885.48860868484
+      },
+      "disabled": {
+        "symbol": "DOGE-USDT-SWAP",
+        "profile_id": "dynamic_long_best_doge_v2",
+        "profile_name": "DOGE 动态委托做多 最佳参数",
+        "slope_filter_enabled": false,
+        "start_local": "2020-07-10 11:00:00",
+        "end_local": "2026-06-28 07:00:00",
+        "candles": 52293,
+        "trades": 1569,
+        "win_rate_pct": 13.448056086679413,
+        "total_pnl": 12477.830585442349,
+        "total_return_pct": 124.77830585442348,
+        "max_drawdown": 12025.017598633323,
+        "max_drawdown_pct": 48.74362741667393,
+        "profit_factor": 1.1088994053513948,
+        "avg_r": 0.07952729142850597,
+        "ending_equity": 22477.83058544235
+      }
+    },
+    "delta_disabled_minus_enabled": {
+      "trades": 33,
+      "win_rate_pct": -0.288923,
+      "total_pnl": -1407.658023,
+      "total_return_pct": -14.07658,
+      "max_drawdown": 22.7855,
+      "max_drawdown_pct": 2.523708,
+      "avg_r": -0.010873
+    }
+  }
+}
