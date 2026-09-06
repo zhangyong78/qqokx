@@ -339,6 +339,10 @@ class LauncherWindow(QMainWindow):
                 )
             else:
                 self._apply_page_workspace_profile(page, target, serial)
+        for window in tuple(self._child_windows):
+            apply_profile = getattr(window, "apply_workspace_profile", None)
+            if callable(apply_profile):
+                apply_profile(target)
 
     @staticmethod
     def _is_chart_page(page: QWidget) -> bool:
@@ -698,7 +702,7 @@ class LauncherWindow(QMainWindow):
         if normalized == "smart-order":
             self.show_page(normalized)
             return
-        window = create_module_window(module_key)
+        window = create_module_window(module_key, profile_name=self._active_profile_name)
         print(f"[launcher] open_module_window created | module={module_key} | type={type(window).__name__}", flush=True)
         self._child_windows.append(window)
         window.destroyed.connect(
@@ -710,7 +714,7 @@ class LauncherWindow(QMainWindow):
         window.activateWindow()
 
 
-def create_module_window(module_key: str) -> QWidget:
+def create_module_window(module_key: str, *, profile_name: str = "") -> QWidget:
     normalized = module_key.strip().lower()
     if normalized == "roll":
         window = RollTerminalWindow()
@@ -737,7 +741,7 @@ def create_module_window(module_key: str) -> QWidget:
         apply_qt_window_icon(window)
         return window
     if normalized == "option-strategy":
-        window = OptionStrategyQtWindow()
+        window = OptionStrategyQtWindow(profile_name=profile_name)
         apply_qt_window_icon(window)
         return window
     for spec in launcher_module_specs():

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
 import traceback
@@ -176,6 +176,18 @@ class ChainLinkedChartSnapshot:
     underlying_error: str = ""
 
 
+@dataclass(frozen=True)
+class LinkedContractSnapshot:
+    family: str
+    option_type: str
+    strike: Decimal
+    current_expiry: str
+    expiries: tuple[str, ...]
+    instruments: tuple[Instrument, ...]
+    tickers_by_inst_id: dict[str, OkxTicker]
+    error: str = ""
+
+
 class _ChainLinkedChartThread(QThread):
     snapshot_ready = Signal(int, object)
     error_raised = Signal(int, str)
@@ -249,6 +261,279 @@ class _ChainLinkedChartThread(QThread):
             return [item for item in candles if item.confirmed], ""
         except Exception as exc:  # noqa: BLE001
             return [], str(exc)
+
+
+class _LinkedContractThread(QThread):
+    snapshot_ready = Signal(int, object)
+
+    def __init__(
+        self,
+        *,
+        request_id: int,
+        source_inst_id: str,
+        client: OkxRestClient,
+        parent: QObject | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self._request_id = request_id
+        self._source_inst_id = source_inst_id.strip().upper()
+        self._client = client
+
+    def run(self) -> None:
+        try:
+            parsed = parse_option_contract(self._source_inst_id)
+            instruments = self._client.get_option_instruments(inst_family=parsed.inst_family)
+            if not instruments:
+                instruments = self._client.get_instruments("OPTION", uly=parsed.inst_family)
+            instruments = [
+                item
+                for item in instruments
+                if (item.inst_family or parsed.inst_family).strip().upper() == parsed.inst_family
+            ]
+            expiries = tuple(
+                sorted({parse_option_contract(item.inst_id).expiry_code for item in instruments})
+            )
+            tickers = self._client.get_tickers("OPTION", inst_family=parsed.inst_family)
+            tickers_by_inst_id = {
+                item.inst_id.strip().upper(): item
+                for item in tickers
+                if item.inst_id.strip().upper()
+            }
+            self.snapshot_ready.emit(
+                self._request_id,
+                LinkedContractSnapshot(
+                    family=parsed.inst_family,
+                    option_type=parsed.option_type,
+                    strike=parsed.strike,
+                    current_expiry=parsed.expiry_code,
+                    expiries=expiries,
+                    instruments=tuple(instruments),
+                    tickers_by_inst_id=tickers_by_inst_id,
+                ),
+            )
+        except Exception as exc:  # noqa: BLE001
+            self.snapshot_ready.emit(
+                self._request_id,
+                LinkedContractSnapshot(
+                    family="",
+                    option_type="",
+                    strike=Decimal("0"),
+                    current_expiry="",
+                    expiries=(),
+                    instruments=(),
+                    tickers_by_inst_id={},
+                    error=str(exc),
+                ),
+            )
+
+
+class _OptionCandleThread(QThread):
+    snapshot_ready = Signal(int, str, object)
+
+    def __init__(
+        self,
+        *,
+        request_id: int,
+        inst_id: str,
+        bar: str,
+        candle_limit: int,
+        client: OkxRestClient,
+        parent: QObject | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self._request_id = request_id
+        self._inst_id = inst_id.strip().upper()
+        self._bar = bar.strip() or "1H"
+        self._candle_limit = max(50, min(int(candle_limit), MAX_OPTION_COMBO_CANDLES))
+        self._client = client
+
+    def run(self) -> None:
+        try:
+            candles = self._client.get_mark_price_candles(
+                self._inst_id,
+                self._bar,
+                limit=self._candle_limit,
+            )
+            confirmed = tuple(item for item in candles if item.confirmed)
+            self.snapshot_ready.emit(self._request_id, self._inst_id, (confirmed, ""))
+        except Exception as exc:  # noqa: BLE001
+            self.snapshot_ready.emit(self._request_id, self._inst_id, ((), str(exc)))
+
+
+class _OptionTradeRecordThread(QThread):
+    """Load account option opening/closing records without blocking linked charts."""
+
+    snapshot_ready = Signal(int, object)
+    error_raised = Signal(int, str)
+
+    def __init__(
+        self,
+        *,
+        request_id: int,
+        profile_name: str,
+        inst_ids: tuple[str, ...],
+        client: OkxRestClient,
+        parent: QObject | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self._request_id = request_id
+        self._profile_name = profile_name.strip()
+        self._inst_ids = tuple(dict.fromkeys(item.strip().upper() for item in inst_ids if item.strip()))
+        self._client = client
+
+    @staticmethod
+    def _decimal(value: object) -> Decimal | None:
+        try:
+            result = Decimal(str(value))
+        except (InvalidOperation, TypeError, ValueError):
+            return None
+        return result if result > 0 else None
+
+    @staticmethod
+    def _absolute_decimal(value: object) -> Decimal | None:
+        try:
+            result = abs(Decimal(str(value)))
+        except (InvalidOperation, TypeError, ValueError):
+            return None
+        return result if result > 0 else None
+
+    @staticmethod
+    def _timestamp_ms(*values: object) -> int:
+        for value in values:
+            try:
+                timestamp = int(value or 0)
+            except (TypeError, ValueError):
+                continue
+            if timestamp > 0:
+                return timestamp if timestamp > 10_000_000_000 else timestamp * 1000
+        return 0
+
+    @staticmethod
+    def _direction(item: object) -> str:
+        raw = getattr(item, "raw", {})
+        raw = raw if isinstance(raw, dict) else {}
+        for value in (
+            getattr(item, "pos_side", None),
+            getattr(item, "direction", None),
+            raw.get("posSide"),
+            raw.get("direction"),
+        ):
+            normalized = str(value or "").strip().lower()
+            if normalized in {"long", "short"}:
+                return normalized
+            if "long" in normalized or "多" in normalized:
+                return "long"
+            if "short" in normalized or "空" in normalized:
+                return "short"
+        try:
+            return "long" if Decimal(str(getattr(item, "position", 0) or 0)) > 0 else "short"
+        except (InvalidOperation, TypeError, ValueError):
+            return ""
+
+    def run(self) -> None:
+        try:
+            runtime = load_runtime(self._profile_name or None)
+            if runtime is None:
+                raise ValueError("当前 API 未配置可用运行环境。")
+            if not self._inst_ids:
+                self.snapshot_ready.emit(self._request_id, OptionTradeRecordSnapshot("", {}))
+                return
+            history = self._client.get_positions_history(
+                runtime.credentials,
+                environment=runtime.environment,
+                inst_types=("OPTION",),
+                limit=100,
+            )
+            current_positions = self._client.get_positions(
+                runtime.credentials,
+                environment=runtime.environment,
+                inst_type="OPTION",
+                prefer_cache=False,
+            )
+            markers_by_inst_id: dict[str, list[PositionPriceMarker]] = {item: [] for item in self._inst_ids}
+            seen_openings: set[tuple[str, str, int]] = set()
+            for item in history:
+                if self.isInterruptionRequested():
+                    return
+                inst_id = str(getattr(item, "inst_id", "") or "").strip().upper()
+                if inst_id not in markers_by_inst_id:
+                    continue
+                direction = self._direction(item)
+                if direction not in {"long", "short"}:
+                    continue
+                raw = getattr(item, "raw", {})
+                raw = raw if isinstance(raw, dict) else {}
+                open_price = self._decimal(getattr(item, "open_avg_price", None))
+                open_size = self._absolute_decimal(
+                    raw.get("openMaxPos")
+                    or raw.get("openTotalPos")
+                    or raw.get("openPos")
+                    or getattr(item, "close_size", None)
+                )
+                opened_at = self._timestamp_ms(
+                    raw.get("openTime"), raw.get("openTs"), raw.get("cTime"), raw.get("createdTime"),
+                )
+                opening_key = (inst_id, direction, opened_at)
+                if open_price is not None and opened_at > 0 and opening_key not in seen_openings:
+                    seen_openings.add(opening_key)
+                    markers_by_inst_id[inst_id].append(
+                        PositionPriceMarker("entry", opened_at, open_price, direction, quantity=open_size)
+                    )
+                close_price = self._decimal(getattr(item, "close_avg_price", None))
+                closed_at = self._timestamp_ms(
+                    raw.get("closeTime"), raw.get("closeTs"), raw.get("uTime"), raw.get("updateTime"),
+                    getattr(item, "update_time", None),
+                )
+                if close_price is None or closed_at <= 0:
+                    continue
+                realized_pnl = getattr(item, "realized_pnl", None)
+                if not isinstance(realized_pnl, Decimal):
+                    realized_pnl = getattr(item, "pnl", None)
+                markers_by_inst_id[inst_id].append(
+                    PositionPriceMarker(
+                        "exit",
+                        closed_at,
+                        close_price,
+                        direction,
+                        realized_pnl=realized_pnl if isinstance(realized_pnl, Decimal) else None,
+                        pnl_currency=str(
+                            raw.get("ccy") or raw.get("pnlCcy") or raw.get("settleCcy") or inst_id.split("-", 1)[0]
+                        ).strip().upper(),
+                    )
+                )
+            for item in current_positions:
+                if self.isInterruptionRequested():
+                    return
+                inst_id = str(getattr(item, "inst_id", "") or "").strip().upper()
+                if inst_id not in markers_by_inst_id:
+                    continue
+                direction = self._direction(item)
+                raw = getattr(item, "raw", {})
+                raw = raw if isinstance(raw, dict) else {}
+                opened_at = self._timestamp_ms(
+                    raw.get("openTime"), raw.get("openTs"), raw.get("cTime"), raw.get("createdTime"),
+                )
+                open_price = self._decimal(getattr(item, "avg_price", None) or raw.get("avgPx"))
+                open_size = self._absolute_decimal(getattr(item, "position", None) or raw.get("pos"))
+                opening_key = (inst_id, direction, opened_at)
+                if direction in {"long", "short"} and open_price is not None and opened_at > 0 and opening_key not in seen_openings:
+                    seen_openings.add(opening_key)
+                    markers_by_inst_id[inst_id].append(
+                        PositionPriceMarker("entry", opened_at, open_price, direction, quantity=open_size)
+                    )
+            normalized = {
+                inst_id: tuple(sorted(markers, key=lambda marker: (marker.timestamp, marker.direction, marker.kind, marker.price)))
+                for inst_id, markers in markers_by_inst_id.items()
+            }
+            self.snapshot_ready.emit(
+                self._request_id,
+                OptionTradeRecordSnapshot(
+                    profile_name=str(getattr(runtime, "credential_profile_name", "") or self._profile_name),
+                    markers_by_inst_id=normalized,
+                ),
+            )
+        except Exception as exc:  # noqa: BLE001
+            self.error_raised.emit(self._request_id, str(exc))
 
 
 class _OptionChainThread(QThread):
@@ -1048,6 +1333,16 @@ class PositionPriceMarker:
     realized_pnl: Decimal | None = None
     pnl_currency: str = ""
     realized_pnl_usdt: Decimal | None = None
+    quantity: Decimal | None = None
+    entry_value_usdt: Decimal | None = None
+
+
+@dataclass(frozen=True)
+class OptionTradeRecordSnapshot:
+    """Opening/closing markers grouped by the option contract they belong to."""
+
+    profile_name: str
+    markers_by_inst_id: dict[str, tuple[PositionPriceMarker, ...]]
 
 
 class CandlestickChartView(QChartView):
@@ -1152,15 +1447,7 @@ class CandlestickChartView(QChartView):
             for label, timestamp in time_markers
             if str(label).strip() and int(timestamp) > 0
         )
-        self._position_price_markers = tuple(
-            item
-            for item in position_price_markers
-            if isinstance(item, PositionPriceMarker)
-            and item.timestamp > 0
-            and item.price > 0
-            and item.direction in {"long", "short"}
-            and item.kind in {"entry", "exit"}
-        )
+        self._position_price_markers = self._normalized_position_price_markers(position_price_markers)
         if tooltip_close_usdt_rate is not None and tooltip_close_usdt_rate > 0:
             self._tooltip_close_usdt_rate = tooltip_close_usdt_rate
             self._tooltip_close_usdt_basis = tooltip_close_usdt_basis.strip()
@@ -1276,6 +1563,45 @@ class CandlestickChartView(QChartView):
             f"L {_format_compact_number(latest.low)}{suffix} "
             f"C {_format_compact_number(latest.close)}{suffix}{moving_average_title}"
         )
+
+    @staticmethod
+    def _normalized_position_price_markers(
+        markers: tuple[PositionPriceMarker, ...] | list[PositionPriceMarker],
+    ) -> tuple[PositionPriceMarker, ...]:
+        return tuple(
+            item
+            for item in markers
+            if isinstance(item, PositionPriceMarker)
+            and item.timestamp > 0
+            and item.price > 0
+            and item.direction in {"long", "short"}
+            and item.kind in {"entry", "exit"}
+        )
+
+    def set_position_price_markers(
+        self,
+        markers: tuple[PositionPriceMarker, ...] | list[PositionPriceMarker],
+    ) -> None:
+        """Overlay account trade records without rebuilding the K-line series."""
+
+        self._position_price_markers = self._normalized_position_price_markers(markers)
+        self.viewport().update()
+
+    def set_tooltip_usdt_context(
+        self,
+        *,
+        rate: Decimal | None,
+        basis: str = "",
+        entry_price: Decimal | None = None,
+    ) -> None:
+        """Update option-chart USDT conversion without rebuilding its series."""
+
+        self._tooltip_close_usdt_rate = rate if rate is not None and rate > 0 else None
+        self._tooltip_close_usdt_basis = basis.strip() if self._tooltip_close_usdt_rate is not None else ""
+        self._tooltip_entry_price = (
+            entry_price if self._tooltip_close_usdt_rate is not None and entry_price is not None and entry_price > 0 else None
+        )
+        self.viewport().update()
 
     def prepend_candles(self, candles: list[Candle]) -> bool:
         """Prepend an older page while keeping the current chart settings and zoom."""
@@ -1639,9 +1965,12 @@ class CandlestickChartView(QChartView):
             time_text = QDateTime.fromMSecsSinceEpoch(marker.timestamp).toString("MM-dd HH:mm")
             label = "开仓" if marker.kind == "entry" else "平仓"
             label_lines = [label, _format_compact_number(marker.price)]
-            if marker.kind == "exit" and result is not None:
-                result_percent = result[1]
-                label_lines.append(f"{result_percent:+.2f}%")
+            if marker.kind == "entry":
+                label_lines.extend(self._position_marker_entry_value_label_lines(marker))
+            if marker.kind == "exit":
+                if result is not None:
+                    result_percent = result[1]
+                    label_lines.append(f"{result_percent:+.2f}%")
                 label_lines.extend(self._position_marker_pnl_label_lines(marker))
             label_lines.append(time_text)
             label_height = 16.0 * len(label_lines)
@@ -1725,6 +2054,13 @@ class CandlestickChartView(QChartView):
         usdt_value = marker.realized_pnl_usdt
         usdt_sign = "+" if usdt_value > 0 else ""
         return (actual_text, f"≈ {usdt_sign}{format_decimal_fixed(usdt_value, 2)} USDT")
+
+    @staticmethod
+    def _position_marker_entry_value_label_lines(marker: PositionPriceMarker) -> tuple[str, ...]:
+        value = marker.entry_value_usdt
+        if value is None:
+            return ()
+        return (f"开仓价值 ≈ {format_decimal_fixed(value, 2)} USDT",)
 
     def _nearest_candle_for_x(self, x: float, plot_area: QRectF) -> Candle | None:
         if not self._candles:
@@ -2054,7 +2390,13 @@ class CandlestickChartView(QChartView):
 class OptionChainLinkedChartDialog(QDialog):
     """One shared-time view for the selected call, DVOL, and matching put."""
 
-    def __init__(self, *, client: OkxRestClient, parent: QWidget | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        client: OkxRestClient,
+        profile_name: str = "",
+        parent: QWidget | None = None,
+    ) -> None:
         super().__init__(parent)
         apply_qt_window_icon(self)
         self.setWindowFlag(Qt.WindowType.WindowMaximizeButtonHint, True)
@@ -2062,10 +2404,28 @@ class OptionChainLinkedChartDialog(QDialog):
         self.setWindowTitle("期权链联动 K 线")
         self.resize(1800, 780)
         self._client = client
+        self._profile_name = str(profile_name or "").strip()
         self._call_quote: OptionQuote | None = None
         self._put_quote: OptionQuote | None = None
         self._request_id = 0
         self._load_thread: _ChainLinkedChartThread | None = None
+        self._side_contract_request_ids = {"left": 0, "right": 0}
+        self._side_contract_threads: dict[str, _LinkedContractThread | None] = {"left": None, "right": None}
+        self._side_candle_request_ids = {"left": 0, "right": 0}
+        self._side_candle_threads: dict[str, _OptionCandleThread | None] = {"left": None, "right": None}
+        self._trade_record_request_id = 0
+        self._active_trade_record_request_id = 0
+        self._trade_record_thread: _OptionTradeRecordThread | None = None
+        self._pending_trade_record_reload = False
+        self._trade_markers_by_inst_id: dict[str, tuple[PositionPriceMarker, ...]] = {}
+        self._side_instruments: dict[str, tuple[Instrument, ...]] = {"left": (), "right": ()}
+        self._side_tickers_by_inst_id: dict[str, dict[str, OkxTicker]] = {"left": {}, "right": {}}
+        self._pending_side_contract_loads: set[str] = set()
+        self._pending_side_candle_loads: set[str] = set()
+        self._syncing_side_controls: set[str] = set()
+        self._side_expiry_combos: dict[str, QComboBox] = {}
+        self._side_type_combos: dict[str, QComboBox] = {}
+        self._side_strike_combos: dict[str, QComboBox] = {}
         self._current_bar = "1H"
         self._syncing_viewport = False
         self._bar_buttons: dict[str, QPushButton] = {}
@@ -2090,6 +2450,11 @@ class OptionChainLinkedChartDialog(QDialog):
             button.clicked.connect(lambda _checked=False, target=bar: self._select_bar(target))
             self._bar_buttons[bar] = button
             toolbar.addWidget(button)
+        self._trade_records_button = QPushButton("开平仓记录：开")
+        self._trade_records_button.setCheckable(True)
+        self._trade_records_button.toggled.connect(self._on_trade_records_toggled)
+        self._trade_records_button.setChecked(True)
+        toolbar.addWidget(self._trade_records_button)
         toolbar.addStretch(1)
         refresh_button = QPushButton("刷新")
         refresh_button.clicked.connect(self._load_candles)
@@ -2100,13 +2465,11 @@ class OptionChainLinkedChartDialog(QDialog):
         self._underlying_chart = CandlestickChartView()
         self._volatility_chart = CandlestickChartView(percent_axis=True)
         self._put_chart = CandlestickChartView()
+        self._side_charts = {"left": self._call_chart, "right": self._put_chart}
         self._charts = (self._call_chart, self._underlying_chart, self._volatility_chart, self._put_chart)
         charts = QSplitter(Qt.Orientation.Horizontal)
         charts.setChildrenCollapsible(False)
-        call_panel = QGroupBox("认购")
-        call_layout = QVBoxLayout(call_panel)
-        call_layout.setContentsMargins(6, 8, 6, 6)
-        call_layout.addWidget(self._call_chart)
+        call_panel = self._build_side_panel("left", "左侧期权", self._call_chart)
         charts.addWidget(call_panel)
 
         underlying_vol_panel = QGroupBox("标底 / 波动率")
@@ -2120,10 +2483,7 @@ class OptionChainLinkedChartDialog(QDialog):
         underlying_vol_layout.addWidget(middle_splitter)
         charts.addWidget(underlying_vol_panel)
 
-        put_panel = QGroupBox("认沽")
-        put_layout = QVBoxLayout(put_panel)
-        put_layout.setContentsMargins(6, 8, 6, 6)
-        put_layout.addWidget(self._put_chart)
+        put_panel = self._build_side_panel("right", "右侧期权", self._put_chart)
         charts.addWidget(put_panel)
         charts.setSizes([600, 600, 600])
         layout.addWidget(charts, 1)
@@ -2134,31 +2494,514 @@ class OptionChainLinkedChartDialog(QDialog):
         self._sync_bar_buttons()
         self._show_empty_messages()
 
+    def _build_side_panel(self, side: str, title: str, chart: CandlestickChartView) -> QGroupBox:
+        panel = QGroupBox(title)
+        panel_layout = QVBoxLayout(panel)
+        panel_layout.setContentsMargins(6, 8, 6, 6)
+        panel_layout.setSpacing(6)
+        toolbar_widget = QWidget(panel)
+        toolbar_widget.setFixedHeight(34)
+        toolbar = QHBoxLayout(toolbar_widget)
+        toolbar.setContentsMargins(0, 0, 0, 0)
+        toolbar.setSpacing(4)
+        expiry_combo = QComboBox()
+        expiry_combo.setMinimumWidth(126)
+        expiry_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        option_type_combo = QComboBox()
+        option_type_combo.setMinimumWidth(72)
+        strike_combo = QComboBox()
+        strike_combo.setMinimumWidth(96)
+        for label, combo in (("到期日", expiry_combo), ("方向", option_type_combo), ("行权价", strike_combo)):
+            toolbar.addWidget(QLabel(label))
+            toolbar.addWidget(combo)
+            combo.setEnabled(False)
+        toolbar.addStretch(1)
+        expiry_combo.currentIndexChanged.connect(lambda _index, target=side: self._on_side_expiry_changed(target))
+        option_type_combo.currentIndexChanged.connect(lambda _index, target=side: self._on_side_type_changed(target))
+        strike_combo.currentIndexChanged.connect(lambda _index, target=side: self._on_side_strike_changed(target))
+        self._side_expiry_combos[side] = expiry_combo
+        self._side_type_combos[side] = option_type_combo
+        self._side_strike_combos[side] = strike_combo
+        panel_layout.addWidget(toolbar_widget)
+        panel_layout.addWidget(chart, 1)
+        return panel
+
+    def _side_quote(self, side: str) -> OptionQuote | None:
+        return self._call_quote if side == "left" else self._put_quote
+
+    def _set_side_quote(self, side: str, quote: OptionQuote) -> None:
+        if side == "left":
+            self._call_quote = quote
+        else:
+            self._put_quote = quote
+
+    @staticmethod
+    def _side_label(side: str) -> str:
+        return "左侧" if side == "left" else "右侧"
+
     def show_pair(self, *, call_quote: OptionQuote | None, put_quote: OptionQuote | None, bar: str = "1H") -> None:
         self._call_quote = call_quote
         self._put_quote = put_quote
         normalized_bar = bar.strip().upper()
         self._current_bar = normalized_bar if normalized_bar in self._bar_buttons else "1H"
-        call_id = call_quote.instrument.inst_id if call_quote is not None else "—"
-        put_id = put_quote.instrument.inst_id if put_quote is not None else "—"
-        self._title_label.setText(f"认购 {call_id}  ·  中间 Deribit DVOL  ·  认沽 {put_id}")
+        self._update_linked_title()
         self._sync_bar_buttons()
+        for side in ("left", "right"):
+            self._side_candle_request_ids[side] += 1
+            thread = self._side_candle_threads[side]
+            if thread is not None and thread.isRunning():
+                thread.requestInterruption()
+            self._load_side_contract_options(side)
         self._load_candles()
+        self._load_trade_records()
         self.show()
         self.raise_()
         self.activateWindow()
 
+    def _update_linked_title(self) -> None:
+        left_id = self._call_quote.instrument.inst_id if self._call_quote is not None else "—"
+        right_id = self._put_quote.instrument.inst_id if self._put_quote is not None else "—"
+        self._title_label.setText(f"左侧 {left_id}  ·  中间 Deribit DVOL  ·  右侧 {right_id}")
+
+    def apply_workspace_profile(self, profile_name: str) -> None:
+        """Keep trade records on the same API selected by the parent workspace."""
+
+        target = str(profile_name or "").strip()
+        if not target or target == self._profile_name:
+            return
+        self._profile_name = target
+        self._trade_markers_by_inst_id.clear()
+        self._clear_trade_record_markers()
+        if self._trade_records_button.isChecked():
+            self._load_trade_records()
+
+    def _selected_trade_record_inst_ids(self) -> tuple[str, ...]:
+        return tuple(
+            dict.fromkeys(
+                quote.instrument.inst_id.strip().upper()
+                for quote in (self._call_quote, self._put_quote)
+                if quote is not None and quote.instrument.inst_id.strip()
+            )
+        )
+
+    def _option_chart_usdt_context(self, side: str) -> tuple[Decimal | None, str]:
+        quote = self._side_quote(side)
+        rate = quote.index_price if quote is not None else None
+        if rate is None or rate <= 0:
+            underlying_candles = getattr(self._underlying_chart, "_candles", ())
+            if underlying_candles:
+                try:
+                    rate = Decimal(str(underlying_candles[-1].close))
+                except (InvalidOperation, TypeError, ValueError):
+                    rate = None
+        if rate is None or rate <= 0 or quote is None:
+            return None, ""
+        inst_parts = quote.instrument.inst_id.strip().upper().split("-")
+        basis_symbol = "-".join(inst_parts[:2]) if len(inst_parts) >= 2 else inst_parts[0]
+        return rate, f"固定基准 {basis_symbol} {_format_compact_number(rate)}（打开图时）"
+
+    def _display_trade_record_markers(
+        self,
+        side: str,
+        markers: tuple[PositionPriceMarker, ...],
+    ) -> tuple[PositionPriceMarker, ...]:
+        quote = self._side_quote(side)
+        rate, _basis = self._option_chart_usdt_context(side)
+        if quote is None or rate is None:
+            return markers
+        base_currency = quote.instrument.inst_id.split("-", 1)[0].strip().upper()
+        contract_value = option_contract_value(quote.instrument)
+        result: list[PositionPriceMarker] = []
+        for marker in markers:
+            rendered = marker
+            if (
+                marker.kind == "exit"
+                and marker.realized_pnl is not None
+                and marker.pnl_currency.strip().upper() == base_currency
+            ):
+                rendered = replace(rendered, realized_pnl_usdt=marker.realized_pnl * rate)
+            if marker.kind == "entry" and marker.quantity is not None:
+                entry_value = marker.price * marker.quantity * contract_value * rate
+                rendered = replace(rendered, entry_value_usdt=entry_value)
+            result.append(rendered)
+        return tuple(result)
+
+    def _apply_side_trade_record_markers(self, side: str) -> None:
+        quote = self._side_quote(side)
+        inst_id = quote.instrument.inst_id.strip().upper() if quote is not None else ""
+        markers: tuple[PositionPriceMarker, ...] = ()
+        if self._trade_records_button.isChecked() and inst_id:
+            markers = self._trade_markers_by_inst_id.get(inst_id, ())
+        rendered_markers = self._display_trade_record_markers(side, markers)
+        entry_prices = [marker.price for marker in rendered_markers if marker.kind == "entry"]
+        rate, basis = self._option_chart_usdt_context(side)
+        self._side_charts[side].set_tooltip_usdt_context(
+            rate=rate,
+            basis=basis,
+            entry_price=entry_prices[-1] if entry_prices else None,
+        )
+        self._side_charts[side].set_position_price_markers(rendered_markers)
+
+    def _clear_trade_record_markers(self) -> None:
+        for chart in self._side_charts.values():
+            chart.set_position_price_markers(())
+
+    def _load_trade_records(self) -> None:
+        if not self._trade_records_button.isChecked():
+            return
+        inst_ids = self._selected_trade_record_inst_ids()
+        if not inst_ids:
+            return
+        if self._trade_record_thread is not None and self._trade_record_thread.isRunning():
+            self._pending_trade_record_reload = True
+            return
+        profile_name = self._profile_name
+        if not profile_name:
+            runtime = load_runtime()
+            profile_name = str(getattr(runtime, "credential_profile_name", "") or "").strip()
+        self._trade_record_request_id += 1
+        request_id = self._trade_record_request_id
+        self._active_trade_record_request_id = request_id
+        self._status_label.setText(f"正在同步 {profile_name or '当前 API'} 的期权开平仓记录…")
+        thread = _OptionTradeRecordThread(
+            request_id=request_id,
+            profile_name=profile_name,
+            inst_ids=inst_ids,
+            client=self._client,
+            parent=self,
+        )
+        self._trade_record_thread = thread
+        thread.snapshot_ready.connect(self._apply_trade_record_snapshot)
+        thread.error_raised.connect(self._apply_trade_record_error)
+        thread.finished.connect(self._clear_trade_record_thread)
+        thread.start()
+
+    @Slot(bool)
+    def _on_trade_records_toggled(self, enabled: bool) -> None:
+        self._trade_records_button.setText(f"开平仓记录：{'开' if enabled else '关'}")
+        self._trade_records_button.setObjectName("Primary" if enabled else "")
+        self._trade_records_button.style().unpolish(self._trade_records_button)
+        self._trade_records_button.style().polish(self._trade_records_button)
+        if not enabled:
+            self._clear_trade_record_markers()
+            self._status_label.setText("开平仓记录已关闭。")
+            return
+        self._trade_markers_by_inst_id.clear()
+        self._clear_trade_record_markers()
+        self._load_trade_records()
+
+    @Slot(int, object)
+    def _apply_trade_record_snapshot(self, request_id: int, payload: object) -> None:
+        if request_id != self._active_trade_record_request_id or not isinstance(payload, OptionTradeRecordSnapshot):
+            return
+        self._trade_markers_by_inst_id = dict(payload.markers_by_inst_id)
+        if not self._trade_records_button.isChecked():
+            return
+        for side in ("left", "right"):
+            self._apply_side_trade_record_markers(side)
+        count = sum(len(items) for items in self._trade_markers_by_inst_id.values())
+        profile_name = payload.profile_name or "当前 API"
+        if count:
+            self._status_label.setText(f"{profile_name} 的开平仓记录已显示（{count} 个标记）。")
+        else:
+            self._status_label.setText(f"{profile_name} 在当前左右期权合约没有开平仓记录。")
+
+    @Slot(int, str)
+    def _apply_trade_record_error(self, request_id: int, message: str) -> None:
+        if request_id != self._active_trade_record_request_id or not self._trade_records_button.isChecked():
+            return
+        self._status_label.setText(f"开平仓记录同步失败：{message}")
+
+    @Slot()
+    def _clear_trade_record_thread(self) -> None:
+        thread = self._trade_record_thread
+        if thread is not None:
+            self._trade_record_thread = None
+            thread.deleteLater()
+        if self._pending_trade_record_reload and self._trade_records_button.isChecked() and not self.isHidden():
+            self._pending_trade_record_reload = False
+            QTimer.singleShot(0, self._load_trade_records)
+
+    def _set_side_controls_enabled(self, side: str, enabled: bool) -> None:
+        for combo in (
+            self._side_expiry_combos[side],
+            self._side_type_combos[side],
+            self._side_strike_combos[side],
+        ):
+            combo.setEnabled(enabled)
+
+    def _load_side_contract_options(self, side: str) -> None:
+        source_quote = self._side_quote(side)
+        if source_quote is None:
+            return
+        self._side_contract_request_ids[side] += 1
+        request_id = self._side_contract_request_ids[side]
+        self._set_side_controls_enabled(side, False)
+        old_thread = self._side_contract_threads[side]
+        if old_thread is not None and old_thread.isRunning():
+            self._pending_side_contract_loads.add(side)
+            old_thread.requestInterruption()
+            return
+        thread = _LinkedContractThread(
+            request_id=request_id,
+            source_inst_id=source_quote.instrument.inst_id,
+            client=self._client,
+            parent=self,
+        )
+        self._side_contract_threads[side] = thread
+        thread.snapshot_ready.connect(
+            lambda current_request_id, payload, target=side: self._apply_side_contract_options(
+                target, current_request_id, payload
+            )
+        )
+        thread.finished.connect(lambda thread=thread, target=side: self._clear_side_contract_thread(target, thread))
+        thread.start()
+
+    def _available_side_types(self, side: str, expiry: str) -> tuple[str, ...]:
+        option_types: set[str] = set()
+        for instrument in self._side_instruments[side]:
+            try:
+                parsed = parse_option_contract(instrument.inst_id)
+            except ValueError:
+                continue
+            if parsed.expiry_code == expiry:
+                option_types.add(parsed.option_type)
+        return tuple(item for item in ("C", "P") if item in option_types)
+
+    def _available_side_strikes(self, side: str, expiry: str, option_type: str) -> tuple[Decimal, ...]:
+        strikes: set[Decimal] = set()
+        for instrument in self._side_instruments[side]:
+            try:
+                parsed = parse_option_contract(instrument.inst_id)
+            except ValueError:
+                continue
+            if parsed.expiry_code == expiry and parsed.option_type == option_type:
+                strikes.add(parsed.strike)
+        return tuple(sorted(strikes))
+
+    def _sync_side_strikes(self, side: str, *, preferred: Decimal | None = None) -> None:
+        expiry = str(self._side_expiry_combos[side].currentData() or "").strip()
+        option_type = str(self._side_type_combos[side].currentData() or "").strip().upper()
+        strikes = self._available_side_strikes(side, expiry, option_type)
+        combo = self._side_strike_combos[side]
+        combo.blockSignals(True)
+        try:
+            combo.clear()
+            for strike in strikes:
+                combo.addItem(format_decimal(strike), str(strike))
+            if strikes:
+                target = preferred if preferred in strikes else min(
+                    strikes,
+                    key=lambda value: abs(value - (preferred or strikes[0])),
+                )
+                combo.setCurrentIndex(combo.findData(str(target)))
+        finally:
+            combo.blockSignals(False)
+
+    def _apply_side_contract_options(self, side: str, request_id: int, payload: object) -> None:
+        if request_id != self._side_contract_request_ids[side] or not isinstance(payload, LinkedContractSnapshot):
+            return
+        if payload.error:
+            self._status_label.setText(f"{self._side_label(side)}期权合约加载失败：{payload.error}")
+            return
+        self._side_instruments[side] = payload.instruments
+        self._side_tickers_by_inst_id[side] = payload.tickers_by_inst_id
+        current_quote = self._side_quote(side)
+        current = current_quote.parsed if current_quote is not None else None
+        expiry = current.expiry_code if current is not None else payload.current_expiry
+        if expiry not in payload.expiries:
+            expiry = payload.expiries[0] if payload.expiries else ""
+        self._syncing_side_controls.add(side)
+        try:
+            expiry_combo = self._side_expiry_combos[side]
+            expiry_combo.blockSignals(True)
+            try:
+                expiry_combo.clear()
+                for item in payload.expiries:
+                    expiry_combo.addItem(f"{item} ({format_option_expiry_label(item)})", item)
+                expiry_combo.setCurrentIndex(expiry_combo.findData(expiry))
+            finally:
+                expiry_combo.blockSignals(False)
+            option_types = self._available_side_types(side, expiry)
+            option_type = current.option_type if current is not None and current.option_type in option_types else (
+                option_types[0] if option_types else ""
+            )
+            type_combo = self._side_type_combos[side]
+            type_combo.blockSignals(True)
+            try:
+                type_combo.clear()
+                for item in option_types:
+                    type_combo.addItem("认购" if item == "C" else "认沽", item)
+                type_combo.setCurrentIndex(type_combo.findData(option_type))
+            finally:
+                type_combo.blockSignals(False)
+            self._sync_side_strikes(side, preferred=current.strike if current is not None else payload.strike)
+        finally:
+            self._syncing_side_controls.discard(side)
+        self._set_side_controls_enabled(side, bool(payload.expiries))
+        self._apply_side_selection(side)
+
+    def _side_quote_for_selection(self, side: str) -> OptionQuote | None:
+        expiry = str(self._side_expiry_combos[side].currentData() or "").strip()
+        option_type = str(self._side_type_combos[side].currentData() or "").strip().upper()
+        try:
+            strike = Decimal(str(self._side_strike_combos[side].currentData() or ""))
+        except InvalidOperation:
+            return None
+        for instrument in self._side_instruments[side]:
+            try:
+                parsed = parse_option_contract(instrument.inst_id)
+            except ValueError:
+                continue
+            if parsed.expiry_code == expiry and parsed.option_type == option_type and parsed.strike == strike:
+                ticker = self._side_tickers_by_inst_id[side].get(instrument.inst_id.strip().upper())
+                return _build_option_quote(instrument, ticker)
+        return None
+
+    def _apply_side_selection(self, side: str) -> None:
+        quote = self._side_quote_for_selection(side)
+        if quote is None:
+            self._status_label.setText(f"{self._side_label(side)}没有可用的期权合约。")
+            return
+        previous = self._side_quote(side)
+        previous_id = previous.instrument.inst_id if previous is not None else ""
+        self._set_side_quote(side, quote)
+        self._update_linked_title()
+        if quote.instrument.inst_id != previous_id:
+            self._side_charts[side].set_position_price_markers(())
+            self._status_label.setText(f"{self._side_label(side)}已切换到 {quote.instrument.inst_id}，正在加载 K 线…")
+            self._load_side_option_candles(side)
+            self._load_trade_records()
+
+    def _on_side_expiry_changed(self, side: str) -> None:
+        if side in self._syncing_side_controls:
+            return
+        previous = self._side_quote(side)
+        preferred = previous.parsed.strike if previous is not None else None
+        self._syncing_side_controls.add(side)
+        try:
+            expiry = str(self._side_expiry_combos[side].currentData() or "").strip()
+            option_types = self._available_side_types(side, expiry)
+            type_combo = self._side_type_combos[side]
+            current_type = str(type_combo.currentData() or "").strip().upper()
+            if current_type not in option_types:
+                current_type = option_types[0] if option_types else ""
+            type_combo.blockSignals(True)
+            try:
+                type_combo.clear()
+                for item in option_types:
+                    type_combo.addItem("认购" if item == "C" else "认沽", item)
+                type_combo.setCurrentIndex(type_combo.findData(current_type))
+            finally:
+                type_combo.blockSignals(False)
+            self._sync_side_strikes(side, preferred=preferred)
+        finally:
+            self._syncing_side_controls.discard(side)
+        self._apply_side_selection(side)
+
+    def _on_side_type_changed(self, side: str) -> None:
+        if side in self._syncing_side_controls:
+            return
+        previous = self._side_quote(side)
+        self._syncing_side_controls.add(side)
+        try:
+            self._sync_side_strikes(side, preferred=previous.parsed.strike if previous is not None else None)
+        finally:
+            self._syncing_side_controls.discard(side)
+        self._apply_side_selection(side)
+
+    def _on_side_strike_changed(self, side: str) -> None:
+        if side not in self._syncing_side_controls:
+            self._apply_side_selection(side)
+
+    def _load_side_option_candles(self, side: str) -> None:
+        quote = self._side_quote(side)
+        if quote is None:
+            return
+        self._side_candle_request_ids[side] += 1
+        request_id = self._side_candle_request_ids[side]
+        self._set_side_controls_enabled(side, False)
+        old_thread = self._side_candle_threads[side]
+        if old_thread is not None and old_thread.isRunning():
+            self._pending_side_candle_loads.add(side)
+            old_thread.requestInterruption()
+            return
+        thread = _OptionCandleThread(
+            request_id=request_id,
+            inst_id=quote.instrument.inst_id,
+            bar=self._current_bar,
+            candle_limit=240,
+            client=self._client,
+            parent=self,
+        )
+        self._side_candle_threads[side] = thread
+        thread.snapshot_ready.connect(
+            lambda current_request_id, inst_id, payload, target=side: self._apply_side_option_candles(
+                target, current_request_id, inst_id, payload
+            )
+        )
+        thread.finished.connect(lambda thread=thread, target=side: self._clear_side_candle_thread(target, thread))
+        thread.start()
+
+    def _apply_side_option_candles(self, side: str, request_id: int, inst_id: str, payload: object) -> None:
+        if request_id != self._side_candle_request_ids[side]:
+            return
+        if not isinstance(payload, tuple) or len(payload) != 2:
+            return
+        quote = self._side_quote(side)
+        if quote is None or inst_id != quote.instrument.inst_id:
+            return
+        candles, error = payload
+        self._set_option_chart(
+            self._side_charts[side],
+            inst_id,
+            tuple(candles) if isinstance(candles, (tuple, list)) else (),
+            str(error or ""),
+            self._side_label(side),
+            tooltip_close_usdt_rate=self._option_chart_usdt_context(side)[0],
+            tooltip_close_usdt_basis=self._option_chart_usdt_context(side)[1],
+        )
+        self._apply_side_trade_record_markers(side)
+        self._sync_initial_viewport()
+        self._status_label.setText(
+            f"{self._side_label(side)} {inst_id} {'加载失败：' + str(error) if error else '已切换。'}"
+        )
+
+    def _clear_side_contract_thread(self, side: str, thread: _LinkedContractThread) -> None:
+        if self._side_contract_threads[side] is not thread:
+            return
+        self._side_contract_threads[side] = None
+        thread.deleteLater()
+        if side in self._pending_side_contract_loads and not self.isHidden():
+            self._pending_side_contract_loads.discard(side)
+            QTimer.singleShot(0, lambda target=side: self._load_side_contract_options(target))
+
+    def _clear_side_candle_thread(self, side: str, thread: _OptionCandleThread) -> None:
+        if self._side_candle_threads[side] is not thread:
+            return
+        self._side_candle_threads[side] = None
+        self._set_side_controls_enabled(side, bool(self._side_expiry_combos[side].count()))
+        thread.deleteLater()
+        if side in self._pending_side_candle_loads and not self.isHidden():
+            self._pending_side_candle_loads.discard(side)
+            QTimer.singleShot(0, lambda target=side: self._load_side_option_candles(target))
+
     def closeEvent(self, event) -> None:  # noqa: ANN001
-        if self._load_thread is not None and self._load_thread.isRunning():
-            self._load_thread.requestInterruption()
-            self._load_thread.wait(1500)
+        threads: list[QThread | None] = [self._load_thread]
+        threads.extend(self._side_contract_threads.values())
+        threads.extend(self._side_candle_threads.values())
+        threads.append(self._trade_record_thread)
+        for thread in threads:
+            if thread is not None and thread.isRunning():
+                thread.requestInterruption()
+                thread.wait(1500)
         super().closeEvent(event)
 
     def _show_empty_messages(self) -> None:
-        self._call_chart.show_message("等待加载认购标记价格 K 线")
+        self._call_chart.show_message("等待加载左侧期权标记价格 K 线")
         self._underlying_chart.show_message("等待加载标底 K 线")
         self._volatility_chart.show_message("等待加载 Deribit DVOL K 线")
-        self._put_chart.show_message("等待加载认沽标记价格 K 线")
+        self._put_chart.show_message("等待加载右侧期权标记价格 K 线")
 
     def _select_bar(self, bar: str) -> None:
         if bar == self._current_bar:
@@ -2188,7 +3031,7 @@ class OptionChainLinkedChartDialog(QDialog):
             return
         self._request_id += 1
         request_id = self._request_id
-        self._status_label.setText(f"正在加载 {self._current_bar} 认购、DVOL、认沽联动 K 线…")
+        self._status_label.setText(f"正在加载 {self._current_bar} 左侧、DVOL、右侧联动 K 线…")
         thread = _ChainLinkedChartThread(
             request_id=request_id,
             call_inst_id=call_id,
@@ -2208,7 +3051,18 @@ class OptionChainLinkedChartDialog(QDialog):
     def _apply_snapshot(self, request_id: int, payload: object) -> None:
         if request_id != self._request_id or not isinstance(payload, ChainLinkedChartSnapshot):
             return
-        self._set_option_chart(self._call_chart, payload.call_inst_id, payload.call_candles, payload.call_error, "认购")
+        current_call_id = self._call_quote.instrument.inst_id if self._call_quote is not None else ""
+        if payload.call_inst_id == current_call_id:
+            self._set_option_chart(
+                self._call_chart,
+                payload.call_inst_id,
+                payload.call_candles,
+                payload.call_error,
+                "左侧",
+                tooltip_close_usdt_rate=self._option_chart_usdt_context("left")[0],
+                tooltip_close_usdt_basis=self._option_chart_usdt_context("left")[1],
+            )
+            self._apply_side_trade_record_markers("left")
         self._set_option_chart(
             self._underlying_chart,
             payload.underlying_inst_id,
@@ -2216,7 +3070,18 @@ class OptionChainLinkedChartDialog(QDialog):
             payload.underlying_error,
             "标底",
         )
-        self._set_option_chart(self._put_chart, payload.put_inst_id, payload.put_candles, payload.put_error, "认沽")
+        current_put_id = self._put_quote.instrument.inst_id if self._put_quote is not None else ""
+        if payload.put_inst_id == current_put_id:
+            self._set_option_chart(
+                self._put_chart,
+                payload.put_inst_id,
+                payload.put_candles,
+                payload.put_error,
+                "右侧",
+                tooltip_close_usdt_rate=self._option_chart_usdt_context("right")[0],
+                tooltip_close_usdt_basis=self._option_chart_usdt_context("right")[1],
+            )
+            self._apply_side_trade_record_markers("right")
         if payload.volatility_candles:
             note = f" | {payload.volatility_resolution_note}" if payload.volatility_resolution_note else ""
             self._volatility_chart.set_candles(
@@ -2228,10 +3093,15 @@ class OptionChainLinkedChartDialog(QDialog):
             self._volatility_chart.show_message(
                 f"Deribit {payload.volatility_currency or '—'} DVOL 暂无缓存；请先在“Deribit 波动率指数”页面同步数据。"
             )
+        # The left option chart is applied before the underlying chart above;
+        # refresh both overlays once more so both sides can use the linked
+        # underlying close as a fallback conversion basis.
+        self._apply_side_trade_record_markers("left")
+        self._apply_side_trade_record_markers("right")
         self._sync_initial_viewport()
         counts = (
-            f"认购 {len(payload.call_candles)} / 标底 {len(payload.underlying_candles)} / "
-            f"波动率 {len(payload.volatility_candles)} / 认沽 {len(payload.put_candles)}"
+            f"左侧 {len(payload.call_candles)} / 标底 {len(payload.underlying_candles)} / "
+            f"波动率 {len(payload.volatility_candles)} / 右侧 {len(payload.put_candles)}"
         )
         self._status_label.setText(f"{self._current_bar} 联动 K 线已加载（{counts} 根）。")
 
@@ -2242,12 +3112,17 @@ class OptionChainLinkedChartDialog(QDialog):
         candles: tuple[Candle, ...],
         error: str,
         side_label: str,
+        *,
+        tooltip_close_usdt_rate: Decimal | None = None,
+        tooltip_close_usdt_basis: str = "",
     ) -> None:
         if candles:
             chart.set_candles(
                 title=f"{side_label} {inst_id} 标记价格K线",
                 candles=list(candles),
                 show_moving_averages=True,
+                tooltip_close_usdt_rate=tooltip_close_usdt_rate,
+                tooltip_close_usdt_basis=tooltip_close_usdt_basis,
             )
             return
         detail = f"：{error}" if error else ""
@@ -2400,7 +3275,7 @@ class OptionStrategyBigChartDialog(QDialog):
 
 
 class OptionStrategyQtWindow(QMainWindow):
-    def __init__(self, parent: QWidget | None = None) -> None:
+    def __init__(self, parent: QWidget | None = None, *, profile_name: str = "") -> None:
         super().__init__(parent)
         self.setWindowTitle("期权策略计算器")
         self.resize(1880, 1180)
@@ -2431,7 +3306,10 @@ class OptionStrategyQtWindow(QMainWindow):
         self._latest_payoff_loaded_at: datetime | None = None
         self._latest_payoff_expiry_at: datetime | None = None
         self._alias_counter = 0
-        self._profile_name = "159"
+        initial_runtime = load_runtime(profile_name or None)
+        self._profile_name = str(
+            profile_name or getattr(initial_runtime, "credential_profile_name", "") or "159"
+        ).strip()
         self._chain_request_id = 0
         self._position_import_request_id = 0
         self._chart_request_id = 0
@@ -2458,6 +3336,19 @@ class OptionStrategyQtWindow(QMainWindow):
         for thread in list(self._worker_threads.values()):
             thread.wait(100)
         super().closeEvent(event)
+
+    def workspace_profile_name(self) -> str:
+        return self._profile_name
+
+    def apply_workspace_profile(self, profile_name: str) -> None:
+        """Receive the main workspace's active API without adding a second selector."""
+
+        target = str(profile_name or "").strip()
+        if not target or target == self._profile_name:
+            return
+        self._profile_name = target
+        if self._chain_linked_chart_dialog is not None:
+            self._chain_linked_chart_dialog.apply_workspace_profile(target)
 
     def _build_ui(self) -> None:
         root = QWidget()
@@ -2863,6 +3754,7 @@ class OptionStrategyQtWindow(QMainWindow):
     def _open_chain_linked_kline(self, chain_row: OptionChainRow) -> None:
         if self._chain_linked_chart_dialog is None:
             self._chain_linked_chart_dialog = OptionChainLinkedChartDialog(client=self._client, parent=self)
+        self._chain_linked_chart_dialog.apply_workspace_profile(str(getattr(self, "_profile_name", "") or ""))
         self._chain_linked_chart_dialog.show_pair(
             call_quote=chain_row.call_quote,
             put_quote=chain_row.put_quote,

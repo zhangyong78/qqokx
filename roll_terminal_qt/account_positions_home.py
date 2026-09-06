@@ -4561,9 +4561,11 @@ class AccountPositionsHomeWidget(QWidget):
 
         window = getattr(self, "_option_strategy_window", None)
         if window is None:
-            window = OptionStrategyQtWindow()
+            window = OptionStrategyQtWindow(profile_name=self._last_profile_name or "")
             window.destroyed.connect(lambda *_args: setattr(self, "_option_strategy_window", None))
             self._option_strategy_window = window
+        else:
+            window.apply_workspace_profile(self._last_profile_name or "")
         window.load_roll_transfer_payload(payload)
         window.show()
         window.raise_()
