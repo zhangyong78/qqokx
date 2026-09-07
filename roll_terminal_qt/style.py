@@ -1,3 +1,23 @@
+from PySide6.QtGui import QFont
+from PySide6.QtWidgets import QApplication
+
+
+GLOBAL_FONT_MODES: dict[str, tuple[str, int]] = {
+    "standard": ("标准", 9),
+    "large": ("大字体", 11),
+    "extra_large": ("特大", 13),
+}
+
+
+def normalize_global_font_mode(value: object) -> str:
+    mode = str(value or "").strip().lower()
+    return mode if mode in GLOBAL_FONT_MODES else "standard"
+
+
+def global_font_mode_label(mode: object) -> str:
+    return GLOBAL_FONT_MODES[normalize_global_font_mode(mode)][0]
+
+
 APP_STYLE = """
 QMainWindow {
     background: #eef3f8;
@@ -406,3 +426,33 @@ QSplitter::handle:pressed {
     background: #93c5fd;
 }
 """
+
+
+def global_font_stylesheet(mode: object) -> str:
+    normalized = normalize_global_font_mode(mode)
+    _label, size = GLOBAL_FONT_MODES[normalized]
+    title_size = size + 7
+    section_size = size + 1
+    return f"""
+QWidget, QMenu, QMenuBar, QToolButton, QPushButton, QLineEdit, QComboBox,
+QTreeWidget, QTableWidget, QHeaderView, QTextEdit, QTabBar::tab {{
+    font-size: {size}pt;
+}}
+QLabel#Title {{ font-size: {title_size}pt; }}
+QLabel#Metric {{ font-size: {section_size}pt; }}
+QLabel#SectionTitle, QLabel#GuideTitle {{ font-size: {section_size}pt; }}
+QLabel#Subtitle, QLabel#GuideText, QLabel#Hint, QLabel#Subtle, QLabel#StatTitle {{
+    font-size: {size}pt;
+}}
+QHeaderView::section {{ font-size: {size}pt; }}
+"""
+
+
+def apply_global_font_mode(app: QApplication, mode: object) -> str:
+    normalized = normalize_global_font_mode(mode)
+    _label, size = GLOBAL_FONT_MODES[normalized]
+    font = QFont(app.font())
+    font.setPointSize(size)
+    app.setFont(font)
+    app.setStyleSheet(APP_STYLE + global_font_stylesheet(normalized))
+    return normalized

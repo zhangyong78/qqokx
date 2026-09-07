@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from typing import Iterable, Literal, Sequence
 
 from PySide6.QtCore import QSignalBlocker, Signal
-from PySide6.QtGui import QAction
+from PySide6.QtGui import QAction, QActionGroup
 from PySide6.QtWidgets import QComboBox, QFrame, QHBoxLayout, QLabel, QMenu, QSizePolicy, QToolButton
 
 
@@ -86,12 +86,18 @@ class WorkspaceHeader(QFrame):
         ("settings:logs", "日志"),
         ("settings:version", "版本信息"),
     )
+    _FONT_MODES = (
+        ("standard", "标准"),
+        ("large", "大字体"),
+        ("extra_large", "特大"),
+    )
 
     def __init__(self, parent=None) -> None:  # noqa: ANN001
         super().__init__(parent)
         self.setObjectName("WorkspaceHeader")
         self._actions: dict[str, QAction] = {}
         self._page_buttons: dict[str, QToolButton] = {}
+        self._font_actions: dict[str, QAction] = {}
 
         layout = QHBoxLayout(self)
         layout.setContentsMargins(12, 5, 10, 5)
@@ -141,7 +147,7 @@ class WorkspaceHeader(QFrame):
         self.task_button.clicked.connect(lambda: self.tool_requested.emit("rr-monitor"))
         layout.addWidget(self.task_button)
 
-        layout.addWidget(self._menu_button("⚙", self._ROUTES[7:]))
+        layout.addWidget(self._settings_menu_button())
         self.setStyleSheet(
             """
             QFrame#WorkspaceHeader { background: #10273a; border: 0; }
@@ -172,6 +178,26 @@ class WorkspaceHeader(QFrame):
         button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
         return button
 
+    def _settings_menu_button(self) -> QToolButton:
+        menu = QMenu(self)
+        font_menu = menu.addMenu("全局字号")
+        font_group = QActionGroup(font_menu)
+        font_group.setExclusive(True)
+        for mode, label in self._FONT_MODES:
+            action = self._register_action(f"settings:font-{mode}", label)
+            action.setCheckable(True)
+            font_group.addAction(action)
+            font_menu.addAction(action)
+            self._font_actions[mode] = action
+        menu.addSeparator()
+        for route_key, label in self._ROUTES[7:]:
+            menu.addAction(self._register_action(route_key, label))
+        button = QToolButton(self)
+        button.setText("⚙")
+        button.setMenu(menu)
+        button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        return button
+
     def _emit_route(self, route_key: str) -> None:
         route_type, value = route_key.split(":", 1)
         if route_type == "page":
@@ -189,6 +215,11 @@ class WorkspaceHeader(QFrame):
 
     def route_keys(self) -> tuple[str, ...]:
         return tuple(self._actions)
+
+    def set_global_font_mode(self, mode: str) -> None:
+        selected = mode if mode in self._font_actions else "standard"
+        for key, action in self._font_actions.items():
+            action.setChecked(key == selected)
 
     def set_active_page(self, page_key: str) -> None:
         button = self._page_buttons.get(page_key)

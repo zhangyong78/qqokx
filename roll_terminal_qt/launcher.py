@@ -5,7 +5,7 @@ import sys
 from datetime import datetime
 from typing import Iterable
 
-from PySide6.QtCore import QCoreApplication, QTimer, Qt, QUrl, Slot
+from PySide6.QtCore import QCoreApplication, QSettings, QTimer, Qt, QUrl, Slot
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
     QApplication,
@@ -40,7 +40,7 @@ from roll_terminal_qt.perf_metrics import measure_ui_step
 from roll_terminal_qt.profile_access import ensure_profile_unlocked, load_profile_snapshots
 from roll_terminal_qt.runtime import load_runtime
 from roll_terminal_qt.smart_order_window import SmartOrderQtWindow
-from roll_terminal_qt.style import APP_STYLE
+from roll_terminal_qt.style import APP_STYLE, apply_global_font_mode, normalize_global_font_mode
 from roll_terminal_qt.ui import RollTerminalWindow
 from roll_terminal_qt.workspace_shell import (
     LocalTaskCount,
@@ -249,6 +249,11 @@ class ModuleCard(QFrame):
 class LauncherWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
+        self._settings = QSettings("qqokx", "roll-terminal-qt")
+        self._global_font_mode = normalize_global_font_mode(self._settings.value("ui/global-font-mode", "standard"))
+        app = QApplication.instance()
+        if app is not None:
+            self._global_font_mode = apply_global_font_mode(app, self._global_font_mode)
         self._child_windows: list[QWidget] = []
         self._shared_data_dialog: SharedDataDialog | None = None
         self._shutdown_in_progress = False
@@ -269,6 +274,7 @@ class LauncherWindow(QMainWindow):
         workspace_layout.setContentsMargins(0, 0, 0, 0)
         workspace_layout.setSpacing(0)
         self._workspace_header = WorkspaceHeader(workspace_root)
+        self._workspace_header.set_global_font_mode(self._global_font_mode)
         self._workspace_header.page_requested.connect(self.show_page)
         self._workspace_header.tool_requested.connect(self._handle_workspace_tool)
         self._workspace_header.profile_requested.connect(self._request_workspace_profile)
@@ -621,6 +627,9 @@ class LauncherWindow(QMainWindow):
     @Slot(str)
     def _handle_workspace_tool(self, tool_key: str) -> None:
         normalized = tool_key.strip().lower()
+        if normalized.startswith("font-"):
+            self._set_global_font_mode(normalized.removeprefix("font-"))
+            return
         if normalized == "rr-monitor":
             self.show_page("kline")
             page = self._pages.get("kline")
@@ -645,6 +654,19 @@ class LauncherWindow(QMainWindow):
             self._show_version_info()
             return
         raise KeyError(f"unknown workspace tool: {tool_key}")
+
+    def _set_global_font_mode(self, mode: str) -> None:
+        app = QApplication.instance()
+        if app is None:
+            return
+        self._global_font_mode = apply_global_font_mode(app, mode)
+        self._settings.setValue("ui/global-font-mode", self._global_font_mode)
+        self._settings.sync()
+        self._workspace_header.set_global_font_mode(self._global_font_mode)
+        for page in self._pages.values():
+            refresh_global_font = getattr(page, "refresh_global_font", None)
+            if callable(refresh_global_font):
+                refresh_global_font()
 
     @Slot()
     def _show_shared_data_dialog(self) -> None:

@@ -40,8 +40,7 @@ from PySide6.QtWidgets import (
 from roll_terminal_qt.app_icon import apply_qt_window_icon
 from okx_quant.models import Candle, Credentials, Instrument, StrategyConfig
 from okx_quant.option_roll import is_short_option_position
-from okx_quant.option_roll_ui import OptionRollSuggestionWindow
-from okx_quant.option_strategy_ui import OptionStrategyCalculatorWindow, _build_option_quote
+from okx_quant.option_roll_ui import OptionRollSuggestionWindow, _build_option_quote
 from okx_quant.okx_client import (
     OkxFillHistoryItem,
     OkxOrderResult,
@@ -661,7 +660,6 @@ class LegacyOptionToolsHost:
         self._root: Tk | None = None
         self._pump_timer: QTimer | None = None
         self._option_roll_window: OptionRollSuggestionWindow | None = None
-        self._option_strategy_window: OptionStrategyCalculatorWindow | None = None
 
     def shutdown(self) -> None:
         if self._pump_timer is not None:
@@ -674,12 +672,6 @@ class LegacyOptionToolsHost:
             except Exception:
                 pass
             self._option_roll_window = None
-        if self._option_strategy_window is not None:
-            try:
-                self._option_strategy_window.destroy()
-            except Exception:
-                pass
-            self._option_strategy_window = None
         if self._root is not None:
             try:
                 self._root.destroy()
@@ -700,16 +692,6 @@ class LegacyOptionToolsHost:
             raise RuntimeError("Tk 妗ユ帴绐楀彛鍒濆鍖栧け璐ャ€?)
         quote = _build_option_quote(instrument, ticker)
 
-        def _send_to_strategy(payload: object) -> None:
-            if self._option_strategy_window is None or not self._option_strategy_window.window.winfo_exists():
-                self._option_strategy_window = OptionStrategyCalculatorWindow(
-                    root,
-                    self._client,
-                    runtime_provider=self._runtime_provider,
-                    logger=None,
-                )
-            self._option_strategy_window.load_roll_transfer_payload(payload)
-
         if self._option_roll_window is not None and self._option_roll_window.window.winfo_exists():
             self._option_roll_window.load_position(
                 position=position,
@@ -728,7 +710,6 @@ class LegacyOptionToolsHost:
             instrument=instrument,
             quote=quote,
             api_name=api_name,
-            send_to_strategy_callback=_send_to_strategy,
             logger=None,
         )
 

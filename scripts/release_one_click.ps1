@@ -1,6 +1,7 @@
 ﻿param(
     [ValidateSet("patch", "minor", "major")]
     [string]$Bump = "patch",
+    [string]$TargetVersion = "",
     [string]$CommitMessage = "",
     [switch]$SkipBuild,
     [switch]$SkipPush,
@@ -91,7 +92,7 @@ function Get-CurrentVersion {
 }
 
 function Format-Version([version]$v) {
-    return "{0}.{1}.{2:00}" -f $v.Major, $v.Minor, $v.Build
+    return "{0}.{1}.{2:000}" -f $v.Major, $v.Minor, $v.Build
 }
 
 function Get-NextVersion([version]$current, [string]$bump) {
@@ -269,7 +270,13 @@ $releaseSummary
 }
 
 $currentVersion = Get-CurrentVersion
-$nextVersion = Get-NextVersion $currentVersion $Bump
+$nextVersion = if ([string]::IsNullOrWhiteSpace($TargetVersion)) {
+    Get-NextVersion $currentVersion $Bump
+}
+else {
+    try { [version]$TargetVersion }
+    catch { throw "目标版本号无效：$TargetVersion" }
+}
 $currentVersionText = Format-Version $currentVersion
 $nextVersionText = Format-Version $nextVersion
 $changedFiles = Get-ChangedFiles

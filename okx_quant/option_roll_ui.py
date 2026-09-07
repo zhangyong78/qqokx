@@ -4,19 +4,17 @@ import threading
 from datetime import datetime
 from decimal import Decimal
 from tkinter import END, StringVar, Text, Toplevel
-from tkinter import messagebox, ttk
+from tkinter import ttk
 from typing import Callable
 
 from okx_quant.log_utils import append_log_line
 from okx_quant.models import Instrument
-from okx_quant.okx_client import OkxPosition, OkxRestClient
+from okx_quant.okx_client import OkxPosition, OkxRestClient, OkxTicker
 from okx_quant.option_roll import (
     OptionRollSuggestion,
-    OptionRollTransferPayload,
     RollPreference,
     RollStrikeScope,
     build_option_roll_suggestions,
-    build_option_roll_transfer_payload,
 )
 from okx_quant.option_strategy import (
     OptionQuote,
@@ -33,8 +31,6 @@ from okx_quant.window_layout import apply_adaptive_window_geometry
 
 
 Logger = Callable[[str], None]
-SendToStrategyCallback = Callable[[OptionRollTransferPayload], None]
-
 STRIKE_LEVEL_PRIORITY_OPTIONS: dict[str, int | None] = {
     "不限": None,
     "1档内优先": 1,
@@ -75,6 +71,17 @@ def _fmt_spread_ratio(value: Decimal | None) -> str:
     return _fmt_quote(value)
 
 
+def _build_option_quote(instrument: Instrument, ticker: OkxTicker | None) -> OptionQuote:
+    return OptionQuote(
+        instrument=instrument,
+        mark_price=ticker.mark if ticker is not None else None,
+        bid_price=ticker.bid if ticker is not None else None,
+        ask_price=ticker.ask if ticker is not None else None,
+        last_price=ticker.last if ticker is not None else None,
+        index_price=ticker.index if ticker is not None else None,
+    )
+
+
 class OptionRollSuggestionWindow:
     def __init__(
         self,
@@ -85,12 +92,10 @@ class OptionRollSuggestionWindow:
         instrument: Instrument,
         quote: OptionQuote,
         api_name: str,
-        send_to_strategy_callback: SendToStrategyCallback,
         logger: Logger | None = None,
     ) -> None:
         self.client = client
         self.logger = logger
-        self._send_to_strategy_callback = send_to_strategy_callback
 
         self.window = Toplevel(parent)
         self.window.title("期权展期建议")
@@ -118,14 +123,11 @@ class OptionRollSuggestionWindow:
         self._closed = False
         self._request_id = 0
         self._suggestions: list[OptionRollSuggestion] = []
-        self._candidate_instruments: dict[str, Instrument] = {}
-        self._candidate_quotes: dict[str, OptionQuote] = {}
 
         self._summary_label: ttk.Label | None = None
         self._result_tree: ttk.Treeview | None = None
         self._detail_text: Text | None = None
         self._scan_button: ttk.Button | None = None
-        self._send_button: ttk.Button | None = None
 
         self._build_ui()
         self.load_position(position=position, instrument=instrument, quote=quote, api_name=api_name, auto_scan=True)
@@ -179,8 +181,6 @@ class OptionRollSuggestionWindow:
         self._current_quote = quote
         self._api_name = api_name
         self._suggestions = []
-        self._candidate_instruments = {}
-        self._candidate_quotes = {}
         self._render_current_position_v2()
         self._render_results()
         self._set_detail("点击“扫描建议”查看候选展期方案。")
@@ -304,7 +304,6 @@ class OptionRollSuggestionWindow:
         result_scroll.grid(row=0, column=1, sticky="ns")
         tree.configure(yscrollcommand=result_scroll.set)
         tree.bind("<<TreeviewSelect>>", self._on_suggestion_selected)
-        tree.bind("<Double-1>", lambda _event: self.send_selected_to_strategy())
         self._result_tree = tree
 
         detail_frame = ttk.LabelFrame(self.window, text="建议详情", padding=10)
@@ -316,10 +315,6 @@ class OptionRollSuggestionWindow:
         detail_scroll = ttk.Scrollbar(detail_frame, orient="vertical", command=detail_text.yview)
         detail_scroll.grid(row=0, column=1, sticky="ns")
         detail_text.configure(yscrollcommand=detail_scroll.set)
-        button_row = ttk.Frame(detail_frame)
-        button_row.grid(row=1, column=0, columnspan=2, sticky="e", pady=(8, 0))
-        self._send_button = ttk.Button(button_row, text="送入期权策略计算器", command=self.send_selected_to_strategy)
-        self._send_button.grid(row=0, column=0)
         self._detail_text = detail_text
 
     def _render_current_position_v2(self) -> None:
@@ -484,8 +479,6 @@ class OptionRollSuggestionWindow:
         if self._scan_button is not None:
             self._scan_button.configure(state="normal")
         self._suggestions = suggestions
-        self._candidate_instruments = instruments
-        self._candidate_quotes = quotes
         self._render_results()
         if suggestions:
             self.status_text.set(f"已生成 {len(suggestions)} 条展期建议。")
@@ -526,8 +519,6 @@ class OptionRollSuggestionWindow:
                     suggestion.reason,
                 ),
             )
-        if self._send_button is not None:
-            self._send_button.configure(state="normal" if self._suggestions else "disabled")
         if self._suggestions and self._result_tree.get_children():
             first = self._result_tree.get_children()[0]
             self._result_tree.selection_set(first)
@@ -558,28 +549,6 @@ class OptionRollSuggestionWindow:
         ]
         detail_lines[-2] = f"价差：{_fmt_quote(suggestion.price_gap)}"
         self._set_detail("\n".join(detail_lines))
-
-    def send_selected_to_strategy(self) -> None:
-        suggestion = self._selected_suggestion()
-        if suggestion is None:
-            messagebox.showinfo("送入策略计算器", "请先选择一条展期建议。", parent=self.window)
-            return
-        candidate_instrument = self._candidate_instruments.get(suggestion.new_inst_id)
-        candidate_quote = self._candidate_quotes.get(suggestion.new_inst_id)
-        if candidate_instrument is None or candidate_quote is None:
-            messagebox.showerror("送入策略计算器失败", "候选合约数据缺失，请重新扫描。", parent=self.window)
-            return
-        payload = build_option_roll_transfer_payload(
-            current_position=self._current_position,
-            current_instrument=self._current_instrument,
-            current_quote=self._current_quote,
-            suggestion=suggestion,
-            candidate_instrument=candidate_instrument,
-            candidate_quote=candidate_quote,
-        )
-        self._send_to_strategy_callback(payload)
-        self._log(f"[展期建议] 已送入策略计算器 | {suggestion.current_inst_id} -> {suggestion.new_inst_id}")
-        self.status_text.set("已送入期权策略计算器，可继续查看盈亏图。")
 
     def _selected_suggestion(self) -> OptionRollSuggestion | None:
         if self._result_tree is None:

@@ -61,9 +61,13 @@ class WorkspaceShellQtTests(QtWidgetTestCase):
                 "page:kline",
                 "page:account",
                 "page:roll",
+                "page:daily-report",
                 "tool:smart-order",
                 "option:option-strategy",
                 "option:deribit-volatility",
+                "settings:font-standard",
+                "settings:font-large",
+                "settings:font-extra_large",
                 "settings:paths",
                 "settings:logs",
                 "settings:version",
@@ -84,6 +88,18 @@ class WorkspaceShellQtTests(QtWidgetTestCase):
 
         self.assertTrue(trading_tools_button.isChecked())
         self.assertFalse(header._page_buttons["roll"].isChecked())
+
+    def test_workspace_header_exposes_global_font_actions(self) -> None:
+        header = WorkspaceHeader()
+        tools: list[str] = []
+        header.tool_requested.connect(tools.append)
+
+        header.set_global_font_mode("extra_large")
+        self.assertTrue(header.action("settings:font-extra_large").isChecked())
+        header.action("settings:font-large").trigger()
+
+        self.assertTrue(header.action("settings:font-large").isChecked())
+        self.assertEqual(tools, ["font-large"])
 
     def test_preferred_profile_uses_159_before_saved_selection(self) -> None:
         self.assertEqual(
