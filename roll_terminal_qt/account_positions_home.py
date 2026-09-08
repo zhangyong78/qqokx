@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import Counter
+from dataclasses import replace
 import json
 import re
 import subprocess
@@ -1117,6 +1118,50 @@ def _position_history_kline_time_markers(item: OkxPositionHistoryItem) -> tuple[
     if closed_at is not None:
         markers.append(("平仓", closed_at))
     return tuple(markers)
+
+
+def _position_history_open_time_text(item: OkxPositionHistoryItem) -> str:
+    raw = item.raw if isinstance(item.raw, dict) else {}
+    opened_at = _position_kline_timestamp(
+        raw.get("openTime"),
+        raw.get("openTs"),
+        raw.get("cTime"),
+        raw.get("createdTime"),
+    )
+    return _format_okx_ms_timestamp(opened_at)
+
+
+def _position_history_raw_size_text(
+    item: OkxPositionHistoryItem,
+    instruments: dict[str, object],
+    *keys: str,
+) -> str:
+    raw = item.raw if isinstance(item.raw, dict) else {}
+    for key in keys:
+        try:
+            value = Decimal(str(raw.get(key) or "").strip())
+        except Exception:
+            continue
+        if value >= 0:
+            return _format_position_history_size(replace(item, close_size=value), instruments)
+    return "-"
+
+
+def _position_history_status_text(item: OkxPositionHistoryItem) -> str:
+    raw = item.raw if isinstance(item.raw, dict) else {}
+    explicit = str(raw.get("posStatus") or raw.get("positionStatus") or "").strip().lower()
+    if explicit in {"partial", "partial_close", "partially_closed", "部分平仓"}:
+        return "部分平仓"
+    if explicit in {"full", "full_close", "closed", "全部平仓"}:
+        return "全部平仓"
+    try:
+        max_size = Decimal(str(raw.get("openMaxPos") or raw.get("maxPos") or "").strip())
+        closed_size = Decimal(
+            str(raw.get("closeTotalPos") or raw.get("closePos") or raw.get("closeSz") or item.close_size or "").strip()
+        )
+    except Exception:
+        return "全部平仓"
+    return "部分平仓" if max_size > 0 and closed_size < max_size else "全部平仓"
 
 
 def _current_position_kline_time_markers(
@@ -2895,7 +2940,7 @@ class AccountPositionsHomeWidget(QWidget):
     def _render_position_history_table(self) -> None:
         if not hasattr(self, "_position_history_table"):
             return
-        self._position_history_table.setHorizontalHeaderItem(10, QTableWidgetItem("\u5df2\u5b9e\u73b0\u6536\u76ca"))
+        self._position_history_table.setHorizontalHeaderItem(12, QTableWidgetItem("\u5df2\u5b9e\u73b0\u6536\u76ca"))
         filtered = self._filtered_position_history_items()
         selected_key = ""
         row = self._position_history_table.currentRow()
@@ -2928,6 +2973,7 @@ class AccountPositionsHomeWidget(QWidget):
         for row, item in enumerate(filtered):
             values = (
                 _format_okx_ms_timestamp(item.update_time),
+                _position_history_open_time_text(item),
                 item.inst_type or "-",
                 item.inst_id or "-",
                 _format_margin_mode(item.mgn_mode or ""),
@@ -2935,7 +2981,8 @@ class AccountPositionsHomeWidget(QWidget):
                 _format_position_history_trade_side(item),
                 _format_position_history_price(item.open_avg_price, item.inst_id, item.inst_type),
                 _format_position_history_price(item.close_avg_price, item.inst_id, item.inst_type),
-                _format_position_history_size(item, self._position_history_instruments),
+                _position_history_raw_size_text(item, self._position_history_instruments, "openMaxPos", "maxPos", "openPos"),
+                _position_history_raw_size_text(item, self._position_history_instruments, "closeTotalPos", "closePos", "closeSz"),
                 _format_position_history_fee_cell(item, self._position_history_usdt_prices),
                 _format_position_history_pnl(
                     item.realized_pnl,
@@ -2943,9 +2990,10 @@ class AccountPositionsHomeWidget(QWidget):
                     with_sign=True,
                     usdt_prices=self._position_history_usdt_prices,
                 ),
-                _position_history_note_summary_text(item, self._position_history_note_text(item)),
+                _position_history_status_text(item),
+                _format_position_note_summary(self._position_history_note_text(item)),
             )
-            self._set_table_row(self._position_history_table, row, values, left_align={2, 11})
+            self._set_table_row(self._position_history_table, row, values, left_align={3, 14})
             self._position_history_table.item(row, 0).setData(
                 Qt.ItemDataRole.UserRole,
                 self._position_history_row_key(item),
@@ -3335,9 +3383,9 @@ class AccountPositionsHomeWidget(QWidget):
         head.addWidget(refresh_button)
         layout.addLayout(head)
 
-        self._position_history_table = QTableWidget(0, 12)
+        self._position_history_table = QTableWidget(0, 15)
         self._position_history_table.setHorizontalHeaderLabels(
-            ("时间", "类型", "合约", "保证金模式", "持仓模式", "交易方向", "开仓均价", "平仓均价", "平仓数量", "手续费", "盈亏", "备注")
+            ("平仓时间", "开仓时间", "类型", "合约", "保证金模式", "持仓模式", "交易方向", "开仓均价", "平仓均价", "最大持仓量", "已平仓量", "手续费", "盈亏", "仓位状态", "备注")
         )
         self._position_history_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self._position_history_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
@@ -3345,18 +3393,11 @@ class AccountPositionsHomeWidget(QWidget):
         self._position_history_table.verticalHeader().setVisible(False)
         header = self._position_history_table.horizontalHeader()
         header.setStretchLastSection(False)
-        header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
-        header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(5, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(6, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(7, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(8, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(9, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(10, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(11, QHeaderView.ResizeMode.Stretch)
+        self._position_history_table.setSortingEnabled(True)
+        for index in range(15):
+            header.setSectionResizeMode(index, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(14, QHeaderView.ResizeMode.Stretch)
         self._position_history_table.itemSelectionChanged.connect(self._refresh_position_history_detail)
         layout.addWidget(self._position_history_table, 1)
 
@@ -4415,7 +4456,7 @@ class AccountPositionsHomeWidget(QWidget):
     def _render_position_history_table(self) -> None:
         if not hasattr(self, "_position_history_table"):
             return
-        self._position_history_table.setHorizontalHeaderItem(10, QTableWidgetItem("\u5df2\u5b9e\u73b0\u6536\u76ca"))
+        self._position_history_table.setHorizontalHeaderItem(12, QTableWidgetItem("\u5df2\u5b9e\u73b0\u6536\u76ca"))
         selected_row = self._position_history_table.currentRow()
         selected_key = None
         if 0 <= selected_row < len(self._position_history_items):
@@ -4425,6 +4466,7 @@ class AccountPositionsHomeWidget(QWidget):
         for row, item in enumerate(self._position_history_items):
             values = (
                 _format_okx_ms_timestamp(item.update_time),
+                _position_history_open_time_text(item),
                 item.inst_type or "-",
                 item.inst_id or "-",
                 _format_margin_mode(item.mgn_mode or ""),
@@ -4432,7 +4474,8 @@ class AccountPositionsHomeWidget(QWidget):
                 _format_position_history_trade_side(item),
                 _format_position_history_price(item.open_avg_price, item.inst_id, item.inst_type),
                 _format_position_history_price(item.close_avg_price, item.inst_id, item.inst_type),
-                _format_position_history_size(item, self._position_history_instruments),
+                _position_history_raw_size_text(item, self._position_history_instruments, "openMaxPos", "maxPos", "openPos"),
+                _position_history_raw_size_text(item, self._position_history_instruments, "closeTotalPos", "closePos", "closeSz"),
                 _format_position_history_fee_cell(item, self._position_history_usdt_prices),
                 _format_position_history_pnl(
                     item.realized_pnl,
@@ -4440,11 +4483,12 @@ class AccountPositionsHomeWidget(QWidget):
                     with_sign=True,
                     usdt_prices=self._position_history_usdt_prices,
                 ),
-                _position_history_note_summary_text(item, self._position_history_note_text(item)),
+                _position_history_status_text(item),
+                _format_position_note_summary(self._position_history_note_text(item)),
             )
             for column, value in enumerate(values):
                 cell = QTableWidgetItem(str(value))
-                if column not in {2, 11}:
+                if column not in {3, 14}:
                     cell.setTextAlignment(int(Qt.AlignmentFlag.AlignCenter | Qt.AlignmentFlag.AlignVCenter))
                 self._position_history_table.setItem(row, column, cell)
         self._position_history_summary_label.setText(f"历史仓位：{len(self._position_history_items)} 条")
@@ -5967,13 +6011,14 @@ class AccountPositionsHomeWidget(QWidget):
         layout.addLayout(filter_row)
 
         self._position_history_table = self._build_history_table(
-            ("时间", "类型", "合约", "保证金模式", "持仓模式", "交易方向", "开仓均价", "平仓均价", "平仓数量", "手续费", "盈亏", "备注"),
-            stretch_columns={2, 11},
+            ("平仓时间", "开仓时间", "类型", "合约", "保证金模式", "持仓模式", "交易方向", "开仓均价", "平仓均价", "最大持仓量", "已平仓量", "手续费", "盈亏", "仓位状态", "备注"),
+            stretch_columns={3, 14},
         )
         self._position_history_table.cellDoubleClicked.connect(self._on_position_history_table_clicked)
         self._position_history_table.setColumnWidth(0, 170)
-        self._position_history_table.setColumnWidth(9, 220)
-        self._position_history_table.setColumnWidth(10, 240)
+        self._position_history_table.setColumnWidth(1, 170)
+        self._position_history_table.setColumnWidth(11, 220)
+        self._position_history_table.setColumnWidth(12, 240)
         layout.addWidget(self._position_history_table, 1)
         self._position_history_summary_label.setMinimumHeight(34)
         return tab
@@ -6664,7 +6709,7 @@ class AccountPositionsHomeWidget(QWidget):
     def _render_position_history_table(self) -> None:
         if not hasattr(self, "_position_history_table"):
             return
-        self._position_history_table.setHorizontalHeaderItem(10, QTableWidgetItem("\u5df2\u5b9e\u73b0\u6536\u76ca"))
+        self._position_history_table.setHorizontalHeaderItem(12, QTableWidgetItem("\u5df2\u5b9e\u73b0\u6536\u76ca"))
         filtered = self._filtered_position_history_items()
         selected_key = ""
         row = self._position_history_table.currentRow()
@@ -6691,6 +6736,7 @@ class AccountPositionsHomeWidget(QWidget):
         for row, item in enumerate(filtered):
             values = (
                 _format_okx_ms_timestamp(item.update_time),
+                _position_history_open_time_text(item),
                 item.inst_type or "-",
                 item.inst_id or "-",
                 _format_margin_mode(item.mgn_mode or ""),
@@ -6698,7 +6744,8 @@ class AccountPositionsHomeWidget(QWidget):
                 _format_position_history_trade_side(item),
                 _format_position_history_price(item.open_avg_price, item.inst_id, item.inst_type),
                 _format_position_history_price(item.close_avg_price, item.inst_id, item.inst_type),
-                _format_position_history_size(item, self._position_history_instruments),
+                _position_history_raw_size_text(item, self._position_history_instruments, "openMaxPos", "maxPos", "openPos"),
+                _position_history_raw_size_text(item, self._position_history_instruments, "closeTotalPos", "closePos", "closeSz"),
                 _format_position_history_fee_cell(item, self._position_history_usdt_prices),
                 _format_position_history_pnl(
                     item.realized_pnl,
@@ -6706,9 +6753,10 @@ class AccountPositionsHomeWidget(QWidget):
                     with_sign=True,
                     usdt_prices=self._position_history_usdt_prices,
                 ),
-                _position_history_note_summary_text(item, self._position_history_note_text(item)),
+                _position_history_status_text(item),
+                _format_position_note_summary(self._position_history_note_text(item)),
             )
-            self._set_table_row(self._position_history_table, row, values, left_align={2, 11})
+            self._set_table_row(self._position_history_table, row, values, left_align={3, 14})
             self._position_history_table.item(row, 0).setData(
                 Qt.ItemDataRole.UserRole,
                 self._position_history_row_key(item),
