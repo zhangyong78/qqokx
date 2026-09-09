@@ -1,0 +1,3786 @@
+from __future__ import annotations
+
+import base64
+import math
+import hashlib
+import hmac
+import http.client
+import json
+import os
+import re
+import threading
+from dataclasses import dataclass
+from datetime import datetime, timezone
+import time
+from decimal import Decimal
+from typing import Any, Callable
+from urllib import error, parse, request
+
+from okx_quant.candle_cache import (
+    DEFAULT_CANDLE_CACHE_CAPACITY,
+    load_candle_cache,
+    load_candle_cache_range,
+    merge_candles,
+    save_candle_cache,
+)
+from okx_quant.client_order_id import OKX_BROKER_TAG, new_custom_order_id
+from okx_quant.models import Candle, Credentials, Instrument, OptionTickBand, OrderPlan, StrategyConfig, TriggerPriceType
+from okx_quant.okx_algo_ws import OkxAlgoWsConnection, OkxAlgoWsConnectionUnavailable
+from okx_quant.okx_candle_ws import CandleStreamKey, OkxCandleWsConnection, OkxCandleWsConnectionUnavailable
+from okx_quant.okx_private_ws import OkxPrivateWsConnection, OkxPrivateWsConnectionUnavailable
+from okx_quant.okx_public_ws import OkxPublicWsConnection, OkxPublicWsConnectionUnavailable
+from okx_quant.persistence import instrument_metadata_cache_file_path
+from okx_quant.pricing import format_decimal, format_decimal_by_increment, snap_to_increment
+
+
+DEFAULT_HEADERS = {
+    "Content-Type": "application/json",
+    "Accept": "application/json",
+    "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/134.0 Safari/537.36"
+    ),
+}
+
+OPTION_ID_PATTERN = re.compile(r"^[A-Z0-9]+-[A-Z0-9]+-\d{6}-[0-9]+-[CP]$")
+FUTURES_ID_PATTERN = re.compile(r"^[A-Z0-9]+-[A-Z0-9]+-\d{6}$")
+MAX_PUBLIC_CANDLE_LIMIT = 300
+FULL_HISTORY_CHECKPOINT_PAGE_INTERVAL = 25
+MAX_BTC_ORDER_EXPOSURE = Decimal("1")
+MAX_NON_BTC_ORDER_NOTIONAL_USD = Decimal("5000")
+USD_LIKE_CURRENCIES = {"USD", "USDT", "USDC"}
+
+
+def _candle_bar_ms(bar: str) -> int:
+    normalized = str(bar or "").strip().upper()
+    if normalized.endswith("UTC"):
+        normalized = normalized[:-3]
+    if len(normalized) < 2:
+        return 0
+    unit = normalized[-1]
+    try:
+        value = int(normalized[:-1])
+    except ValueError:
+        return 0
+    if value <= 0:
+        return 0
+    if unit == "M":
+        return value * 60_000
+    if unit == "H":
+        return value * 60 * 60_000
+    if unit == "D":
+        return value * 24 * 60 * 60_000
+    return 0
+
+
+def _candles_have_internal_gaps(candles: list[Candle], bar: str) -> bool:
+    expected_gap = _candle_bar_ms(bar)
+    if expected_gap <= 0 or len(candles) < 2:
+        return False
+    for left, right in zip(candles, candles[1:]):
+        if int(right.ts) - int(left.ts) != expected_gap:
+            return True
+    return False
+
+
+class OkxApiError(RuntimeError):
+    def __init__(self, message: str, *, code: str | None = None, status: int | None = None) -> None:
+        super().__init__(message)
+        self.code = code
+        self.status = status
+
+
+def _okx_order_data_reject_message(item: dict[str, Any]) -> str:
+    """OKX /trade/order 等返回的 data[] 单项：主单失败或「操作全部失败」时尽量带出附带 TP/SL 子错误。"""
+    s_msg = str(item.get("sMsg") or "").strip() or "-"
+    s_code = str(item.get("sCode") if item.get("sCode") is not None else "").strip()
+    sub_code = str(item.get("subCode") if item.get("subCode") is not None else "").strip()
+    segments: list[str] = []
+    if s_msg and s_msg != "-":
+        segments.append(s_msg)
+    if s_code and s_code.lower() not in {"", "0", "none"}:
+        segments.append(f"sCode={s_code}")
+    if sub_code and sub_code.lower() not in {"", "none"}:
+        segments.append(f"subCode={sub_code}")
+
+    attach = item.get("attachAlgoOrds")
+    attach_had_detail = False
+    if isinstance(attach, list):
+        for idx, sub in enumerate(attach, start=1):
+            if not isinstance(sub, dict):
+                continue
+            sm = str(sub.get("sMsg") or "").strip()
+            sc = str(sub.get("sCode") if sub.get("sCode") is not None else "").strip()
+            if sm or (sc and sc.lower() not in {"", "0", "none"}):
+                attach_had_detail = True
+                segments.append(f"附带TP/SL[{idx}] sCode={sc or '-'} sMsg={sm or '-'}")
+
+    detail = " | ".join(segments) if segments else "OKX 订单请求被拒绝"
+    hint = _okx_order_reject_hint_by_code(s_code=s_code, sub_code=sub_code, item=item)
+    if hint:
+        detail += f" | 提示：{hint}"
+    if "操作全部失败" in s_msg:
+        detail += (
+            " | 常见原因：附带止盈止损价位或触发类型不符合规则；张数/tickSz 步长；"
+            "净持仓模式下误传 posSide（或双向模式漏传）；逐仓缺 ccy；模拟盘限制；保证金不足。"
+            "可在网页端用同价试挂对照。"
+        )
+    # OKX 有时只给笼统 sMsg，无 attach 子项：附上 data[0] 原文便于对照官方文档 / 工单
+    if "操作全部失败" in s_msg and not attach_had_detail:
+        try:
+            raw = json.dumps(item, ensure_ascii=False, default=str)
+        except (TypeError, ValueError):
+            raw = str(item)
+        if len(raw) > 700:
+            raw = raw[:700] + "…"
+        detail += f" | data[0]={raw}"
+    return detail
+
+
+def _okx_order_reject_hint_by_code(*, s_code: str, sub_code: str, item: dict[str, Any]) -> str:
+    code = (s_code or "").strip()
+    sub = (sub_code or "").strip()
+    msg = str(item.get("sMsg") or "").strip()
+    if code == "51008" or ("保证金" in msg and "不足" in msg):
+        return "账户保证金不足。请降低下单张数，或先撤掉占用保证金的挂单/仓位后再试。"
+    if code == "51000":
+        if "posSide" in msg:
+            return "posSide 与账户持仓模式不匹配。净持仓请勿传 posSide；双向持仓请传 long/short。"
+        if "clOrdId" in msg:
+            return "clOrdId 不符合规则。请只用英文/数字/短横线，长度控制在 32 字符以内。"
+        return "请求参数不合法。请检查 posSide、sz、px、tdMode 是否与账户设置一致。"
+    if code == "51004":
+        limit_match = re.search(r"持仓上限\s*([0-9]+(?:\.[0-9]+)?)\s*张", msg)
+        order_match = re.search(r"当前下单张数[:：]\s*([0-9]+(?:\.[0-9]+)?)\s*张", msg)
+        held_match = re.search(r"当前合约多空持有仓位[:：]\s*([0-9]+(?:\.[0-9]+)?)\s*张", msg)
+        pending_match = re.search(r"当前合约多空挂单张数[:：]\s*([0-9]+(?:\.[0-9]+)?)\s*张", msg)
+        occupied_match = re.search(r"其他合约占用额度[:：]\s*([0-9]+(?:\.[0-9]+)?)\s*张", msg)
+        if limit_match and held_match:
+            limit_qty = Decimal(limit_match.group(1))
+            held_qty = Decimal(held_match.group(1))
+            pending_qty = Decimal(pending_match.group(1)) if pending_match else Decimal("0")
+            occupied_qty = Decimal(occupied_match.group(1)) if occupied_match else Decimal("0")
+            requested_qty = Decimal(order_match.group(1)) if order_match else None
+            remaining_qty = max(limit_qty - held_qty - pending_qty - occupied_qty, Decimal("0"))
+            hint = f"该币种当前最多还能再开 {format_decimal(remaining_qty)} 张。"
+            if requested_qty is not None:
+                hint += f" 本次请求 {format_decimal(requested_qty)} 张，已超过交易所上限 {format_decimal(limit_qty)} 张。"
+            hint += " 请减小开仓张数，或换子账户执行。"
+            return hint
+        return "该币种/账户当前可开张数已触达交易所上限。请减小开仓张数，或换子账户执行。"
+    if code == "51121" or sub == "51121":
+        return "下单数量超出该合约或账户当前可下范围。请减小张数后重试。"
+    if code in {"51006", "51131"} or sub == "51131":
+        return "下单价格超出交易所允许范围。请贴近盘口价格后重试。"
+    if code == "50011":
+        return "请求过于频繁。请稍等 1-2 秒再重试。"
+    return ""
+
+
+def _okx_trade_order_request_log_fragment(order: dict[str, Any]) -> str:
+    """下单 POST body 摘要，便于对照 OKX 拒单原因（控制长度）。"""
+    keys = (
+        "instId",
+        "tdMode",
+        "side",
+        "ordType",
+        "px",
+        "sz",
+        "tgtCcy",
+        "posSide",
+        "ccy",
+        "clOrdId",
+        "algoClOrdId",
+        "reduceOnly",
+        "cxlOnClosePos",
+    )
+    frag: dict[str, Any] = {k: order[k] for k in keys if k in order and order[k] is not None}
+    top_level_algo_fields = {
+        k: order.get(k)
+        for k in ("tpTriggerPx", "slTriggerPx", "tpTriggerPxType", "slTriggerPxType", "tpOrdPx", "slOrdPx")
+        if order.get(k) not in (None, "")
+    }
+    if top_level_algo_fields:
+        frag["algo_tp_sl"] = top_level_algo_fields
+    aa = order.get("attachAlgoOrds")
+    if isinstance(aa, list) and aa:
+        frag["attachAlgoOrds_n"] = len(aa)
+        first = aa[0] if isinstance(aa[0], dict) else None
+        if isinstance(first, dict):
+            frag["attach_tp_sl"] = {
+                k: first.get(k)
+                for k in (
+                    "tpTriggerPx",
+                    "slTriggerPx",
+                    "tpTriggerPxType",
+                    "slTriggerPxType",
+                    "tpOrdPx",
+                    "slOrdPx",
+                )
+                if first.get(k) not in (None, "")
+            }
+    try:
+        s = json.dumps(frag, ensure_ascii=False, default=str)
+    except (TypeError, ValueError):
+        s = str(frag)
+    if len(s) > 950:
+        s = s[:950] + "…"
+    return s
+
+
+def _raise_order_error_with_request(exc: OkxApiError, order: dict[str, Any]) -> None:
+    msg = str(exc)
+    if "请求=" in msg:
+        raise exc
+    req = _okx_trade_order_request_log_fragment(order)
+    raise OkxApiError(f"{msg} | 请求={req}", code=exc.code, status=exc.status) from exc
+
+
+@dataclass
+class OkxOrderResult:
+    ord_id: str
+    cl_ord_id: str | None
+    s_code: str
+    s_msg: str
+    raw: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class OkxOrderStatus:
+    ord_id: str
+    state: str
+    side: str | None
+    ord_type: str | None
+    price: Decimal | None
+    avg_price: Decimal | None
+    size: Decimal | None
+    filled_size: Decimal | None
+    raw: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class OkxTicker:
+    inst_id: str
+    last: Decimal | None
+    bid: Decimal | None
+    ask: Decimal | None
+    mark: Decimal | None
+    index: Decimal | None
+    raw: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class OkxOrderBook:
+    inst_id: str
+    bids: tuple[tuple[Decimal, Decimal], ...]
+    asks: tuple[tuple[Decimal, Decimal], ...]
+    raw: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class OkxPriceLimit:
+    inst_id: str
+    buy_limit: Decimal | None
+    sell_limit: Decimal | None
+    ts: int | None
+    raw: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class OkxMaxOrderSize:
+    inst_id: str
+    ccy: str | None
+    max_buy: Decimal | None
+    max_sell: Decimal | None
+    raw: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class OkxPosition:
+    inst_id: str
+    inst_type: str
+    pos_side: str
+    mgn_mode: str
+    position: Decimal
+    avail_position: Decimal | None
+    avg_price: Decimal | None
+    mark_price: Decimal | None
+    unrealized_pnl: Decimal | None
+    unrealized_pnl_ratio: Decimal | None
+    liquidation_price: Decimal | None
+    leverage: Decimal | None
+    margin_ccy: str | None
+    last_price: Decimal | None
+    realized_pnl: Decimal | None
+    margin_ratio: Decimal | None
+    initial_margin: Decimal | None
+    maintenance_margin: Decimal | None
+    delta: Decimal | None
+    gamma: Decimal | None
+    vega: Decimal | None
+    theta: Decimal | None
+    raw: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class OkxFillHistoryItem:
+    fill_time: int | None
+    inst_id: str
+    inst_type: str
+    side: str | None
+    pos_side: str | None
+    fill_price: Decimal | None
+    fill_size: Decimal | None
+    fill_fee: Decimal | None
+    fee_currency: str | None
+    pnl: Decimal | None
+    order_id: str | None
+    trade_id: str | None
+    exec_type: str | None
+    raw: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class OkxPositionHistoryItem:
+    update_time: int | None
+    inst_id: str
+    inst_type: str
+    mgn_mode: str | None
+    pos_side: str | None
+    direction: str | None
+    open_avg_price: Decimal | None
+    close_avg_price: Decimal | None
+    close_size: Decimal | None
+    pnl: Decimal | None
+    realized_pnl: Decimal | None
+    settle_pnl: Decimal | None
+    raw: dict[str, Any]
+    fee: Decimal | None = None
+    fee_currency: str | None = None
+    funding_fee: Decimal | None = None
+
+
+@dataclass(frozen=True)
+class OkxTradeOrderItem:
+    source_kind: str
+    source_label: str
+    created_time: int | None
+    update_time: int | None
+    inst_id: str
+    inst_type: str
+    side: str | None
+    pos_side: str | None
+    td_mode: str | None
+    ord_type: str | None
+    state: str | None
+    price: Decimal | None
+    size: Decimal | None
+    filled_size: Decimal | None
+    avg_price: Decimal | None
+    order_id: str | None
+    algo_id: str | None
+    client_order_id: str | None
+    algo_client_order_id: str | None
+    pnl: Decimal | None
+    fee: Decimal | None
+    fee_currency: str | None
+    reduce_only: bool | None
+    trigger_price: Decimal | None
+    trigger_price_type: str | None
+    order_price: Decimal | None
+    actual_price: Decimal | None
+    actual_size: Decimal | None
+    actual_side: str | None
+    take_profit_trigger_price: Decimal | None
+    take_profit_order_price: Decimal | None
+    take_profit_trigger_price_type: str | None
+    stop_loss_trigger_price: Decimal | None
+    stop_loss_order_price: Decimal | None
+    stop_loss_trigger_price_type: str | None
+    raw: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class OkxAccountBillItem:
+    bill_id: str
+    bill_time: int | None
+    inst_id: str
+    inst_type: str
+    bill_type: str | None
+    bill_sub_type: str | None
+    business_type: str | None
+    event_type: str | None
+    side: str | None
+    pos_side: str | None
+    size: Decimal | None
+    price: Decimal | None
+    amount: Decimal | None
+    fee: Decimal | None
+    pnl: Decimal | None
+    balance_change: Decimal | None
+    currency: str | None
+    order_id: str | None
+    trade_id: str | None
+    client_order_id: str | None
+    raw: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class OkxAccountAssetItem:
+    ccy: str
+    equity: Decimal | None
+    equity_usd: Decimal | None
+    cash_balance: Decimal | None
+    available_balance: Decimal | None
+    available_equity: Decimal | None
+    frozen_balance: Decimal | None
+    unrealized_pnl: Decimal | None
+    discount_equity: Decimal | None
+    liability: Decimal | None
+    cross_liability: Decimal | None
+    interest: Decimal | None
+    raw: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class OkxAccountOverview:
+    total_equity: Decimal | None
+    adjusted_equity: Decimal | None
+    isolated_equity: Decimal | None
+    available_equity: Decimal | None
+    unrealized_pnl: Decimal | None
+    initial_margin: Decimal | None
+    maintenance_margin: Decimal | None
+    order_frozen: Decimal | None
+    notional_usd: Decimal | None
+    details: tuple[OkxAccountAssetItem, ...]
+    raw: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class OkxAccountConfig:
+    account_level: str | None
+    position_mode: str | None
+    auto_loan: bool | None
+    greeks_type: str | None
+    level: str | None
+    raw: dict[str, Any]
+
+
+class OkxRestClient:
+    base_url = "https://www.okx.com"
+    _OPTION_TICK_BAND_CACHE_TTL_S = 600.0
+
+    def __init__(self, *, logger: Callable[[str], None] | None = None) -> None:
+        self._logger = logger or (lambda _message: None)
+        self._public_ws_lock = threading.Lock()
+        self._public_ws_connections: dict[str, OkxPublicWsConnection] = {}
+        self._public_ws_error_once: set[str] = set()
+        self._private_ws_lock = threading.Lock()
+        self._private_ws_connections: dict[tuple[str, str, str], OkxPrivateWsConnection] = {}
+        self._private_ws_error_once: set[tuple[str, str, str]] = set()
+        self._algo_ws_lock = threading.Lock()
+        self._algo_ws_connections: dict[tuple[str, str, str], OkxAlgoWsConnection] = {}
+        self._algo_ws_error_once: set[tuple[str, str, str]] = set()
+        self._candle_ws_lock = threading.Lock()
+        self._candle_ws_connections: dict[str, OkxCandleWsConnection] = {}
+        self._candle_ws_error_once: set[str] = set()
+        self._instrument_cache_lock = threading.Lock()
+        self._instrument_cache_loaded = False
+        self._instrument_cache_by_id: dict[str, Instrument] = {}
+        self._option_tick_band_cache_lock = threading.Lock()
+        self._option_tick_band_cache: dict[str, tuple[tuple[OptionTickBand, ...], float]] = {}
+
+    def detach_profile_websockets(self, credentials: Credentials, *, environment: str) -> tuple[object, ...]:
+        """Detach private WS connections for one API profile without waiting for them.
+
+        The returned connections are already removed from this client's maps,
+        so they can be stopped in a background worker while a new API profile
+        is brought online immediately.
+        """
+        profile_name = (credentials.profile_name or "").strip()
+        key = (credentials.api_key, profile_name, environment)
+        connections: list[object] = []
+        with self._private_ws_lock:
+            connection = self._private_ws_connections.pop(key, None)
+            if connection is not None:
+                connections.append(connection)
+            self._private_ws_error_once.discard(key)
+        with self._algo_ws_lock:
+            connection = self._algo_ws_connections.pop(key, None)
+            if connection is not None:
+                connections.append(connection)
+            self._algo_ws_error_once.discard(key)
+        return tuple(connections)
+
+    def close_profile_websockets(self, credentials: Credentials, *, environment: str) -> None:
+        """Stop and forget private WS connections for one API profile."""
+        connections = self.detach_profile_websockets(credentials, environment=environment)
+        for connection in connections:
+            try:
+                connection.stop()  # type: ignore[attr-defined]
+            except Exception as exc:  # noqa: BLE001
+                self._logger(f"关闭 API Profile WS 失败：{exc}")
+
+    def close(self) -> None:
+        """Stop all WS connections owned by this REST client."""
+        connections: list[object] = []
+        for lock, mapping, error_once in (
+            (self._public_ws_lock, self._public_ws_connections, self._public_ws_error_once),
+            (self._private_ws_lock, self._private_ws_connections, self._private_ws_error_once),
+            (self._algo_ws_lock, self._algo_ws_connections, self._algo_ws_error_once),
+            (self._candle_ws_lock, self._candle_ws_connections, self._candle_ws_error_once),
+        ):
+            with lock:
+                connections.extend(mapping.values())
+                mapping.clear()
+                error_once.clear()
+        for connection in connections:
+            try:
+                connection.stop()  # type: ignore[attr-defined]
+            except Exception as exc:  # noqa: BLE001
+                self._logger(f"关闭 WS 连接失败：{exc}")
+
+    def get_instruments(
+        self,
+        inst_type: str,
+        *,
+        uly: str | None = None,
+        inst_family: str | None = None,
+        prefer_cached: bool = False,
+    ) -> list[Instrument]:
+        normalized_type = inst_type.upper()
+        normalized_family = (inst_family or "").strip().upper() or None
+        if prefer_cached:
+            cached = self._get_cached_instruments(normalized_type, inst_family=normalized_family)
+            if cached:
+                return cached
+
+        params = {"instType": normalized_type}
+        if uly:
+            params["uly"] = uly
+        if normalized_family:
+            params["instFamily"] = normalized_family
+
+        try:
+            payload = self._request("GET", "/api/v5/public/instruments", params=params)
+        except Exception:
+            cached = self._get_cached_instruments(normalized_type, inst_family=normalized_family)
+            if cached:
+                return cached
+            raise
+        instruments: list[Instrument] = []
+        for item in payload["data"]:
+            instruments.append(
+                Instrument(
+                    inst_id=item["instId"],
+                    inst_type=item["instType"],
+                    tick_size=_decimal_or(item.get("tickSz"), Decimal("0.00000001")),
+                    lot_size=_decimal_or(item.get("lotSz"), Decimal("1")),
+                    min_size=_decimal_or(item.get("minSz"), _decimal_or(item.get("lotSz"), Decimal("1"))),
+                    state=item.get("state", ""),
+                    settle_ccy=item.get("settleCcy"),
+                    ct_val=_to_decimal(item.get("ctVal")),
+                    ct_mult=_to_decimal(item.get("ctMult")),
+                    ct_val_ccy=item.get("ctValCcy"),
+                    uly=item.get("uly"),
+                    inst_family=item.get("instFamily"),
+                )
+            )
+        instruments.sort(key=lambda item: item.inst_id)
+        self._cache_instruments(instruments)
+        return instruments
+
+    def get_swap_instruments(self) -> list[Instrument]:
+        return self.get_instruments("SWAP")
+
+    def get_option_instruments(self, *, uly: str | None = None, inst_family: str | None = None) -> list[Instrument]:
+        return self.get_instruments("OPTION", uly=uly, inst_family=inst_family)
+
+    def get_option_tick_bands(self, inst_family: str, *, force_refresh: bool = False) -> list[OptionTickBand]:
+        """Return the live OKX price bands required for option order prices."""
+        normalized_family = str(inst_family or "").strip().upper()
+        if not re.fullmatch(r"[A-Z0-9]+-[A-Z0-9]+", normalized_family):
+            raise ValueError("期权价格分档缺少有效的 instFamily。")
+        now = time.monotonic()
+        with self._option_tick_band_cache_lock:
+            cached = self._option_tick_band_cache.get(normalized_family)
+        if cached is not None and not force_refresh and now - cached[1] < self._OPTION_TICK_BAND_CACHE_TTL_S:
+            return list(cached[0])
+        try:
+            payload = self._request(
+                "GET",
+                "/api/v5/public/instrument-tick-bands",
+                params={"instType": "OPTION", "instFamily": normalized_family},
+            )
+        except Exception:
+            if cached is not None:
+                return list(cached[0])
+            raise
+        data = payload.get("data")
+        if not isinstance(data, list) or not data or not isinstance(data[0], dict):
+            raise OkxApiError(f"{normalized_family} 未返回期权价格分档。")
+        raw_bands = data[0].get("tickBand")
+        if not isinstance(raw_bands, list) or not raw_bands:
+            raise OkxApiError(f"{normalized_family} 未返回有效的期权价格分档。")
+        bands: list[OptionTickBand] = []
+        for raw_band in raw_bands:
+            if not isinstance(raw_band, dict):
+                continue
+            tick_size = _to_decimal(raw_band.get("tickSz"))
+            min_price = _to_decimal(raw_band.get("minPx"))
+            max_price = _to_decimal(raw_band.get("maxPx"))
+            if tick_size is None or tick_size <= 0 or min_price is None or min_price < 0:
+                continue
+            bands.append(
+                OptionTickBand(
+                    min_price=min_price,
+                    max_price=max_price if max_price is not None and max_price > min_price else None,
+                    tick_size=tick_size,
+                )
+            )
+        if not bands:
+            raise OkxApiError(f"{normalized_family} 的期权价格分档格式无效。")
+        resolved = tuple(sorted(bands, key=lambda band: band.min_price))
+        with self._option_tick_band_cache_lock:
+            self._option_tick_band_cache[normalized_family] = (resolved, time.monotonic())
+        return list(resolved)
+
+    def get_spot_instruments(self) -> list[Instrument]:
+        return self.get_instruments("SPOT")
+
+    def get_cached_instruments(self, inst_type: str, *, inst_family: str | None = None) -> list[Instrument]:
+        return self._get_cached_instruments(inst_type, inst_family=inst_family)
+
+    def get_cached_instrument(self, inst_id: str) -> Instrument | None:
+        return self._get_cached_instrument(inst_id)
+
+    def _spot_td_mode_for_account(self, credentials: Credentials, config: StrategyConfig) -> str:
+        try:
+            account_config = self.get_account_config(credentials, environment=config.environment)
+        except Exception:
+            return "cash"
+        account_level = str(getattr(account_config, "account_level", "") or "").strip()
+        if account_level in {"3", "4"}:
+            return "cross"
+        return "cash"
+
+    def _enforce_order_size_safety_limit(
+        self,
+        *,
+        instrument: Instrument | None,
+        size: Decimal,
+        reference_price: Decimal | None = None,
+        inst_id: str | None = None,
+    ) -> None:
+        normalized_inst_id = (
+            instrument.inst_id if instrument is not None else inst_id or ""
+        ).strip().upper()
+        base_ccy = _instrument_base_currency(instrument, normalized_inst_id)
+        abs_size = abs(size)
+        if abs_size <= 0:
+            return
+
+        price = reference_price if reference_price is not None and reference_price > 0 else None
+        if base_ccy == "BTC":
+            exposure = _estimate_base_exposure(instrument, abs_size, price)
+            if exposure is None and _instrument_needs_reference_price_for_base_exposure(instrument):
+                price = self._order_size_safety_reference_price(normalized_inst_id)
+                exposure = _estimate_base_exposure(instrument, abs_size, price)
+            if exposure is None:
+                raise OkxApiError(f"{normalized_inst_id} BTC报单暴露无法确认，已拦截。")
+            if exposure > MAX_BTC_ORDER_EXPOSURE:
+                raise OkxApiError(
+                    f"{normalized_inst_id} BTC报单暴露 {format_decimal(exposure)} BTC "
+                    f"超过绝对限制 {format_decimal(MAX_BTC_ORDER_EXPOSURE)} BTC，已拦截。"
+                )
+            return
+
+        notional = _estimate_notional_usd(instrument, abs_size, price)
+        if notional is None and _instrument_needs_reference_price_for_notional(instrument):
+            price = self._order_size_safety_reference_price(normalized_inst_id)
+            notional = _estimate_notional_usd(instrument, abs_size, price)
+        if notional is None:
+            raise OkxApiError(f"{normalized_inst_id} 报单名义价值无法确认，已拦截。")
+        if notional > MAX_NON_BTC_ORDER_NOTIONAL_USD:
+            raise OkxApiError(
+                f"{normalized_inst_id} 报单名义价值 {format_decimal(notional)} USD "
+                f"超过绝对限制 {format_decimal(MAX_NON_BTC_ORDER_NOTIONAL_USD)} USD，已拦截。"
+            )
+
+    def _order_size_safety_reference_price(self, inst_id: str) -> Decimal:
+        ticker = self.get_ticker(inst_id)
+        price = _ticker_reference_price(ticker)
+        if price is None or price <= 0:
+            raise OkxApiError(f"{inst_id} 缺少可用价格，无法确认报单绝对限制，已拦截。")
+        return price
+
+    def get_instrument(self, inst_id: str, *, prefer_cached: bool = False) -> Instrument:
+        normalized = inst_id.strip().upper()
+        if prefer_cached:
+            cached = self._get_cached_instrument(normalized)
+            if cached is not None:
+                return cached
+        inst_type = infer_inst_type(normalized)
+        inst_family = infer_option_family(normalized) if inst_type == "OPTION" else None
+        for instrument in self.get_instruments(inst_type, inst_family=inst_family, prefer_cached=prefer_cached):
+            if instrument.inst_id == normalized:
+                return instrument
+        raise OkxApiError(f"未找到可交易标的：{normalized}")
+
+    def _ensure_instrument_cache_loaded(self) -> None:
+        with self._instrument_cache_lock:
+            if self._instrument_cache_loaded:
+                return
+            self._instrument_cache_loaded = True
+            cache_path = instrument_metadata_cache_file_path()
+            if not cache_path.exists():
+                return
+            try:
+                payload = json.loads(cache_path.read_text(encoding="utf-8"))
+            except Exception:
+                return
+            items = payload.get("items") if isinstance(payload, dict) else None
+            if not isinstance(items, list):
+                return
+            loaded: dict[str, Instrument] = {}
+            for item in items:
+                instrument = _deserialize_instrument_cache_item(item)
+                if instrument is not None:
+                    loaded[instrument.inst_id] = instrument
+            self._instrument_cache_by_id = loaded
+
+    def _get_cached_instrument(self, inst_id: str) -> Instrument | None:
+        self._ensure_instrument_cache_loaded()
+        return self._instrument_cache_by_id.get(inst_id.strip().upper())
+
+    def _get_cached_instruments(self, inst_type: str, *, inst_family: str | None = None) -> list[Instrument]:
+        self._ensure_instrument_cache_loaded()
+        normalized_type = inst_type.strip().upper()
+        normalized_family = (inst_family or "").strip().upper() or None
+        instruments = [
+            instrument
+            for instrument in self._instrument_cache_by_id.values()
+            if instrument.inst_type == normalized_type
+            and (normalized_family is None or (instrument.inst_family or "").strip().upper() == normalized_family)
+        ]
+        instruments.sort(key=lambda item: item.inst_id)
+        return instruments
+
+    def _cache_instruments(self, instruments: list[Instrument]) -> None:
+        if not instruments:
+            return
+        self._ensure_instrument_cache_loaded()
+        with self._instrument_cache_lock:
+            for instrument in instruments:
+                self._instrument_cache_by_id[instrument.inst_id] = instrument
+            try:
+                payload = {
+                    "version": 1,
+                    "updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
+                    "items": [
+                        _serialize_instrument_cache_item(item)
+                        for item in sorted(self._instrument_cache_by_id.values(), key=lambda instrument: instrument.inst_id)
+                    ],
+                }
+                target = instrument_metadata_cache_file_path()
+                target.parent.mkdir(parents=True, exist_ok=True)
+                temp_path = target.with_suffix(target.suffix + ".tmp")
+                temp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+                temp_path.replace(target)
+            except Exception:
+                return
+
+    def get_candles(self, inst_id: str, bar: str, limit: int = 200) -> list[Candle]:
+        payload = self._request(
+            "GET",
+            "/api/v5/market/candles",
+            params={"instId": inst_id, "bar": bar, "limit": str(max(1, min(limit, MAX_PUBLIC_CANDLE_LIMIT)))},
+        )
+        return self._parse_candles_payload(payload)
+
+    def get_candles_history(
+        self,
+        inst_id: str,
+        bar: str,
+        limit: int = 200,
+        *,
+        progress_callback: Callable[[dict[str, Any]], None] | None = None,
+    ) -> list[Candle]:
+        fetch_full_history = limit <= 0
+        requested_limit = 0 if fetch_full_history else max(1, limit)
+        cached = load_candle_cache(inst_id, bar, limit=None if fetch_full_history else requested_limit)
+        cached_window = list(cached) if fetch_full_history else cached[-requested_limit:]
+        cache_window_has_gaps = _candles_have_internal_gaps(cached_window, bar)
+        cached_ts = {candle.ts for candle in cached}
+        latest_added_ts: set[int] = set()
+        older_added_ts: set[int] = set()
+
+        try:
+            latest_batch = self._fetch_history_candles_page(
+                inst_id,
+                bar,
+                limit=MAX_PUBLIC_CANDLE_LIMIT if fetch_full_history else min(requested_limit, MAX_PUBLIC_CANDLE_LIMIT),
+            )
+        except Exception:
+            returned = list(cached) if fetch_full_history else cached[-requested_limit:]
+            self.last_candle_history_stats = {
+                "cache_hit_count": len(returned) if fetch_full_history else min(len(returned), requested_limit),
+                "latest_fetch_count": 0,
+                "older_fetch_count": 0,
+                "requested_count": requested_limit,
+                "returned_count": len(returned),
+                "full_history": fetch_full_history,
+            }
+            if fetch_full_history and cached:
+                return returned
+            if not fetch_full_history and len(cached) >= requested_limit:
+                return returned
+            raise
+
+        latest_batch_ts = {candle.ts for candle in latest_batch}
+        latest_added_ts = latest_batch_ts - cached_ts
+
+        seed_candles = cached if not cache_window_has_gaps else []
+        collected = merge_candles(seed_candles, latest_batch)
+        after = str(collected[0].ts) if collected else None
+        page_count = 1 if latest_batch else 0
+        if fetch_full_history and collected:
+            self._emit_candle_history_progress(
+                progress_callback,
+                inst_id=inst_id,
+                bar=bar,
+                page_count=page_count,
+                cached_count=len(cached),
+                total_count=len(collected),
+                oldest_ts=collected[0].ts,
+                newest_ts=collected[-1].ts,
+            )
+            self._save_full_history_checkpoint(inst_id, bar, collected)
+
+        while after is not None:
+            if not fetch_full_history and len(collected) >= requested_limit:
+                break
+            page_limit = MAX_PUBLIC_CANDLE_LIMIT if fetch_full_history else min(requested_limit - len(collected), MAX_PUBLIC_CANDLE_LIMIT)
+            batch = self._fetch_history_candles_page(inst_id, bar, limit=page_limit, after=after)
+            if not batch:
+                break
+            previous_ts = {candle.ts for candle in collected}
+            previous_oldest = collected[0].ts if collected else None
+            collected = merge_candles(collected, batch)
+            older_added_ts.update({candle.ts for candle in batch} - previous_ts)
+            page_count += 1
+            if fetch_full_history and collected:
+                self._emit_candle_history_progress(
+                    progress_callback,
+                    inst_id=inst_id,
+                    bar=bar,
+                    page_count=page_count,
+                    cached_count=len(cached),
+                    total_count=len(collected),
+                    oldest_ts=collected[0].ts,
+                    newest_ts=collected[-1].ts,
+                )
+                if page_count % FULL_HISTORY_CHECKPOINT_PAGE_INTERVAL == 0:
+                    self._save_full_history_checkpoint(inst_id, bar, collected)
+            oldest_ts = collected[0].ts if collected else None
+            if oldest_ts is None or oldest_ts == previous_oldest:
+                break
+            after = str(oldest_ts)
+            if len(batch) < page_limit:
+                break
+
+        save_candle_cache(
+            inst_id,
+            bar,
+            merge_candles(cached, collected),
+            max_records=max(DEFAULT_CANDLE_CACHE_CAPACITY, requested_limit, len(collected)),
+        )
+        returned = list(collected) if fetch_full_history else collected[-requested_limit:]
+        returned_ts = {candle.ts for candle in returned}
+        self.last_candle_history_stats = {
+            "cache_hit_count": len(returned_ts & cached_ts),
+            "latest_fetch_count": len(returned_ts & latest_added_ts),
+            "older_fetch_count": len(returned_ts & older_added_ts),
+            "requested_count": requested_limit,
+            "returned_count": len(returned),
+            "full_history": fetch_full_history,
+        }
+        return returned
+
+    @staticmethod
+    def _emit_candle_history_progress(
+        progress_callback: Callable[[dict[str, Any]], None] | None,
+        *,
+        inst_id: str,
+        bar: str,
+        page_count: int,
+        cached_count: int,
+        total_count: int,
+        oldest_ts: int | None,
+        newest_ts: int | None,
+    ) -> None:
+        if progress_callback is None:
+            return
+        try:
+            progress_callback(
+                {
+                    "inst_id": inst_id,
+                    "bar": bar,
+                    "page_count": page_count,
+                    "cached_count": cached_count,
+                    "total_count": total_count,
+                    "oldest_ts": oldest_ts,
+                    "newest_ts": newest_ts,
+                }
+            )
+        except Exception:
+            return
+
+    @staticmethod
+    def _save_full_history_checkpoint(inst_id: str, bar: str, candles: list[Candle]) -> None:
+        save_candle_cache(
+            inst_id,
+            bar,
+            candles,
+            max_records=max(DEFAULT_CANDLE_CACHE_CAPACITY, len(candles)),
+        )
+
+    def get_candles_history_range(
+        self,
+        inst_id: str,
+        bar: str,
+        *,
+        start_ts: int,
+        end_ts: int,
+        limit: int = 200,
+        preload_count: int = 0,
+    ) -> list[Candle]:
+        if start_ts > end_ts:
+            raise ValueError("开始时间不能晚于结束时间")
+        fetch_full_history = limit <= 0
+        requested_limit = 0 if fetch_full_history else max(1, limit)
+        preload_limit = max(0, preload_count)
+        selected_collected: list[Candle] = []
+        preload_collected: list[Candle] = []
+        after = str(end_ts + 1)
+
+        while after is not None:
+            enough_selected = (not fetch_full_history) and len(selected_collected) >= requested_limit
+            enough_preload = len(preload_collected) >= preload_limit
+            if enough_selected and enough_preload:
+                break
+            page_limit = MAX_PUBLIC_CANDLE_LIMIT
+            batch = self._fetch_history_candles_page(inst_id, bar, limit=page_limit, after=after)
+            if not batch:
+                break
+            eligible_batch = [candle for candle in batch if candle.ts <= end_ts]
+            selected_batch = [candle for candle in eligible_batch if start_ts <= candle.ts <= end_ts]
+            preload_batch = [candle for candle in eligible_batch if candle.ts < start_ts]
+            selected_collected = merge_candles(selected_collected, selected_batch)
+            if preload_limit > 0:
+                preload_collected = merge_candles(preload_collected, preload_batch)
+                if len(preload_collected) > preload_limit:
+                    preload_collected = preload_collected[-preload_limit:]
+            oldest_ts = batch[0].ts if batch else None
+            if oldest_ts is None or oldest_ts <= start_ts:
+                if preload_limit == 0 or len(preload_collected) >= preload_limit:
+                    break
+            next_after = str(oldest_ts)
+            if next_after == after:
+                break
+            after = next_after
+            if len(batch) < page_limit:
+                break
+
+        cached = load_candle_cache_range(
+            inst_id,
+            bar,
+            start_ts=start_ts,
+            end_ts=end_ts,
+            limit=None if fetch_full_history else requested_limit,
+            preload_count=preload_limit,
+        )
+        merged = merge_candles(cached, merge_candles(preload_collected, selected_collected))
+
+        in_range = [candle for candle in merged if start_ts <= candle.ts <= end_ts]
+        in_range.sort(key=lambda c: c.ts)
+        selected_returned = list(in_range) if fetch_full_history else in_range[-requested_limit:]
+
+        below_start = [candle for candle in merged if candle.ts < start_ts]
+        below_start.sort(key=lambda c: c.ts)
+        preload_returned = below_start[-preload_limit:] if preload_limit > 0 else []
+
+        returned = merge_candles(preload_returned, selected_returned)
+        save_candle_cache(
+            inst_id,
+            bar,
+            merged,
+            max_records=max(
+                DEFAULT_CANDLE_CACHE_CAPACITY,
+                requested_limit + preload_limit,
+                len(merged),
+            ),
+        )
+        self.last_candle_history_stats = {
+            "range_mode": True,
+            "start_ts": start_ts,
+            "end_ts": end_ts,
+            "requested_count": requested_limit,
+            "selected_count": len(selected_returned),
+            "preload_count": len(preload_returned),
+            "returned_count": len(returned),
+            "full_history": fetch_full_history,
+        }
+        return returned
+
+    def _fetch_history_candles_page(
+        self,
+        inst_id: str,
+        bar: str,
+        *,
+        limit: int,
+        after: str | None = None,
+    ) -> list[Candle]:
+        params = {"instId": inst_id, "bar": bar, "limit": str(max(1, min(limit, MAX_PUBLIC_CANDLE_LIMIT)))}
+        if after is not None:
+            params["after"] = after
+        payload = self._request("GET", "/api/v5/market/history-candles", params=params)
+        return self._parse_candles_payload(payload)
+
+    def _parse_candles_payload(self, payload: dict[str, Any]) -> list[Candle]:
+        candles: list[Candle] = []
+        for row in payload["data"]:
+            candles.append(
+                Candle(
+                    ts=int(row[0]),
+                    open=Decimal(row[1]),
+                    high=Decimal(row[2]),
+                    low=Decimal(row[3]),
+                    close=Decimal(row[4]),
+                    volume=Decimal(row[5]),
+                    confirmed=(row[8] == "1") if len(row) > 8 else True,
+                )
+            )
+        candles.sort(key=lambda candle: candle.ts)
+        return candles
+
+    def get_candles_history_before(self, inst_id: str, bar: str, before_ts: int, limit: int = 240) -> list[Candle]:
+        """Load one older trade-price candle page whose timestamps precede ``before_ts``."""
+        if before_ts <= 0:
+            return []
+        return self._fetch_history_candles_page(
+            inst_id,
+            bar,
+            limit=min(max(1, limit), MAX_PUBLIC_CANDLE_LIMIT),
+            after=str(before_ts),
+        )
+
+    def get_mark_price_candles(self, inst_id: str, bar: str, limit: int = 200) -> list[Candle]:
+        requested_limit = max(1, limit)
+        collected = self._fetch_mark_price_candles_page(
+            inst_id,
+            bar,
+            limit=min(requested_limit, MAX_PUBLIC_CANDLE_LIMIT),
+        )
+        after = str(collected[0].ts) if collected else None
+
+        while len(collected) < requested_limit and after is not None:
+            page_limit = min(requested_limit - len(collected), MAX_PUBLIC_CANDLE_LIMIT)
+            batch = self._fetch_mark_price_candles_page(inst_id, bar, limit=page_limit, after=after)
+            if not batch:
+                break
+            previous_oldest = collected[0].ts if collected else None
+            collected = merge_candles(collected, batch)
+            oldest_ts = collected[0].ts if collected else None
+            if oldest_ts is None or oldest_ts == previous_oldest:
+                break
+            after = str(oldest_ts)
+            if len(batch) < page_limit:
+                break
+        return collected[-requested_limit:]
+
+    def get_mark_price_candles_before(self, inst_id: str, bar: str, before_ts: int, limit: int = 240) -> list[Candle]:
+        """Load one older mark-price candle page whose timestamps precede ``before_ts``."""
+        if before_ts <= 0:
+            return []
+        return self._fetch_mark_price_candles_page(
+            inst_id,
+            bar,
+            limit=min(max(1, limit), MAX_PUBLIC_CANDLE_LIMIT),
+            after=str(before_ts),
+        )
+
+    def _fetch_mark_price_candles_page(
+        self,
+        inst_id: str,
+        bar: str,
+        *,
+        limit: int,
+        after: str | None = None,
+    ) -> list[Candle]:
+        params = {"instId": inst_id, "bar": bar, "limit": str(max(1, min(limit, MAX_PUBLIC_CANDLE_LIMIT)))}
+        if after is not None:
+            params["after"] = after
+        payload = self._request("GET", "/api/v5/market/mark-price-candles", params=params)
+        return self._parse_mark_price_candles_payload(payload)
+
+    def _parse_mark_price_candles_payload(self, payload: dict[str, Any]) -> list[Candle]:
+        candles: list[Candle] = []
+        for row in payload["data"]:
+            candles.append(
+                Candle(
+                    ts=int(row[0]),
+                    open=Decimal(row[1]),
+                    high=Decimal(row[2]),
+                    low=Decimal(row[3]),
+                    close=Decimal(row[4]),
+                    volume=Decimal("0"),
+                    confirmed=(row[5] == "1") if len(row) > 5 else True,
+                )
+            )
+        candles.sort(key=lambda candle: candle.ts)
+        return candles
+
+    def get_tickers(
+        self,
+        inst_type: str,
+        *,
+        uly: str | None = None,
+        inst_family: str | None = None,
+    ) -> list[OkxTicker]:
+        params = {"instType": inst_type.upper()}
+        if uly:
+            params["uly"] = uly
+        if inst_family:
+            params["instFamily"] = inst_family
+        payload = self._request("GET", "/api/v5/market/tickers", params=params)
+        items: list[OkxTicker] = []
+        for row in payload.get("data", []):
+            items.append(
+                OkxTicker(
+                    inst_id=row.get("instId", ""),
+                    last=_to_decimal(row.get("last")),
+                    bid=_to_decimal(row.get("bidPx")),
+                    ask=_to_decimal(row.get("askPx")),
+                    mark=_to_decimal(row.get("markPx")),
+                    index=_first_decimal(row.get("idxPx"), row.get("indexPx")),
+                    raw=row,
+                )
+            )
+        items.sort(key=lambda item: item.inst_id)
+        return items
+
+    def get_ticker(self, inst_id: str) -> OkxTicker:
+        payload = self._request("GET", "/api/v5/market/ticker", params={"instId": inst_id})
+        if not payload["data"]:
+            raise OkxApiError(f"OKX 鏈繑鍥炶鎯咃細{inst_id}")
+        first = payload["data"][0]
+        return self._build_ticker_from_public_item(inst_id=inst_id, item=first)
+
+    def get_order_book(self, inst_id: str, depth: int = 50) -> OkxOrderBook:
+        size = max(1, min(depth, 400))
+        payload = self._request("GET", "/api/v5/market/books", params={"instId": inst_id, "sz": str(size)})
+        if not payload["data"]:
+            raise OkxApiError(f"OKX 未返回盘口：{inst_id}")
+        first = payload["data"][0]
+        return self._build_order_book_from_public_item(inst_id=inst_id, item=first)
+
+    def get_price_limit(self, inst_id: str) -> OkxPriceLimit | None:
+        payload = self._request("GET", "/api/v5/public/price-limit", params={"instId": inst_id})
+        if not payload["data"]:
+            return None
+        first = payload["data"][0]
+        return OkxPriceLimit(
+            inst_id=first.get("instId", inst_id),
+            buy_limit=_first_decimal(first.get("buyLmt"), first.get("buyLimit")),
+            sell_limit=_first_decimal(first.get("sellLmt"), first.get("sellLimit")),
+            ts=_to_int(first.get("ts")),
+            raw=first,
+        )
+
+    def get_max_order_size(
+        self,
+        credentials: Credentials,
+        *,
+        environment: str,
+        inst_id: str,
+        td_mode: str,
+        ccy: str | None = None,
+        px: Decimal | None = None,
+        leverage: Decimal | None = None,
+    ) -> OkxMaxOrderSize | None:
+        params = {
+            "instId": inst_id,
+            "tdMode": td_mode,
+        }
+        if ccy:
+            params["ccy"] = ccy
+        if px is not None and px > 0:
+            params["px"] = format_decimal(px)
+        if leverage is not None and leverage > 0:
+            params["lever"] = format_decimal(leverage)
+        payload = self._request(
+            "GET",
+            "/api/v5/account/max-size",
+            params=params,
+            auth=True,
+            credentials=credentials,
+            simulated=environment == "demo",
+        )
+        if not payload["data"]:
+            return None
+        first = payload["data"][0]
+        return OkxMaxOrderSize(
+            inst_id=first.get("instId", inst_id),
+            ccy=first.get("ccy"),
+            max_buy=_first_decimal(first.get("maxBuy"), first.get("maxBuySz")),
+            max_sell=_first_decimal(first.get("maxSell"), first.get("maxSellSz")),
+            raw=first,
+        )
+
+    def ensure_public_ws_market_watch(self, inst_id: str, *, environment: str) -> None:
+        connection = self._public_ws_connection_for(environment=environment)
+        if connection is None:
+            return
+        connection.watch_inst_id(inst_id)
+
+    def get_cached_public_ticker(
+        self,
+        inst_id: str,
+        *,
+        environment: str,
+    ) -> tuple[int, OkxTicker] | None:
+        connection = self._public_ws_connection_for(environment=environment)
+        if connection is None:
+            return None
+        payload = connection.get_latest_ticker(inst_id)
+        if payload is None:
+            return None
+        version, item = payload
+        return version, self._build_ticker_from_public_item(inst_id=inst_id, item=item)
+
+    def get_cached_public_ticker_with_age(
+        self,
+        inst_id: str,
+        *,
+        environment: str,
+    ) -> tuple[int, OkxTicker, float] | None:
+        """Return a public WS ticker and how long ago it was received locally."""
+        connection = self._public_ws_connection_for(environment=environment)
+        if connection is None:
+            return None
+        payload = connection.get_latest_ticker_snapshot(inst_id)
+        if payload is None:
+            return None
+        version, item, received_at = payload
+        return (
+            version,
+            self._build_ticker_from_public_item(inst_id=inst_id, item=item),
+            max(time.time() - received_at, 0.0),
+        )
+
+    def get_cached_public_order_book(
+        self,
+        inst_id: str,
+        *,
+        environment: str,
+    ) -> tuple[int, OkxOrderBook] | None:
+        connection = self._public_ws_connection_for(environment=environment)
+        if connection is None:
+            return None
+        payload = connection.get_latest_order_book(inst_id)
+        if payload is None:
+            return None
+        version, item = payload
+        return version, self._build_order_book_from_public_item(inst_id=inst_id, item=item)
+
+    def get_public_ws_debug_status(self, *, environment: str) -> dict[str, Any]:
+        if not self._public_ws_enabled():
+            return {
+                "enabled": False,
+                "available": False,
+                "connected": False,
+                "watch_count": 0,
+                "ticker_count": 0,
+                "order_book_count": 0,
+                "last_error": "",
+                "reason": "disabled",
+            }
+        connection = self._public_ws_connection_for(environment=environment)
+        if connection is None:
+            return {
+                "enabled": True,
+                "available": False,
+                "connected": False,
+                "watch_count": 0,
+                "ticker_count": 0,
+                "order_book_count": 0,
+                "last_error": "",
+                "reason": "unavailable",
+            }
+        status = connection.debug_status()
+        status["enabled"] = True
+        status["available"] = True
+        status["reason"] = ""
+        return status
+
+    def wait_public_market_update(
+        self,
+        inst_ids: tuple[str, ...] | list[str],
+        *,
+        environment: str,
+        after_version: int = 0,
+        timeout: float = 1.0,
+    ) -> int | None:
+        connection = self._public_ws_connection_for(environment=environment)
+        if connection is None:
+            return None
+        return connection.wait_for_market_update(inst_ids, after_version=after_version, timeout=timeout)
+
+    def _build_ticker_from_public_item(self, *, inst_id: str, item: dict[str, Any]) -> OkxTicker:
+        return OkxTicker(
+            inst_id=inst_id,
+            last=_to_decimal(item.get("last")),
+            bid=_to_decimal(item.get("bidPx")),
+            ask=_to_decimal(item.get("askPx")),
+            mark=_to_decimal(item.get("markPx")),
+            index=_first_decimal(item.get("idxPx"), item.get("indexPx")),
+            raw=item,
+        )
+
+    def _build_order_book_from_public_item(self, *, inst_id: str, item: dict[str, Any]) -> OkxOrderBook:
+        bids: list[tuple[Decimal, Decimal]] = []
+        asks: list[tuple[Decimal, Decimal]] = []
+        for row in item.get("bids", []):
+            if len(row) < 2:
+                continue
+            price = _to_decimal(row[0])
+            book_size = _to_decimal(row[1])
+            if price is None or book_size is None:
+                continue
+            bids.append((price, book_size))
+        for row in item.get("asks", []):
+            if len(row) < 2:
+                continue
+            price = _to_decimal(row[0])
+            book_size = _to_decimal(row[1])
+            if price is None or book_size is None:
+                continue
+            asks.append((price, book_size))
+        return OkxOrderBook(
+            inst_id=inst_id,
+            bids=tuple(bids),
+            asks=tuple(asks),
+            raw=item,
+        )
+
+    def get_order_algo(
+        self,
+        credentials: Credentials,
+        *,
+        environment: str,
+        inst_id: str,
+        algo_id: str | None = None,
+        algo_cl_ord_id: str | None = None,
+    ) -> dict[str, Any] | None:
+        """GET /api/v5/trade/order-algo：查询单笔算法委托（含终态），用于判断止损是否已触发/撤单。
+
+        官方参数以 algoId 为主；若仅有 algoClOrdId，部分场景需附带 instId。
+        """
+        aid = (algo_id or "").strip()
+        acl = (algo_cl_ord_id or "").strip()
+        if not aid and not acl:
+            raise ValueError("get_order_algo 需要 algoId 或 algoClOrdId")
+        params: dict[str, str] = {}
+        if aid:
+            params["algoId"] = aid
+        else:
+            params["algoClOrdId"] = acl
+            params["instId"] = inst_id.strip().upper()
+        payload = self._request(
+            "GET",
+            "/api/v5/trade/order-algo",
+            params=params,
+            auth=True,
+            credentials=credentials,
+            simulated=environment == "demo",
+        )
+        data = payload.get("data")
+        if not isinstance(data, list) or not data:
+            return None
+        first = data[0]
+        return first if isinstance(first, dict) else None
+
+    def get_mark_price(self, inst_id: str) -> Decimal:
+        payload = self._request(
+            "GET",
+            "/api/v5/public/mark-price",
+            params={"instType": infer_inst_type(inst_id), "instId": inst_id},
+        )
+        if not payload.get("data"):
+            raise OkxApiError(f"{inst_id} 缺少标记价格，无法触发")
+        mark_price = _to_decimal(payload["data"][0].get("markPx"))
+        if mark_price is None:
+            raise OkxApiError(f"{inst_id} 缺少标记价格，无法触发")
+        return mark_price
+
+    @staticmethod
+    def _trigger_price_from_ticker(ticker: OkxTicker, inst_id: str, price_type: TriggerPriceType) -> Decimal | None:
+        if price_type == "last":
+            if ticker.last is None:
+                raise OkxApiError(f"{inst_id} ????????????")
+            return ticker.last
+        if price_type == "mark":
+            return ticker.mark
+        if price_type == "index":
+            if ticker.index is None:
+                raise OkxApiError(f"{inst_id} ???????????")
+            return ticker.index
+        raise ValueError(f"Unsupported trigger price type: {price_type}")
+
+    def get_trigger_price(
+        self,
+        inst_id: str,
+        price_type: TriggerPriceType,
+        *,
+        environment: str | None = None,
+        max_cached_age_seconds: float | None = None,
+    ) -> Decimal:
+        env = str(environment or "").strip().lower()
+        if env:
+            self.ensure_public_ws_market_watch(inst_id, environment=env)
+            cached_payload = None
+            if max_cached_age_seconds is not None:
+                snapshot = self.get_cached_public_ticker_with_age(inst_id, environment=env)
+                if snapshot is not None:
+                    version, cached_ticker, cached_age_seconds = snapshot
+                    if cached_age_seconds <= max(max_cached_age_seconds, 0.0):
+                        cached_payload = version, cached_ticker
+            else:
+                cached_payload = self.get_cached_public_ticker(inst_id, environment=env)
+            if cached_payload is not None:
+                _version, cached_ticker = cached_payload
+                cached_price = self._trigger_price_from_ticker(cached_ticker, inst_id, price_type)
+                if cached_price is not None:
+                    return cached_price
+        ticker = self.get_ticker(inst_id)
+        if price_type == "mark" and ticker.mark is None:
+            return self.get_mark_price(inst_id)
+        if price_type == "last":
+            if ticker.last is None:
+                raise OkxApiError(f"{inst_id} ????????????")
+            return ticker.last
+        if price_type == "mark":
+            if ticker.mark is None:
+                raise OkxApiError(f"{inst_id} ???????????")
+            return ticker.mark
+        if price_type == "index":
+            if ticker.index is None:
+                raise OkxApiError(f"{inst_id} ???????????")
+            return ticker.index
+        raise ValueError(f"Unsupported trigger price type: {price_type}")
+
+    def get_positions(
+        self,
+        credentials: Credentials,
+        *,
+        environment: str,
+        inst_type: str | None = None,
+        prefer_cache: bool = True,
+    ) -> list[OkxPosition]:
+        if prefer_cache:
+            cached_positions = self.get_cached_private_positions(
+                credentials,
+                environment=environment,
+            )
+            if cached_positions is not None:
+                _, positions = cached_positions
+                if inst_type:
+                    inst_type_upper = inst_type.upper()
+                    return [item for item in positions if item.inst_type.upper() == inst_type_upper]
+                return positions
+        params: dict[str, str] | None = None
+        if inst_type:
+            params = {"instType": inst_type.upper()}
+
+        payload = self._request(
+            "GET",
+            "/api/v5/account/positions",
+            params=params,
+            auth=True,
+            credentials=credentials,
+            simulated=environment == "demo",
+        )
+        positions: list[OkxPosition] = []
+        for item in payload.get("data", []):
+            position = _to_decimal(item.get("pos")) or Decimal("0")
+            if position == 0:
+                continue
+            positions.append(
+                OkxPosition(
+                    inst_id=item.get("instId", ""),
+                    inst_type=item.get("instType", ""),
+                    pos_side=item.get("posSide", ""),
+                    mgn_mode=item.get("mgnMode", ""),
+                    position=position,
+                    avail_position=_to_decimal(item.get("availPos")),
+                    avg_price=_to_decimal(item.get("avgPx")),
+                    mark_price=_to_decimal(item.get("markPx")),
+                    unrealized_pnl=_to_decimal(item.get("upl")),
+                    unrealized_pnl_ratio=_to_decimal(item.get("uplRatio")),
+                    liquidation_price=_to_decimal(item.get("liqPx")),
+                    leverage=_to_decimal(item.get("lever")),
+                    margin_ccy=item.get("ccy"),
+                    last_price=_to_decimal(item.get("last")),
+                    realized_pnl=_to_decimal(item.get("realizedPnl")),
+                    margin_ratio=_to_decimal(item.get("mgnRatio")),
+                    initial_margin=_to_decimal(item.get("imr")),
+                    maintenance_margin=_to_decimal(item.get("mmr")),
+                    delta=_first_decimal(item.get("deltaPA"), item.get("deltaBS")),
+                    gamma=_first_decimal(item.get("gammaPA"), item.get("gammaBS")),
+                    vega=_first_decimal(item.get("vegaPA"), item.get("vegaBS")),
+                    theta=_first_decimal(item.get("thetaPA"), item.get("thetaBS")),
+                    raw=item,
+                )
+            )
+        positions.sort(key=lambda item: (item.inst_type, item.inst_id, item.pos_side))
+        return positions
+
+    def get_account_overview(
+        self,
+        credentials: Credentials,
+        *,
+        environment: str,
+        prefer_cache: bool = True,
+    ) -> OkxAccountOverview:
+        if prefer_cache:
+            cached_overview = self.get_cached_private_account_overview(
+                credentials,
+                environment=environment,
+            )
+            if cached_overview is not None:
+                _, overview = cached_overview
+                return overview
+        payload = self._request(
+            "GET",
+            "/api/v5/account/balance",
+            auth=True,
+            credentials=credentials,
+            simulated=environment == "demo",
+        )
+        first = (payload.get("data") or [{}])[0]
+        details: list[OkxAccountAssetItem] = []
+        for item in first.get("details", []):
+            details.append(
+                OkxAccountAssetItem(
+                    ccy=item.get("ccy", ""),
+                    equity=_first_decimal(item.get("eq"), item.get("cashBal")),
+                    equity_usd=_to_decimal(item.get("eqUsd")),
+                    cash_balance=_to_decimal(item.get("cashBal")),
+                    available_balance=_to_decimal(item.get("availBal")),
+                    available_equity=_to_decimal(item.get("availEq")),
+                    frozen_balance=_first_decimal(item.get("frozenBal"), item.get("ordFrozen"), item.get("fixedBal")),
+                    unrealized_pnl=_to_decimal(item.get("upl")),
+                    discount_equity=_to_decimal(item.get("disEq")),
+                    liability=_first_decimal(item.get("liab"), item.get("uplLiab")),
+                    cross_liability=_to_decimal(item.get("crossLiab")),
+                    interest=_to_decimal(item.get("interest")),
+                    raw=item,
+                )
+            )
+        details.sort(key=lambda asset: (asset.equity_usd or Decimal("0"), asset.equity or Decimal("0")), reverse=True)
+        return OkxAccountOverview(
+            total_equity=_to_decimal(first.get("totalEq")),
+            adjusted_equity=_to_decimal(first.get("adjEq")),
+            isolated_equity=_to_decimal(first.get("isoEq")),
+            available_equity=_to_decimal(first.get("availEq")),
+            unrealized_pnl=_to_decimal(first.get("upl")),
+            initial_margin=_to_decimal(first.get("imr")),
+            maintenance_margin=_to_decimal(first.get("mmr")),
+            order_frozen=_first_decimal(first.get("ordFroz"), first.get("frozenBal")),
+            notional_usd=_to_decimal(first.get("notionalUsd")),
+            details=tuple(details),
+            raw=first,
+        )
+
+    def get_account_config(
+        self,
+        credentials: Credentials,
+        *,
+        environment: str,
+    ) -> OkxAccountConfig:
+        payload = self._request(
+            "GET",
+            "/api/v5/account/config",
+            auth=True,
+            credentials=credentials,
+            simulated=environment == "demo",
+        )
+        first = (payload.get("data") or [{}])[0]
+        auto_loan_raw = first.get("autoLoan")
+        auto_loan: bool | None
+        if auto_loan_raw in {None, ""}:
+            auto_loan = None
+        else:
+            auto_loan = str(auto_loan_raw).strip().lower() in {"true", "on", "1"}
+        return OkxAccountConfig(
+            account_level=first.get("acctLv"),
+            position_mode=first.get("posMode"),
+            auto_loan=auto_loan,
+            greeks_type=first.get("greeksType"),
+            level=first.get("level"),
+            raw=first,
+        )
+
+    def wait_private_order_update(
+        self,
+        credentials: Credentials,
+        *,
+        environment: str,
+        inst_id: str,
+        ord_id: str | None = None,
+        cl_ord_id: str | None = None,
+        after_version: int = 0,
+        timeout: float = 1.0,
+    ) -> tuple[int, OkxOrderStatus] | None:
+        connection = self._private_ws_connection_for(credentials, environment=environment)
+        if connection is None:
+            return None
+        payload = connection.wait_for_order_update(
+            ord_id=ord_id,
+            cl_ord_id=cl_ord_id,
+            after_version=after_version,
+            timeout=timeout,
+        )
+        if payload is None:
+            return None
+        version, item = payload
+        return version, _build_okx_order_status_from_ws_item(item, fallback_ord_id=ord_id, fallback_inst_id=inst_id)
+
+    def get_cached_private_order_status(
+        self,
+        credentials: Credentials,
+        *,
+        environment: str,
+        inst_id: str,
+        ord_id: str | None = None,
+        cl_ord_id: str | None = None,
+    ) -> tuple[int, OkxOrderStatus] | None:
+        connection = self._private_ws_connection_for(credentials, environment=environment)
+        if connection is None:
+            return None
+        payload = connection.get_latest_order(ord_id=ord_id, cl_ord_id=cl_ord_id)
+        if payload is None:
+            return None
+        version, item = payload
+        return version, _build_okx_order_status_from_ws_item(item, fallback_ord_id=ord_id, fallback_inst_id=inst_id)
+
+    def get_cached_private_order_statuses(
+        self,
+        credentials: Credentials,
+        *,
+        environment: str,
+        limit: int = 50,
+    ) -> tuple[int, list[OkxOrderStatus]] | None:
+        connection = self._private_ws_connection_for(credentials, environment=environment)
+        if connection is None:
+            return None
+        payload = connection.get_latest_orders(limit=limit)
+        if payload is None:
+            return None
+        version, items = payload
+        statuses = [
+            _build_okx_order_status_from_ws_item(
+                item,
+                fallback_ord_id=str(item.get("ordId") or ""),
+                fallback_inst_id=str(item.get("instId") or ""),
+            )
+            for item in items
+        ]
+        return version, statuses
+
+    def add_private_update_listener(
+        self,
+        credentials: Credentials,
+        *,
+        environment: str,
+        listener: Callable[[str, int], None],
+    ) -> Callable[[], None] | None:
+        """Subscribe to ordinary private-account WS cache updates for this API profile."""
+        connection = self._private_ws_connection_for(credentials, environment=environment)
+        if connection is None:
+            return None
+        return connection.add_update_listener(listener)
+
+    def get_cached_algo_order_statuses(
+        self,
+        credentials: Credentials,
+        *,
+        environment: str,
+        limit: int = 50,
+    ) -> tuple[int, list[OkxTradeOrderItem]] | None:
+        connection = self._algo_ws_connection_for(credentials, environment=environment)
+        if connection is None:
+            return None
+        payload = connection.get_latest_orders(limit=limit)
+        if payload is None:
+            return None
+        version, items = payload
+        return version, [
+            self._parse_algo_order_item(item, default_inst_type="")
+            for item in items
+        ]
+
+    def add_algo_order_update_listener(
+        self,
+        credentials: Credentials,
+        *,
+        environment: str,
+        listener: Callable[[str, int], None],
+    ) -> Callable[[], None] | None:
+        """Subscribe to algorithm-order WS updates for this API profile."""
+        connection = self._algo_ws_connection_for(credentials, environment=environment)
+        if connection is None:
+            return None
+        return connection.add_update_listener(listener)
+
+    def watch_candle(
+        self,
+        key: CandleStreamKey,
+        listener: Callable[[Candle, bool], None],
+    ) -> Callable[[], None] | None:
+        connection = self._candle_ws_connection_for(environment=key.environment)
+        if connection is None:
+            return None
+        return connection.watch(key, listener)
+
+    def get_cached_private_positions(
+        self,
+        credentials: Credentials,
+        *,
+        environment: str,
+    ) -> tuple[int, list[OkxPosition]] | None:
+        connection = self._private_ws_connection_for(credentials, environment=environment)
+        if connection is None:
+            return None
+        payload = connection.get_latest_positions()
+        if payload is None:
+            return None
+        version, items = payload
+        positions = [_build_okx_position(item) for item in items if _position_has_nonzero_size(item)]
+        positions.sort(key=lambda item: (item.inst_type, item.inst_id, item.pos_side))
+        return version, positions
+
+    def get_cached_private_account_overview(
+        self,
+        credentials: Credentials,
+        *,
+        environment: str,
+    ) -> tuple[int, OkxAccountOverview] | None:
+        connection = self._private_ws_connection_for(credentials, environment=environment)
+        if connection is None:
+            return None
+        payload = connection.get_latest_account()
+        if payload is None:
+            return None
+        version, items = payload
+        if not items:
+            return None
+        return version, _build_okx_account_overview(items[0])
+
+    def get_private_ws_debug_status(
+        self,
+        credentials: Credentials,
+        *,
+        environment: str,
+    ) -> dict[str, Any]:
+        if not self._private_ws_enabled():
+            return {
+                "enabled": False,
+                "available": False,
+                "connected": False,
+                "positions_version": 0,
+                "positions_received_at": None,
+                "account_version": 0,
+                "account_received_at": None,
+                "last_error": "",
+                "reason": "disabled",
+            }
+        connection = self._private_ws_connection_for(credentials, environment=environment)
+        if connection is None:
+            return {
+                "enabled": True,
+                "available": False,
+                "connected": False,
+                "positions_version": 0,
+                "positions_received_at": None,
+                "account_version": 0,
+                "account_received_at": None,
+                "last_error": "",
+                "reason": "unavailable",
+            }
+        status = connection.debug_status()
+        status["enabled"] = True
+        status["available"] = True
+        status["reason"] = ""
+        return status
+
+    _ACCOUNT_CONFIG_CACHE_TTL_S = 45.0
+
+    def _private_ws_enabled(self) -> bool:
+        value = os.getenv("QQOKX_PRIVATE_WS_ENABLED", "1").strip().lower()
+        return value not in {"0", "false", "no", "off"}
+
+    def _algo_ws_enabled(self) -> bool:
+        value = os.getenv("QQOKX_ALGO_WS_ENABLED", "1").strip().lower()
+        return self._private_ws_enabled() and value not in {"0", "false", "no", "off"}
+
+    def _public_ws_enabled(self) -> bool:
+        value = os.getenv("QQOKX_PUBLIC_WS_ENABLED", "1").strip().lower()
+        return value not in {"0", "false", "no", "off"}
+
+    def _candle_ws_enabled(self) -> bool:
+        value = os.getenv("QQOKX_CANDLE_WS_ENABLED", "1").strip().lower()
+        return self._public_ws_enabled() and value not in {"0", "false", "no", "off"}
+
+    def _public_ws_connection_for(self, *, environment: str) -> OkxPublicWsConnection | None:
+        if not self._public_ws_enabled():
+            return None
+        key = environment.strip().lower() or "demo"
+        with self._public_ws_lock:
+            connection = self._public_ws_connections.get(key)
+            if connection is None:
+                connection = OkxPublicWsConnection(environment=key, logger=self._logger)
+                self._public_ws_connections[key] = connection
+            try:
+                connection.start()
+            except OkxPublicWsConnectionUnavailable as exc:
+                if key not in self._public_ws_error_once:
+                    self._logger(f"OKX 公共 WS 不可用，继续回退 REST：{exc}")
+                    self._public_ws_error_once.add(key)
+                return None
+            except Exception as exc:  # noqa: BLE001
+                if key not in self._public_ws_error_once:
+                    self._logger(f"OKX 公共 WS 启动失败，继续回退 REST：{exc}")
+                    self._public_ws_error_once.add(key)
+                return None
+        return connection
+
+    def _private_ws_connection_for(
+        self,
+        credentials: Credentials,
+        *,
+        environment: str,
+    ) -> OkxPrivateWsConnection | None:
+        if not self._private_ws_enabled():
+            return None
+        profile_name = (credentials.profile_name or "").strip()
+        key = (credentials.api_key, profile_name, environment)
+        with self._private_ws_lock:
+            connection = self._private_ws_connections.get(key)
+            if connection is None:
+                connection = OkxPrivateWsConnection(
+                    credentials,
+                    environment=environment,
+                    logger=self._logger,
+                )
+                self._private_ws_connections[key] = connection
+            try:
+                connection.start()
+            except OkxPrivateWsConnectionUnavailable as exc:
+                if key not in self._private_ws_error_once:
+                    self._logger(f"OKX 私有 WS 不可用，继续回退 REST：{exc}")
+                    self._private_ws_error_once.add(key)
+                return None
+            except Exception as exc:  # noqa: BLE001
+                if key not in self._private_ws_error_once:
+                    self._logger(f"OKX 私有 WS 启动失败，继续回退 REST：{exc}")
+                    self._private_ws_error_once.add(key)
+                return None
+        return connection
+
+    def _candle_ws_connection_for(self, *, environment: str) -> OkxCandleWsConnection | None:
+        if not self._candle_ws_enabled():
+            return None
+        key = environment.strip().lower() or "demo"
+        with self._candle_ws_lock:
+            connection = self._candle_ws_connections.get(key)
+            if connection is None:
+                connection = OkxCandleWsConnection(environment=key, logger=self._logger)
+                self._candle_ws_connections[key] = connection
+            try:
+                connection.start()
+            except OkxCandleWsConnectionUnavailable as exc:
+                if key not in self._candle_ws_error_once:
+                    self._logger(f"OKX K线 WS 不可用，继续回退 REST：{exc}")
+                    self._candle_ws_error_once.add(key)
+                return None
+            except Exception as exc:  # noqa: BLE001
+                if key not in self._candle_ws_error_once:
+                    self._logger(f"OKX K线 WS 启动失败，继续回退 REST：{exc}")
+                    self._candle_ws_error_once.add(key)
+                return None
+        return connection
+
+    def _algo_ws_connection_for(
+        self,
+        credentials: Credentials,
+        *,
+        environment: str,
+    ) -> OkxAlgoWsConnection | None:
+        if not self._algo_ws_enabled():
+            return None
+        profile_name = (credentials.profile_name or "").strip()
+        key = (credentials.api_key, profile_name, environment)
+        with self._algo_ws_lock:
+            connection = self._algo_ws_connections.get(key)
+            if connection is None:
+                connection = OkxAlgoWsConnection(
+                    credentials,
+                    environment=environment,
+                    logger=self._logger,
+                )
+                self._algo_ws_connections[key] = connection
+            try:
+                connection.start()
+            except OkxAlgoWsConnectionUnavailable as exc:
+                if key not in self._algo_ws_error_once:
+                    self._logger(f"OKX 算法单 WS 不可用，继续回退 REST：{exc}")
+                    self._algo_ws_error_once.add(key)
+                return None
+            except Exception as exc:  # noqa: BLE001
+                if key not in self._algo_ws_error_once:
+                    self._logger(f"OKX 算法单 WS 启动失败，继续回退 REST：{exc}")
+                    self._algo_ws_error_once.add(key)
+                return None
+        return connection
+
+    def _get_account_config_cached(self, credentials: Credentials, config: StrategyConfig) -> OkxAccountConfig | None:
+        cache = getattr(self, "_account_config_posmode_cache", None)
+        if cache is None:
+            cache = {}
+            setattr(self, "_account_config_posmode_cache", cache)
+        key = (credentials.profile_name or "", config.environment)
+        now = time.time()
+        hit = cache.get(key)
+        if hit is not None and now - hit[1] < self._ACCOUNT_CONFIG_CACHE_TTL_S:
+            return hit[0]
+        try:
+            cfg = self.get_account_config(credentials, environment=config.environment)
+        except OkxApiError:
+            # /account/config 偶发失败时，优先回退到最近一次可用缓存，
+            # 避免双向持仓账号因本次拿不到 posMode 而漏传 posSide 导致整单拒绝。
+            if hit is not None:
+                return hit[0]
+            return None
+        cache[key] = (cfg, now)
+        return cfg
+
+    def _derivative_order_pos_side(
+        self,
+        credentials: Credentials,
+        config: StrategyConfig,
+        instrument: Instrument,
+        trade_side: str,
+        *,
+        plan_pos_side: str | None,
+    ) -> str | None:
+        """以 OKX 账户 posMode 为准，避免「界面净持仓 / 双向」与真实账户不一致导致整单被拒。"""
+        if instrument.inst_type not in {"SWAP", "FUTURES"}:
+            return plan_pos_side
+        acct = self._get_account_config_cached(credentials, config)
+        if acct is None:
+            # 请求 /account/config 失败时不猜 posSide，避免净持仓误传 long/short。
+            return None
+        mode = (acct.position_mode or "").strip().lower()
+        if mode == "long_short_mode":
+            return "long" if trade_side == "buy" else "short"
+        if mode == "net_mode":
+            return None
+        # 应答无 posMode 或未知枚举：退回启动器（老行为）；真正 net 双向用户请以 OKX 端为准勾选「净持仓」。
+        if config.position_mode == "long_short":
+            return "long" if trade_side == "buy" else "short"
+        return None
+
+    def _reduce_only_order_pos_side(
+        self,
+        credentials: Credentials,
+        config: StrategyConfig,
+        instrument: Instrument,
+        trade_side: str,
+        *,
+        plan_pos_side: str | None,
+    ) -> str | None:
+        normalized_plan_pos = (plan_pos_side or "").strip().lower()
+        acct = self._get_account_config_cached(credentials, config)
+        acct_mode = (acct.position_mode or "").strip().lower() if acct is not None else ""
+        if acct_mode == "net_mode":
+            return None
+        if normalized_plan_pos in {"long", "short"}:
+            return normalized_plan_pos
+        expects_long_short = instrument.inst_type in {"SWAP", "FUTURES"} and (
+            acct_mode == "long_short_mode" or config.position_mode == "long_short"
+        )
+        if expects_long_short:
+            raise OkxApiError("双向持仓模式下，reduceOnly 平仓单必须显式传入 posSide；已拦截以避免误开反向仓位。")
+        return self._derivative_order_pos_side(
+            credentials,
+            config,
+            instrument,
+            trade_side,
+            plan_pos_side=plan_pos_side,
+        )
+
+    def _maybe_isolated_margin_ccy(self, order: dict[str, Any], *, instrument: Instrument, config: StrategyConfig) -> None:
+        if config.trade_mode != "isolated" or instrument.inst_type not in {"SWAP", "FUTURES"}:
+            return
+        cc = (instrument.settle_ccy or "").strip()
+        if cc:
+            order["ccy"] = cc
+
+    def get_fills_history(
+        self,
+        credentials: Credentials,
+        *,
+        environment: str,
+        inst_types: tuple[str, ...] = ("SWAP", "FUTURES", "OPTION", "SPOT"),
+        limit: int = 100,
+    ) -> list[OkxFillHistoryItem]:
+        items: list[OkxFillHistoryItem] = []
+        normalized_types = tuple(dict.fromkeys(inst_type.upper() for inst_type in inst_types))
+        # Fills are often concentrated in a single instType (for example OPTION).
+        # If we split a small global limit evenly across 4 types, active types get
+        # truncated too aggressively and recent fills disappear from the UI.
+        per_type_target = max(min(limit, 100), math.ceil(limit / max(len(normalized_types), 1)))
+        for inst_type in normalized_types:
+            collected_for_type = 0
+            after: str | None = None
+            while collected_for_type < per_type_target:
+                request_limit = min(100, max(1, per_type_target - collected_for_type))
+                params = {"instType": inst_type, "limit": str(request_limit)}
+                if after:
+                    params["after"] = after
+                payload = self._request(
+                    "GET",
+                    "/api/v5/trade/fills-history",
+                    params=params,
+                    auth=True,
+                    credentials=credentials,
+                    simulated=environment == "demo",
+                )
+                batch = payload.get("data", [])
+                if not batch:
+                    break
+                for item in batch:
+                    items.append(
+                        OkxFillHistoryItem(
+                            fill_time=_to_int(item.get("fillTime"), item.get("ts"), item.get("cTime")),
+                            inst_id=item.get("instId", ""),
+                            inst_type=item.get("instType", inst_type),
+                            side=item.get("side"),
+                            pos_side=item.get("posSide"),
+                            fill_price=_to_decimal(item.get("fillPx")),
+                            fill_size=_to_decimal(item.get("fillSz")),
+                            fill_fee=_first_decimal(item.get("fee"), item.get("fillFee")),
+                            fee_currency=item.get("feeCcy") or item.get("fillFeeCcy"),
+                            pnl=_to_decimal(item.get("fillPnl")),
+                            order_id=item.get("ordId"),
+                            trade_id=item.get("tradeId"),
+                            exec_type=item.get("execType"),
+                            raw=item,
+                        )
+                    )
+                collected_for_type += len(batch)
+                after = str(batch[-1].get("billId") or batch[-1].get("ts") or "")
+                if not after or len(batch) < request_limit:
+                    break
+        items = self._merge_exercise_and_delivery_history(
+            items,
+            credentials=credentials,
+            environment=environment,
+            limit=limit,
+        )
+        items.sort(key=lambda item: item.fill_time or 0, reverse=True)
+        return items[:limit]
+
+    def _merge_exercise_and_delivery_history(
+        self,
+        fills: list[OkxFillHistoryItem],
+        *,
+        credentials: Credentials,
+        environment: str,
+        limit: int,
+    ) -> list[OkxFillHistoryItem]:
+        existing_keys = {_fill_history_dedupe_key(item) for item in fills}
+        merged = list(fills)
+        for inst_type in ("OPTION", "FUTURES"):
+            bills = self._fetch_execution_bill_history(
+                credentials=credentials,
+                environment=environment,
+                inst_type=inst_type,
+                target_count=max(limit, 100),
+            )
+            for bill in bills:
+                synthetic = _build_fill_history_item_from_bill(bill)
+                if synthetic is None:
+                    continue
+                dedupe_key = _fill_history_dedupe_key(synthetic)
+                if dedupe_key in existing_keys:
+                    continue
+                existing_keys.add(dedupe_key)
+                merged.append(synthetic)
+                if len(merged) >= limit * 2:
+                    return merged
+        return merged
+
+    def _fetch_account_bill_history(
+        self,
+        *,
+        credentials: Credentials,
+        environment: str,
+        inst_type: str,
+        target_count: int,
+    ) -> list[dict[str, Any]]:
+        collected: list[dict[str, Any]] = []
+        seen_bill_ids: set[str] = set()
+        archive_page_limit = 100
+        after: str | None = None
+
+        while len(collected) < target_count:
+            params = {"instType": inst_type, "limit": str(archive_page_limit)}
+            if after:
+                params["after"] = after
+            try:
+                batch = self._request(
+                    "GET",
+                    "/api/v5/account/bills-archive",
+                    params=params,
+                    auth=True,
+                    credentials=credentials,
+                    simulated=environment == "demo",
+                ).get("data", [])
+            except Exception:
+                batch = []
+            if not batch:
+                break
+            for bill in batch:
+                bill_id = str(bill.get("billId") or "")
+                if bill_id and bill_id in seen_bill_ids:
+                    continue
+                if bill_id:
+                    seen_bill_ids.add(bill_id)
+                collected.append(bill)
+            last_bill_id = str(batch[-1].get("billId") or "")
+            if not last_bill_id or len(batch) < archive_page_limit:
+                break
+            after = last_bill_id
+
+        try:
+            recent_bills = self._request(
+                "GET",
+                "/api/v5/account/bills",
+                params={"instType": inst_type, "limit": "100"},
+                auth=True,
+                credentials=credentials,
+                simulated=environment == "demo",
+            ).get("data", [])
+        except Exception:
+            recent_bills = []
+
+        for bill in recent_bills:
+            bill_id = str(bill.get("billId") or "")
+            if bill_id and bill_id in seen_bill_ids:
+                continue
+            if bill_id:
+                seen_bill_ids.add(bill_id)
+            collected.append(bill)
+
+        collected.sort(key=lambda item: _to_int(item.get("ts"), item.get("cTime"), item.get("uTime")) or 0, reverse=True)
+        return collected
+
+    def _fetch_execution_bill_history(
+        self,
+        *,
+        credentials: Credentials,
+        environment: str,
+        inst_type: str,
+        target_count: int,
+    ) -> list[dict[str, Any]]:
+        return self._fetch_account_bill_history(
+            credentials=credentials,
+            environment=environment,
+            inst_type=inst_type,
+            target_count=target_count,
+        )
+
+    def get_account_bills_history(
+        self,
+        credentials: Credentials,
+        *,
+        environment: str,
+        inst_types: tuple[str, ...] = ("SWAP", "FUTURES", "OPTION", "SPOT"),
+        limit: int = 200,
+    ) -> list[OkxAccountBillItem]:
+        items: list[OkxAccountBillItem] = []
+        normalized_types = tuple(dict.fromkeys(inst_type.upper() for inst_type in inst_types))
+        per_type_target = max(1, math.ceil(limit / max(len(normalized_types), 1)))
+        seen_bill_ids: set[str] = set()
+        for inst_type in normalized_types:
+            bills = self._fetch_account_bill_history(
+                credentials=credentials,
+                environment=environment,
+                inst_type=inst_type,
+                target_count=max(per_type_target, 100),
+            )
+            for item in bills:
+                parsed = _build_account_bill_item(item, default_inst_type=inst_type)
+                if parsed is None:
+                    continue
+                if parsed.bill_id and parsed.bill_id in seen_bill_ids:
+                    continue
+                if parsed.bill_id:
+                    seen_bill_ids.add(parsed.bill_id)
+                items.append(parsed)
+        items.sort(key=lambda item: item.bill_time or 0, reverse=True)
+        return items[:limit]
+
+    def get_positions_history(
+        self,
+        credentials: Credentials,
+        *,
+        environment: str,
+        inst_types: tuple[str, ...] = ("SWAP", "FUTURES", "OPTION"),
+        limit: int = 100,
+        after_ms: int | None = None,
+        before_ms: int | None = None,
+    ) -> list[OkxPositionHistoryItem]:
+        items: list[OkxPositionHistoryItem] = []
+        per_type_limit = max(1, min(limit, 100))
+        for inst_type in inst_types:
+            params = {"instType": inst_type, "limit": str(per_type_limit)}
+            if after_ms is not None:
+                params["after"] = str(int(after_ms))
+            if before_ms is not None:
+                params["before"] = str(int(before_ms))
+            payload = self._request(
+                "GET",
+                "/api/v5/account/positions-history",
+                params=params,
+                auth=True,
+                credentials=credentials,
+                simulated=environment == "demo",
+            )
+            for item in payload.get("data", []):
+                items.append(
+                    OkxPositionHistoryItem(
+                        update_time=_to_int(item.get("uTime"), item.get("cTime"), item.get("ts")),
+                        inst_id=item.get("instId", ""),
+                        inst_type=item.get("instType", inst_type),
+                        mgn_mode=item.get("mgnMode"),
+                        pos_side=item.get("posSide"),
+                        direction=item.get("direction"),
+                        open_avg_price=_to_decimal(item.get("openAvgPx")),
+                        close_avg_price=_to_decimal(item.get("closeAvgPx")),
+                        close_size=_first_decimal(item.get("closeTotalPos"), item.get("closePos"), item.get("closeSz")),
+                        pnl=_to_decimal(item.get("pnl")),
+                        realized_pnl=_to_decimal(item.get("realizedPnl")),
+                        settle_pnl=_to_decimal(item.get("settledPnl")),
+                        raw=item,
+                        fee=_first_decimal(item.get("fee"), item.get("fillFee")),
+                        fee_currency=(str(item.get("feeCcy") or item.get("ccy") or "").strip() or None),
+                        funding_fee=_to_decimal(item.get("fundingFee")),
+                    )
+                )
+        items.sort(key=lambda item: item.update_time or 0, reverse=True)
+        return items[:limit]
+
+    def get_pending_orders(
+        self,
+        credentials: Credentials,
+        *,
+        environment: str,
+        inst_types: tuple[str, ...] = ("SWAP", "FUTURES", "OPTION", "SPOT"),
+        limit: int = 100,
+        include_algo: bool = True,
+    ) -> list[OkxTradeOrderItem]:
+        items: list[OkxTradeOrderItem] = []
+        normalized_types = tuple(dict.fromkeys(inst_type.upper() for inst_type in inst_types))
+        per_type_target = max(1, math.ceil(limit / max(len(normalized_types), 1)))
+        request_limit = min(100, max(1, per_type_target))
+        for inst_type in normalized_types:
+            payload = self._request(
+                "GET",
+                "/api/v5/trade/orders-pending",
+                params={"instType": inst_type, "limit": str(request_limit)},
+                auth=True,
+                credentials=credentials,
+                simulated=environment == "demo",
+            )
+            for item in payload.get("data", []):
+                items.append(self._parse_trade_order_item(item, default_inst_type=inst_type, source_kind="normal"))
+        if include_algo:
+            items.extend(
+                self._fetch_algo_orders(
+                    credentials=credentials,
+                    environment=environment,
+                    limit=limit,
+                    history=False,
+                )
+            )
+        items.sort(key=lambda item: item.update_time or item.created_time or 0, reverse=True)
+        return items[:limit]
+
+    def get_order_history(
+        self,
+        credentials: Credentials,
+        *,
+        environment: str,
+        inst_types: tuple[str, ...] = ("SWAP", "FUTURES", "OPTION", "SPOT"),
+        limit: int = 100,
+        include_algo: bool = True,
+    ) -> list[OkxTradeOrderItem]:
+        items: list[OkxTradeOrderItem] = []
+        normalized_types = tuple(dict.fromkeys(inst_type.upper() for inst_type in inst_types))
+        per_type_target = max(1, math.ceil(limit / max(len(normalized_types), 1)))
+        for inst_type in normalized_types:
+            collected_for_type = 0
+            after: str | None = None
+            while collected_for_type < per_type_target:
+                request_limit = min(100, max(1, per_type_target - collected_for_type))
+                params = {"instType": inst_type, "limit": str(request_limit)}
+                if after:
+                    params["after"] = after
+                payload = self._request(
+                    "GET",
+                    "/api/v5/trade/orders-history",
+                    params=params,
+                    auth=True,
+                    credentials=credentials,
+                    simulated=environment == "demo",
+                )
+                batch = payload.get("data", [])
+                if not batch:
+                    break
+                for item in batch:
+                    items.append(self._parse_trade_order_item(item, default_inst_type=inst_type, source_kind="normal"))
+                collected_for_type += len(batch)
+                after = str(batch[-1].get("ordId") or batch[-1].get("uTime") or batch[-1].get("cTime") or "")
+                if not after or len(batch) < request_limit:
+                    break
+        if include_algo:
+            items.extend(
+                self._fetch_algo_orders(
+                    credentials=credentials,
+                    environment=environment,
+                    limit=limit,
+                    history=True,
+                )
+            )
+        items.sort(key=lambda item: item.update_time or item.created_time or 0, reverse=True)
+        return items[:limit]
+
+    def _fetch_algo_orders(
+        self,
+        *,
+        credentials: Credentials,
+        environment: str,
+        limit: int,
+        history: bool,
+    ) -> list[OkxTradeOrderItem]:
+        endpoint = "/api/v5/trade/orders-algo-history" if history else "/api/v5/trade/orders-algo-pending"
+        ord_types = ("conditional", "oco", "trigger", "move_order_stop")
+        states = ("effective", "canceled", "order_failed") if history else ("",)
+        request_limit = min(100, max(20, limit))
+        items: list[OkxTradeOrderItem] = []
+        seen_keys: set[tuple[str, str, str, int]] = set()
+        for ord_type in ord_types:
+            for state in states:
+                params = {"ordType": ord_type, "limit": str(request_limit)}
+                if state:
+                    params["state"] = state
+                try:
+                    payload = self._request(
+                        "GET",
+                        endpoint,
+                        params=params,
+                        auth=True,
+                        credentials=credentials,
+                        simulated=environment == "demo",
+                    )
+                except Exception:
+                    continue
+                for item in payload.get("data", []):
+                    parsed = self._parse_trade_order_item(item, default_inst_type="", source_kind="algo")
+                    key = (
+                        parsed.algo_id or "",
+                        parsed.order_id or "",
+                        parsed.algo_client_order_id or parsed.client_order_id or "",
+                        parsed.created_time or 0,
+                    )
+                    if key in seen_keys:
+                        continue
+                    seen_keys.add(key)
+                    items.append(parsed)
+        return items
+
+    def _parse_trade_order_item(
+        self,
+        item: dict[str, Any],
+        *,
+        default_inst_type: str,
+        source_kind: str,
+    ) -> OkxTradeOrderItem:
+        if source_kind == "algo":
+            return self._parse_algo_order_item(item, default_inst_type=default_inst_type)
+        return self._parse_normal_order_item(item, default_inst_type=default_inst_type)
+
+    def _parse_normal_order_item(
+        self,
+        item: dict[str, Any],
+        *,
+        default_inst_type: str,
+    ) -> OkxTradeOrderItem:
+        inst_id = str(item.get("instId") or "").strip().upper()
+        tp_sl = _extract_tp_sl_fields(item)
+        return OkxTradeOrderItem(
+            source_kind="normal",
+            source_label="普通委托",
+            created_time=_to_int(item.get("cTime"), item.get("ts")),
+            update_time=_to_int(item.get("uTime"), item.get("fillTime"), item.get("ts")),
+            inst_id=inst_id,
+            inst_type=str(item.get("instType") or default_inst_type or infer_inst_type(inst_id)).upper(),
+            side=item.get("side"),
+            pos_side=item.get("posSide"),
+            td_mode=item.get("tdMode"),
+            ord_type=item.get("ordType"),
+            state=item.get("state"),
+            price=_to_decimal(item.get("px")),
+            size=_first_decimal(item.get("sz"), item.get("qty")),
+            filled_size=_first_decimal(item.get("accFillSz"), item.get("fillSz")),
+            avg_price=_first_decimal(item.get("avgPx"), item.get("fillPx")),
+            order_id=item.get("ordId"),
+            algo_id=item.get("algoId"),
+            client_order_id=item.get("clOrdId"),
+            algo_client_order_id=item.get("algoClOrdId"),
+            pnl=_to_decimal(item.get("pnl")),
+            fee=_first_decimal(item.get("fee"), item.get("fillFee")),
+            fee_currency=item.get("feeCcy") or item.get("fillFeeCcy"),
+            reduce_only=_to_bool(item.get("reduceOnly")),
+            trigger_price=None,
+            trigger_price_type=None,
+            order_price=_to_decimal(item.get("px")),
+            actual_price=_first_decimal(item.get("avgPx"), item.get("fillPx")),
+            actual_size=_first_decimal(item.get("accFillSz"), item.get("fillSz")),
+            actual_side=item.get("side"),
+            take_profit_trigger_price=tp_sl["take_profit_trigger_price"],
+            take_profit_order_price=tp_sl["take_profit_order_price"],
+            take_profit_trigger_price_type=tp_sl["take_profit_trigger_price_type"],
+            stop_loss_trigger_price=tp_sl["stop_loss_trigger_price"],
+            stop_loss_order_price=tp_sl["stop_loss_order_price"],
+            stop_loss_trigger_price_type=tp_sl["stop_loss_trigger_price_type"],
+            raw=item,
+        )
+
+    def _parse_algo_order_item(
+        self,
+        item: dict[str, Any],
+        *,
+        default_inst_type: str,
+    ) -> OkxTradeOrderItem:
+        inst_id = str(item.get("instId") or "").strip().upper()
+        tp_sl = _extract_tp_sl_fields(item)
+        return OkxTradeOrderItem(
+            source_kind="algo",
+            source_label="算法委托",
+            created_time=_to_int(item.get("cTime"), item.get("ts")),
+            update_time=_to_int(item.get("uTime"), item.get("triggerTime"), item.get("actualTime"), item.get("ts")),
+            inst_id=inst_id,
+            inst_type=str(item.get("instType") or default_inst_type or infer_inst_type(inst_id)).upper(),
+            side=item.get("side"),
+            pos_side=item.get("posSide"),
+            td_mode=item.get("tdMode"),
+            ord_type=item.get("ordType"),
+            state=item.get("state"),
+            price=_first_decimal(item.get("px"), item.get("actualPx")),
+            size=_first_decimal(item.get("sz"), item.get("closeFraction")),
+            filled_size=_first_decimal(item.get("actualSz"), item.get("accFillSz")),
+            avg_price=_first_decimal(item.get("actualPx"), item.get("avgPx")),
+            order_id=item.get("ordId") or item.get("actualOrdId"),
+            algo_id=item.get("algoId"),
+            client_order_id=item.get("clOrdId") or item.get("attachAlgoClOrdId"),
+            algo_client_order_id=item.get("algoClOrdId"),
+            pnl=_to_decimal(item.get("pnl")),
+            fee=_first_decimal(item.get("fee"), item.get("actualFee"), item.get("fillFee")),
+            fee_currency=item.get("feeCcy") or item.get("feeCurrency") or item.get("fillFeeCcy"),
+            reduce_only=_to_bool(item.get("reduceOnly")),
+            trigger_price=_first_decimal(item.get("triggerPx"), item.get("activePx")),
+            trigger_price_type=item.get("triggerPxType"),
+            order_price=_first_decimal(item.get("orderPx"), item.get("px")),
+            actual_price=_first_decimal(item.get("actualPx"), item.get("avgPx")),
+            actual_size=_first_decimal(item.get("actualSz"), item.get("accFillSz")),
+            actual_side=item.get("actualSide"),
+            take_profit_trigger_price=tp_sl["take_profit_trigger_price"],
+            take_profit_order_price=tp_sl["take_profit_order_price"],
+            take_profit_trigger_price_type=tp_sl["take_profit_trigger_price_type"],
+            stop_loss_trigger_price=tp_sl["stop_loss_trigger_price"],
+            stop_loss_order_price=tp_sl["stop_loss_order_price"],
+            stop_loss_trigger_price_type=tp_sl["stop_loss_trigger_price_type"],
+            raw=item,
+        )
+
+    def place_market_order(
+        self,
+        credentials: Credentials,
+        config: StrategyConfig,
+        plan: OrderPlan,
+        *,
+        cl_ord_id: str | None = None,
+        include_take_profit: bool = True,
+        stop_loss_algo_cl_ord_id: str | None = None,
+        include_attached_protection: bool = True,
+    ) -> OkxOrderResult:
+        cl_ord_id = cl_ord_id or new_custom_order_id("mkt")
+        if include_attached_protection:
+            stop_loss_algo_cl_ord_id = stop_loss_algo_cl_ord_id or new_custom_order_id("att")
+        instrument = self.get_instrument(plan.inst_id)
+        if instrument.inst_type == "OPTION":
+            raise OkxApiError("OKX 期权不支持这里的市价附带止盈止损下单，请改走本地下单/本地止盈止损流程")
+
+        self._enforce_order_size_safety_limit(
+            instrument=instrument,
+            size=plan.size,
+            reference_price=plan.entry_reference,
+        )
+
+        order: dict[str, Any] = {
+            "instId": plan.inst_id,
+            "tdMode": config.trade_mode,
+            "side": plan.side,
+            "ordType": "market",
+            "sz": _format_exchange_contract_sz(instrument, plan.size),
+            "tag": OKX_BROKER_TAG,
+        }
+        tick = instrument.tick_size if instrument.tick_size and instrument.tick_size > 0 else None
+        if include_attached_protection:
+            order["attachAlgoOrds"] = [
+                _build_attached_algo_order(
+                    config=config,
+                    plan=plan,
+                    include_take_profit=include_take_profit,
+                    stop_loss_algo_cl_ord_id=stop_loss_algo_cl_ord_id,
+                    tick_size=tick,
+                )
+            ]
+        ps = self._derivative_order_pos_side(
+            credentials,
+            config,
+            instrument,
+            plan.side,
+            plan_pos_side=plan.pos_side,
+        )
+        if ps:
+            order["posSide"] = ps
+        self._maybe_isolated_margin_ccy(order, instrument=instrument, config=config)
+        if cl_ord_id:
+            order["clOrdId"] = cl_ord_id
+
+        try:
+            payload = self._request(
+                "POST",
+                "/api/v5/trade/order",
+                body=order,
+                auth=True,
+                credentials=credentials,
+                simulated=config.environment == "demo",
+            )
+            return self._parse_order_result(
+                payload,
+                empty_message="OKX 返回了空的市价下单结果",
+                fallback_cl_ord_id=cl_ord_id,
+            )
+        except OkxApiError as exc:
+            _raise_order_error_with_request(exc, order)
+
+    def place_limit_order(
+        self,
+        credentials: Credentials,
+        config: StrategyConfig,
+        plan: OrderPlan,
+        *,
+        cl_ord_id: str | None = None,
+        include_take_profit: bool = True,
+        stop_loss_algo_cl_ord_id: str | None = None,
+        include_attached_protection: bool = True,
+    ) -> OkxOrderResult:
+        cl_ord_id = cl_ord_id or new_custom_order_id("lmt")
+        if include_attached_protection:
+            stop_loss_algo_cl_ord_id = stop_loss_algo_cl_ord_id or new_custom_order_id("att")
+        instrument = self.get_instrument(plan.inst_id)
+        if instrument.inst_type == "OPTION":
+            raise OkxApiError("OKX 期权不支持这里的限价附带止盈止损下单，请改走本地下单/本地止盈止损流程")
+
+        tick = instrument.tick_size
+        entry_px = plan.entry_reference
+        if tick is not None and tick > 0:
+            entry_px = snap_to_increment(entry_px, tick, "nearest")
+        px_txt = format_decimal(entry_px)
+        tick_opt = tick if tick is not None and tick > 0 else None
+        self._enforce_order_size_safety_limit(instrument=instrument, size=plan.size, reference_price=entry_px)
+        order: dict[str, Any] = {
+            "instId": plan.inst_id,
+            "tdMode": config.trade_mode,
+            "side": plan.side,
+            "ordType": "limit",
+            "px": px_txt,
+            "sz": _format_exchange_contract_sz(instrument, plan.size),
+            "tag": OKX_BROKER_TAG,
+        }
+        if include_attached_protection:
+            order["attachAlgoOrds"] = [
+                _build_attached_algo_order(
+                    config=config,
+                    plan=plan,
+                    include_take_profit=include_take_profit,
+                    stop_loss_algo_cl_ord_id=stop_loss_algo_cl_ord_id,
+                    tick_size=tick_opt,
+                )
+            ]
+        ps = self._derivative_order_pos_side(
+            credentials,
+            config,
+            instrument,
+            plan.side,
+            plan_pos_side=plan.pos_side,
+        )
+        if ps:
+            order["posSide"] = ps
+        self._maybe_isolated_margin_ccy(order, instrument=instrument, config=config)
+        if cl_ord_id:
+            order["clOrdId"] = cl_ord_id
+
+        try:
+            payload = self._request(
+                "POST",
+                "/api/v5/trade/order",
+                body=order,
+                auth=True,
+                credentials=credentials,
+                simulated=config.environment == "demo",
+            )
+            return self._parse_order_result(
+                payload,
+                empty_message="OKX 返回了空的限价下单结果",
+                fallback_cl_ord_id=cl_ord_id,
+            )
+        except OkxApiError as exc:
+            _raise_order_error_with_request(exc, order)
+
+    def place_trigger_limit_algo_order(
+        self,
+        credentials: Credentials,
+        config: StrategyConfig,
+        plan: OrderPlan,
+        *,
+        algo_cl_ord_id: str | None = None,
+        include_take_profit: bool = True,
+        stop_loss_algo_cl_ord_id: str | None = None,
+        include_attached_protection: bool = True,
+    ) -> OkxOrderResult:
+        """POST /api/v5/trade/order-algo — ordType=trigger: when triggerPx is touched, place a limit at orderPx (entry)."""
+        algo_cl_ord_id = algo_cl_ord_id or new_custom_order_id("trg")
+        if include_attached_protection:
+            stop_loss_algo_cl_ord_id = stop_loss_algo_cl_ord_id or new_custom_order_id("att")
+        instrument = self.get_instrument(plan.inst_id)
+        if instrument.inst_type == "OPTION":
+            raise OkxApiError("OKX 期权不支持这里的触发限价附带止盈止损下单，请改走本地下单/本地止盈止损流程")
+
+        tick = instrument.tick_size
+        if tick is None or tick <= 0:
+            raise OkxApiError(f"{plan.inst_id} 缺少有效 tick，无法计算触发价与限价关系")
+
+        entry = snap_to_increment(plan.entry_reference, tick, "nearest")
+        if plan.side == "buy":
+            # OKX: buy stop — triggerPx must be strictly above orderPx (limit entry).
+            trigger_px = snap_to_increment(entry + tick, tick, "up")
+        elif plan.side == "sell":
+            # OKX: sell stop — triggerPx must be strictly below orderPx.
+            raw_trigger = entry - tick
+            if raw_trigger <= 0:
+                raise OkxApiError("触发价计算结果无效（入场价过低）")
+            trigger_px = snap_to_increment(raw_trigger, tick, "down")
+        else:
+            raise OkxApiError(f"不支持的订单方向：{plan.side}")
+
+        tick_opt = tick
+        self._enforce_order_size_safety_limit(instrument=instrument, size=plan.size, reference_price=entry)
+        order: dict[str, Any] = {
+            "instId": plan.inst_id,
+            "tdMode": config.trade_mode,
+            "side": plan.side,
+            "ordType": "trigger",
+            "sz": _format_exchange_contract_sz(instrument, plan.size),
+            "triggerPx": format_decimal(trigger_px),
+            "triggerPxType": config.tp_sl_trigger_type,
+            "orderPx": format_decimal(entry),
+            "tag": OKX_BROKER_TAG,
+        }
+        if include_attached_protection:
+            order["attachAlgoOrds"] = [
+                _build_attached_algo_order(
+                    config=config,
+                    plan=plan,
+                    include_take_profit=include_take_profit,
+                    stop_loss_algo_cl_ord_id=stop_loss_algo_cl_ord_id,
+                    tick_size=tick_opt,
+                )
+            ]
+        ps = self._derivative_order_pos_side(
+            credentials,
+            config,
+            instrument,
+            plan.side,
+            plan_pos_side=plan.pos_side,
+        )
+        if ps:
+            order["posSide"] = ps
+        self._maybe_isolated_margin_ccy(order, instrument=instrument, config=config)
+        if algo_cl_ord_id:
+            order["algoClOrdId"] = algo_cl_ord_id
+
+        try:
+            payload = self._request(
+                "POST",
+                "/api/v5/trade/order-algo",
+                body=order,
+                auth=True,
+                credentials=credentials,
+                simulated=config.environment == "demo",
+            )
+            return self._parse_algo_order_result(
+                payload,
+                empty_message="OKX 返回了空的触发价算法单结果",
+                fallback_algo_cl_ord_id=algo_cl_ord_id,
+            )
+        except OkxApiError as exc:
+            _raise_order_error_with_request(exc, order)
+
+    def place_stop_loss_algo_order(
+        self,
+        credentials: Credentials,
+        config: StrategyConfig,
+        *,
+        inst_id: str,
+        side: str,
+        size: Decimal,
+        pos_side: str | None,
+        stop_loss_trigger_price: Decimal,
+        algo_cl_ord_id: str | None = None,
+    ) -> OkxOrderResult:
+        algo_cl_ord_id = algo_cl_ord_id or new_custom_order_id("slg")
+        instrument = self.get_instrument(inst_id)
+        if instrument.inst_type == "OPTION":
+            raise OkxApiError("OKX 期权不支持这里的独立止损算法单，请改走本地止损流程")
+
+        stop_loss_txt = _format_okx_px_for_increment(stop_loss_trigger_price, instrument.tick_size)
+        resolved_pos_side = self._reduce_only_order_pos_side(
+            credentials,
+            config,
+            instrument,
+            side,
+            plan_pos_side=pos_side,
+        )
+        self._enforce_order_size_safety_limit(
+            instrument=instrument,
+            size=size,
+            reference_price=stop_loss_trigger_price,
+        )
+
+        order: dict[str, Any] = {
+            "instId": inst_id,
+            "tdMode": config.trade_mode,
+            "side": side,
+            "ordType": "conditional",
+            "sz": _format_exchange_contract_sz(instrument, size),
+            "slTriggerPx": stop_loss_txt,
+            "slOrdPx": "-1",
+            "slTriggerPxType": config.tp_sl_trigger_type,
+            "reduceOnly": True,
+            "cxlOnClosePos": True,
+            "tag": OKX_BROKER_TAG,
+        }
+        if resolved_pos_side:
+            order["posSide"] = resolved_pos_side
+        self._maybe_isolated_margin_ccy(order, instrument=instrument, config=config)
+        if algo_cl_ord_id:
+            order["algoClOrdId"] = algo_cl_ord_id
+
+        try:
+            payload = self._request(
+                "POST",
+                "/api/v5/trade/order-algo",
+                body=order,
+                auth=True,
+                credentials=credentials,
+                simulated=config.environment == "demo",
+            )
+            return self._parse_algo_order_result(
+                payload,
+                empty_message="OKX 未返回独立止损算法单结果",
+                fallback_algo_cl_ord_id=algo_cl_ord_id,
+            )
+        except OkxApiError as exc:
+            _raise_order_error_with_request(exc, order)
+
+    def place_simple_order(
+        self,
+        credentials: Credentials,
+        config: StrategyConfig,
+        *,
+        inst_id: str,
+        side: str,
+        size: Decimal,
+        ord_type: str,
+        pos_side: str | None = None,
+        price: Decimal | None = None,
+        cl_ord_id: str | None = None,
+        reduce_only: bool = False,
+        instrument: Instrument | None = None,
+    ) -> OkxOrderResult:
+        cl_ord_id = cl_ord_id or new_custom_order_id("ord")
+        normalized_inst_id = inst_id.strip().upper()
+        inst = instrument if instrument is not None and instrument.inst_id.strip().upper() == normalized_inst_id else None
+        if inst is None:
+            try:
+                inst = self.get_instrument(normalized_inst_id)
+            except Exception:
+                inst = None
+        sz_txt = _format_exchange_contract_sz(inst, size) if inst is not None else format_decimal(size)
+        order: dict[str, Any] = {
+            "instId": normalized_inst_id,
+            "tdMode": config.trade_mode,
+            "side": side,
+            "ordType": ord_type,
+            "sz": sz_txt,
+            "tag": OKX_BROKER_TAG,
+        }
+        resolved_pos = pos_side
+        if inst is not None and inst.inst_type == "SPOT":
+            order["tdMode"] = self._spot_td_mode_for_account(credentials, config)
+            if str(ord_type or "").strip().lower() == "post_only":
+                order["ordType"] = "limit"
+            elif str(ord_type or "").strip().lower() == "market" and str(side or "").strip().lower() == "buy":
+                # For SPOT market buys we submit base-asset quantity; tell OKX that sz is base_ccy.
+                order["tgtCcy"] = "base_ccy"
+        if reduce_only:
+            order["reduceOnly"] = True
+        reference_price = price
+        if price is not None:
+            if inst is not None and inst.tick_size is not None and inst.tick_size > 0:
+                px_snapped = snap_to_increment(price, inst.tick_size, "nearest")
+                order["px"] = format_decimal(px_snapped)
+                reference_price = px_snapped
+            else:
+                order["px"] = format_decimal(price)
+        if inst is not None and reduce_only:
+            resolved_pos = self._reduce_only_order_pos_side(
+                credentials,
+                config,
+                inst,
+                side,
+                plan_pos_side=pos_side,
+            )
+        self._enforce_order_size_safety_limit(
+            instrument=inst,
+            inst_id=normalized_inst_id,
+            size=size,
+            reference_price=reference_price,
+        )
+        if inst is not None:
+            if not reduce_only:
+                resolved_pos = self._derivative_order_pos_side(
+                    credentials,
+                    config,
+                    inst,
+                    side,
+                    plan_pos_side=pos_side,
+                )
+            self._maybe_isolated_margin_ccy(order, instrument=inst, config=config)
+        if resolved_pos:
+            order["posSide"] = resolved_pos
+        if cl_ord_id:
+            order["clOrdId"] = cl_ord_id
+
+        try:
+            payload = self._request(
+                "POST",
+                "/api/v5/trade/order",
+                body=order,
+                auth=True,
+                credentials=credentials,
+                simulated=config.environment == "demo",
+            )
+            return self._parse_order_result(
+                payload,
+                empty_message="OKX 返回了空的下单结果",
+                fallback_cl_ord_id=cl_ord_id,
+            )
+        except OkxApiError as exc:
+            if (
+                exc.code == "51000"
+                and inst is not None
+                and inst.inst_type == "SPOT"
+                and str(order.get("ordType") or "").strip().lower() == "post_only"
+                and order.get("px") not in {None, ""}
+            ):
+                retry_order = dict(order)
+                retry_order["ordType"] = "limit"
+                try:
+                    payload = self._request(
+                        "POST",
+                        "/api/v5/trade/order",
+                        body=retry_order,
+                        auth=True,
+                        credentials=credentials,
+                        simulated=config.environment == "demo",
+                    )
+                    return self._parse_order_result(
+                        payload,
+                        empty_message="OKX 返回了空的下单结果",
+                        fallback_cl_ord_id=cl_ord_id,
+                    )
+                except OkxApiError as retry_exc:
+                    _raise_order_error_with_request(retry_exc, retry_order)
+            _raise_order_error_with_request(exc, order)
+
+    def place_aggressive_limit_order(
+        self,
+        credentials: Credentials,
+        config: StrategyConfig,
+        instrument: Instrument,
+        *,
+        side: str,
+        size: Decimal,
+        pos_side: str | None = None,
+        cl_ord_id: str | None = None,
+    ) -> OkxOrderResult:
+        ticker = self.get_ticker(instrument.inst_id)
+        base_price = _pick_aggressive_price(ticker, side)
+        if base_price is None or base_price <= 0:
+            raise OkxApiError(f"{instrument.inst_id} 缺少可用买一卖一或最新价，无法下单")
+
+        if side == "buy":
+            order_price = snap_to_increment(base_price + (instrument.tick_size * 2), instrument.tick_size, "up")
+        else:
+            raw_price = base_price - (instrument.tick_size * 2)
+            if raw_price <= 0:
+                raw_price = instrument.tick_size
+            order_price = snap_to_increment(raw_price, instrument.tick_size, "down")
+
+        return self.place_simple_order(
+            credentials,
+            config,
+            inst_id=instrument.inst_id,
+            side=side,
+            size=size,
+            ord_type="ioc",
+            pos_side=pos_side,
+            price=order_price,
+            cl_ord_id=cl_ord_id,
+            instrument=instrument,
+        )
+
+    def get_order(
+        self,
+        credentials: Credentials,
+        config: StrategyConfig,
+        *,
+        inst_id: str,
+        ord_id: str | None = None,
+        cl_ord_id: str | None = None,
+        request_timeout: float | None = None,
+    ) -> OkxOrderStatus:
+        if not ord_id and not cl_ord_id:
+            raise ValueError("ord_id 和 cl_ord_id 至少需要提供一个")
+        params = {"instId": inst_id}
+        if ord_id:
+            params["ordId"] = ord_id
+        if cl_ord_id:
+            params["clOrdId"] = cl_ord_id
+        payload = self._request(
+            "GET",
+            "/api/v5/trade/order",
+            params=params,
+            auth=True,
+            credentials=credentials,
+            simulated=config.environment == "demo",
+            timeout_seconds=request_timeout,
+        )
+        if not payload["data"]:
+            order_key = ord_id or cl_ord_id or ""
+            raise OkxApiError(f"OKX 鏈繑鍥炶鍗曠姸鎬侊細{order_key}")
+
+        first = payload["data"][0]
+        return OkxOrderStatus(
+            ord_id=first.get("ordId", ord_id or ""),
+            state=first.get("state", ""),
+            side=first.get("side"),
+            ord_type=first.get("ordType"),
+            price=_to_decimal(first.get("px")),
+            avg_price=_to_decimal(first.get("avgPx")),
+            size=_to_decimal(first.get("sz")),
+            filled_size=_to_decimal(first.get("accFillSz")),
+            raw=first,
+        )
+
+    def cancel_order(
+        self,
+        credentials: Credentials,
+        config: StrategyConfig,
+        *,
+        inst_id: str,
+        ord_id: str | None = None,
+        cl_ord_id: str | None = None,
+        request_timeout: float | None = None,
+    ) -> OkxOrderResult:
+        return self.cancel_order_by_id(
+            credentials,
+            environment=config.environment,
+            inst_id=inst_id,
+            ord_id=ord_id,
+            cl_ord_id=cl_ord_id,
+            request_timeout=request_timeout,
+        )
+
+    def cancel_order_by_id(
+        self,
+        credentials: Credentials,
+        *,
+        environment: str,
+        inst_id: str,
+        ord_id: str | None = None,
+        cl_ord_id: str | None = None,
+        request_timeout: float | None = None,
+    ) -> OkxOrderResult:
+        if not ord_id and not cl_ord_id:
+            raise ValueError("ord_id 和 cl_ord_id 至少需要提供一个")
+        body = {"instId": inst_id}
+        if ord_id:
+            body["ordId"] = ord_id
+        if cl_ord_id:
+            body["clOrdId"] = cl_ord_id
+        payload = self._request(
+            "POST",
+            "/api/v5/trade/cancel-order",
+            body=body,
+            auth=True,
+            credentials=credentials,
+            simulated=environment == "demo",
+            timeout_seconds=request_timeout,
+        )
+        return self._parse_order_result(
+            payload,
+            empty_message="OKX 返回了空的撤单结果",
+            fallback_cl_ord_id=cl_ord_id,
+        )
+
+    def cancel_algo_order(
+        self,
+        credentials: Credentials,
+        *,
+        environment: str,
+        inst_id: str,
+        algo_id: str | None = None,
+        algo_cl_ord_id: str | None = None,
+    ) -> OkxOrderResult:
+        if not algo_id and not algo_cl_ord_id:
+            raise ValueError("algo_id 和 algo_cl_ord_id 至少需要提供一个")
+        body_item = {"instId": inst_id}
+        if algo_id:
+            body_item["algoId"] = algo_id
+        if algo_cl_ord_id:
+            body_item["algoClOrdId"] = algo_cl_ord_id
+        payload = self._request(
+            "POST",
+            "/api/v5/trade/cancel-algos",
+            body=[body_item],
+            auth=True,
+            credentials=credentials,
+            simulated=environment == "demo",
+        )
+        return self._parse_algo_order_result(
+            payload,
+            empty_message="OKX 返回了空的算法撤单结果",
+            fallback_algo_cl_ord_id=algo_cl_ord_id,
+        )
+
+    def amend_algo_order(
+        self,
+        credentials: Credentials,
+        *,
+        environment: str,
+        inst_id: str,
+        algo_id: str | None = None,
+        algo_cl_ord_id: str | None = None,
+        req_id: str | None = None,
+        new_stop_loss_trigger_price: Decimal | None = None,
+        new_stop_loss_trigger_price_type: str | None = None,
+    ) -> OkxOrderResult:
+        if not algo_id and not algo_cl_ord_id:
+            raise ValueError("algo_id or algo_cl_ord_id is required")
+        if new_stop_loss_trigger_price is None:
+            raise ValueError("new_stop_loss_trigger_price is required")
+
+        body_item: dict[str, Any] = {
+            "instId": inst_id,
+            "newSlTriggerPx": format_decimal(new_stop_loss_trigger_price),
+            "newSlOrdPx": "-1",
+        }
+        if algo_id:
+            body_item["algoId"] = algo_id
+        if algo_cl_ord_id:
+            body_item["algoClOrdId"] = algo_cl_ord_id
+        if req_id:
+            body_item["reqId"] = req_id
+        if new_stop_loss_trigger_price_type:
+            body_item["newSlTriggerPxType"] = new_stop_loss_trigger_price_type
+
+        payload = self._request(
+            "POST",
+            "/api/v5/trade/amend-algos",
+            body=body_item,
+            auth=True,
+            credentials=credentials,
+            simulated=environment == "demo",
+        )
+        return self._parse_algo_order_result(
+            payload,
+            empty_message="OKX did not return an amend-algo result",
+            fallback_algo_cl_ord_id=algo_cl_ord_id,
+        )
+
+    def _parse_order_result(
+        self,
+        payload: dict[str, Any],
+        *,
+        empty_message: str,
+        fallback_cl_ord_id: str | None = None,
+    ) -> OkxOrderResult:
+        if not payload["data"]:
+            raise OkxApiError(empty_message)
+
+        first = payload["data"][0]
+        sc = first.get("sCode")
+        if str(sc).strip().lower() not in {"", "0", "none"}:
+            raise OkxApiError(_okx_order_data_reject_message(first), code=str(sc) if sc is not None else None)
+
+        return OkxOrderResult(
+            ord_id=first.get("ordId", ""),
+            cl_ord_id=first.get("clOrdId") or fallback_cl_ord_id,
+            s_code=first.get("sCode", "0"),
+            s_msg=first.get("sMsg", ""),
+            raw=payload,
+        )
+
+    def _parse_algo_order_result(
+        self,
+        payload: dict[str, Any],
+        *,
+        empty_message: str,
+        fallback_algo_cl_ord_id: str | None = None,
+    ) -> OkxOrderResult:
+        if not payload["data"]:
+            raise OkxApiError(empty_message)
+
+        first = payload["data"][0]
+        if first.get("sCode") not in {None, "", "0"}:
+            raise OkxApiError(first.get("sMsg", "OKX 算法委托撤单请求被拒绝"), code=first.get("sCode"))
+
+        return OkxOrderResult(
+            ord_id=first.get("algoId", ""),
+            cl_ord_id=first.get("algoClOrdId") or first.get("clOrdId") or fallback_algo_cl_ord_id,
+            s_code=first.get("sCode", "0"),
+            s_msg=first.get("sMsg", ""),
+            raw=payload,
+        )
+
+    def _request(
+        self,
+        method: str,
+        path: str,
+        *,
+        params: dict[str, str] | None = None,
+        body: dict[str, Any] | None = None,
+        auth: bool = False,
+        credentials: Credentials | None = None,
+        simulated: bool = False,
+        timeout_seconds: float | None = None,
+    ) -> dict[str, Any]:
+        if params:
+            query_string = parse.urlencode(params)
+            path = f"{path}?{query_string}"
+
+        data = b""
+        body_text = ""
+        if body is not None:
+            body_text = json.dumps(body, separators=(",", ":"))
+            data = body_text.encode("utf-8")
+
+        headers = dict(DEFAULT_HEADERS)
+        if auth:
+            if credentials is None:
+                raise ValueError("閴存潈璇锋眰缂哄皯 API 鍑瘉")
+            timestamp = _okx_timestamp()
+            signature = _sign_request(timestamp, method, path, body_text, credentials.secret_key)
+            headers.update(
+                {
+                    "OK-ACCESS-KEY": credentials.api_key,
+                    "OK-ACCESS-SIGN": signature,
+                    "OK-ACCESS-TIMESTAMP": timestamp,
+                    "OK-ACCESS-PASSPHRASE": credentials.passphrase,
+                }
+            )
+
+        if simulated:
+            headers["x-simulated-trading"] = "1"
+
+        url = f"{self.base_url}{path}"
+        req = request.Request(url, data=data or None, headers=headers, method=method.upper())
+
+        try:
+            with request.urlopen(req, timeout=max(float(timeout_seconds or 20), 0.1)) as response:
+                content = response.read().decode("utf-8")
+                payload = json.loads(content)
+        except error.HTTPError as exc:
+            body_text = exc.read().decode("utf-8", errors="replace")
+            raise OkxApiError(f"HTTP {exc.code}: {body_text}", status=exc.code) from exc
+        except error.URLError as exc:
+            raise OkxApiError(f"网络错误：{exc.reason}") from exc
+        except http.client.RemoteDisconnected as exc:
+            detail = str(exc).strip() or "Remote end closed connection without response"
+            raise OkxApiError(f"网络错误：{detail}") from exc
+
+        except OSError as exc:
+            detail = str(exc).strip()
+            lowered = detail.lower()
+            if any(
+                marker in lowered
+                for marker in (
+                    "timeout",
+                    "timed out",
+                    "handshake",
+                    "connection reset",
+                    "connection aborted",
+                    "connection refused",
+                    "eof occurred",
+                    "remote end closed connection without response",
+                    "remotedisconnected",
+                )
+            ):
+                raise OkxApiError(f"网络错误：{detail or exc.__class__.__name__}") from exc
+            raise
+
+        if payload.get("code") not in {None, "0"}:
+            message = str(payload.get("msg") or "").strip() or f"OKX API 错误 code={payload.get('code')}"
+            data = payload.get("data")
+            first = data[0] if isinstance(data, list) and data and isinstance(data[0], dict) else None
+            if isinstance(first, dict):
+                detail = _okx_order_data_reject_message(first)
+                if detail and detail not in message:
+                    message = f"{message} | {detail}"
+            raise OkxApiError(message, code=payload.get("code"))
+        return payload
+
+
+def infer_inst_type(inst_id: str) -> str:
+    normalized = inst_id.strip().upper()
+    if normalized.endswith("-SWAP"):
+        return "SWAP"
+    if OPTION_ID_PATTERN.match(normalized):
+        return "OPTION"
+    if FUTURES_ID_PATTERN.match(normalized):
+        return "FUTURES"
+    return "SPOT"
+
+
+def infer_option_family(inst_id: str) -> str | None:
+    normalized = inst_id.strip().upper()
+    if not OPTION_ID_PATTERN.match(normalized):
+        return None
+    parts = normalized.split("-")
+    return f"{parts[0]}-{parts[1]}"
+
+
+def _serialize_instrument_cache_item(instrument: Instrument) -> dict[str, Any]:
+    return {
+        "inst_id": instrument.inst_id,
+        "inst_type": instrument.inst_type,
+        "tick_size": str(instrument.tick_size),
+        "lot_size": str(instrument.lot_size),
+        "min_size": str(instrument.min_size),
+        "state": instrument.state,
+        "settle_ccy": instrument.settle_ccy,
+        "ct_val": str(instrument.ct_val) if instrument.ct_val is not None else None,
+        "ct_mult": str(instrument.ct_mult) if instrument.ct_mult is not None else None,
+        "ct_val_ccy": instrument.ct_val_ccy,
+        "uly": instrument.uly,
+        "inst_family": instrument.inst_family,
+    }
+
+
+def _deserialize_instrument_cache_item(payload: Any) -> Instrument | None:
+    if not isinstance(payload, dict):
+        return None
+    inst_id = str(payload.get("inst_id") or "").strip().upper()
+    inst_type = str(payload.get("inst_type") or "").strip().upper()
+    if not inst_id or not inst_type:
+        return None
+    try:
+        tick_size = Decimal(str(payload.get("tick_size")))
+        lot_size = Decimal(str(payload.get("lot_size")))
+        min_size = Decimal(str(payload.get("min_size")))
+    except Exception:
+        return None
+    return Instrument(
+        inst_id=inst_id,
+        inst_type=inst_type,
+        tick_size=tick_size,
+        lot_size=lot_size,
+        min_size=min_size,
+        state=str(payload.get("state") or ""),
+        settle_ccy=str(payload.get("settle_ccy") or "").strip().upper() or None,
+        ct_val=_to_decimal(payload.get("ct_val")),
+        ct_mult=_to_decimal(payload.get("ct_mult")),
+        ct_val_ccy=str(payload.get("ct_val_ccy") or "").strip().upper() or None,
+        uly=str(payload.get("uly") or "").strip().upper() or None,
+        inst_family=str(payload.get("inst_family") or "").strip().upper() or None,
+    )
+
+
+def _pick_aggressive_price(ticker: OkxTicker, side: str) -> Decimal | None:
+    if side == "buy":
+        return ticker.ask or ticker.last or ticker.bid
+    return ticker.bid or ticker.last or ticker.ask
+
+
+def _to_decimal(value: Any) -> Decimal | None:
+    if value in {None, ""}:
+        return None
+    return Decimal(str(value))
+
+
+def _decimal_or(value: Any, fallback: Decimal) -> Decimal:
+    decimal_value = _to_decimal(value)
+    return decimal_value if decimal_value is not None else fallback
+
+
+def _first_decimal(*values: Any) -> Decimal | None:
+    for value in values:
+        decimal_value = _to_decimal(value)
+        if decimal_value is not None:
+            return decimal_value
+    return None
+
+
+def _to_int(*values: Any) -> int | None:
+    for value in values:
+        if value in {None, ""}:
+            continue
+        try:
+            return int(str(value))
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def _to_bool(value: Any) -> bool | None:
+    if value in {None, ""}:
+        return None
+    normalized = str(value).strip().lower()
+    if normalized in {"true", "1", "yes", "y"}:
+        return True
+    if normalized in {"false", "0", "no", "n"}:
+        return False
+    return None
+
+
+def _format_exchange_contract_sz(instrument: Instrument, size: Decimal) -> str:
+    """按 lotSz 步长格式化张数；OKX 对 sz 小数位不匹配时常返回笼统「操作全部失败」。"""
+    lot = instrument.lot_size
+    if instrument.inst_type in {"SWAP", "FUTURES"} and lot is not None and lot > 0:
+        snapped = snap_to_increment(size, lot, "down")
+        if snapped <= 0:
+            raise OkxApiError(
+                f"下单张数 {format_decimal(size)} 小于最小步长 {format_decimal_by_increment(lot, lot)}，请增大数量"
+            )
+        return format_decimal_by_increment(snapped, lot)
+    return format_decimal(size)
+
+
+def _instrument_base_currency(instrument: Instrument | None, inst_id: str) -> str:
+    for value in (
+        instrument.uly if instrument is not None else None,
+        instrument.inst_family if instrument is not None else None,
+        instrument.inst_id if instrument is not None else None,
+        inst_id,
+    ):
+        normalized = str(value or "").strip().upper()
+        if normalized:
+            return normalized.split("-", 1)[0]
+    return ""
+
+
+def _contract_value(instrument: Instrument | None) -> Decimal | None:
+    if instrument is None or instrument.ct_val is None or instrument.ct_val <= 0:
+        return None
+    multiplier = instrument.ct_mult if instrument.ct_mult is not None and instrument.ct_mult > 0 else Decimal("1")
+    return instrument.ct_val * multiplier
+
+
+def _estimate_base_exposure(
+    instrument: Instrument | None,
+    size: Decimal,
+    reference_price: Decimal | None,
+) -> Decimal | None:
+    if instrument is None:
+        return size
+    base_ccy = _instrument_base_currency(instrument, instrument.inst_id)
+    ct_val_ccy = str(instrument.ct_val_ccy or "").strip().upper()
+    if instrument.inst_type == "SPOT":
+        return size
+    contract_value = _contract_value(instrument)
+    if contract_value is None:
+        return None
+    if ct_val_ccy == base_ccy:
+        return size * contract_value
+    if ct_val_ccy in USD_LIKE_CURRENCIES and reference_price is not None and reference_price > 0:
+        return (size * contract_value) / reference_price
+    return None
+
+
+def _estimate_notional_usd(
+    instrument: Instrument | None,
+    size: Decimal,
+    reference_price: Decimal | None,
+) -> Decimal | None:
+    if instrument is None:
+        return None
+    base_ccy = _instrument_base_currency(instrument, instrument.inst_id)
+    ct_val_ccy = str(instrument.ct_val_ccy or "").strip().upper()
+    if instrument.inst_type == "SPOT":
+        if reference_price is None or reference_price <= 0:
+            return None
+        return size * reference_price
+    contract_value = _contract_value(instrument)
+    if contract_value is None:
+        return None
+    if ct_val_ccy in USD_LIKE_CURRENCIES:
+        return size * contract_value
+    if ct_val_ccy == base_ccy and reference_price is not None and reference_price > 0:
+        return size * contract_value * reference_price
+    return None
+
+
+def _instrument_needs_reference_price_for_base_exposure(instrument: Instrument | None) -> bool:
+    if instrument is None:
+        return False
+    ct_val_ccy = str(instrument.ct_val_ccy or "").strip().upper()
+    return instrument.inst_type == "SPOT" or ct_val_ccy in USD_LIKE_CURRENCIES
+
+
+def _instrument_needs_reference_price_for_notional(instrument: Instrument | None) -> bool:
+    if instrument is None:
+        return False
+    base_ccy = _instrument_base_currency(instrument, instrument.inst_id)
+    ct_val_ccy = str(instrument.ct_val_ccy or "").strip().upper()
+    return instrument.inst_type == "SPOT" or ct_val_ccy == base_ccy
+
+
+def _ticker_reference_price(ticker: OkxTicker) -> Decimal | None:
+    for value in (ticker.last, ticker.mark, ticker.index):
+        if value is not None and value > 0:
+            return value
+    if ticker.bid is not None and ticker.ask is not None and ticker.bid > 0 and ticker.ask > 0:
+        return (ticker.bid + ticker.ask) / Decimal("2")
+    for value in (ticker.bid, ticker.ask):
+        if value is not None and value > 0:
+            return value
+    return None
+
+
+def _format_okx_px_for_increment(value: Decimal, tick_size: Decimal | None) -> str:
+    if tick_size is not None and tick_size > 0:
+        snapped = snap_to_increment(value, tick_size, "nearest")
+        return format_decimal(snapped)
+    return format_decimal(value)
+
+
+def _build_attached_algo_order(
+    *,
+    config: StrategyConfig,
+    plan: OrderPlan,
+    include_take_profit: bool = True,
+    stop_loss_algo_cl_ord_id: str | None = None,
+    tick_size: Decimal | None = None,
+) -> dict[str, str]:
+    order = {
+        "slTriggerPx": _format_okx_px_for_increment(plan.stop_loss, tick_size),
+        "slOrdPx": "-1",
+        "slTriggerPxType": config.tp_sl_trigger_type,
+    }
+    if include_take_profit:
+        order.update(
+            {
+                "tpTriggerPx": _format_okx_px_for_increment(plan.take_profit, tick_size),
+                "tpOrdPx": "-1",
+                "tpTriggerPxType": config.tp_sl_trigger_type,
+                "tpOrdKind": "condition",
+            }
+        )
+    if stop_loss_algo_cl_ord_id:
+        order["attachAlgoClOrdId"] = stop_loss_algo_cl_ord_id
+    return order
+
+
+def _extract_tp_sl_fields(item: dict[str, Any]) -> dict[str, Decimal | str | None]:
+    """合并主单字段与 attachAlgoOrds（可能多条：TP/SL 分站）。"""
+    take_profit_trigger_price = _first_decimal(item.get("tpTriggerPx"), item.get("takeProfitTriggerPrice"))
+    take_profit_order_price = _first_decimal(item.get("tpOrdPx"), item.get("takeProfitOrdPx"))
+    take_profit_trigger_price_type = item.get("tpTriggerPxType") or item.get("takeProfitTriggerPxType")
+    stop_loss_trigger_price = _first_decimal(item.get("slTriggerPx"), item.get("stopLossTriggerPrice"))
+    stop_loss_order_price = _first_decimal(item.get("slOrdPx"), item.get("stopLossOrdPx"))
+    stop_loss_trigger_price_type = item.get("slTriggerPxType") or item.get("stopLossTriggerPxType")
+
+    attach_algo_orders = item.get("attachAlgoOrds")
+    if isinstance(attach_algo_orders, list):
+        for raw in attach_algo_orders:
+            if not isinstance(raw, dict):
+                continue
+            if take_profit_trigger_price is None:
+                take_profit_trigger_price = _first_decimal(raw.get("tpTriggerPx"), raw.get("takeProfitTriggerPrice"))
+            if take_profit_order_price is None:
+                take_profit_order_price = _first_decimal(raw.get("tpOrdPx"), raw.get("takeProfitOrdPx"))
+            if take_profit_trigger_price_type is None:
+                take_profit_trigger_price_type = raw.get("tpTriggerPxType") or raw.get("takeProfitTriggerPxType")
+            if stop_loss_trigger_price is None:
+                stop_loss_trigger_price = _first_decimal(raw.get("slTriggerPx"), raw.get("stopLossTriggerPrice"))
+            if stop_loss_order_price is None:
+                stop_loss_order_price = _first_decimal(raw.get("slOrdPx"), raw.get("stopLossOrdPx"))
+            if stop_loss_trigger_price_type is None:
+                stop_loss_trigger_price_type = raw.get("slTriggerPxType") or raw.get("stopLossTriggerPxType")
+
+    return {
+        "take_profit_trigger_price": take_profit_trigger_price,
+        "take_profit_order_price": take_profit_order_price,
+        "take_profit_trigger_price_type": take_profit_trigger_price_type,
+        "stop_loss_trigger_price": stop_loss_trigger_price,
+        "stop_loss_order_price": stop_loss_order_price,
+        "stop_loss_trigger_price_type": stop_loss_trigger_price_type,
+    }
+
+
+def _build_okx_order_status_from_ws_item(
+    item: dict[str, Any],
+    *,
+    fallback_ord_id: str | None,
+    fallback_inst_id: str,
+) -> OkxOrderStatus:
+    return OkxOrderStatus(
+        ord_id=str(item.get("ordId") or fallback_ord_id or ""),
+        state=str(item.get("state") or ""),
+        side=item.get("side"),
+        ord_type=item.get("ordType"),
+        price=_to_decimal(item.get("px")),
+        avg_price=_to_decimal(item.get("avgPx")),
+        size=_first_decimal(item.get("sz"), item.get("origSz")),
+        filled_size=_first_decimal(item.get("accFillSz"), item.get("fillSz")),
+        raw={"instId": item.get("instId", fallback_inst_id), **item},
+    )
+
+
+def _position_has_nonzero_size(item: dict[str, Any]) -> bool:
+    position = _to_decimal(item.get("pos")) or Decimal("0")
+    return position != 0
+
+
+def _build_okx_position(item: dict[str, Any]) -> OkxPosition:
+    position = _to_decimal(item.get("pos")) or Decimal("0")
+    return OkxPosition(
+        inst_id=item.get("instId", ""),
+        inst_type=item.get("instType", ""),
+        pos_side=item.get("posSide", ""),
+        mgn_mode=item.get("mgnMode", ""),
+        position=position,
+        avail_position=_to_decimal(item.get("availPos")),
+        avg_price=_to_decimal(item.get("avgPx")),
+        mark_price=_to_decimal(item.get("markPx")),
+        unrealized_pnl=_to_decimal(item.get("upl")),
+        unrealized_pnl_ratio=_to_decimal(item.get("uplRatio")),
+        liquidation_price=_to_decimal(item.get("liqPx")),
+        leverage=_to_decimal(item.get("lever")),
+        margin_ccy=item.get("ccy"),
+        last_price=_to_decimal(item.get("last")),
+        realized_pnl=_to_decimal(item.get("realizedPnl")),
+        margin_ratio=_to_decimal(item.get("mgnRatio")),
+        initial_margin=_to_decimal(item.get("imr")),
+        maintenance_margin=_to_decimal(item.get("mmr")),
+        delta=_first_decimal(item.get("deltaPA"), item.get("deltaBS")),
+        gamma=_first_decimal(item.get("gammaPA"), item.get("gammaBS")),
+        vega=_first_decimal(item.get("vegaPA"), item.get("vegaBS")),
+        theta=_first_decimal(item.get("thetaPA"), item.get("thetaBS")),
+        raw=item,
+    )
+
+
+def _build_okx_account_overview(item: dict[str, Any]) -> OkxAccountOverview:
+    details: list[OkxAccountAssetItem] = []
+    for asset in item.get("details", []):
+        if not isinstance(asset, dict):
+            continue
+        details.append(
+            OkxAccountAssetItem(
+                ccy=asset.get("ccy", ""),
+                equity=_first_decimal(asset.get("eq"), asset.get("cashBal")),
+                equity_usd=_to_decimal(asset.get("eqUsd")),
+                cash_balance=_to_decimal(asset.get("cashBal")),
+                available_balance=_to_decimal(asset.get("availBal")),
+                available_equity=_to_decimal(asset.get("availEq")),
+                frozen_balance=_first_decimal(asset.get("frozenBal"), asset.get("ordFrozen"), asset.get("fixedBal")),
+                unrealized_pnl=_to_decimal(asset.get("upl")),
+                discount_equity=_to_decimal(asset.get("disEq")),
+                liability=_first_decimal(asset.get("liab"), asset.get("uplLiab")),
+                cross_liability=_to_decimal(asset.get("crossLiab")),
+                interest=_to_decimal(asset.get("interest")),
+                raw=asset,
+            )
+        )
+    details.sort(key=lambda asset: (asset.equity_usd or Decimal("0"), asset.equity or Decimal("0")), reverse=True)
+    return OkxAccountOverview(
+        total_equity=_to_decimal(item.get("totalEq")),
+        adjusted_equity=_to_decimal(item.get("adjEq")),
+        isolated_equity=_to_decimal(item.get("isoEq")),
+        available_equity=_to_decimal(item.get("availEq")),
+        unrealized_pnl=_to_decimal(item.get("upl")),
+        initial_margin=_to_decimal(item.get("imr")),
+        maintenance_margin=_to_decimal(item.get("mmr")),
+        order_frozen=_first_decimal(item.get("ordFroz"), item.get("frozenBal")),
+        notional_usd=_to_decimal(item.get("notionalUsd")),
+        details=tuple(details),
+        raw=item,
+    )
+
+
+def _fill_history_dedupe_key(item: OkxFillHistoryItem) -> tuple[Any, ...]:
+    return (
+        item.inst_id,
+        item.fill_time,
+        item.fill_price,
+        item.fill_size,
+        item.side,
+        item.exec_type,
+    )
+
+
+def _build_fill_history_item_from_bill(item: dict[str, Any]) -> OkxFillHistoryItem | None:
+    inst_id = str(item.get("instId") or "").strip()
+    inst_type = str(item.get("instType") or "").strip().upper()
+    if not inst_id or inst_type not in {"OPTION", "FUTURES"}:
+        return None
+    fill_time = _to_int(item.get("ts"), item.get("cTime"), item.get("uTime"))
+    fill_price = _first_decimal(item.get("px"), item.get("fillPx"), item.get("price"))
+    fill_size = _first_decimal(item.get("sz"), item.get("fillSz"), item.get("size"))
+    if fill_time is None or fill_price is None or fill_size is None:
+        return None
+    side = _normalize_bill_fill_side(item)
+    exec_type = _normalize_bill_exec_type(item)
+    if exec_type not in {"exercise", "delivery"}:
+        return None
+    return OkxFillHistoryItem(
+        fill_time=fill_time,
+        inst_id=inst_id,
+        inst_type=inst_type,
+        side=side,
+        pos_side=item.get("posSide"),
+        fill_price=fill_price,
+        fill_size=fill_size,
+        fill_fee=_first_decimal(item.get("fee"), item.get("fillFee")),
+        fee_currency=item.get("feeCcy") or item.get("fillFeeCcy"),
+        pnl=_first_decimal(item.get("pnl"), item.get("fillPnl"), item.get("balChg"), item.get("posBalChg")),
+        order_id=item.get("ordId"),
+        trade_id=item.get("tradeId"),
+        exec_type=exec_type,
+        raw=item,
+    )
+
+
+def _build_account_bill_item(item: dict[str, Any], *, default_inst_type: str) -> OkxAccountBillItem | None:
+    bill_id = str(item.get("billId") or "").strip()
+    bill_time = _to_int(item.get("ts"), item.get("cTime"), item.get("uTime"), item.get("fillTime"))
+    inst_id = str(item.get("instId") or "").strip().upper()
+    inst_type = str(item.get("instType") or default_inst_type or infer_inst_type(inst_id)).strip().upper()
+    if not bill_id or bill_time is None:
+        return None
+    return OkxAccountBillItem(
+        bill_id=bill_id,
+        bill_time=bill_time,
+        inst_id=inst_id,
+        inst_type=inst_type,
+        bill_type=str(item.get("type") or "").strip() or None,
+        bill_sub_type=str(item.get("subType") or "").strip() or None,
+        business_type=str(item.get("bizType") or "").strip() or None,
+        event_type=str(item.get("eventType") or "").strip() or None,
+        side=str(item.get("side") or "").strip().lower() or None,
+        pos_side=str(item.get("posSide") or "").strip().lower() or None,
+        size=_first_decimal(item.get("sz"), item.get("fillSz"), item.get("size")),
+        price=_first_decimal(item.get("px"), item.get("fillPx"), item.get("price")),
+        amount=_first_decimal(item.get("pnl"), item.get("balChg"), item.get("posBalChg"), item.get("amount")),
+        fee=_first_decimal(item.get("fee"), item.get("fillFee")),
+        pnl=_first_decimal(item.get("pnl"), item.get("fillPnl")),
+        balance_change=_first_decimal(item.get("balChg"), item.get("posBalChg")),
+        currency=str(item.get("ccy") or item.get("feeCcy") or item.get("fillFeeCcy") or "").strip() or None,
+        order_id=str(item.get("ordId") or "").strip() or None,
+        trade_id=str(item.get("tradeId") or "").strip() or None,
+        client_order_id=str(item.get("clOrdId") or item.get("algoClOrdId") or "").strip() or None,
+        raw=item,
+    )
+
+
+def _normalize_bill_fill_side(item: dict[str, Any]) -> str | None:
+    side = str(item.get("side") or "").strip().lower()
+    if side in {"buy", "sell"}:
+        return side
+    sub_type = str(item.get("subType") or "").strip().lower()
+    if "buy" in sub_type:
+        return "buy"
+    if "sell" in sub_type:
+        return "sell"
+    return "exercise"
+
+
+def _normalize_bill_exec_type(item: dict[str, Any]) -> str:
+    text = " ".join(
+        str(item.get(key) or "").strip().lower()
+        for key in ("subType", "type", "bizType", "eventType")
+    )
+    sub_type = str(item.get("subType") or "").strip()
+    if sub_type in {"170", "171"}:
+        return "exercise"
+    if sub_type in {"112", "113"}:
+        return "delivery"
+    if any(marker in text for marker in ("exercise", "琛屾潈")):
+        return "exercise"
+    if any(marker in text for marker in ("delivery", "浜ゅ壊", "expire", "expiration")):
+        return "delivery"
+    return ""
+
+
+def _okx_timestamp() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+def _sign_request(timestamp: str, method: str, path: str, body: str, secret_key: str) -> str:
+    prehash = f"{timestamp}{method.upper()}{path}{body}"
+    digest = hmac.new(secret_key.encode("utf-8"), prehash.encode("utf-8"), hashlib.sha256).digest()
+    return base64.b64encode(digest).decode("utf-8")

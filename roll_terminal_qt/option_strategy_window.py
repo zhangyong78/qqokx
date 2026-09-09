@@ -497,6 +497,12 @@ class _OptionTradeRecordThread(QThread):
                 )
                 if close_price is None or closed_at <= 0:
                     continue
+                close_size = self._absolute_decimal(
+                    raw.get("closeTotalPos")
+                    or raw.get("closePos")
+                    or raw.get("closeSz")
+                    or getattr(item, "close_size", None)
+                )
                 realized_pnl = getattr(item, "realized_pnl", None)
                 if not isinstance(realized_pnl, Decimal):
                     realized_pnl = getattr(item, "pnl", None)
@@ -510,6 +516,8 @@ class _OptionTradeRecordThread(QThread):
                         pnl_currency=str(
                             raw.get("ccy") or raw.get("pnlCcy") or raw.get("settleCcy") or inst_id.split("-", 1)[0]
                         ).strip().upper(),
+                        quantity=close_size,
+                        quantity_unit=inst_id.split("-", 1)[0].strip().upper(),
                     )
                 )
             for item in current_positions:
@@ -1346,7 +1354,10 @@ class PositionPriceMarker:
     pnl_currency: str = ""
     realized_pnl_usdt: Decimal | None = None
     quantity: Decimal | None = None
+    quantity_unit: str = ""
+    quantity_base: Decimal | None = None
     entry_value_usdt: Decimal | None = None
+    exit_value_usdt: Decimal | None = None
 
 
 @dataclass(frozen=True)
@@ -1984,12 +1995,14 @@ class CandlestickChartView(QChartView):
             time_text = QDateTime.fromMSecsSinceEpoch(marker.timestamp).toString("MM-dd HH:mm")
             label = "开仓" if marker.kind == "entry" else "平仓"
             label_lines = [label, _format_compact_number(marker.price)]
+            label_lines.extend(self._position_marker_quantity_label_lines(marker))
             if marker.kind == "entry":
                 label_lines.extend(self._position_marker_entry_value_label_lines(marker))
             if marker.kind == "exit":
+                label_lines.extend(self._position_marker_exit_value_label_lines(marker))
                 if result is not None:
                     result_percent = result[1]
-                    label_lines.append(f"{result_percent:+.2f}%")
+                    label_lines.append(f"盈亏比例 {result_percent:+.2f}%")
                 label_lines.extend(self._position_marker_pnl_label_lines(marker))
             label_lines.append(time_text)
             label_height = 16.0 * len(label_lines)
@@ -2020,10 +2033,11 @@ class CandlestickChartView(QChartView):
             painter.setPen(Qt.PenStyle.NoPen)
             painter.setBrush(color)
             painter.drawPolygon(triangle)
-            label_x = min(max(x + 7.0, plot_area.left() + 3.0), plot_area.right() - 112.0)
+            label_width = 220.0
+            label_x = min(max(x + 7.0, plot_area.left() + 3.0), plot_area.right() - label_width - 3.0)
             painter.setPen(color)
             painter.drawText(
-                QRectF(label_x, label_y, 108.0, label_height),
+                QRectF(label_x, label_y, label_width, label_height),
                 Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop,
                 "\n".join(label_lines),
             )
@@ -2080,6 +2094,25 @@ class CandlestickChartView(QChartView):
         if value is None:
             return ()
         return (f"开仓价值 ≈ {format_decimal_fixed(value, 2)} USDT",)
+
+    @staticmethod
+    def _position_marker_quantity_label_lines(marker: PositionPriceMarker) -> tuple[str, ...]:
+        quantity = marker.quantity
+        if quantity is None:
+            return ()
+        label = "开仓数量" if marker.kind == "entry" else "平仓数量"
+        base_quantity = marker.quantity_base
+        unit = marker.quantity_unit.strip().upper()
+        display_quantity = base_quantity if base_quantity is not None else quantity
+        display_unit = unit or "张"
+        return (f"{label} {_format_compact_number(display_quantity)} {display_unit}",)
+
+    @staticmethod
+    def _position_marker_exit_value_label_lines(marker: PositionPriceMarker) -> tuple[str, ...]:
+        value = marker.exit_value_usdt
+        if value is None:
+            return ()
+        return (f"平仓价值 ≈ {format_decimal_fixed(value, 2)} USDT",)
 
     def _nearest_candle_for_x(self, x: float, plot_area: QRectF) -> Candle | None:
         if not self._candles:
@@ -2701,13 +2734,22 @@ class OptionChainLinkedChartDialog(QDialog):
     ) -> tuple[PositionPriceMarker, ...]:
         quote = self._side_quote(side)
         rate, _basis = self._option_chart_usdt_context(side)
-        if quote is None or rate is None:
+        if quote is None:
             return markers
         base_currency = quote.instrument.inst_id.split("-", 1)[0].strip().upper()
         contract_value = option_contract_value(quote.instrument)
         result: list[PositionPriceMarker] = []
         for marker in markers:
             rendered = marker
+            if marker.quantity is not None and contract_value > 0:
+                rendered = replace(
+                    rendered,
+                    quantity_unit=base_currency,
+                    quantity_base=marker.quantity * contract_value,
+                )
+            if rate is None:
+                result.append(rendered)
+                continue
             if (
                 marker.kind == "exit"
                 and marker.realized_pnl is not None
@@ -2717,6 +2759,9 @@ class OptionChainLinkedChartDialog(QDialog):
             if marker.kind == "entry" and marker.quantity is not None:
                 entry_value = marker.price * marker.quantity * contract_value * rate
                 rendered = replace(rendered, entry_value_usdt=entry_value)
+            if marker.kind == "exit" and marker.quantity is not None:
+                exit_value = marker.price * marker.quantity * contract_value * rate
+                rendered = replace(rendered, exit_value_usdt=exit_value)
             result.append(rendered)
         return tuple(result)
 

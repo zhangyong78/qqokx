@@ -227,6 +227,57 @@ class RollTerminalQtWindowHelperTests(QtWidgetTestCase):
             ("盈亏 +0.00125000 BTC", "≈ +100.00 USDT"),
         )
 
+    def test_position_close_marker_label_includes_close_quantity(self) -> None:
+        marker = PositionPriceMarker(
+            "exit",
+            2,
+            Decimal("0.0125"),
+            "long",
+            quantity=Decimal("50"),
+            quantity_unit="BTC",
+            quantity_base=Decimal("0.5"),
+        )
+
+        self.assertEqual(
+            CandlestickChartView._position_marker_quantity_label_lines(marker),
+            ("平仓数量 0.5 BTC",),
+        )
+
+    def test_position_marker_labels_include_open_and_close_values(self) -> None:
+        entry = PositionPriceMarker(
+            "entry",
+            1,
+            Decimal("0.0115"),
+            "long",
+            quantity=Decimal("100"),
+            quantity_unit="BTC",
+            quantity_base=Decimal("1"),
+            entry_value_usdt=Decimal("910.15"),
+        )
+        exit_marker = PositionPriceMarker(
+            "exit",
+            2,
+            Decimal("0.007"),
+            "long",
+            quantity=Decimal("100"),
+            quantity_unit="BTC",
+            quantity_base=Decimal("1"),
+            exit_value_usdt=Decimal("554.00"),
+        )
+
+        self.assertEqual(
+            CandlestickChartView._position_marker_quantity_label_lines(entry),
+            ("开仓数量 1 BTC",),
+        )
+        self.assertEqual(
+            CandlestickChartView._position_marker_entry_value_label_lines(entry),
+            ("开仓价值 ≈ 910.15 USDT",),
+        )
+        self.assertEqual(
+            CandlestickChartView._position_marker_exit_value_label_lines(exit_marker),
+            ("平仓价值 ≈ 554.00 USDT",),
+        )
+
     def test_option_chain_mark_columns_resolve_the_matching_contract(self) -> None:
         instrument_kwargs = {
             "inst_type": "OPTION",

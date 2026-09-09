@@ -89,6 +89,7 @@ from okx_quant.app_paths import data_root
 from okx_quant.models import Candle, Credentials, EmailNotificationConfig, Instrument, OptionTickBand, StrategyConfig
 from okx_quant.notifications import EmailNotifier
 from okx_quant.option_roll import is_short_option_position
+from okx_quant.option_strategy import option_contract_value
 from okx_quant.okx_client import (
     OkxFillHistoryItem,
     OkxOrderResult,
@@ -1054,10 +1055,20 @@ def _position_history_kline_direction(item: OkxPositionHistoryItem) -> str | Non
     return None
 
 
+def _position_history_kline_size(item: OkxPositionHistoryItem, *keys: str) -> Decimal | None:
+    raw = item.raw if isinstance(item.raw, dict) else {}
+    for key in keys:
+        value = _position_kline_positive_decimal(raw.get(key))
+        if value is not None:
+            return value
+    return _position_kline_positive_decimal(getattr(item, "close_size", None))
+
+
 def _position_history_kline_price_markers(
     item: OkxPositionHistoryItem,
     *,
     usdt_prices: dict[str, Decimal] | None = None,
+    instrument: Instrument | None = None,
 ) -> tuple[PositionPriceMarker, ...]:
     raw = item.raw if isinstance(item.raw, dict) else {}
     direction = _position_history_kline_direction(item)
@@ -1068,6 +1079,23 @@ def _position_history_kline_price_markers(
     markers: list[PositionPriceMarker] = []
     open_price = _position_kline_positive_decimal(getattr(item, "open_avg_price", None))
     close_price = _position_kline_positive_decimal(getattr(item, "close_avg_price", None))
+    open_size = _position_history_kline_size(item, "openMaxPos", "maxPos", "openPos")
+    close_size = _position_history_kline_size(item, "closeTotalPos", "closePos", "closeSz")
+    base_currency = str(getattr(item, "inst_id", "") or "").strip().upper().split("-", 1)[0]
+    is_option = str(getattr(item, "inst_type", "") or "").strip().upper() == "OPTION"
+    contract_value: Decimal | None = Decimal("1")
+    if is_option and instrument is not None:
+        try:
+            contract_value = option_contract_value(instrument)
+        except Exception:
+            contract_value = None
+    elif is_option:
+        contract_value = None
+    usdt_rate = None
+    if usdt_prices:
+        candidate = usdt_prices.get(base_currency)
+        if isinstance(candidate, Decimal) and candidate > 0:
+            usdt_rate = candidate
     realized_pnl = getattr(item, "realized_pnl", None)
     pnl_currency = ""
     realized_pnl_usdt: Decimal | None = None
@@ -1076,19 +1104,40 @@ def _position_history_kline_price_markers(
         if usdt_prices:
             realized_pnl_usdt = _position_history_realized_pnl_usdt(item, usdt_prices)
     if opened_at is not None and open_price is not None:
-        markers.append(PositionPriceMarker("entry", opened_at, open_price, direction))
-    if closed_at is not None and close_price is not None:
-        markers.append(
-            PositionPriceMarker(
-                "exit",
-                closed_at,
-                close_price,
-                direction,
-                realized_pnl=realized_pnl if isinstance(realized_pnl, Decimal) else None,
-                pnl_currency=pnl_currency,
-                realized_pnl_usdt=realized_pnl_usdt,
-            )
+        entry = PositionPriceMarker(
+            "entry",
+            opened_at,
+            open_price,
+            direction,
+            quantity=open_size,
+            quantity_unit=base_currency if contract_value is not None else "张",
+            quantity_base=open_size * contract_value if open_size is not None and contract_value is not None else None,
         )
+        if entry.quantity_base is not None and usdt_rate is not None:
+            entry = replace(
+                entry,
+                entry_value_usdt=entry.price * entry.quantity_base * usdt_rate,
+            )
+        markers.append(entry)
+    if closed_at is not None and close_price is not None:
+        exit_marker = PositionPriceMarker(
+            "exit",
+            closed_at,
+            close_price,
+            direction,
+            realized_pnl=realized_pnl if isinstance(realized_pnl, Decimal) else None,
+            pnl_currency=pnl_currency,
+            realized_pnl_usdt=realized_pnl_usdt,
+            quantity=close_size,
+            quantity_unit=base_currency if contract_value is not None else "张",
+            quantity_base=close_size * contract_value if close_size is not None and contract_value is not None else None,
+        )
+        if exit_marker.quantity_base is not None and usdt_rate is not None:
+            exit_marker = replace(
+                exit_marker,
+                exit_value_usdt=exit_marker.price * exit_marker.quantity_base * usdt_rate,
+            )
+        markers.append(exit_marker)
     return tuple(markers)
 
 
@@ -5558,7 +5607,9 @@ class AccountPositionsHomeWidget(QWidget):
 
     @Slot(int, int)
     def _on_position_history_table_clicked(self, row: int, column: int) -> None:
-        if column != 2 or row < 0 or row >= len(self._visible_position_history_items):
+        # The contract column is index 3: the opening-time column was added
+        # before the historical position type/contract columns.
+        if column != 3 or row < 0 or row >= len(self._visible_position_history_items):
             return
         item = self._visible_position_history_items[row]
         if not item.inst_id or not item.inst_type:
@@ -5579,6 +5630,7 @@ class AccountPositionsHomeWidget(QWidget):
             position_price_markers=_position_history_kline_price_markers(
                 item,
                 usdt_prices=self._position_history_usdt_prices,
+                instrument=self._position_history_instruments.get(item.inst_id),
             ),
         )
 

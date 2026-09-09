@@ -1,0 +1,31 @@
+{
+  "version": 1,
+  "entries": {
+    "BTC-USDT-SWAP|4H": {
+      "lines": [],
+      "rr": [],
+      "alerts": {
+        "ma_cross": {
+          "enabled": true,
+          "last_event_candle_time": 0
+        },
+        "box_breakout": {
+          "enabled": false,
+          "last_event_candle_time": 0
+        }
+      },
+      "visuals": {
+        "auto_box_visible": false,
+        "history_box_visible": false,
+        "auto_channel_visible": false
+      },
+      "auto_channel": {
+        "anchor_distance": 8,
+        "min_bars": 18,
+        "max_violations": 0
+      },
+      "events": []
+    }
+  },
+  "updated_at": "2026-08-25T13:15:17Z"
+}

@@ -112,6 +112,49 @@ class PositionDisplayForegroundColorsTest(TestCase):
         self.assertEqual(markers[1].pnl_currency, "BTC")
         self.assertEqual(markers[1].realized_pnl_usdt, Decimal("100.00"))
 
+    def test_history_option_kline_markers_convert_contracts_to_coin_quantity_and_value(self) -> None:
+        history_item = SimpleNamespace(
+            update_time=1_752_300_600_000,
+            inst_id="BTC-USD-260828-81000-C",
+            inst_type="OPTION",
+            pos_side="long",
+            direction=None,
+            open_avg_price=Decimal("0.0115"),
+            close_avg_price=Decimal("0.0070"),
+            close_size=Decimal("100"),
+            realized_pnl=Decimal("0.0039"),
+            raw={
+                "cTime": "1752210000000",
+                "uTime": "1752300600000",
+                "openMaxPos": "100",
+                "closeTotalPos": "100",
+                "pnlCcy": "BTC",
+            },
+        )
+        instrument = Instrument(
+            inst_id=history_item.inst_id,
+            inst_type="OPTION",
+            tick_size=Decimal("0.0001"),
+            lot_size=Decimal("1"),
+            min_size=Decimal("1"),
+            state="live",
+            ct_val=Decimal("1"),
+            ct_mult=Decimal("0.01"),
+            ct_val_ccy="BTC",
+        )
+
+        markers = account_positions_module._position_history_kline_price_markers(
+            history_item,
+            usdt_prices={"BTC": Decimal("80000")},
+            instrument=instrument,
+        )
+
+        self.assertEqual(markers[0].quantity, Decimal("100"))
+        self.assertEqual(markers[0].quantity_base, Decimal("1.00"))
+        self.assertEqual(markers[0].entry_value_usdt, Decimal("920.000"))
+        self.assertEqual(markers[1].quantity_base, Decimal("1.00"))
+        self.assertEqual(markers[1].exit_value_usdt, Decimal("560.000"))
+
     def test_current_position_kline_price_marker_uses_current_open_price_only(self) -> None:
         position = SimpleNamespace(
             position=Decimal("0.5"),
@@ -155,7 +198,7 @@ class PositionDisplayForegroundColorsTest(TestCase):
             _open_position_history_kline=MagicMock(),
         )
 
-        AccountPositionsHomeWidget._on_position_history_table_clicked(app, 0, 2)
+        AccountPositionsHomeWidget._on_position_history_table_clicked(app, 0, 3)
         AccountPositionsHomeWidget._on_position_history_table_clicked(app, 0, 1)
 
         app._open_position_history_kline.assert_called_once_with(history_item)
@@ -240,8 +283,8 @@ class AccountPositionsHistoryTabWiringTest(QtWidgetTestCase):
         ):
             widget = AccountPositionsHomeWidget()
             try:
-                widget._position_history_table.cellClicked.emit(0, 2)
-                handler.assert_called_once_with(0, 2)
+                widget._position_history_table.cellDoubleClicked.emit(0, 3)
+                handler.assert_called_once_with(0, 3)
             finally:
                 self.dispose_widget(widget)
 
