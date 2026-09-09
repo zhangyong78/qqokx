@@ -16,7 +16,7 @@ from types import SimpleNamespace
 from typing import Callable
 
 from PySide6.QtCore import QSignalBlocker, QThread, QTimer, Qt, Signal, Slot
-from PySide6.QtGui import QAction, QColor, QFont
+from PySide6.QtGui import QAction, QColor, QFont, QPalette
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -1141,7 +1141,12 @@ def _position_history_kline_price_markers(
     return tuple(markers)
 
 
-def _current_position_kline_price_markers(position: OkxPosition) -> tuple[PositionPriceMarker, ...]:
+def _current_position_kline_price_markers(
+    position: OkxPosition,
+    *,
+    usdt_prices: dict[str, Decimal] | None = None,
+    instrument: Instrument | None = None,
+) -> tuple[PositionPriceMarker, ...]:
     raw = position.raw if isinstance(position.raw, dict) else {}
     opened_at = _position_kline_timestamp(
         raw.get("openTime"),
@@ -1153,7 +1158,37 @@ def _current_position_kline_price_markers(position: OkxPosition) -> tuple[Positi
     if opened_at is None or price is None:
         return ()
     direction = "short" if _position_is_short(position) else "long"
-    return (PositionPriceMarker("entry", opened_at, price, direction),)
+    quantity = _position_kline_positive_decimal(getattr(position, "position", None))
+    if quantity is None:
+        for key in ("pos", "availPos", "sz", "openPos"):
+            quantity = _position_kline_positive_decimal(raw.get(key))
+            if quantity is not None:
+                break
+    base_currency = str(getattr(position, "inst_id", "") or "").strip().upper().split("-", 1)[0]
+    contract_value = Decimal("1")
+    is_option = str(getattr(position, "inst_type", "") or "").strip().upper() == "OPTION"
+    if is_option and instrument is not None:
+        try:
+            contract_value = option_contract_value(instrument)
+        except Exception:
+            contract_value = Decimal("1")
+    quantity_base = quantity * contract_value if quantity is not None else None
+    usdt_rate = usdt_prices.get(base_currency) if usdt_prices else None
+    entry_value_usdt = None
+    if quantity_base is not None and isinstance(usdt_rate, Decimal) and usdt_rate > 0:
+        entry_value_usdt = price * quantity_base * usdt_rate
+    return (
+        PositionPriceMarker(
+            "entry",
+            opened_at,
+            price,
+            direction,
+            quantity=quantity,
+            quantity_unit=base_currency if not is_option or instrument is not None else "张",
+            quantity_base=quantity_base,
+            entry_value_usdt=entry_value_usdt,
+        ),
+    )
 
 
 def _position_history_kline_time_markers(item: OkxPositionHistoryItem) -> tuple[tuple[str, int], ...]:
@@ -1310,7 +1345,7 @@ class QuantityInputDialog(QDialog):
         apply_qt_window_icon(self)
         self._result_text: str | None = None
         self.setWindowTitle(title)
-        self.resize(420, 140)
+        self.resize(460, 170)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(16, 16, 16, 16)
@@ -1318,15 +1353,33 @@ class QuantityInputDialog(QDialog):
 
         prompt_label = QLabel(prompt)
         prompt_label.setWordWrap(True)
+        prompt_font = QFont(self.font())
+        prompt_font.setPointSize(max(prompt_font.pointSize(), 12))
+        prompt_label.setFont(prompt_font)
         layout.addWidget(prompt_label)
 
         row = QHBoxLayout()
         row.setSpacing(8)
         self._edit = QLineEdit(initial_value)
+        edit_font = QFont(self.font())
+        edit_font.setPointSize(max(edit_font.pointSize() + 4, 16))
+        edit_font.setBold(True)
+        self._edit.setFont(edit_font)
+        self._edit.setMinimumHeight(38)
+        self._edit.setStyleSheet(
+            "QLineEdit { color: #0f172a; padding: 4px 8px; selection-color: #ffffff; selection-background-color: #2563eb; }"
+            "QLineEdit:focus { border: 2px solid #2563eb; }"
+        )
+        edit_palette = self._edit.palette()
+        edit_palette.setColor(QPalette.ColorRole.Text, QColor("#0f172a"))
+        edit_palette.setColor(QPalette.ColorRole.Highlight, QColor("#2563eb"))
+        edit_palette.setColor(QPalette.ColorRole.HighlightedText, QColor("#ffffff"))
+        self._edit.setPalette(edit_palette)
         self._edit.selectAll()
         row.addWidget(self._edit, 1)
         unit_label = QLabel(unit_text)
         unit_label.setObjectName("Subtle")
+        unit_label.setFont(prompt_font)
         row.addWidget(unit_label)
         layout.addLayout(row)
 
@@ -1423,7 +1476,14 @@ class InstrumentKlineDialog(QDialog):
         super().__init__(parent)
         apply_qt_window_icon(self)
         self.setWindowTitle("合约 K 线图")
-        self.resize(max(int(initial_width), 480), max(int(initial_height), 320))
+        requested_width = max(int(initial_width), 480)
+        requested_height = max(int(initial_height), 320)
+        screen = QApplication.primaryScreen()
+        if screen is not None:
+            available = screen.availableGeometry()
+            requested_width = min(requested_width, max(480, available.width() - 24))
+            requested_height = min(requested_height, max(320, available.height() - 48))
+        self.resize(requested_width, requested_height)
 
         self._inst_id = ""
         self._inst_type = ""
@@ -1443,19 +1503,23 @@ class InstrumentKlineDialog(QDialog):
         layout.setContentsMargins(12, 12, 12, 12)
         layout.setSpacing(10)
 
-        header = QHBoxLayout()
+        header = QVBoxLayout()
         header.setSpacing(8)
         self._title_label = QLabel("等待选择持仓")
         self._title_label.setObjectName("SectionTitle")
+        self._title_label.setWordWrap(True)
         self._status_label = QLabel("点击持仓后自动加载对应 K 线。")
         self._status_label.setObjectName("Subtle")
-        header.addWidget(self._title_label, 1)
-        header.addWidget(self._status_label, 2)
+        self._status_label.setWordWrap(True)
+        header.addWidget(self._title_label)
+        header.addWidget(self._status_label)
         layout.addLayout(header)
 
         bar_row = QHBoxLayout()
         bar_row.setSpacing(8)
-        bar_row.addWidget(QLabel("周期"))
+        period_label = QLabel("周期")
+        period_label.setMinimumWidth(40)
+        bar_row.addWidget(period_label)
         for text, bar in POSITION_KLINE_BAR_OPTIONS:
             button = QPushButton(text)
             button.setCheckable(True)
@@ -5572,8 +5636,6 @@ class AccountPositionsHomeWidget(QWidget):
             )
         if not time_markers:
             time_markers = _current_position_kline_time_markers(position, self._position_history_items)
-        if position_price_markers is None:
-            position_price_markers = _current_position_kline_price_markers(position)
         underlying_usdt_price: Decimal | None = None
         underlying_usdt_basis = ""
         option_entry_price: Decimal | None = None
@@ -5595,6 +5657,15 @@ class AccountPositionsHomeWidget(QWidget):
                 underlying_usdt_basis = f"{underlying}-USDT {candidate}（打开图时）"
             if isinstance(position.avg_price, Decimal) and position.avg_price > 0:
                 option_entry_price = position.avg_price
+        if position_price_markers is None:
+            marker_usdt_prices = dict(self._upl_usdt_prices)
+            if underlying_usdt_price is not None:
+                marker_usdt_prices[position.inst_id.split("-", 1)[0].strip().upper()] = underlying_usdt_price
+            position_price_markers = _current_position_kline_price_markers(
+                position,
+                usdt_prices=marker_usdt_prices,
+                instrument=self._position_instruments.get(position.inst_id),
+            )
         self._instrument_kline_dialog.show_instrument(
             inst_id=position.inst_id,
             inst_type=position.inst_type,

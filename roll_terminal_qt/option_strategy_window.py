@@ -1868,6 +1868,14 @@ class CandlestickChartView(QChartView):
                     f"L {_format_compact_number(candle.low)}  C {_format_compact_number(candle.close)}",
                     f"游标 {hover_value_text}{suffix}",
                 ]
+            candle_markers = self._position_markers_for_candle(candle)
+            for position_marker in candle_markers:
+                marker_label = "开仓" if position_marker.kind == "entry" else "平仓"
+                tooltip_lines.append(f"{marker_label}价 {_format_compact_number(position_marker.price)}")
+                tooltip_lines.extend(self._position_marker_quantity_label_lines(position_marker))
+                tooltip_lines.extend(self._position_marker_entry_value_label_lines(position_marker))
+                tooltip_lines.extend(self._position_marker_exit_value_label_lines(position_marker))
+                tooltip_lines.extend(self._position_marker_pnl_label_lines(position_marker))
             painter.end()
             self._update_hover_overlays(
                 bounds=plot_area,
@@ -2005,7 +2013,8 @@ class CandlestickChartView(QChartView):
                     label_lines.append(f"盈亏比例 {result_percent:+.2f}%")
                 label_lines.extend(self._position_marker_pnl_label_lines(marker))
             label_lines.append(time_text)
-            label_height = 16.0 * len(label_lines)
+            line_height = max(16.0, float(painter.fontMetrics().lineSpacing()))
+            label_height = (line_height * len(label_lines)) + 4.0
             # Point to the outside of the candle's wick, not to the order
             # price inside its body.  This keeps the arrow shaft and head out
             # of the K-line while still unambiguously identifying its candle.
@@ -2029,7 +2038,8 @@ class CandlestickChartView(QChartView):
                 triangle = QPolygonF(
                     (QPointF(x - 5.0, arrow_tip + 7.0), QPointF(x + 5.0, arrow_tip + 7.0), QPointF(x, arrow_tip))
                 )
-                label_y = min(plot_area.bottom() - label_height - 2.0, candle_bottom + 6.0)
+                label_y = min(plot_area.bottom() - label_height - 3.0, candle_bottom + 6.0)
+            label_y = max(plot_area.top() + 3.0, min(label_y, plot_area.bottom() - label_height - 3.0))
             painter.setPen(Qt.PenStyle.NoPen)
             painter.setBrush(color)
             painter.drawPolygon(triangle)
@@ -2113,6 +2123,25 @@ class CandlestickChartView(QChartView):
         if value is None:
             return ()
         return (f"平仓价值 ≈ {format_decimal_fixed(value, 2)} USDT",)
+
+    def _position_markers_for_candle(self, candle: Candle) -> tuple[PositionPriceMarker, ...]:
+        """Return opening/closing markers whose timestamps fall in this candle."""
+        if not self._position_price_markers:
+            return ()
+        index = next((i for i, item in enumerate(self._candles) if item.ts == candle.ts), -1)
+        if index < 0:
+            return ()
+        if index + 1 < len(self._candles):
+            end_ts = self._candles[index + 1].ts
+        elif index > 0:
+            end_ts = candle.ts + (candle.ts - self._candles[index - 1].ts)
+        else:
+            end_ts = candle.ts + 1
+        return tuple(
+            marker
+            for marker in self._position_price_markers
+            if candle.ts <= marker.timestamp < end_ts
+        )
 
     def _nearest_candle_for_x(self, x: float, plot_area: QRectF) -> Candle | None:
         if not self._candles:

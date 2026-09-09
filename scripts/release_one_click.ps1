@@ -44,8 +44,8 @@ function Resolve-GitExecutable {
 
 function Invoke-PythonScript([string[]]$Arguments) {
     $candidates = @(
-        (Join-Path $repoRoot '.venv\Scripts\python.exe'),
         (Join-Path $repoRoot '.venv_old\Scripts\python.exe'),
+        (Join-Path $repoRoot '.venv\Scripts\python.exe'),
         (Join-Path $env:ProgramFiles 'Python313\python.exe'),
         (Join-Path $env:ProgramFiles 'Python312\python.exe'),
         (Join-Path $env:LocalAppData 'Programs\Python\Python313\python.exe'),
