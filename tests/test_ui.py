@@ -66,6 +66,7 @@ from okx_quant.ui import (
     _build_strategy_start_confirmation_message,
     _build_trend_parameter_hint_text,
     _build_strategy_template_payload,
+    build_strategy_group_id,
     _build_fixed_order_size_hint_text,
     _coerce_log_file_path,
     _filter_position_history_items,
@@ -109,6 +110,27 @@ from okx_quant.ui import (
 
 
 class UiHelpersTest(TestCase):
+    def test_strategy_group_id_is_stable_but_scoped_to_api_and_parameters(self) -> None:
+        common = {
+            "strategy_id": "ema_dynamic_long",
+            "strategy_name": "EMA 动态委托做多",
+            "symbol": "SOL-USDT-SWAP",
+            "direction_label": "只做多",
+            "run_mode_label": "交易并下单",
+            "config_snapshot": {"bar": "15m", "ema_period": 21},
+        }
+        first = build_strategy_group_id(api_name="ReapAi", **common)
+        repeated = build_strategy_group_id(api_name="ReapAi", **common)
+        other_api = build_strategy_group_id(api_name="xhb", **common)
+        other_parameters = build_strategy_group_id(
+            api_name="ReapAi",
+            **{**common, "config_snapshot": {"bar": "15m", "ema_period": 34}},
+        )
+
+        self.assertEqual(first, repeated)
+        self.assertNotEqual(first, other_api)
+        self.assertNotEqual(first, other_parameters)
+
     def test_semi_auto_strategy_definitions_return_all_launchable_builtin_strategies(self) -> None:
         entries = QuantApp.semi_auto_strategy_definitions(SimpleNamespace())
 

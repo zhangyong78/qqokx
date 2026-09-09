@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import queue
 import subprocess
@@ -1091,6 +1092,7 @@ class StrategyTradeLedgerRecord:
     updated_at: datetime | None = None
     semi_auto_pool_id: str = ""
     semi_auto_task_id: str = ""
+    strategy_group_id: str = ""
 
 
 @dataclass
@@ -1156,6 +1158,12 @@ class StrategySession:
     semi_auto_task_id: str = ""
     semi_auto_mode: str = ""
     email_notifications_enabled: bool = True
+    strategy_group_id: str = ""
+    pause_after_cleanup: bool = False
+    market_condition_paused: bool = False
+    market_condition_last_allowed: bool | None = None
+    market_condition_last_checked_at: datetime | None = None
+    market_condition_last_note: str = ""
 
     @property
     def log_prefix(self) -> str:
@@ -1262,6 +1270,7 @@ class StrategyHistoryRecord:
     net_pnl_total: Decimal = Decimal("0")
     last_net_pnl: Decimal | None = None
     last_close_reason: str = ""
+    strategy_group_id: str = ""
 
 
 @dataclass
@@ -1385,6 +1394,37 @@ def _serialize_strategy_config_snapshot(config: StrategyConfig) -> dict[str, obj
         else:
             snapshot[item.name] = value
     return snapshot
+
+
+def build_strategy_group_id(
+    *,
+    api_name: str,
+    strategy_id: str,
+    strategy_name: str,
+    symbol: str,
+    direction_label: str,
+    run_mode_label: str,
+    config_snapshot: dict[str, object] | None = None,
+    trader_id: str = "",
+) -> str:
+    """Return a stable accounting identity for repeated runs of one deployment.
+
+    The API profile is intentionally part of the identity.  Two otherwise
+    identical strategies on different accounts must never share positions or
+    PnL totals.  The full config snapshot also separates parameter versions.
+    """
+    identity = {
+        "api_name": str(api_name or "").strip(),
+        "strategy_id": str(strategy_id or "").strip(),
+        "strategy_name": str(strategy_name or "").strip(),
+        "symbol": str(symbol or "").strip().upper(),
+        "direction_label": str(direction_label or "").strip(),
+        "run_mode_label": str(run_mode_label or "").strip(),
+        "trader_id": str(trader_id or "").strip(),
+        "config_snapshot": dict(config_snapshot or {}),
+    }
+    canonical = json.dumps(identity, ensure_ascii=False, sort_keys=True, default=str, separators=(",", ":"))
+    return f"sg-{hashlib.sha256(canonical.encode('utf-8')).hexdigest()[:20]}"
 
 
 def _strategy_config_default(field_name: str) -> object:
@@ -1756,6 +1796,24 @@ def _deserialize_strategy_config_snapshot(payload: object) -> StrategyConfig | N
             payload.get("daily_filter_period"),
             int(_strategy_config_default("daily_filter_period")),
             minimum=1,
+        ),
+        runtime_gate_enabled=_coerce_snapshot_bool(
+            payload.get("runtime_gate_enabled"),
+            bool(_strategy_config_default("runtime_gate_enabled")),
+        ),
+        runtime_gate_inst_id=_coerce_snapshot_optional_text(payload.get("runtime_gate_inst_id")),
+        runtime_gate_bar=_coerce_snapshot_text(
+            payload.get("runtime_gate_bar"),
+            str(_strategy_config_default("runtime_gate_bar")),
+        ),
+        runtime_gate_ma_type=_coerce_snapshot_text(
+            payload.get("runtime_gate_ma_type"),
+            str(_strategy_config_default("runtime_gate_ma_type")),
+        ),
+        runtime_gate_period=_coerce_snapshot_int(
+            payload.get("runtime_gate_period"),
+            int(_strategy_config_default("runtime_gate_period")),
+            minimum=0,
         ),
     )
 
@@ -2620,20 +2678,11 @@ def _build_normal_strategy_book_summary(
     ]
     normal_ledgers = _normal_strategy_trade_ledger_records(ledger_records, history_records, filters=active_filters)
     history_by_id = {record.record_id: record for record in normal_history}
-    strategy_keys: set[tuple[str, str, str, str, str, str]] = set()
+    strategy_keys: set[tuple[str, str, str, str, str, str, str]] = set()
     api_names: set[str] = set()
     for record in normal_ledgers:
         history_record = history_by_id.get(record.history_record_id)
-        strategy_keys.add(
-            (
-                record.api_name or "-",
-                _history_record_trader_label(history_record),
-                record.strategy_name or "-",
-                record.symbol or "-",
-                _history_record_bar_label(history_record),
-                record.direction_label or "-",
-            )
-        )
+        strategy_keys.add(_normal_strategy_book_group_key(record, history_record))
         if record.api_name:
             api_names.add(record.api_name)
     return NormalStrategyBookSummary(
@@ -2668,6 +2717,27 @@ def _normal_strategy_book_summary_text(summary: NormalStrategyBookSummary) -> st
     )
 
 
+def _normal_strategy_book_group_key(
+    record: StrategyTradeLedgerRecord,
+    history_record: StrategyHistoryRecord | None,
+) -> tuple[str, str, str, str, str, str, str]:
+    """Group repeated runs without mixing API accounts or parameter versions."""
+    group_id = str(
+        record.strategy_group_id
+        or (history_record.strategy_group_id if history_record is not None else "")
+        or ""
+    ).strip()
+    return (
+        group_id,
+        record.api_name or "-",
+        _history_record_trader_label(history_record),
+        record.strategy_name or "-",
+        record.symbol or "-",
+        _history_record_bar_label(history_record),
+        record.direction_label or "-",
+    )
+
+
 def _build_normal_strategy_book_group_rows(
     ledger_records: list[StrategyTradeLedgerRecord],
     history_records: list[StrategyHistoryRecord],
@@ -2676,17 +2746,10 @@ def _build_normal_strategy_book_group_rows(
 ) -> list[tuple[str, tuple[object, ...]]]:
     normal_ledgers = _normal_strategy_trade_ledger_records(ledger_records, history_records, filters=filters)
     history_by_id = {record.record_id: record for record in history_records}
-    grouped: dict[tuple[str, str, str, str, str, str], list[StrategyTradeLedgerRecord]] = {}
+    grouped: dict[tuple[str, str, str, str, str, str, str], list[StrategyTradeLedgerRecord]] = {}
     for record in normal_ledgers:
         history_record = history_by_id.get(record.history_record_id)
-        key = (
-            record.api_name or "-",
-            _history_record_trader_label(history_record),
-            record.strategy_name or "-",
-            record.symbol or "-",
-            _history_record_bar_label(history_record),
-            record.direction_label or "-",
-        )
+        key = _normal_strategy_book_group_key(record, history_record)
         grouped.setdefault(key, []).append(record)
 
     rows: list[tuple[str, tuple[object, ...]]] = []
@@ -2696,7 +2759,7 @@ def _build_normal_strategy_book_group_rows(
         reverse=True,
     )
     for key, records in ordered_items:
-        api_name, trader_label, strategy_name, symbol, bar, direction_label = key
+        group_id, api_name, trader_label, strategy_name, symbol, bar, direction_label = key
         trade_count = len(records)
         win_count = sum(1 for record in records if (record.net_pnl or Decimal("0")) > 0)
         loss_count = trade_count - win_count
@@ -2713,7 +2776,7 @@ def _build_normal_strategy_book_group_rows(
             key=lambda item: item.updated_at or item.stopped_at or item.started_at if item is not None else datetime.min,
             default=None,
         )
-        row_id = "||".join(key)
+        row_id = "||".join(key if group_id else key[1:])
         rows.append(
             (
                 row_id,
@@ -3600,6 +3663,10 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         self.daily_filter_scope_label = StringVar(value=DAILY_FILTER_SCOPE_VALUE_TO_LABEL["both"])
         self.daily_filter_ma_type = StringVar(value="EMA")
         self.daily_filter_period = StringVar(value="5")
+        self.runtime_gate_enabled = BooleanVar(value=False)
+        self.runtime_gate_bar = StringVar(value="4H")
+        self.runtime_gate_ma_type = StringVar(value="EMA")
+        self.runtime_gate_period = StringVar(value="0")
         self.trend_ema_slope_filter_enabled = BooleanVar(value=True)
         self.trend_ema_slope_filter_min_ratio = StringVar(value="0")
         self.atr_percentile_filter_max = StringVar(value="0")
@@ -3924,6 +3991,8 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         self._strategy_book_tree_hover_tip_column = ""
         self._positions_snapshot_by_profile: dict[str, ProfilePositionSnapshot] = {}
         self._session_live_pnl_cache: dict[str, tuple[Decimal | None, datetime | None]] = {}
+        self._market_condition_scheduler_job: str | None = None
+        self._market_condition_scheduler_inflight: set[str] = set()
 
         self._settings_watch_enabled = False
         self._api_sender_override_watch_enabled = False
@@ -3958,6 +4027,7 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         self.root.after(250, self._drain_log_queue)
         self.root.after(500, self._refresh_status)
         self.root.after(900, self._attempt_auto_restore_recoverable_sessions)
+        self.root.after(5000, self._run_market_condition_scheduler)
         self.root.after(1200, self._refresh_positions_periodic)
         self._start_strategy_status_email_scheduler()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -4061,6 +4131,11 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
             "daily_filter_scope": self.daily_filter_scope_label,
             "daily_filter_ma_type": self.daily_filter_ma_type,
             "daily_filter_period": self.daily_filter_period,
+            "runtime_gate_enabled": getattr(self, "runtime_gate_enabled", None),
+            "runtime_gate_inst_id": None,
+            "runtime_gate_bar": getattr(self, "runtime_gate_bar", None),
+            "runtime_gate_ma_type": getattr(self, "runtime_gate_ma_type", None),
+            "runtime_gate_period": getattr(self, "runtime_gate_period", None),
             "trend_ema_slope_filter_enabled": self.trend_ema_slope_filter_enabled,
             "trend_ema_slope_filter_min_ratio": self.trend_ema_slope_filter_min_ratio,
             "atr_percentile_filter_max": self.atr_percentile_filter_max,
@@ -5069,6 +5144,43 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         self._mtf_reversal_mode_combo.grid(row=row, column=3, sticky="ew", pady=_lp)
 
         row += 1
+        self._runtime_gate_enabled_check = ttk.Checkbutton(
+            launch_form,
+            text="启用独立行情运行条件（不等于日线过滤）",
+            variable=self.runtime_gate_enabled,
+        )
+        self._runtime_gate_enabled_check.grid(row=row, column=0, columnspan=4, sticky="w", pady=_lp)
+
+        row += 1
+        ttk.Label(launch_form, text="运行条件周期").grid(row=row, column=0, sticky="w", pady=_lp)
+        self._runtime_gate_bar_combo = ttk.Combobox(
+            launch_form,
+            textvariable=self.runtime_gate_bar,
+            values=["1H", "4H", "1D"],
+            state="readonly",
+        )
+        self._runtime_gate_bar_combo.grid(row=row, column=1, sticky="ew", padx=_ix, pady=_lp)
+        ttk.Label(launch_form, text="运行条件均线").grid(row=row, column=2, sticky="w", pady=_lp)
+        self._runtime_gate_ma_combo = ttk.Combobox(
+            launch_form,
+            textvariable=self.runtime_gate_ma_type,
+            values=MOVING_AVERAGE_TYPE_OPTIONS,
+            state="readonly",
+        )
+        self._runtime_gate_ma_combo.grid(row=row, column=3, sticky="ew", pady=_lp)
+
+        row += 1
+        ttk.Label(launch_form, text="运行条件均线周期").grid(row=row, column=0, sticky="w", pady=_lp)
+        self._runtime_gate_period_entry = ttk.Entry(launch_form, textvariable=self.runtime_gate_period)
+        self._runtime_gate_period_entry.grid(row=row, column=1, sticky="ew", padx=_ix, pady=_lp)
+        ttk.Label(
+            launch_form,
+            text="填0表示使用当前策略趋势EMA；不满足时空闲策略暂停，有持仓继续管理。",
+            justify="left",
+            wraplength=_hint_wrap,
+        ).grid(row=row, column=2, columnspan=2, sticky="w", pady=_lp)
+
+        row += 1
         self._daily_filter_enabled_check = ttk.Checkbutton(
             launch_form,
             text="鍚敤鏃ョ嚎杩囨护锛堜粎浣跨敤褰撴椂宸叉敹鐩樼殑涓婁竴鏍规棩绾匡級",
@@ -5423,8 +5535,11 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         session_group = ttk.LabelFrame(control_row, text="会话控制", padding=(8, 6))
         session_group.grid(row=0, column=0, sticky="w")
         ttk.Button(session_group, text="停止选中策略", command=self.stop_selected_session).grid(row=0, column=0)
-        ttk.Button(session_group, text="恢复选中策略", command=self.recover_selected_session).grid(
+        ttk.Button(session_group, text="暂停选中策略", command=self.pause_selected_session).grid(
             row=0, column=1, padx=(8, 0)
+        )
+        ttk.Button(session_group, text="恢复选中策略", command=self.recover_selected_session).grid(
+            row=0, column=2, padx=(8, 0)
         )
 
         trade_group = ttk.LabelFrame(control_row, text="持仓处理", padding=(8, 6))
@@ -11179,6 +11294,8 @@ def _build_strategy_start_confirmation_message(
     ]
     if config.uses_daily_filter():
         lines.append(config.daily_filter_summary())
+    if config.uses_runtime_gate():
+        lines.append(config.runtime_gate_summary())
     if visibility.show_big_ema:
         lines.append(f"EMA大周期：{config.big_ema_period}（大趋势过滤线）")
     if profile.family in {"cross_breakout_long", "cross_breakdown_short"}:

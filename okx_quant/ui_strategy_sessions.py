@@ -4353,6 +4353,16 @@ class UiStrategySessionsMixin:
             semi_auto_pool_id=semi_auto_pool_id.strip(),
             semi_auto_task_id=semi_auto_task_id.strip(),
             semi_auto_mode=semi_auto_mode.strip(),
+            strategy_group_id=build_strategy_group_id(
+                api_name=api_name,
+                strategy_id=definition.strategy_id,
+                strategy_name=definition.name,
+                symbol=session_symbol,
+                direction_label=direction_label,
+                run_mode_label=run_mode_label,
+                config_snapshot=_serialize_strategy_config_snapshot(config),
+                trader_id=trader_id.strip(),
+            ),
         )
 
         self.sessions[session_id] = session
@@ -4412,6 +4422,124 @@ class UiStrategySessionsMixin:
             ended_reason="用户手动停止",
             source_label="用户手动停止",
             show_dialog=True,
+        )
+
+    def pause_selected_session(self) -> None:
+        session = self._selected_session()
+        if session is None:
+            messagebox.showinfo("提示", "请先在右侧选择一个策略会话。")
+            return
+        self._request_stop_strategy_session(
+            session.session_id,
+            ended_reason="用户暂停",
+            source_label="用户暂停",
+            show_dialog=True,
+            preserve_recovery=True,
+        )
+
+    def _run_market_condition_scheduler(self) -> None:
+        """Check opt-in independent market gates without touching other APIs."""
+        self._market_condition_scheduler_job = None
+        for session in tuple(self.sessions.values()):
+            if not session.config.uses_runtime_gate():
+                continue
+            if session.session_id in self._market_condition_scheduler_inflight:
+                continue
+            if session.status in {"停止中", "暂停中", "恢复中"} or session.stop_cleanup_in_progress:
+                continue
+            credentials = self._credentials_for_profile_or_none(session.api_name)
+            if credentials is None:
+                continue
+            self._market_condition_scheduler_inflight.add(session.session_id)
+            threading.Thread(
+                target=self._market_condition_gate_worker,
+                args=(session.session_id, credentials),
+                daemon=True,
+            ).start()
+        try:
+            self._market_condition_scheduler_job = self.root.after(
+                60_000,
+                self._run_market_condition_scheduler,
+            )
+        except Exception:
+            self._market_condition_scheduler_job = None
+
+    def _market_condition_gate_worker(self, session_id: str, credentials: Credentials) -> None:
+        session = self.sessions.get(session_id)
+        if session is None:
+            self._market_condition_scheduler_inflight.discard(session_id)
+            return
+        try:
+            allowed, note = session.engine.evaluate_live_market_gate(credentials, session.config)
+        except Exception as exc:
+            note = f"检查失败：{_format_network_error_message(str(exc))}"
+            try:
+                self.root.after(
+                    0,
+                    lambda sid=session_id, detail=note: self._apply_market_condition_gate_error(sid, detail),
+                )
+            except Exception:
+                self._market_condition_scheduler_inflight.discard(session_id)
+            return
+        try:
+            self.root.after(
+                0,
+                lambda sid=session_id, value=allowed, detail=note: self._apply_market_condition_gate(
+                    sid,
+                    value,
+                    detail,
+                ),
+            )
+        except Exception:
+            self._market_condition_scheduler_inflight.discard(session_id)
+
+    def _apply_market_condition_gate_error(self, session_id: str, note: str) -> None:
+        self._market_condition_scheduler_inflight.discard(session_id)
+        session = self.sessions.get(session_id)
+        if session is None:
+            return
+        session.market_condition_last_checked_at = datetime.now()
+        session.market_condition_last_note = note
+        self._log_session_message(session, f"行情条件调度暂未更新状态：{note}")
+
+    def _apply_market_condition_gate(self, session_id: str, allowed: bool, note: str) -> None:
+        self._market_condition_scheduler_inflight.discard(session_id)
+        session = self.sessions.get(session_id)
+        if session is None or not session.config.uses_runtime_gate():
+            return
+        previous = session.market_condition_last_allowed
+        session.market_condition_last_allowed = bool(allowed)
+        session.market_condition_last_checked_at = datetime.now()
+        session.market_condition_last_note = note
+
+        if allowed:
+            if (
+                session.market_condition_paused
+                and session.status in {"已暂停", "待恢复"}
+                and not session.engine.is_running
+            ):
+                self._log_session_message(session, f"行情条件恢复放行，准备恢复策略：{note}")
+                self._recover_session(session.session_id, auto=False)
+            elif previous is False:
+                self._log_session_message(session, f"行情条件恢复放行，策略保持运行：{note}")
+            return
+
+        if previous is not False:
+            self._log_session_message(session, f"行情条件不满足：{note}")
+        if session.status != "运行中" or session.stop_cleanup_in_progress:
+            return
+        if session.active_trade is not None:
+            session.runtime_status = "行情不满足，持仓继续管理"
+            self._upsert_session_row(session)
+            self._refresh_selected_session_details()
+            return
+        session.market_condition_paused = True
+        self._request_stop_strategy_session(
+            session.session_id,
+            ended_reason="行情条件不满足，自动暂停",
+            source_label="行情条件调度",
+            show_dialog=False,
+            preserve_recovery=True,
         )
 
     def _clear_session_manual_management_state(self, session: StrategySession) -> None:
@@ -4614,6 +4742,7 @@ class UiStrategySessionsMixin:
         ended_reason: str,
         source_label: str,
         show_dialog: bool,
+        preserve_recovery: bool = False,
     ) -> bool:
         session = self.sessions.get(session_id)
         if session is None:
@@ -4926,15 +5055,20 @@ class UiStrategySessionsMixin:
         *,
         ended_reason: str,
         show_dialog: bool,
+        preserve_recovery: bool = False,
     ) -> None:
-        session.status = "已停止"
-        session.runtime_status = "已停止"
+        session.pause_after_cleanup = bool(preserve_recovery)
+        session.status = "暂停中" if preserve_recovery else "已停止"
+        session.runtime_status = "暂停中" if preserve_recovery else "已停止"
         session.stop_cleanup_in_progress = True
         session.stop_result_show_dialog = show_dialog
         session.ended_reason = ended_reason
         if session.stopped_at is None:
             session.stopped_at = datetime.now()
-        self._remove_recoverable_strategy_session(session.session_id)
+        if preserve_recovery:
+            self._upsert_recoverable_strategy_session(session)
+        else:
+            self._remove_recoverable_strategy_session(session.session_id)
         QuantApp._refresh_strategy_session_stop_requested_ui(self, session)
 
     def _stop_session_cleanup_worker(self, session_id: str, credentials: Credentials) -> None:
@@ -4957,13 +5091,18 @@ class UiStrategySessionsMixin:
             return
         show_dialog = bool(getattr(session, "stop_result_show_dialog", True))
         should_refresh_active_profile = session.api_name.strip() == self._current_credential_profile()
+        preserve_recovery = bool(getattr(session, "pause_after_cleanup", False))
         session.stop_result_show_dialog = True
         session.stop_cleanup_in_progress = False
-        session.status = "已停止"
+        session.status = "已暂停" if preserve_recovery else "已停止"
+        session.runtime_status = session.status
         if session.stopped_at is None:
             session.stopped_at = datetime.now()
         session.ended_reason = result.final_reason
-        self._remove_recoverable_strategy_session(session.session_id)
+        if preserve_recovery:
+            self._upsert_recoverable_strategy_session(session)
+        else:
+            self._remove_recoverable_strategy_session(session.session_id)
         self._upsert_session_row(session)
         self._refresh_selected_session_details()
         self._sync_strategy_history_from_session(session)
@@ -4991,7 +5130,9 @@ class UiStrategySessionsMixin:
         self._log_session_message(session, f"停止流程结束 | 结论={result.final_reason}")
 
         if result.needs_manual_review:
-            details: list[str] = ["策略已停止，但检测到需要人工接管的情况。"]
+            details: list[str] = [
+                f"策略{'已暂停，可恢复' if preserve_recovery else '已停止'}，但检测到需要人工接管的情况。"
+            ]
             if result.cancel_failed_summaries or result.remaining_pending_summaries:
                 details.append("")
                 details.append("委托检查：")
@@ -5018,9 +5159,9 @@ class UiStrategySessionsMixin:
 
         if show_dialog:
             messagebox.showinfo(
-                "停止结果",
+                "暂停结果" if preserve_recovery else "停止结果",
                 (
-                    "策略已停止。\n\n"
+                    f"策略{'已暂停，可恢复' if preserve_recovery else '已停止'}。\n\n"
                     f"自动撤单：{len(result.cancel_requested_summaries)} 条\n"
                     "未发现残留仓位或需人工接管的问题。"
                 ),
@@ -5033,14 +5174,23 @@ class UiStrategySessionsMixin:
         if session is None:
             return
         show_dialog = bool(getattr(session, "stop_result_show_dialog", True))
+        preserve_recovery = bool(getattr(session, "pause_after_cleanup", False))
         session.stop_result_show_dialog = True
         session.stop_cleanup_in_progress = False
-        session.status = "已停止"
+        session.status = "已暂停" if preserve_recovery else "已停止"
+        session.runtime_status = session.status
         if session.stopped_at is None:
             session.stopped_at = datetime.now()
         friendly_message = _format_network_error_message(message)
-        session.ended_reason = "用户手动停止（停止清理失败，需人工检查）"
-        self._remove_recoverable_strategy_session(session.session_id)
+        session.ended_reason = (
+            "用户暂停（停止清理失败，需人工检查）"
+            if preserve_recovery
+            else "用户手动停止（停止清理失败，需人工检查）"
+        )
+        if preserve_recovery:
+            self._upsert_recoverable_strategy_session(session)
+        else:
+            self._remove_recoverable_strategy_session(session.session_id)
         self._upsert_session_row(session)
         self._refresh_selected_session_details()
         self._sync_strategy_history_from_session(session)
@@ -6082,6 +6232,28 @@ class UiStrategySessionsMixin:
             daily_filter_scope=daily_filter_scope,
             daily_filter_ma_type=daily_filter_ma_type,
             daily_filter_period=daily_filter_period,
+            runtime_gate_enabled=bool(getattr(self, "runtime_gate_enabled", None).get())
+            if getattr(self, "runtime_gate_enabled", None) is not None
+            else False,
+            runtime_gate_inst_id=None,
+            runtime_gate_bar=(
+                str(getattr(self, "runtime_gate_bar", None).get() or "4H").strip() or "4H"
+                if getattr(self, "runtime_gate_bar", None) is not None
+                else "4H"
+            ),
+            runtime_gate_ma_type=(
+                str(getattr(self, "runtime_gate_ma_type", None).get() or "EMA").strip().lower() or "ema"
+                if getattr(self, "runtime_gate_ma_type", None) is not None
+                else "ema"
+            ),
+            runtime_gate_period=(
+                self._parse_nonnegative_int(
+                    getattr(self, "runtime_gate_period", None).get() or "0",
+                    "行情运行条件均线周期",
+                )
+                if getattr(self, "runtime_gate_period", None) is not None
+                else 0
+            ),
             startup_chase_current_signal=startup_chase_current_signal,
             startup_chase_window_seconds=startup_chase_window_seconds
             if strategy_uses_startup_chase_window(strategy_id)
@@ -7666,6 +7838,7 @@ class UiStrategySessionsMixin:
             api_name=session.api_name,
             strategy_id=session.strategy_id,
             strategy_name=session.strategy_name,
+            strategy_group_id=str(getattr(session, "strategy_group_id", "") or ""),
             symbol=trade_inst_id or session.symbol,
             direction_label=session.direction_label,
             run_mode_label=session.run_mode_label,
@@ -9421,6 +9594,11 @@ class UiStrategySessionsMixin:
                 direction_label=record.direction_label or definition.default_signal_label,
                 run_mode_label=record.run_mode_label or _reverse_lookup_label(RUN_MODE_OPTIONS, config.run_mode, ""),
             )
+            history_record = getattr(self, "_strategy_history_by_id", {}).get(record.history_record_id)
+            auto_paused = bool(
+                history_record is not None
+                and "行情条件不满足" in str(getattr(history_record, "ended_reason", "") or "")
+            )
             session = StrategySession(
                 session_id=record.session_id,
                 api_name=record.api_name,
@@ -9440,6 +9618,24 @@ class UiStrategySessionsMixin:
                 runtime_status="待恢复",
                 recovery_root_dir=record.recovery_root_dir,
                 recovery_supported=self._strategy_session_supports_recovery(config),
+                strategy_group_id=(
+                    getattr(
+                        getattr(self, "_strategy_history_by_id", {}).get(record.history_record_id),
+                        "strategy_group_id",
+                        "",
+                    )
+                    if getattr(self, "_strategy_history_by_id", {}).get(record.history_record_id) is not None
+                    else build_strategy_group_id(
+                        api_name=record.api_name,
+                        strategy_id=record.strategy_id,
+                        strategy_name=record.strategy_name or definition.name,
+                        symbol=session_symbol,
+                        direction_label=record.direction_label or definition.default_signal_label,
+                        run_mode_label=record.run_mode_label or _reverse_lookup_label(RUN_MODE_OPTIONS, config.run_mode, ""),
+                        config_snapshot=record.config_snapshot,
+                    )
+                ),
+                market_condition_paused=auto_paused,
             )
             self.sessions[record.session_id] = session
             set_notifier_logger = getattr(session_notifier, "set_logger", None)
@@ -9725,6 +9921,8 @@ class UiStrategySessionsMixin:
         def _mark_recovery_back_to_running(status_note: str) -> None:
             session.status = "运行中"
             session.runtime_status = "等待信号"
+            session.pause_after_cleanup = False
+            session.market_condition_paused = False
             session.stopped_at = None
             session.ended_reason = ""
             session.active_trade = None
@@ -9777,7 +9975,7 @@ class UiStrategySessionsMixin:
     def recover_selected_session(self) -> None:
         session = self._selected_session()
         if session is None:
-            messagebox.showinfo("提示", "请先在右侧选择一条待恢复会话。", parent=self.root)
+            messagebox.showinfo("提示", "请先在右侧选择一条待恢复或已暂停会话。", parent=self.root)
             return
         if not self._recover_session(session.session_id, auto=False):
             self._refresh_selected_session_details()
@@ -9945,6 +10143,8 @@ class UiStrategySessionsMixin:
                 def _mark_recovery_back_to_running(status_note: str) -> None:
                     session.status = "运行中"
                     session.runtime_status = "等待信号"
+                    session.pause_after_cleanup = False
+                    session.market_condition_paused = False
                     session.stopped_at = None
                     session.ended_reason = ""
                     self._remove_recoverable_strategy_session(session.session_id)
@@ -10275,6 +10475,8 @@ class UiStrategySessionsMixin:
         def _mark_recovery_back_to_running(status_note: str) -> None:
             session.status = "运行中"
             session.runtime_status = "等待信号"
+            session.pause_after_cleanup = False
+            session.market_condition_paused = False
             session.stopped_at = None
             session.ended_reason = ""
             self._remove_recoverable_strategy_session(session.session_id)
@@ -10669,6 +10871,7 @@ class UiStrategySessionsMixin:
         ended_reason: str,
         source_label: str,
         show_dialog: bool,
+        preserve_recovery: bool = False,
     ) -> bool:
         session = self.sessions.get(session_id)
         if session is None:
@@ -10678,25 +10881,53 @@ class UiStrategySessionsMixin:
                 messagebox.showinfo("提示", "这个策略正在执行停止清理，请稍等。")
             return False
         if not session.engine.is_running:
-            if session.status in {"待恢复", "恢复中"}:
+            if session.status in {"待恢复", "恢复中", "已暂停"}:
                 session.stop_cleanup_in_progress = False
-                session.status = "已停止"
-                session.runtime_status = "已停止"
+                session.pause_after_cleanup = bool(preserve_recovery)
+                session.status = "已暂停" if preserve_recovery else "已停止"
+                session.runtime_status = "已暂停" if preserve_recovery else "已停止"
                 session.stopped_at = datetime.now()
                 session.ended_reason = ended_reason
-                self._clear_session_manual_management_state(session)
-                session.active_trade = None
-                self._remove_recoverable_strategy_session(session.session_id)
+                if not preserve_recovery:
+                    self._clear_session_manual_management_state(session)
+                    session.active_trade = None
+                    self._remove_recoverable_strategy_session(session.session_id)
+                else:
+                    self._upsert_recoverable_strategy_session(session)
                 self._upsert_session_row(session)
                 self._refresh_selected_session_details()
                 self._sync_strategy_history_from_session(session)
-                self._log_session_message(session, f"{source_label}，已放弃恢复接管并标记为已停止。")
+                self._log_session_message(
+                    session,
+                    f"{source_label}，已标记为{'已暂停，可恢复' if preserve_recovery else '已停止'}。",
+                )
                 return True
             if show_dialog:
                 messagebox.showinfo("提示", "这个策略已经停止了。")
             return False
         if session.config.run_mode == "signal_only":
-            self._stop_sessions_by_id([session.session_id])
+            session.pause_after_cleanup = bool(preserve_recovery)
+            session.stop_cleanup_in_progress = True
+            session.status = "暂停中" if preserve_recovery else "停止中"
+            session.runtime_status = session.status
+            session.ended_reason = ended_reason
+            session.engine.stop()
+            session.engine.wait_stopped(timeout=1.5)
+            session.stop_cleanup_in_progress = False
+            session.status = "已暂停" if preserve_recovery else "已停止"
+            session.runtime_status = session.status
+            session.stopped_at = datetime.now()
+            if preserve_recovery:
+                self._upsert_recoverable_strategy_session(session)
+            else:
+                self._remove_recoverable_strategy_session(session.session_id)
+            self._upsert_session_row(session)
+            self._refresh_selected_session_details()
+            self._sync_strategy_history_from_session(session)
+            self._log_session_message(
+                session,
+                f"{source_label}，已标记为{'已暂停，可恢复' if preserve_recovery else '已停止'}。",
+            )
             return True
 
         credentials = self._credentials_for_profile_or_none(session.api_name)
@@ -10706,6 +10937,7 @@ class UiStrategySessionsMixin:
             session,
             ended_reason=ended_reason,
             show_dialog=show_dialog,
+            preserve_recovery=preserve_recovery,
         )
         self._log_session_message(session, f"{source_label}，策略线程已停止，后台继续检查本策略委托与持仓。")
         if credentials is None:
@@ -10757,6 +10989,17 @@ class UiStrategySessionsMixin:
             net_pnl_total=_parse_decimal_snapshot(payload.get("net_pnl_total")),
             last_net_pnl=_parse_decimal_snapshot(payload.get("last_net_pnl"), default=None),
             last_close_reason=str(payload.get("last_close_reason", "")).strip(),
+            strategy_group_id=str(payload.get("strategy_group_id", "")).strip()
+            or build_strategy_group_id(
+                api_name=str(payload.get("api_name", "")).strip(),
+                strategy_id=str(payload.get("strategy_id", "")).strip(),
+                strategy_name=str(payload.get("strategy_name", "")).strip(),
+                symbol=str(payload.get("symbol", "")).strip(),
+                direction_label=str(payload.get("direction_label", "")).strip(),
+                run_mode_label=str(payload.get("run_mode_label", "")).strip(),
+                config_snapshot=dict(config_snapshot) if isinstance(config_snapshot, dict) else {},
+                trader_id=str((config_snapshot or {}).get("trader_id", "")) if isinstance(config_snapshot, dict) else "",
+            ),
         )
 
     @staticmethod
@@ -10785,6 +11028,7 @@ class UiStrategySessionsMixin:
             "net_pnl_total": format(record.net_pnl_total, "f"),
             "last_net_pnl": format(record.last_net_pnl, "f") if record.last_net_pnl is not None else "",
             "last_close_reason": record.last_close_reason,
+            "strategy_group_id": record.strategy_group_id,
         }
 
     def _sort_strategy_history_records(self) -> None:
@@ -10813,6 +11057,7 @@ class UiStrategySessionsMixin:
             api_name=str(payload.get("api_name", "")).strip(),
             strategy_id=str(payload.get("strategy_id", "")).strip(),
             strategy_name=str(payload.get("strategy_name", "")).strip(),
+            strategy_group_id=str(payload.get("strategy_group_id", "")).strip(),
             symbol=str(payload.get("symbol", "")).strip(),
             direction_label=str(payload.get("direction_label", "")).strip(),
             run_mode_label=str(payload.get("run_mode_label", "")).strip(),
@@ -10860,6 +11105,7 @@ class UiStrategySessionsMixin:
             "api_name": record.api_name,
             "strategy_id": record.strategy_id,
             "strategy_name": record.strategy_name,
+            "strategy_group_id": record.strategy_group_id,
             "symbol": record.symbol,
             "direction_label": record.direction_label,
             "run_mode_label": record.run_mode_label,
@@ -10926,12 +11172,33 @@ class UiStrategySessionsMixin:
                 record = self._trade_ledger_record_from_payload(item)
                 if record is not None:
                     records.append(record)
+        records_changed = self._backfill_strategy_group_ids_from_history(records)
         deduped_records = self._dedupe_strategy_trade_ledger_records(records)
         self._strategy_trade_ledger_records = deduped_records
         self._strategy_trade_ledger_by_id = {record.record_id: record for record in self._strategy_trade_ledger_records}
-        if len(deduped_records) != len(records):
+        if records_changed or len(deduped_records) != len(records):
             self._save_strategy_trade_ledger_records()
         self._rebuild_history_financials_from_trade_ledger()
+
+    def _backfill_strategy_group_ids_from_history(
+        self,
+        records: list[StrategyTradeLedgerRecord],
+    ) -> bool:
+        """Attach legacy ledger rows to the stable group stored on their session."""
+        history_by_id = {
+            record.record_id: record
+            for record in self._strategy_history_records
+        }
+        changed = False
+        for record in records:
+            if record.strategy_group_id:
+                continue
+            history = history_by_id.get(record.history_record_id)
+            if history is None or not history.strategy_group_id:
+                continue
+            record.strategy_group_id = history.strategy_group_id
+            changed = True
+        return changed
 
     @staticmethod
     def _strategy_trade_ledger_business_key(record: StrategyTradeLedgerRecord) -> tuple[str, ...]:
@@ -11149,6 +11416,7 @@ class UiStrategySessionsMixin:
             net_pnl_total=session.net_pnl_total,
             last_net_pnl=session.last_net_pnl,
             last_close_reason=session.last_close_reason,
+            strategy_group_id=str(getattr(session, "strategy_group_id", "") or ""),
         )
 
     def _upsert_strategy_history_record(self, record: StrategyHistoryRecord) -> None:
@@ -11199,6 +11467,7 @@ class UiStrategySessionsMixin:
             ("net_pnl_total", session.net_pnl_total),
             ("last_net_pnl", session.last_net_pnl),
             ("last_close_reason", session.last_close_reason),
+            ("strategy_group_id", str(getattr(session, "strategy_group_id", "") or "")),
         ):
             if getattr(record, attr) != desired:
                 setattr(record, attr, desired)

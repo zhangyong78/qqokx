@@ -54,6 +54,44 @@ class _HistoryClient:
 
 
 class StrategyEngineTest(TestCase):
+    def test_evaluate_live_market_gate_is_independent_from_daily_filter(self) -> None:
+        engine = StrategyEngine(object(), lambda _message: None)
+        config = StrategyConfig(
+            inst_id="SOL-USDT-SWAP",
+            bar="1H",
+            ema_period=21,
+            atr_period=10,
+            atr_stop_multiplier=Decimal("2"),
+            atr_take_multiplier=Decimal("4"),
+            order_size=Decimal("1"),
+            trade_mode="cross",
+            signal_mode="long_only",
+            position_mode="net",
+            environment="live",
+            tp_sl_trigger_type="mark",
+            runtime_gate_enabled=True,
+            runtime_gate_bar="4H",
+            runtime_gate_ma_type="ema",
+            runtime_gate_period=2,
+        )
+        rising = [
+            Candle(1, Decimal("1"), Decimal("1"), Decimal("1"), Decimal("1"), Decimal("1"), True),
+            Candle(2, Decimal("2"), Decimal("2"), Decimal("2"), Decimal("2"), Decimal("2"), True),
+        ]
+        with patch.object(engine, "_get_candles_with_retry", return_value=rising):
+            allowed, note = engine.evaluate_live_market_gate(Credentials("k", "s", "p"), config)
+        self.assertTrue(allowed)
+        self.assertIn("独立行情运行条件", note)
+
+        flat = [
+            Candle(1, Decimal("1"), Decimal("1"), Decimal("1"), Decimal("1"), Decimal("1"), True),
+            Candle(2, Decimal("1"), Decimal("1"), Decimal("1"), Decimal("1"), Decimal("1"), True),
+        ]
+        with patch.object(engine, "_get_candles_with_retry", return_value=flat):
+            allowed, note = engine.evaluate_live_market_gate(Credentials("k", "s", "p"), config)
+        self.assertTrue(allowed)
+        self.assertIn("当前偏置=neutral", note)
+
     def test_build_okx_write_failure_message_explains_environment_mismatch(self) -> None:
         message = StrategyEngine._build_okx_write_failure_message(
             label="开仓报单",

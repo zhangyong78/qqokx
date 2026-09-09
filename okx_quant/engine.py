@@ -758,6 +758,68 @@ class StrategyEngine:
             return direction_filter_bias == "short"
         return True
 
+    def evaluate_live_market_gate(
+        self,
+        credentials: Credentials,
+        config: StrategyConfig,
+    ) -> tuple[bool, str]:
+        """Evaluate the independent session-level market run gate.
+
+        The regular strategy loop still owns entry decisions.  This method is
+        only used by the optional session scheduler to pause an idle strategy
+        when the configured higher-timeframe trend does not support its
+        direction.  It deliberately does not read the daily-filter settings.
+        """
+        if not config.uses_runtime_gate():
+            return True, "独立行情运行条件未启用"
+        gate_period = max(int(config.resolved_runtime_gate_period()), 1)
+        gate_bar = config.resolved_runtime_gate_bar()
+        gate_inst_id = config.resolved_runtime_gate_inst_id()
+        lookback = max(
+            recommended_indicator_lookback(
+                gate_period,
+            ),
+            120,
+        )
+        entry_candles = [
+            candle
+            for candle in self._get_candles_with_retry(
+                gate_inst_id,
+                gate_bar,
+                limit=lookback,
+            )
+            if candle.confirmed
+        ]
+        if not entry_candles:
+            raise ValueError("行情运行条件暂时没有已确认K线")
+        values = moving_average(
+            [candle.close for candle in entry_candles],
+            gate_period,
+            config.resolved_runtime_gate_ma_type(),
+        )
+        latest_ma = values[-1] if values else None
+        if latest_ma is None:
+            return True, f"独立行情运行条件数据不足，保持运行（{gate_bar}）"
+        latest_close = entry_candles[-1].close
+        if latest_close > latest_ma:
+            latest_bias = "long"
+        elif latest_close < latest_ma:
+            latest_bias = "short"
+        else:
+            latest_bias = "neutral"
+        effective_signal_mode = resolve_dynamic_signal_mode(config.strategy_id, config.signal_mode)
+        candidate_signals = {
+            "long_only": ("long",),
+            "short_only": ("short",),
+        }.get(effective_signal_mode, ("long", "short"))
+        allowed = latest_bias == "neutral" or any(latest_bias == signal for signal in candidate_signals)
+        return (
+            allowed,
+            f"独立行情运行条件={gate_bar} {config.resolved_runtime_gate_ma_type().upper()}{gate_period}"
+            f" | 收盘={format_decimal(latest_close)} | MA={format_decimal(latest_ma)} "
+            f"| 当前偏置={latest_bias} | {'保持运行' if allowed else '暂停'}",
+        )
+
     def _apply_live_daily_filter_to_decision(
         self,
         entry_candles: list,
@@ -6467,6 +6529,8 @@ class StrategyEngine:
             )
         if config.uses_daily_filter():
             message = f"{message} | {config.daily_filter_summary()}"
+        if config.uses_runtime_gate():
+            message = f"{message} | {config.runtime_gate_summary()}"
         self._logger(message)
 
     def _log_local_mode_summary(

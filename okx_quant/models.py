@@ -458,6 +458,11 @@ class StrategyConfig:
     daily_filter_scope: DailyFilterScope = "both"
     daily_filter_ma_type: MovingAverageType = "ema"
     daily_filter_period: int = 5
+    runtime_gate_enabled: bool = False
+    runtime_gate_inst_id: str | None = None
+    runtime_gate_bar: str = "4H"
+    runtime_gate_ma_type: MovingAverageType = "ema"
+    runtime_gate_period: int = 0
     rail_candidate_ema_periods: tuple[int, ...] = (21, 34, 55, 89)
     rail_touch_atr_ratio: Decimal = Decimal("0.2")
     rail_bounce_atr_ratio: Decimal = Decimal("0.6")
@@ -533,6 +538,31 @@ class StrategyConfig:
         return (
             f"日线过滤：{boundary_label} {str(self.daily_filter_ma_type or 'ema').upper()}"
             f"{max(int(self.daily_filter_period), 1)} close-vs-MA | {scope_label}"
+        )
+
+    def resolved_runtime_gate_inst_id(self) -> str:
+        return (self.runtime_gate_inst_id or self.inst_id).strip()
+
+    def resolved_runtime_gate_bar(self) -> str:
+        return (self.runtime_gate_bar or "4H").strip()
+
+    def resolved_runtime_gate_period(self) -> int:
+        return self.runtime_gate_period if self.runtime_gate_period > 0 else self.trend_ema_period
+
+    def resolved_runtime_gate_ma_type(self) -> MovingAverageType:
+        return normalize_moving_average_type(self.runtime_gate_ma_type or self.trend_ema_type)
+
+    def uses_runtime_gate(self) -> bool:
+        return bool(self.runtime_gate_enabled)
+
+    def runtime_gate_summary(self) -> str:
+        if not self.uses_runtime_gate():
+            return "行情运行条件：关闭"
+        return (
+            f"行情运行条件：{self.resolved_runtime_gate_inst_id()} "
+            f"{self.resolved_runtime_gate_bar()} "
+            f"{moving_average_display_label(self.resolved_runtime_gate_ma_type(), self.resolved_runtime_gate_period())}"
+            "，按策略方向判断"
         )
 
     def resolved_backtest_entry_slippage_rate(self) -> Decimal:
