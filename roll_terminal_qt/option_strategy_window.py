@@ -1920,12 +1920,13 @@ class CandlestickChartView(QChartView):
                     )
                 )
             )
-            label_x = min(max(x + 6.0, plot_area.left() + 4.0), plot_area.right() - 116.0)
+            label_width = 180.0
+            label_x = min(max(x + 6.0, plot_area.left() + 4.0), plot_area.right() - label_width)
             label_y = plot_area.top() + 6.0 + ((visible_index % 2) * 34.0)
             label_text = f"{label}\n{QDateTime.fromMSecsSinceEpoch(timestamp).toString('yyyy-MM-dd HH:mm')}"
             painter.setPen(color)
             painter.drawText(
-                QRectF(label_x, label_y, 112.0, 32.0),
+                QRectF(label_x, label_y, label_width, 32.0),
                 Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop,
                 label_text,
             )

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime
 from decimal import Decimal
 from pathlib import Path
 
@@ -251,8 +251,31 @@ class DailyTradeReportWidget(QWidget):
         if self._trade_kline_window is None:
             self._trade_kline_window = InstrumentKlineDialog(initial_bar="1H", parent=self)
             self._trade_kline_window.destroyed.connect(lambda: setattr(self, "_trade_kline_window", None))
+        opened_at = trade.opened_at
+        if opened_at is None:
+            closed_ms = int(trade.closed_at.timestamp() * 1000) if trade.closed_at else 0
+            candidates = []
+            for profile_name, environment in self._history_scopes:
+                for history_item in load_local_position_history(profile_name, environment, limit=5000):
+                    if str(getattr(history_item, "inst_id", "") or "").strip().upper() != symbol:
+                        continue
+                    update_ms = int(getattr(history_item, "update_time", 0) or 0)
+                    if closed_ms and update_ms and abs(update_ms - closed_ms) > 3 * 24 * 60 * 60 * 1000:
+                        continue
+                    raw = getattr(history_item, "raw", {})
+                    raw = raw if isinstance(raw, dict) else {}
+                    for key in ("openTime", "openTimeMs", "startTime", "beginTime"):
+                        try:
+                            value = int(raw.get(key) or 0)
+                        except (TypeError, ValueError):
+                            value = 0
+                        if value > 0:
+                            candidates.append(value if value >= 100_000_000_000 else value * 1000)
+                            break
+            if candidates:
+                opened_at = datetime.fromtimestamp(min(candidates) / 1000, tz=REPORT_TIMEZONE)
         markers = []
-        for label, timestamp in (("开仓", trade.opened_at), ("平仓", trade.closed_at)):
+        for label, timestamp in (("开仓", opened_at), ("平仓", trade.closed_at)):
             if timestamp is not None:
                 # InstrumentKlineDialog and CandlestickChartView use
                 # millisecond timestamps, while datetime.timestamp() returns
