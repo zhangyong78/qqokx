@@ -10976,3 +10976,27 @@ class PositionTakeoverEntryTsTest(TestCase):
             raw={"cTime": "1704067200"},
         )
         self.assertEqual(QuantApp._position_takeover_entry_ts_ms(pos), 1704067200000)
+
+
+class SessionTradeDetailPerformanceTest(TestCase):
+    def test_size_text_uses_contract_fallback_without_sync_instrument_request(self) -> None:
+        client = SimpleNamespace(get_instrument=MagicMock())
+        app = SimpleNamespace(
+            client=client,
+            _session_trade_detail_instruments=lambda _session: {},
+        )
+        session = SimpleNamespace(
+            config=SimpleNamespace(trade_inst_id="DOGE-USDT-SWAP", inst_id="DOGE-USDT-SWAP"),
+        )
+        record = SimpleNamespace(
+            size=Decimal("3.17"),
+            symbol="DOGE-USDT-SWAP",
+            entry_price=Decimal("0.08862"),
+            exit_price=None,
+            direction_label="只做空",
+        )
+
+        text = QuantApp._session_trade_detail_size_text(app, session, record, instruments={})
+
+        self.assertEqual(text, "-3.17 张")
+        client.get_instrument.assert_not_called()

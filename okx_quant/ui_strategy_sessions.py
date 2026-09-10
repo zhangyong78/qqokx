@@ -8349,30 +8349,24 @@ class UiStrategySessionsMixin:
         self,
         session: StrategySession,
         record: StrategyTradeLedgerRecord,
+        *,
+        instruments: dict[str, Instrument] | None = None,
     ) -> str:
         if record.size is None:
             return "-"
         inst_id = _session_trade_inst_id(session) or str(record.symbol or "").strip().upper()
         if not inst_id:
             return _format_optional_decimal(record.size)
-        instruments = self._session_trade_detail_instruments(session)
-        instrument = instruments.get(inst_id)
-        if instrument is None:
-            try:
-                instrument = self.client.get_instrument(inst_id)
-            except Exception:
-                instrument = None
-            else:
-                instruments[inst_id] = instrument
-                cached = dict(getattr(self, "_position_instruments", {}) or {})
-                cached[inst_id] = instrument
-                self._position_instruments = cached
+        # This runs on Tk's UI thread.  Never wait for a network request here:
+        # first paint uses the local cache (or a "张" fallback), and any
+        # missing contract metadata is fetched in the background afterwards.
+        resolved_instruments = instruments if instruments is not None else self._session_trade_detail_instruments(session)
         amount, currency = _history_display_amount(
             inst_id=inst_id,
             inst_type=infer_inst_type(inst_id),
             size=record.size,
             reference_price=record.entry_price or record.exit_price,
-            instruments=instruments,
+            instruments=resolved_instruments,
         )
         if amount is None:
             return _format_optional_decimal(record.size)
@@ -8390,6 +8384,7 @@ class UiStrategySessionsMixin:
         records: list[StrategyTradeLedgerRecord],
     ) -> None:
         tree.delete(*tree.get_children())
+        instruments = self._session_trade_detail_instruments(session)
         for index, record in enumerate(records, start=1):
             fee_total = (record.entry_fee or Decimal("0")) + (record.exit_fee or Decimal("0"))
             net_pnl = record.net_pnl or Decimal("0")
@@ -8408,7 +8403,7 @@ class UiStrategySessionsMixin:
                     record.direction_label or "-",
                     _format_history_datetime(record.opened_at),
                     _format_optional_decimal(record.entry_price),
-                    self._session_trade_detail_size_text(session, record),
+                    self._session_trade_detail_size_text(session, record, instruments=instruments),
                     _format_history_datetime(record.closed_at),
                     _format_optional_decimal(record.exit_price),
                     _format_optional_usdt_precise(fee_total, places=2),
@@ -8419,6 +8414,84 @@ class UiStrategySessionsMixin:
                 ),
                 tags=(row_tag,),
             )
+
+    def _request_session_trade_detail_instrument_refresh(
+        self,
+        session: StrategySession,
+        records: list[StrategyTradeLedgerRecord],
+        *,
+        latest_only: bool,
+    ) -> bool:
+        cached = self._session_trade_detail_instruments(session)
+        inst_ids = {
+            str(record.symbol or _session_trade_inst_id(session) or "").strip().upper()
+            for record in records
+            if record.size is not None
+        }
+        missing = sorted(inst_id for inst_id in inst_ids if inst_id and inst_id not in cached)
+        if not missing:
+            return False
+
+        inflight = getattr(self, "_session_trade_detail_instrument_fetch_inflight", None)
+        if not isinstance(inflight, set):
+            inflight = set()
+            self._session_trade_detail_instrument_fetch_inflight = inflight
+        requested = [inst_id for inst_id in missing if inst_id not in inflight]
+        if not requested:
+            return bool(missing)
+        inflight.update(requested)
+        session_id = session.session_id
+
+        def _apply(loaded: dict[str, Instrument]) -> None:
+            active_inflight = getattr(self, "_session_trade_detail_instrument_fetch_inflight", None)
+            if isinstance(active_inflight, set):
+                active_inflight.difference_update(requested)
+            if loaded:
+                refreshed_cache = dict(getattr(self, "_position_instruments", {}) or {})
+                refreshed_cache.update(loaded)
+                self._position_instruments = refreshed_cache
+            window = getattr(self, "_session_trade_detail_window", None)
+            tree = getattr(self, "_session_trade_detail_tree", None)
+            if (
+                window is None
+                or not _widget_exists(window)
+                or tree is None
+                or not _widget_exists(tree)
+                or getattr(self, "_session_trade_detail_context_session_id", None) != session_id
+            ):
+                return
+            current_session = self.sessions.get(session_id)
+            if current_session is None:
+                return
+            current_records = self._session_trade_detail_records(current_session, latest_only=latest_only)
+            self._populate_session_trade_detail_tree(tree, current_session, current_records)
+            summary_label = getattr(self, "_session_trade_detail_summary_label", None)
+            if summary_label is not None and _widget_exists(summary_label):
+                summary_label.configure(text="合约数量换算已从缓存更新。" if loaded else "合约数量按张数显示。")
+
+        def _worker() -> None:
+            loaded: dict[str, Instrument] = {}
+            for inst_id in requested:
+                try:
+                    instrument = self.client.get_instrument(inst_id)
+                except Exception:
+                    continue
+                if instrument is not None:
+                    loaded[inst_id] = instrument
+            root = getattr(self, "root", None)
+            if root is not None and hasattr(root, "after"):
+                try:
+                    root.after(0, lambda: _apply(loaded))
+                    return
+                except Exception:
+                    pass
+
+        try:
+            threading.Thread(target=_worker, daemon=True).start()
+        except RuntimeError:
+            inflight.difference_update(requested)
+            return False
+        return True
 
     def _build_session_trade_detail_header_text(
         self,
@@ -8456,6 +8529,8 @@ class UiStrategySessionsMixin:
         self._session_trade_detail_tree = None
         self._session_trade_detail_context_label = None
         self._session_trade_detail_summary_label = None
+        self._session_trade_detail_context_session_id = None
+        self._session_trade_detail_context_latest_only = False
 
     def _open_session_trade_detail_window(self, session: StrategySession, *, latest_only: bool = False) -> None:
         records = self._session_trade_detail_records(session, latest_only=latest_only)
@@ -8574,11 +8649,20 @@ class UiStrategySessionsMixin:
         header_text = self._build_session_trade_detail_header_text(session, records, latest_only=latest_only)
         title_prefix = "最近一笔净盈亏明细" if latest_only else "净盈亏明细"
         window.title(f"{title_prefix} | {session.session_id} | {session.symbol}")
+        self._session_trade_detail_context_session_id = session.session_id
+        self._session_trade_detail_context_latest_only = latest_only
         if context_label is not None and _widget_exists(context_label):
             context_label.configure(text=header_text)
         if summary_label is not None and _widget_exists(summary_label):
             summary_label.configure(text="")
         self._populate_session_trade_detail_tree(tree, session, records)
+        if self._request_session_trade_detail_instrument_refresh(
+            session,
+            records,
+            latest_only=latest_only,
+        ):
+            if summary_label is not None and _widget_exists(summary_label):
+                summary_label.configure(text="正在后台补充合约数量换算，盈亏数据已立即显示。")
         window.deiconify()
         window.lift()
         window.focus_force()
@@ -11260,7 +11344,20 @@ class UiStrategySessionsMixin:
         try:
             from okx_quant.strategy_trade_ledger_backfill import backfill_strategy_trade_ledger
 
-            backfill_result = backfill_strategy_trade_ledger(write=True)
+            history_strategy_ids = tuple(
+                dict.fromkeys(
+                    str(record.strategy_id or "").strip()
+                    for record in self._strategy_history_records
+                    if str(record.strategy_id or "").strip()
+                )
+            )
+            if history_strategy_ids:
+                backfill_result = backfill_strategy_trade_ledger(
+                    strategy_ids=history_strategy_ids,
+                    write=True,
+                )
+            else:
+                backfill_result = backfill_strategy_trade_ledger(write=True)
             if backfill_result.added_record_count or backfill_result.updated_history_count:
                 self._enqueue_log(
                     "历史交易账本回补完成"

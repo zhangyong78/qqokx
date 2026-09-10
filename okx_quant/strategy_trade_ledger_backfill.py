@@ -34,6 +34,9 @@ _ORDER_ID_RE = re.compile(r"\bordId=(?P<value>[A-Za-z0-9]+)")
 _CLIENT_ORDER_ID_RE = re.compile(r"\bclOrdId=(?P<value>[A-Za-z0-9]+)")
 _PRICE_RE = re.compile(r"成交均价=(?P<value>-?\d+(?:\.\d+)?)")
 _SIZE_RE = re.compile(r"成交数量=(?P<value>-?\d+(?:\.\d+)?)张")
+_SUMMARY_ENTRY_PRICE_RE = re.compile(r"开仓均价=(?P<value>-?\d+(?:\.\d+)?)")
+_SUMMARY_EXIT_PRICE_RE = re.compile(r"平仓均价=(?P<value>-?\d+(?:\.\d+)?)")
+_SUMMARY_SIZE_RE = re.compile(r"数量=(?P<value>-?\d+(?:\.\d+)?)")
 _SIGNAL_BAR_RE = re.compile(r"(?P<value>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) \|")
 
 
@@ -145,7 +148,7 @@ def _extract_signal_bar_at(message: str) -> datetime | None:
 
 
 def _is_entry_fill_message(message: str) -> bool:
-    return "本地下单成交" in message
+    return "本地下单成交" in message or "挂单已成交" in message
 
 
 def _derive_close_reason(message: str, pending_reason: str) -> tuple[str, str]:
@@ -164,6 +167,10 @@ def _is_close_fill_message(message: str) -> bool:
     if "已成交" not in message:
         return False
     return "平仓" in message or "止损" in message or "止盈" in message
+
+
+def _is_close_summary_message(message: str) -> bool:
+    return "本轮结束" in message and "平仓均价=" in message
 
 
 def _close_reason_hint(message: str) -> str:
@@ -304,6 +311,35 @@ def parse_trade_rounds_for_history_record(history_record: dict[str, object], *, 
                     close_reason=close_reason,
                     reason_confidence=confidence,
                     summary_note="回补自会话日志",
+                )
+            )
+            current_trade = None
+            pending_close_reason = ""
+            continue
+        if current_trade is not None and _is_close_summary_message(event.message):
+            # Exchange-managed exits often only emit the final round summary
+            # after a hot upgrade/restart.  Recover the prices and size from
+            # that summary when no separate close-fill line was persisted.
+            close_reason = event.message.partition("原因=")[2].split("|", 1)[0].strip()
+            rounds.append(
+                ParsedTradeRound(
+                    session_id=session_id,
+                    symbol=event.symbol or current_trade.symbol,
+                    opened_at=current_trade.opened_at,
+                    closed_at=event.at,
+                    entry_order_id=current_trade.entry_order_id,
+                    entry_client_order_id=current_trade.entry_client_order_id,
+                    signal_bar_at=current_trade.signal_bar_at,
+                    entry_price_log=(
+                        _extract_regex_decimal(_SUMMARY_ENTRY_PRICE_RE, event.message)
+                        or current_trade.entry_price_log
+                    ),
+                    entry_size_log=current_trade.entry_size_log,
+                    exit_price_log=_extract_regex_decimal(_SUMMARY_EXIT_PRICE_RE, event.message),
+                    exit_size_log=_extract_regex_decimal(_SUMMARY_SIZE_RE, event.message),
+                    close_reason=close_reason or pending_close_reason or "策略平仓",
+                    reason_confidence="high" if close_reason else "medium",
+                    summary_note="回补自会话日志（本轮结束摘要）",
                 )
             )
             current_trade = None

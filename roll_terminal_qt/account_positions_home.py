@@ -1215,6 +1215,37 @@ def _position_history_open_time_text(item: OkxPositionHistoryItem) -> str:
     return _format_okx_ms_timestamp(opened_at)
 
 
+def _position_history_holding_time_text(item: OkxPositionHistoryItem) -> str:
+    """Format the time held through the latest close snapshot.
+
+    ``update_time`` is the exchange/history snapshot time.  For a partial
+    close it is the partial-close time; when the position is fully closed the
+    later full-close snapshot replaces it, so the displayed duration follows
+    the position lifecycle naturally.
+    """
+    raw = item.raw if isinstance(item.raw, dict) else {}
+    opened_at = _position_kline_timestamp(
+        raw.get("openTime"),
+        raw.get("openTs"),
+        raw.get("cTime"),
+        raw.get("createdTime"),
+    )
+    closed_at = _position_kline_timestamp(
+        raw.get("closeTime"),
+        raw.get("closeTs"),
+        raw.get("uTime"),
+        raw.get("updateTime"),
+        item.update_time,
+    )
+    if opened_at is None or closed_at is None or closed_at < opened_at:
+        return "-"
+    total_seconds = (closed_at - opened_at) // 1000
+    days, remainder = divmod(total_seconds, 24 * 60 * 60)
+    hours, remainder = divmod(remainder, 60 * 60)
+    minutes, seconds = divmod(remainder, 60)
+    return f"{days}天 {hours:02d}:{minutes:02d}:{seconds:02d}" if days else f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+
 def _position_history_raw_size_text(
     item: OkxPositionHistoryItem,
     instruments: dict[str, object],
@@ -3053,7 +3084,7 @@ class AccountPositionsHomeWidget(QWidget):
     def _render_position_history_table(self) -> None:
         if not hasattr(self, "_position_history_table"):
             return
-        self._position_history_table.setHorizontalHeaderItem(12, QTableWidgetItem("\u5df2\u5b9e\u73b0\u6536\u76ca"))
+        self._position_history_table.setHorizontalHeaderItem(13, QTableWidgetItem("\u5df2\u5b9e\u73b0\u6536\u76ca"))
         filtered = self._filtered_position_history_items()
         selected_key = ""
         row = self._position_history_table.currentRow()
@@ -3087,6 +3118,7 @@ class AccountPositionsHomeWidget(QWidget):
             values = (
                 _format_okx_ms_timestamp(item.update_time),
                 _position_history_open_time_text(item),
+                _position_history_holding_time_text(item),
                 item.inst_type or "-",
                 item.inst_id or "-",
                 _format_margin_mode(item.mgn_mode or ""),
@@ -3496,9 +3528,9 @@ class AccountPositionsHomeWidget(QWidget):
         head.addWidget(refresh_button)
         layout.addLayout(head)
 
-        self._position_history_table = QTableWidget(0, 15)
+        self._position_history_table = QTableWidget(0, 16)
         self._position_history_table.setHorizontalHeaderLabels(
-            ("平仓时间", "开仓时间", "类型", "合约", "保证金模式", "持仓模式", "交易方向", "开仓均价", "平仓均价", "最大持仓量", "已平仓量", "手续费", "盈亏", "仓位状态", "备注")
+            ("平仓时间", "开仓时间", "持仓时间", "类型", "合约", "保证金模式", "持仓模式", "交易方向", "开仓均价", "平仓均价", "最大持仓量", "已平仓量", "手续费", "盈亏", "仓位状态", "备注")
         )
         self._position_history_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self._position_history_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
@@ -3507,10 +3539,10 @@ class AccountPositionsHomeWidget(QWidget):
         header = self._position_history_table.horizontalHeader()
         header.setStretchLastSection(False)
         self._position_history_table.setSortingEnabled(True)
-        for index in range(15):
+        for index in range(16):
             header.setSectionResizeMode(index, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
-        header.setSectionResizeMode(14, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(15, QHeaderView.ResizeMode.Stretch)
         self._position_history_table.itemSelectionChanged.connect(self._refresh_position_history_detail)
         layout.addWidget(self._position_history_table, 1)
 
@@ -4569,7 +4601,7 @@ class AccountPositionsHomeWidget(QWidget):
     def _render_position_history_table(self) -> None:
         if not hasattr(self, "_position_history_table"):
             return
-        self._position_history_table.setHorizontalHeaderItem(12, QTableWidgetItem("\u5df2\u5b9e\u73b0\u6536\u76ca"))
+        self._position_history_table.setHorizontalHeaderItem(13, QTableWidgetItem("\u5df2\u5b9e\u73b0\u6536\u76ca"))
         selected_row = self._position_history_table.currentRow()
         selected_key = None
         if 0 <= selected_row < len(self._position_history_items):
@@ -4580,6 +4612,7 @@ class AccountPositionsHomeWidget(QWidget):
             values = (
                 _format_okx_ms_timestamp(item.update_time),
                 _position_history_open_time_text(item),
+                _position_history_holding_time_text(item),
                 item.inst_type or "-",
                 item.inst_id or "-",
                 _format_margin_mode(item.mgn_mode or ""),
@@ -6832,7 +6865,7 @@ class AccountPositionsHomeWidget(QWidget):
     def _render_position_history_table(self) -> None:
         if not hasattr(self, "_position_history_table"):
             return
-        self._position_history_table.setHorizontalHeaderItem(12, QTableWidgetItem("\u5df2\u5b9e\u73b0\u6536\u76ca"))
+        self._position_history_table.setHorizontalHeaderItem(13, QTableWidgetItem("\u5df2\u5b9e\u73b0\u6536\u76ca"))
         filtered = self._filtered_position_history_items()
         selected_key = ""
         row = self._position_history_table.currentRow()
@@ -6860,6 +6893,7 @@ class AccountPositionsHomeWidget(QWidget):
             values = (
                 _format_okx_ms_timestamp(item.update_time),
                 _position_history_open_time_text(item),
+                _position_history_holding_time_text(item),
                 item.inst_type or "-",
                 item.inst_id or "-",
                 _format_margin_mode(item.mgn_mode or ""),
@@ -6879,7 +6913,7 @@ class AccountPositionsHomeWidget(QWidget):
                 _position_history_status_text(item),
                 _format_position_note_summary(self._position_history_note_text(item)),
             )
-            self._set_table_row(self._position_history_table, row, values, left_align={3, 14})
+            self._set_table_row(self._position_history_table, row, values, left_align={4, 15})
             self._position_history_table.item(row, 0).setData(
                 Qt.ItemDataRole.UserRole,
                 self._position_history_row_key(item),
