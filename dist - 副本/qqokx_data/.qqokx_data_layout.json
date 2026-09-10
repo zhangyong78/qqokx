@@ -1,8 +1,0 @@
-{
-  "layout_version": 1,
-  "data_root": "D:\\qqokx\\dist\\qqokx_data",
-  "project_root": "D:\\qqokx\\dist\\qqokx_server_package_v0.6.108_20260825_205557",
-  "env_var": "QQOKX_DATA_DIR",
-  "default_data_dir_name": "qqokx_data",
-  "written_at": "2026-08-25T13:00:15Z"
-}

@@ -22,9 +22,11 @@ tests_artifacts/
 *.bak_*
 debug_*.txt
 dist/
+dist - 副本/
 build/
 *.egg-info/
 .worktrees/
 reports/任务.txt
+reports/reapai_august_2026_full/
 reports/backtest_exports/batch_*.txt
 reports/backtest_exports/single_*.txt
