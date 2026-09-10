@@ -2404,6 +2404,29 @@ class UiStrategySessionsMixin:
                 for item in self._strategy_trade_ledger_records
                 if item.strategy_group_id == strategy_group_id
             ]
+        if not matched:
+            # A manually relaunched strategy can legitimately have a new
+            # parameter snapshot (and therefore a new group id) while still
+            # representing the same API/instrument/strategy stream.  Use the
+            # semantic identity as a final read-only fallback so its prior
+            # settled PnL remains accessible after a restart.
+            api_name = str(getattr(session, "api_name", "") or "").strip().casefold()
+            strategy_id = str(getattr(session, "strategy_id", "") or "").strip()
+            symbol = str(_session_trade_inst_id(session) or session.symbol or "").strip().upper()
+            direction_label = str(getattr(session, "direction_label", "") or "").strip()
+            run_mode_label = str(getattr(session, "run_mode_label", "") or "").strip()
+            if api_name and strategy_id and symbol:
+                matched = [
+                    item
+                    for item in self._strategy_trade_ledger_records
+                    if (
+                        str(item.api_name or "").strip().casefold() == api_name
+                        and str(item.strategy_id or "").strip() == strategy_id
+                        and str(item.symbol or "").strip().upper() == symbol
+                        and (not direction_label or str(item.direction_label or "").strip() == direction_label)
+                        and (not run_mode_label or str(item.run_mode_label or "").strip() == run_mode_label)
+                    )
+                ]
         matched.sort(
             key=lambda item: (
                 item.opened_at or item.closed_at or datetime.min,

@@ -264,7 +264,7 @@ class DailyTradeReportWidget(QWidget):
                         continue
                     raw = getattr(history_item, "raw", {})
                     raw = raw if isinstance(raw, dict) else {}
-                    for key in ("openTime", "openTimeMs", "startTime", "beginTime"):
+                    for key in ("openTime", "openTimeMs", "startTime", "beginTime", "cTime", "createdTime"):
                         try:
                             value = int(raw.get(key) or 0)
                         except (TypeError, ValueError):
@@ -272,6 +272,12 @@ class DailyTradeReportWidget(QWidget):
                         if value > 0:
                             candidates.append(value if value >= 100_000_000_000 else value * 1000)
                             break
+                    if not candidates and getattr(history_item, "created_time", None):
+                        try:
+                            created_ms = int(getattr(history_item, "created_time"))
+                            candidates.append(created_ms if created_ms >= 100_000_000_000 else created_ms * 1000)
+                        except (TypeError, ValueError):
+                            pass
             if candidates:
                 opened_at = datetime.fromtimestamp(min(candidates) / 1000, tz=REPORT_TIMEZONE)
         markers = []
