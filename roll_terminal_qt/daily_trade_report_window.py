@@ -34,7 +34,7 @@ from okx_quant.daily_trade_report import (
 )
 from okx_quant.persistence import list_history_cache_scopes
 from roll_terminal_qt.history_service import load_local_position_history
-from roll_terminal_qt.kline_analysis_window import KlineAnalysisWindow
+from roll_terminal_qt.account_positions_home import InstrumentKlineDialog
 
 
 class DailyTradeReportWidget(QWidget):
@@ -46,7 +46,7 @@ class DailyTradeReportWidget(QWidget):
         self._stopping = False
         self._profile_name = str(profile_name or "").strip()
         self._history_scopes: list[tuple[str, str]] = []
-        self._trade_kline_window: KlineAnalysisWindow | None = None
+        self._trade_kline_window: InstrumentKlineDialog | None = None
         self._build_ui()
         self._refresh_profiles()
         self.refresh_report()
@@ -248,49 +248,18 @@ class DailyTradeReportWidget(QWidget):
         symbol = str(getattr(trade, "symbol", "") or (item.text() if item is not None else "")).strip().upper()
         if not symbol or symbol == "-":
             return
-        # The daily report is hosted by the launcher.  Reuse its embedded K-line
-        # page instead of creating a second top-level Qt window (the latter can
-        # compete with the WebEngine/network workers on Windows).
-        launcher = self.window()
-        show_page = getattr(launcher, "show_page", None)
-        pages = getattr(launcher, "_pages", None)
-        if callable(show_page) and isinstance(pages, dict):
-            show_page("kline")
-            self._trade_kline_window = pages.get("kline")
         if self._trade_kline_window is None:
-            self._trade_kline_window = KlineAnalysisWindow()
+            self._trade_kline_window = InstrumentKlineDialog(initial_bar="1H", parent=self)
             self._trade_kline_window.destroyed.connect(lambda: setattr(self, "_trade_kline_window", None))
-        combo = getattr(self._trade_kline_window, "_symbol_combo", None)
-        if combo is not None:
-            if combo.findText(symbol, Qt.MatchFlag.MatchFixedString) < 0:
-                combo.addItem(symbol)
-            combo.setCurrentText(symbol)
-        period_combo = getattr(self._trade_kline_window, "_period_combo", None)
-        if period_combo is not None:
-            period_combo.setCurrentText("1H")
-        direction_combo = getattr(self._trade_kline_window, "_history_trade_direction_combo", None)
-        direction = "short" if "short" in str(getattr(trade, "direction", "")).strip().lower() else "long"
-        if direction_combo is not None:
-            direction_index = direction_combo.findData(direction)
-            if direction_index >= 0:
-                direction_combo.setCurrentIndex(direction_index)
-        history_check = getattr(self._trade_kline_window, "_show_history_trades_check", None)
-        if history_check is not None and not history_check.isChecked():
-            history_check.setChecked(True)
-        load_history = getattr(self._trade_kline_window, "_load_history_trades", None)
-        if callable(load_history):
-            # Changing the symbol already schedules the normal history load.
-            # Do not force a second network request on every row click; this
-            # avoids piling up Qt/network callbacks when users click several
-            # transactions in succession.
-            load_history(force=False)
-        best_check = getattr(self._trade_kline_window, "_best_parameter_indicators_check", None)
-        if best_check is not None and not best_check.isChecked():
-            best_check.setChecked(True)
-        if not bool(getattr(self._trade_kline_window, "_embedded", False)):
-            self._trade_kline_window.show()
-            self._trade_kline_window.raise_()
-            self._trade_kline_window.activateWindow()
+        markers = []
+        for label, timestamp in (("开仓", trade.opened_at), ("平仓", trade.closed_at)):
+            if timestamp is not None:
+                markers.append((label, int(timestamp.timestamp())))
+        self._trade_kline_window.show_instrument(
+            inst_id=symbol,
+            inst_type="OPTION" if symbol.count("-") >= 3 else "SWAP",
+            time_markers=tuple(markers),
+        )
 
     def _export(self, kind: str) -> None:
         if self._report is None:
