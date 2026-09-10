@@ -62,6 +62,10 @@ from okx_quant.strategy_live_chart import (
     render_strategy_live_chart,
 )
 from okx_quant.stop_execution import assess_stop_execution
+from okx_quant.daily_trade_report import (
+    daily_trade_from_position_history,
+    daily_trade_from_strategy_ledger,
+)
 
 _SESSION_RUNTIME_HEARTBEAT_PREFIX = "__qqokx_runtime_heartbeat__|"
 _SESSION_RUNTIME_HEARTBEAT_TIMEOUT_POLLS = 6
@@ -10246,6 +10250,14 @@ class UiStrategySessionsMixin:
                 if not auto:
                     self._enqueue_log(f"{session.log_prefix} 未检测到现有仓位或挂单，恢复为信号监听。")
                 return self._restart_recoverable_signal_monitoring(session, credentials)
+            if str(getattr(trade, "manual_reason", "") or "").strip().lower() == "manual_flatten":
+                # A manual close may have filled before the application was
+                # hot-upgraded. Reconcile that completed trade first, then
+                # resume signal monitoring instead of marking the session
+                # stopped merely because the position is already gone.
+                trade.reconciliation_started = True
+                self._start_session_trade_reconciliation(session, trade)
+                return self._restart_recoverable_signal_monitoring(session, credentials)
             if not supports_position_recovery:
                 reason = "恢复接管结束：该模式仅支持空闲等待信号自动重启，不支持未完成持仓/挂单自动接管。"
                 session.status = "已停止"
@@ -12198,7 +12210,14 @@ class UiStrategySessionsMixin:
         self._refresh_strategy_book_window()
 
     def _daily_trade_report_trades(self) -> list[DailyTrade]:
-        ledger_trades = [daily_trade_from_strategy_ledger(record) for record in self._strategy_trade_ledger_records]
+        # Keep the dependency local as well as at module scope so a hot-upgraded
+        # server cannot retain a stale module namespace from the previous build.
+        from okx_quant.daily_trade_report import (
+            daily_trade_from_position_history as _daily_trade_from_position_history,
+            daily_trade_from_strategy_ledger as _daily_trade_from_strategy_ledger,
+        )
+
+        ledger_trades = [_daily_trade_from_strategy_ledger(record) for record in self._strategy_trade_ledger_records]
         trades = list(ledger_trades)
 
         # The server may have fresh exchange history even when a strategy row
@@ -12227,7 +12246,7 @@ class UiStrategySessionsMixin:
                         item = _position_history_item_from_cache(cached_record)
                         if item is None:
                             continue
-                        trade = daily_trade_from_position_history(
+                        trade = _daily_trade_from_position_history(
                             item,
                             api_name=profile_dir.name,
                             environment=environment_dir.name,
@@ -12346,12 +12365,19 @@ class UiStrategySessionsMixin:
             return
         if start_date > end_date:
             start_date, end_date = end_date, start_date
-        report = build_daily_trade_report(
-            self._daily_trade_report_trades(),
-            start_date=start_date,
-            end_date=end_date,
-            api_name=self._daily_trade_report_api_var.get() or "全部API",
-        )
+        try:
+            report = build_daily_trade_report(
+                self._daily_trade_report_trades(),
+                start_date=start_date,
+                end_date=end_date,
+                api_name=self._daily_trade_report_api_var.get() or "全部API",
+            )
+        except Exception as exc:
+            # Keep a malformed legacy record from escaping the Tk callback and
+            # taking down the report window (or obscuring the running strategies).
+            self._daily_trade_report_status_var.set(f"刷新失败：{exc}")
+            messagebox.showerror("日报刷新失败", str(exc), parent=window)
+            return
         self._daily_trade_report = report
         trees = self._daily_trade_report_trees
         daily_tree = trees["daily"]

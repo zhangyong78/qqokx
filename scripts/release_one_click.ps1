@@ -164,7 +164,7 @@ function Get-ChangedFiles {
     foreach ($path in ($raw -split "`0")) {
         if ([string]::IsNullOrWhiteSpace($path)) { continue }
         $normalized = $path.Trim().Replace('\', '/')
-        if ($normalized -match '^(dist/|reports/|\.codex/|__pycache__/)' -or $normalized -like '*.pyc') { continue }
+        if ($normalized -match '^(dist/|dist - 副本/|reports/|\.codex/|__pycache__/)' -or $normalized -like '*.pyc') { continue }
         if ($seen.Add($normalized)) { $files.Add($normalized) }
     }
     return $files
@@ -297,7 +297,6 @@ if ($DryRun) {
 
 Update-Version-Files -oldVersionText $currentVersionText -newVersionText $nextVersionText -releaseSummary $releaseSummary
 if (-not $SkipBuild) { Invoke-PythonScript @('scripts\build_server_package.py') }
-Invoke-GitCommand @('add', '-u')
 $changedFiles = Get-ChangedFiles
 if ($changedFiles.Count -gt 0) {
     $tempList = [System.IO.Path]::GetTempFileName()
