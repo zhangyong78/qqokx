@@ -259,6 +259,22 @@ class DailyTradeReportWidget(QWidget):
         period_combo = getattr(self._trade_kline_window, "_period_combo", None)
         if period_combo is not None:
             period_combo.setCurrentText("1H")
+        direction_combo = getattr(self._trade_kline_window, "_history_trade_direction_combo", None)
+        direction = "short" if "short" in str(getattr(trade, "direction", "")).strip().lower() else "long"
+        if direction_combo is not None:
+            direction_index = direction_combo.findData(direction)
+            if direction_index >= 0:
+                direction_combo.setCurrentIndex(direction_index)
+        history_check = getattr(self._trade_kline_window, "_show_history_trades_check", None)
+        if history_check is not None and not history_check.isChecked():
+            history_check.setChecked(True)
+        load_history = getattr(self._trade_kline_window, "_load_history_trades", None)
+        if callable(load_history):
+            # Changing the symbol already schedules the normal history load.
+            # Do not force a second network request on every row click; this
+            # avoids piling up Qt/network callbacks when users click several
+            # transactions in succession.
+            load_history(force=False)
         best_check = getattr(self._trade_kline_window, "_best_parameter_indicators_check", None)
         if best_check is not None and not best_check.isChecked():
             best_check.setChecked(True)
