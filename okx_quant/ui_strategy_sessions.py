@@ -2456,6 +2456,41 @@ class UiStrategySessionsMixin:
             return None, None
         return latest_ledger.entry_price, latest_ledger.opened_at
 
+    def _session_display_financials(
+        self,
+        session: StrategySession,
+    ) -> tuple[int, int, Decimal, Decimal, Decimal, Decimal, Decimal | None, str]:
+        """Financials for the UI, using the same ledger scope as PnL details.
+
+        Persisted session totals remain session-owned to keep historical reports
+        and daily accounting free of cross-session double counting.  The running
+        dashboard instead presents the strategy-chain scope used by its detail
+        dialog, so a displayed number always opens to the same total.
+        """
+        records = self._strategy_live_chart_ledger_records(session)
+        if not records:
+            return (
+                session.trade_count,
+                session.win_count,
+                session.gross_pnl_total,
+                session.fee_total,
+                session.funding_total,
+                session.net_pnl_total,
+                session.last_net_pnl,
+                session.last_close_reason,
+            )
+        latest = max(records, key=lambda item: (item.closed_at or datetime.min, item.record_id))
+        return (
+            len(records),
+            sum(1 for item in records if (item.net_pnl or Decimal("0")) > 0),
+            sum(((item.gross_pnl or Decimal("0")) for item in records), Decimal("0")),
+            sum((((item.entry_fee or Decimal("0")) + (item.exit_fee or Decimal("0"))) for item in records), Decimal("0")),
+            sum(((item.funding_fee or Decimal("0")) for item in records), Decimal("0")),
+            sum(((item.net_pnl or Decimal("0")) for item in records), Decimal("0")),
+            latest.net_pnl,
+            latest.close_reason,
+        )
+
     @staticmethod
     def _strategy_live_chart_event_anchors(direction_label: str) -> tuple[str, str]:
         normalized = str(direction_label or "").strip().lower()
@@ -8160,6 +8195,11 @@ class UiStrategySessionsMixin:
             if session.status in {"待恢复", "恢复中"} and recovery_summary
             else session.display_status
         )
+        display_financials = getattr(self, "_session_display_financials", None)
+        if callable(display_financials):
+            _trade_count, _win_count, _gross_pnl, _fee_total, _funding_total, display_net_pnl, display_last_pnl, _last_reason = display_financials(session)
+        else:
+            display_net_pnl, display_last_pnl = session.net_pnl_total, session.last_net_pnl
         values = (
             session.session_id,
             trader_label,
@@ -8182,8 +8222,8 @@ class UiStrategySessionsMixin:
             self._session_runtime_stop_price_text(session),
             self._session_runtime_take_profit_text(session),
             _format_optional_usdt_precise(live_pnl, places=2),
-            _format_optional_usdt_precise(session.net_pnl_total, places=2),
-            _format_optional_usdt_precise(session.last_net_pnl, places=2),
+            _format_optional_usdt_precise(display_net_pnl, places=2),
+            _format_optional_usdt_precise(display_last_pnl, places=2),
             status_text,
             self._format_session_started_at(session.started_at),
         )
@@ -8837,6 +8877,38 @@ class UiStrategySessionsMixin:
 
         preserve_scroll = session.session_id == self._selected_session_detail_session_id
         live_pnl, live_pnl_refreshed_at = self._session_live_pnl_snapshot(session)
+        display_financials = getattr(self, "_session_display_financials", None)
+        if callable(display_financials):
+            (
+                display_trade_count,
+                display_win_count,
+                display_gross_pnl,
+                display_fee_total,
+                display_funding_total,
+                display_net_pnl,
+                display_last_pnl,
+                display_last_reason,
+            ) = display_financials(session)
+        else:
+            (
+                display_trade_count,
+                display_win_count,
+                display_gross_pnl,
+                display_fee_total,
+                display_funding_total,
+                display_net_pnl,
+                display_last_pnl,
+                display_last_reason,
+            ) = (
+                session.trade_count,
+                session.win_count,
+                session.gross_pnl_total,
+                session.fee_total,
+                session.funding_total,
+                session.net_pnl_total,
+                session.last_net_pnl,
+                session.last_close_reason,
+            )
         duplicate_warning = QuantApp._build_duplicate_launch_conflict_warning(
             session,
             QuantApp._duplicate_launch_conflicts_for(self, session),
@@ -8862,14 +8934,14 @@ class UiStrategySessionsMixin:
             heartbeat_note=self._session_runtime_heartbeat_note(session)
             if self._session_runtime_heartbeat_expected(session) or session.last_runtime_heartbeat_at is not None
             else "",
-            trade_count=session.trade_count,
-            win_count=session.win_count,
-            gross_pnl_total=session.gross_pnl_total,
-            fee_total=session.fee_total,
-            funding_total=session.funding_total,
-            net_pnl_total=session.net_pnl_total,
-            last_net_pnl=session.last_net_pnl,
-            last_close_reason=session.last_close_reason,
+            trade_count=display_trade_count,
+            win_count=display_win_count,
+            gross_pnl_total=display_gross_pnl,
+            fee_total=display_fee_total,
+            funding_total=display_funding_total,
+            net_pnl_total=display_net_pnl,
+            last_net_pnl=display_last_pnl,
+            last_close_reason=display_last_reason,
             live_pnl=live_pnl,
             live_pnl_refreshed_at=live_pnl_refreshed_at,
             position_cache_note=self._session_position_cache_note(session),

@@ -4716,8 +4716,13 @@ class UiPositionsMixin:
         live_total = Decimal("0")
         live_covered = 0
         latest_refresh_at: datetime | None = None
+        display_financials = getattr(self, "_session_display_financials", None)
         for session in active_sessions:
-            net_total += session.net_pnl_total or Decimal("0")
+            if callable(display_financials):
+                _count, _wins, _gross, _fees, _funding, display_net_pnl, _last_pnl, _last_reason = display_financials(session)
+                net_total += display_net_pnl or Decimal("0")
+            else:
+                net_total += session.net_pnl_total or Decimal("0")
             live_pnl, refreshed_at = self._session_live_pnl_snapshot(session)
             if refreshed_at is not None and (latest_refresh_at is None or refreshed_at > latest_refresh_at):
                 latest_refresh_at = refreshed_at
@@ -4781,8 +4786,13 @@ class UiPositionsMixin:
         live_total = Decimal("0")
         live_covered = 0
         latest_refresh_at: datetime | None = None
+        display_financials = getattr(self, "_session_display_financials", None)
         for session in active_sessions:
-            net_total += session.net_pnl_total or Decimal("0")
+            if callable(display_financials):
+                _count, _wins, _gross, _fees, _funding, display_net_pnl, _last_pnl, _last_reason = display_financials(session)
+                net_total += display_net_pnl or Decimal("0")
+            else:
+                net_total += session.net_pnl_total or Decimal("0")
             live_pnl, refreshed_at = self._session_live_pnl_snapshot(session)
             if refreshed_at is not None and (latest_refresh_at is None or refreshed_at > latest_refresh_at):
                 latest_refresh_at = refreshed_at

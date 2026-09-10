@@ -7336,6 +7336,67 @@ class StrategyTradeTrackingTest(TestCase):
         self.assertEqual(len(result), 1)
         self.assertEqual(result[0].record_id, "S01-round-1")
 
+    def test_session_display_financials_uses_same_ledger_scope_as_pnl_dialog(self) -> None:
+        older = StrategyTradeLedgerRecord(
+            record_id="old",
+            history_record_id="H-old",
+            session_id="S209",
+            api_name="reap",
+            strategy_id="ema55_slope_short",
+            strategy_name="均线斜率做空",
+            symbol="DOGE-USDT-SWAP",
+            direction_label="只做空",
+            run_mode_label="交易并下单",
+            environment="live",
+            opened_at=datetime(2026, 6, 29, 13, 0),
+            closed_at=datetime(2026, 6, 30, 1, 31),
+            net_pnl=Decimal("-1.76"),
+            gross_pnl=Decimal("-1.48"),
+            entry_fee=Decimal("-0.20"),
+            exit_fee=Decimal("-0.08"),
+            funding_fee=Decimal("0"),
+            close_reason="本地止损触发",
+        )
+        current = StrategyTradeLedgerRecord(
+            record_id="current",
+            history_record_id="H-current",
+            session_id="S245",
+            api_name="reap",
+            strategy_id="ema55_slope_short",
+            strategy_name="均线斜率做空",
+            symbol="DOGE-USDT-SWAP",
+            direction_label="只做空",
+            run_mode_label="交易并下单",
+            environment="live",
+            opened_at=datetime(2026, 9, 10, 10, 0),
+            closed_at=datetime(2026, 9, 10, 11, 0),
+            net_pnl=Decimal("2.50"),
+            gross_pnl=Decimal("2.70"),
+            entry_fee=Decimal("-0.10"),
+            exit_fee=Decimal("-0.10"),
+            funding_fee=Decimal("0"),
+            close_reason="斜率转正平仓",
+        )
+        session = SimpleNamespace(
+            trade_count=0,
+            win_count=0,
+            gross_pnl_total=Decimal("0"),
+            fee_total=Decimal("0"),
+            funding_total=Decimal("0"),
+            net_pnl_total=Decimal("0"),
+            last_net_pnl=None,
+            last_close_reason="",
+        )
+        app = SimpleNamespace(_strategy_live_chart_ledger_records=lambda _session: [older, current])
+
+        result = QuantApp._session_display_financials(app, session)
+
+        self.assertEqual(result[0], 2)
+        self.assertEqual(result[1], 1)
+        self.assertEqual(result[5], Decimal("0.74"))
+        self.assertEqual(result[6], Decimal("2.50"))
+        self.assertEqual(result[7], "斜率转正平仓")
+
     def test_apply_financial_totals_keeps_decimal_zero_when_trade_ledger_is_empty(self) -> None:
         target = SimpleNamespace(
             trade_count=99,
