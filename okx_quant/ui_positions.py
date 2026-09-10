@@ -4705,11 +4705,19 @@ class UiPositionsMixin:
     def _refresh_running_session_summary(self) -> None:
         self._refresh_running_session_filter_controls()
         self._refresh_session_live_pnl_cache()
-        active_sessions = [
+        all_active_sessions = [
             session for session in self.sessions.values() if self._session_counts_toward_running_summary(session)
         ]
-        if not active_sessions:
+        if not all_active_sessions:
             self.session_summary_text.set("多策略合计：当前没有运行中的策略。")
+            return
+        active_sessions = [
+            session
+            for session in all_active_sessions
+            if QuantApp._session_matches_running_filter(self, session)
+        ]
+        if not active_sessions:
+            self.session_summary_text.set("多策略合计：当前筛选没有运行中的策略。")
             return
 
         net_total = Decimal("0")
@@ -4775,11 +4783,19 @@ class UiPositionsMixin:
         refresh_account_equities = getattr(self, "_refresh_running_session_account_equities_if_needed", None)
         if callable(refresh_account_equities):
             refresh_account_equities()
-        active_sessions = [
+        all_active_sessions = [
             session for session in self.sessions.values() if self._session_counts_toward_running_summary(session)
         ]
-        if not active_sessions:
+        if not all_active_sessions:
             self.session_summary_text.set("多策略合计：当前没有运行中的策略。")
+            return
+        active_sessions = [
+            session
+            for session in all_active_sessions
+            if QuantApp._session_matches_running_filter(self, session)
+        ]
+        if not active_sessions:
+            self.session_summary_text.set("多策略合计：当前筛选没有运行中的策略。")
             return
 
         net_total = Decimal("0")
@@ -4815,13 +4831,12 @@ class UiPositionsMixin:
         selected_filter = QuantApp._current_running_session_filter_label(self)
         selected_api_filter = QuantApp._current_running_session_api_filter_label(self)
         if selected_filter != RUNNING_SESSION_FILTER_OPTIONS[0] or selected_api_filter != STRATEGY_BOOK_FILTER_ALL_API:
-            visible_count = sum(1 for session in active_sessions if QuantApp._session_matches_running_filter(self, session))
             filter_parts: list[str] = []
             if selected_filter != RUNNING_SESSION_FILTER_OPTIONS[0]:
                 filter_parts.append(selected_filter)
             if selected_api_filter != STRATEGY_BOOK_FILTER_ALL_API:
                 filter_parts.append(f"API {selected_api_filter}")
-            parts.append(f"当前筛选 {' | '.join(filter_parts)} {visible_count}条")
+            parts.append(f"当前筛选 {' | '.join(filter_parts)} {len(active_sessions)}条")
         position_cache_summary = (
             self._running_session_position_cache_summary(active_sessions)
             if hasattr(self, "_running_session_position_cache_summary")

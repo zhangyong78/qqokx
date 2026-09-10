@@ -9152,6 +9152,47 @@ class SessionLivePnlSummaryTest(TestCase):
 
         self.assertIn("当前筛选 交易员策略 1条", app.session_summary_text.get())
 
+    def test_refresh_running_session_summary_uses_selected_api_only(self) -> None:
+        reap_session = SimpleNamespace(
+            session_id="S01",
+            api_name="ReapAi",
+            engine=SimpleNamespace(is_running=True),
+            stop_cleanup_in_progress=False,
+            status="运行中",
+            net_pnl_total=Decimal("12"),
+            trader_id="",
+            config=SimpleNamespace(run_mode="trade"),
+        )
+        xhb_session = SimpleNamespace(
+            session_id="S02",
+            api_name="xhb",
+            engine=SimpleNamespace(is_running=True),
+            stop_cleanup_in_progress=False,
+            status="运行中",
+            net_pnl_total=Decimal("-5"),
+            trader_id="",
+            config=SimpleNamespace(run_mode="trade"),
+        )
+        app = SimpleNamespace(
+            sessions={"S01": reap_session, "S02": xhb_session},
+            _session_live_pnl_cache={"S01": (Decimal("2"), None), "S02": (Decimal("-1"), None)},
+            session_summary_text=_Var(),
+            running_session_filter=_Var("全部"),
+            running_session_api_filter=_Var("xhb"),
+            _refresh_session_live_pnl_cache=lambda: None,
+            _session_live_pnl_snapshot=lambda session: app._session_live_pnl_cache.get(session.session_id, (None, None)),
+            _session_counts_toward_running_summary=lambda session: QuantApp._session_counts_toward_running_summary(session),
+        )
+
+        QuantApp._refresh_running_session_summary(app)
+
+        text = app.session_summary_text.get()
+        self.assertIn("多策略合计：1 个策略", text)
+        self.assertIn("实时浮盈亏=-1.00", text)
+        self.assertIn("净盈亏=-5.00", text)
+        self.assertNotIn("+12.00", text)
+        self.assertIn("当前筛选 API xhb 1条", text)
+
 
 class RunningSessionFilterTest(TestCase):
     def test_session_category_label_distinguishes_regular_trader_and_signal_watch(self) -> None:
