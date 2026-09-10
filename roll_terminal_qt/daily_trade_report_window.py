@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import date, datetime
+from datetime import date
 from decimal import Decimal
 from pathlib import Path
 
@@ -24,7 +24,6 @@ from PySide6.QtWidgets import (
 from okx_quant.daily_trade_report import (
     DailyTrade,
     DailyTradeReport,
-    REPORT_TIMEZONE,
     build_daily_trade_report,
     daily_trade_from_position_history,
     format_report_decimal,
@@ -34,7 +33,12 @@ from okx_quant.daily_trade_report import (
 )
 from okx_quant.persistence import list_history_cache_scopes
 from roll_terminal_qt.history_service import load_local_position_history
-from roll_terminal_qt.account_positions_home import InstrumentKlineDialog
+from roll_terminal_qt.account_positions_home import (
+    InstrumentKlineDialog,
+    PositionPriceMarker,
+    _position_history_kline_price_markers,
+    _position_history_kline_time_markers,
+)
 
 
 class DailyTradeReportWidget(QWidget):
@@ -251,46 +255,66 @@ class DailyTradeReportWidget(QWidget):
         if self._trade_kline_window is None:
             self._trade_kline_window = InstrumentKlineDialog(initial_bar="1H", parent=self)
             self._trade_kline_window.destroyed.connect(lambda: setattr(self, "_trade_kline_window", None))
-        opened_at = trade.opened_at
-        if opened_at is None:
-            closed_ms = int(trade.closed_at.timestamp() * 1000) if trade.closed_at else 0
-            candidates = []
-            for profile_name, environment in self._history_scopes:
-                for history_item in load_local_position_history(profile_name, environment, limit=5000):
-                    if str(getattr(history_item, "inst_id", "") or "").strip().upper() != symbol:
-                        continue
-                    update_ms = int(getattr(history_item, "update_time", 0) or 0)
-                    if closed_ms and update_ms and abs(update_ms - closed_ms) > 3 * 24 * 60 * 60 * 1000:
-                        continue
-                    raw = getattr(history_item, "raw", {})
-                    raw = raw if isinstance(raw, dict) else {}
-                    for key in ("openTime", "openTimeMs", "startTime", "beginTime", "cTime", "createdTime"):
-                        try:
-                            value = int(raw.get(key) or 0)
-                        except (TypeError, ValueError):
-                            value = 0
-                        if value > 0:
-                            candidates.append(value if value >= 100_000_000_000 else value * 1000)
-                            break
-                    if not candidates and getattr(history_item, "created_time", None):
-                        try:
-                            created_ms = int(getattr(history_item, "created_time"))
-                            candidates.append(created_ms if created_ms >= 100_000_000_000 else created_ms * 1000)
-                        except (TypeError, ValueError):
-                            pass
-            if candidates:
-                opened_at = datetime.fromtimestamp(min(candidates) / 1000, tz=REPORT_TIMEZONE)
-        markers = []
-        for label, timestamp in (("开仓", opened_at), ("平仓", trade.closed_at)):
-            if timestamp is not None:
-                # InstrumentKlineDialog and CandlestickChartView use
-                # millisecond timestamps, while datetime.timestamp() returns
-                # seconds.
-                markers.append((label, int(timestamp.timestamp() * 1000)))
+        closed_ms = int(trade.closed_at.timestamp() * 1000) if trade.closed_at else 0
+        matched_history_item = None
+        matched_distance = None
+        for profile_name, environment in self._history_scopes:
+            for history_item in load_local_position_history(profile_name, environment, limit=5000):
+                if str(getattr(history_item, "inst_id", "") or "").strip().upper() != symbol:
+                    continue
+                update_ms = int(getattr(history_item, "update_time", 0) or 0)
+                distance = abs(update_ms - closed_ms) if update_ms and closed_ms else 0
+                if matched_history_item is None or distance < matched_distance:
+                    matched_history_item = history_item
+                    matched_distance = distance
+        if matched_history_item is not None:
+            markers = _position_history_kline_price_markers(matched_history_item)
+            time_markers = _position_history_kline_time_markers(matched_history_item)
+        else:
+            markers = ()
+            time_markers = tuple(
+                (label, int(timestamp.timestamp() * 1000))
+                for label, timestamp in (("开仓", trade.opened_at), ("平仓", trade.closed_at))
+                if timestamp is not None
+            )
+        if not markers:
+            # Keep the transaction-details entry point useful even when an
+            # older/corrupt history snapshot lacks direction or raw position
+            # fields.  The report still has the prices and quantity needed for
+            # the same visual entry/exit markers.
+            direction = str(trade.direction or "").strip().lower()
+            direction = "short" if direction == "short" else "long"
+            direct_markers = []
+            if trade.opened_at is not None and trade.entry_price is not None:
+                direct_markers.append(
+                    PositionPriceMarker(
+                        "entry",
+                        int(trade.opened_at.timestamp() * 1000),
+                        trade.entry_price,
+                        direction,
+                        quantity=trade.size,
+                        quantity_unit="张" if symbol.count("-") >= 3 else symbol.split("-", 1)[0],
+                        entry_value_usdt=None,
+                    )
+                )
+            if trade.closed_at is not None and trade.exit_price is not None:
+                direct_markers.append(
+                    PositionPriceMarker(
+                        "exit",
+                        int(trade.closed_at.timestamp() * 1000),
+                        trade.exit_price,
+                        direction,
+                        realized_pnl=trade.net_pnl,
+                        quantity=trade.size,
+                        quantity_unit="张" if symbol.count("-") >= 3 else symbol.split("-", 1)[0],
+                    )
+                )
+            markers = tuple(direct_markers)
         self._trade_kline_window.show_instrument(
             inst_id=symbol,
             inst_type="OPTION" if symbol.count("-") >= 3 else "SWAP",
-            time_markers=tuple(markers),
+            time_markers=time_markers,
+            position_price_markers=markers,
         )
 
     def _export(self, kind: str) -> None:
