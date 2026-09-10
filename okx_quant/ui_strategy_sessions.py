@@ -11388,6 +11388,12 @@ class UiStrategySessionsMixin:
         self._strategy_trade_ledger_by_id = {record.record_id: record for record in self._strategy_trade_ledger_records}
         if records_changed or len(deduped_records) != len(records):
             self._save_strategy_trade_ledger_records()
+        if len(deduped_records) != len(records):
+            self._enqueue_log(
+                "策略交易账本已去重"
+                f" | 清理重复记录={len(records) - len(deduped_records)}"
+                " | 已优先保留原始结算数据"
+            )
         self._rebuild_history_financials_from_trade_ledger()
 
     def _backfill_strategy_group_ids_from_history(
@@ -11429,19 +11435,83 @@ class UiStrategySessionsMixin:
             format(record.exit_price, "f") if record.exit_price is not None else "",
         )
 
+    @staticmethod
+    def _strategy_trade_ledger_link_keys(record: StrategyTradeLedgerRecord) -> set[tuple[str, ...]]:
+        """Return IDs that identify one trade across native and log backfill rows.
+
+        A native settlement has a round ID, while a recovered old log normally
+        does not.  They can nevertheless be the same trade because OKX's entry
+        or exit order ID is shared.  Keep this separate from the primary key so
+        legacy rows with no usable exchange IDs still retain their old behavior.
+        """
+        session_id = str(record.session_id or "").strip()
+        if not session_id:
+            return set()
+        keys: set[tuple[str, ...]] = set()
+        entry_order_id = str(record.entry_order_id or "").strip()
+        exit_order_id = str(record.exit_order_id or "").strip()
+        if entry_order_id:
+            keys.add(("entry_order", session_id, entry_order_id))
+        if exit_order_id:
+            keys.add(("exit_order", session_id, exit_order_id))
+        return keys
+
+    @classmethod
+    def _strategy_trade_ledger_same_trade(
+        cls,
+        left: StrategyTradeLedgerRecord,
+        right: StrategyTradeLedgerRecord,
+    ) -> bool:
+        if cls._strategy_trade_ledger_business_key(left) == cls._strategy_trade_ledger_business_key(right):
+            return True
+        return bool(
+            cls._strategy_trade_ledger_link_keys(left)
+            & cls._strategy_trade_ledger_link_keys(right)
+        )
+
+    @staticmethod
+    def _strategy_trade_ledger_record_quality(record: StrategyTradeLedgerRecord) -> int:
+        """Prefer native settlement rows over approximate log-only recovery."""
+        score = 0
+        if str(record.round_id or "").strip():
+            score += 100
+        if "回补自会话日志" not in str(record.summary_note or ""):
+            score += 20
+        if str(record.entry_order_id or "").strip():
+            score += 5
+        if str(record.exit_order_id or "").strip():
+            score += 5
+        if record.entry_fee is not None and record.exit_fee is not None:
+            score += 3
+        if record.funding_fee is not None:
+            score += 2
+        return score
+
     def _dedupe_strategy_trade_ledger_records(
         self,
         records: list[StrategyTradeLedgerRecord],
     ) -> list[StrategyTradeLedgerRecord]:
-        deduped: dict[tuple[str, ...], StrategyTradeLedgerRecord] = {}
+        deduped: list[StrategyTradeLedgerRecord] = []
         for record in records:
-            deduped[self._strategy_trade_ledger_business_key(record)] = record
-        merged = list(deduped.values())
-        merged.sort(
+            duplicate_index = next(
+                (
+                    index
+                    for index, existing in enumerate(deduped)
+                    if self._strategy_trade_ledger_same_trade(existing, record)
+                ),
+                None,
+            )
+            if duplicate_index is None:
+                deduped.append(record)
+                continue
+            existing = deduped[duplicate_index]
+            if self._strategy_trade_ledger_record_quality(record) >= self._strategy_trade_ledger_record_quality(existing):
+                deduped[duplicate_index] = record
+        deduped.sort(
             key=lambda item: (item.closed_at.isoformat(timespec="seconds"), item.record_id),
             reverse=True,
         )
-        return merged
+        return deduped
 
     def _next_strategy_trade_ledger_record_id(self, session: StrategySession, round_id: str, closed_at: datetime) -> str:
         normalized_round_id = str(round_id or "").strip()
@@ -11457,11 +11527,10 @@ class UiStrategySessionsMixin:
 
     def _upsert_strategy_trade_ledger_record(self, record: StrategyTradeLedgerRecord) -> None:
         existing = self._strategy_trade_ledger_by_id.get(record.record_id)
-        existing_business_key = self._strategy_trade_ledger_business_key(record)
         replaced_by_business_key = False
         if existing is None:
             for index, item in enumerate(self._strategy_trade_ledger_records):
-                if self._strategy_trade_ledger_business_key(item) != existing_business_key:
+                if not self._strategy_trade_ledger_same_trade(item, record):
                     continue
                 existing = item
                 self._strategy_trade_ledger_by_id.pop(item.record_id, None)

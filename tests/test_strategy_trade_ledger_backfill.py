@@ -231,6 +231,16 @@ class StrategyTradeLedgerBackfillTest(unittest.TestCase):
             self.assertEqual(history_record["last_close_reason"], "斜率转正平仓")
             self.assertEqual(history_record["net_pnl_total"], "-3.428536320")
 
+            # A native strategy settlement uses a round ID, whereas the
+            # recovered log row does not.  The shared entry order still means
+            # they are the same transaction and must not be added twice.
+            ledger_record["record_id"] = "S222-native-round"
+            ledger_record["round_id"] = "S222-202606162240"
+            ledger_record["summary_note"] = "本地斜率转正平仓 | 原始结算"
+            (state_dir / "strategy_trade_ledger.json").write_text(
+                json.dumps({"records": [ledger_record]}, ensure_ascii=False),
+                encoding="utf-8",
+            )
             repeat = backfill_strategy_trade_ledger(state_dir=state_dir, write=False)
             self.assertEqual(repeat.added_record_count, 0)
 

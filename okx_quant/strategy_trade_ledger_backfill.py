@@ -563,6 +563,21 @@ def _business_key(record: dict[str, object]) -> tuple[str, ...]:
     )
 
 
+def _trade_link_keys(record: dict[str, object]) -> set[tuple[str, ...]]:
+    """IDs shared by a native ledger settlement and an old-log recovery row."""
+    session_id = str(record.get("session_id") or "").strip()
+    if not session_id:
+        return set()
+    keys: set[tuple[str, ...]] = set()
+    entry_order_id = str(record.get("entry_order_id") or "").strip()
+    exit_order_id = str(record.get("exit_order_id") or "").strip()
+    if entry_order_id:
+        keys.add(("entry_order", session_id, entry_order_id))
+    if exit_order_id:
+        keys.add(("exit_order", session_id, exit_order_id))
+    return keys
+
+
 def _build_record_id(existing_ids: set[str], *, session_id: str, closed_at: datetime) -> str:
     base = f"{closed_at.strftime('%Y%m%d%H%M%S%f')}-{session_id}"
     candidate = base
@@ -751,6 +766,11 @@ def backfill_strategy_trade_ledger(
     normalized_targets = {str(item).strip() for item in strategy_ids if str(item).strip()}
     existing_ids = {str(item.get("record_id") or "").strip() for item in ledger_records}
     existing_keys = {_business_key(item) for item in ledger_records}
+    existing_trade_links = {
+        link_key
+        for item in ledger_records
+        for link_key in _trade_link_keys(item)
+    }
 
     caches: dict[tuple[str, str], _ApiEnvironmentHistoryCache] = {}
     scanned_history_count = 0
@@ -780,10 +800,12 @@ def backfill_strategy_trade_ledger(
             if record is None:
                 continue
             business_key = _business_key(record)
-            if business_key in existing_keys:
+            record_trade_links = _trade_link_keys(record)
+            if business_key in existing_keys or bool(record_trade_links & existing_trade_links):
                 continue
             ledger_records.append(record)
             existing_keys.add(business_key)
+            existing_trade_links.update(record_trade_links)
             added_record_count += 1
 
     updated_history_count = _rebuild_history_financials(history_records, ledger_records)

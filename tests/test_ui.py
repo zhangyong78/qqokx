@@ -7267,6 +7267,7 @@ class StrategyTradeTrackingTest(TestCase):
             _strategy_trade_ledger_by_id={existing.record_id: existing},
             _save_strategy_trade_ledger_records=MagicMock(),
             _strategy_trade_ledger_business_key=lambda record: QuantApp._strategy_trade_ledger_business_key(record),
+            _strategy_trade_ledger_same_trade=lambda left, right: QuantApp._strategy_trade_ledger_same_trade(left, right),
         )
 
         QuantApp._upsert_strategy_trade_ledger_record(app, incoming)
@@ -7275,6 +7276,52 @@ class StrategyTradeTrackingTest(TestCase):
         self.assertEqual(app._strategy_trade_ledger_records[0].record_id, "S01-1")
         self.assertEqual(set(app._strategy_trade_ledger_by_id.keys()), {"S01-1"})
         app._save_strategy_trade_ledger_records.assert_called_once()
+
+    def test_dedupe_strategy_trade_ledger_prefers_native_settlement_over_log_backfill(self) -> None:
+        native = StrategyTradeLedgerRecord(
+            record_id="S01-round-1",
+            history_record_id="H01",
+            session_id="S01",
+            api_name="reap",
+            strategy_id="ema55_slope_short",
+            strategy_name="均线斜率做空",
+            symbol="ETH-USDT-SWAP",
+            direction_label="只做空",
+            run_mode_label="交易并下单",
+            environment="live",
+            closed_at=datetime(2026, 7, 18, 1, 12, 9),
+            round_id="S01-202607172100",
+            opened_at=datetime(2026, 7, 17, 21, 0, 23),
+            entry_order_id="ENTRY-1",
+            exit_order_id="EXIT-1",
+            summary_note="本地止损触发 | 原始结算",
+        )
+        recovered = StrategyTradeLedgerRecord(
+            record_id="recovered-1",
+            history_record_id="H01",
+            session_id="S01",
+            api_name="reap",
+            strategy_id="ema55_slope_short",
+            strategy_name="均线斜率做空",
+            symbol="ETH-USDT-SWAP",
+            direction_label="只做空",
+            run_mode_label="交易并下单",
+            environment="live",
+            closed_at=datetime(2026, 7, 18, 1, 12, 9),
+            opened_at=datetime(2026, 7, 17, 21, 0, 23),
+            entry_order_id="ENTRY-1",
+            exit_order_id="EXIT-1",
+            summary_note="回补自会话日志；手续费来源=估算",
+        )
+        app = SimpleNamespace(
+            _strategy_trade_ledger_same_trade=lambda left, right: QuantApp._strategy_trade_ledger_same_trade(left, right),
+            _strategy_trade_ledger_record_quality=lambda record: QuantApp._strategy_trade_ledger_record_quality(record),
+        )
+
+        result = QuantApp._dedupe_strategy_trade_ledger_records(app, [recovered, native])
+
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0].record_id, "S01-round-1")
 
     def test_apply_financial_totals_keeps_decimal_zero_when_trade_ledger_is_empty(self) -> None:
         target = SimpleNamespace(

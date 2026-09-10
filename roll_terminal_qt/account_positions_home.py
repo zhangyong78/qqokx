@@ -82,6 +82,25 @@ class _PositionTreeDelegate(QStyledItemDelegate):
             painter.drawLine(rect.right(), rect.top(), rect.right(), rect.bottom())
         painter.restore()
 
+
+class _HoldingTimeTableWidgetItem(QTableWidgetItem):
+    """Display holding time text while sorting by its numeric hour value."""
+
+    def __init__(self, text: str, hours: int | None) -> None:
+        super().__init__(text)
+        self._holding_hours = hours
+
+    def __lt__(self, other: QTableWidgetItem) -> bool:
+        if isinstance(other, _HoldingTimeTableWidgetItem):
+            left = self._holding_hours
+            right = other._holding_hours
+            if left is None:
+                return right is not None
+            if right is None:
+                return False
+            return left < right
+        return super().__lt__(other)
+
 from roll_terminal_qt.app_icon import apply_qt_window_icon
 from roll_terminal_qt.option_roll_window import OptionRollQtDialog
 from okx_quant.log_utils import append_log_line
@@ -1215,7 +1234,7 @@ def _position_history_open_time_text(item: OkxPositionHistoryItem) -> str:
     return _format_okx_ms_timestamp(opened_at)
 
 
-def _position_history_holding_time_text(item: OkxPositionHistoryItem) -> str:
+def _position_history_holding_hours(item: OkxPositionHistoryItem) -> int | None:
     """Format the time held through the latest close snapshot.
 
     ``update_time`` is the exchange/history snapshot time.  For a partial
@@ -1238,12 +1257,17 @@ def _position_history_holding_time_text(item: OkxPositionHistoryItem) -> str:
         item.update_time,
     )
     if opened_at is None or closed_at is None or closed_at < opened_at:
-        return "-"
+        return None
     total_seconds = (closed_at - opened_at) // 1000
-    days, remainder = divmod(total_seconds, 24 * 60 * 60)
-    hours, remainder = divmod(remainder, 60 * 60)
-    minutes, seconds = divmod(remainder, 60)
-    return f"{days}天 {hours:02d}:{minutes:02d}:{seconds:02d}" if days else f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+    return total_seconds // 3600
+
+
+def _position_history_holding_time_text(item: OkxPositionHistoryItem) -> str:
+    total_hours = _position_history_holding_hours(item)
+    if total_hours is None:
+        return "-"
+    days, hours = divmod(total_hours, 24)
+    return f"{days}天{hours}小时" if days else f"{hours}小时"
 
 
 def _position_history_raw_size_text(
@@ -3119,7 +3143,6 @@ class AccountPositionsHomeWidget(QWidget):
                 _format_okx_ms_timestamp(item.update_time),
                 _position_history_open_time_text(item),
                 _position_history_holding_time_text(item),
-                item.inst_type or "-",
                 item.inst_id or "-",
                 _format_margin_mode(item.mgn_mode or ""),
                 _format_history_side(None, item.pos_side or item.direction),
@@ -3139,6 +3162,14 @@ class AccountPositionsHomeWidget(QWidget):
                 _format_position_note_summary(self._position_history_note_text(item)),
             )
             self._set_table_row(self._position_history_table, row, values, left_align={3, 14})
+            holding_item = self._position_history_table.item(row, 2)
+            if holding_item is not None:
+                holding_item = _HoldingTimeTableWidgetItem(
+                    holding_item.text(),
+                    _position_history_holding_hours(item),
+                )
+                holding_item.setTextAlignment(int(Qt.AlignmentFlag.AlignCenter | Qt.AlignmentFlag.AlignVCenter))
+                self._position_history_table.setItem(row, 2, holding_item)
             self._position_history_table.item(row, 0).setData(
                 Qt.ItemDataRole.UserRole,
                 self._position_history_row_key(item),
@@ -3528,9 +3559,9 @@ class AccountPositionsHomeWidget(QWidget):
         head.addWidget(refresh_button)
         layout.addLayout(head)
 
-        self._position_history_table = QTableWidget(0, 16)
+        self._position_history_table = QTableWidget(0, 15)
         self._position_history_table.setHorizontalHeaderLabels(
-            ("平仓时间", "开仓时间", "持仓时间", "类型", "合约", "保证金模式", "持仓模式", "交易方向", "开仓均价", "平仓均价", "最大持仓量", "已平仓量", "手续费", "盈亏", "仓位状态", "备注")
+            ("平仓时间", "开仓时间", "持仓时间", "合约", "保证金模式", "持仓模式", "交易方向", "开仓均价", "平仓均价", "最大持仓量", "已平仓量", "手续费", "盈亏", "仓位状态", "备注")
         )
         self._position_history_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self._position_history_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
@@ -3539,10 +3570,11 @@ class AccountPositionsHomeWidget(QWidget):
         header = self._position_history_table.horizontalHeader()
         header.setStretchLastSection(False)
         self._position_history_table.setSortingEnabled(True)
-        for index in range(16):
+        for index in range(15):
             header.setSectionResizeMode(index, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
-        header.setSectionResizeMode(15, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(3, QHeaderView.ResizeMode.Interactive)
+        header.resizeSection(3, 220)
+        header.setSectionResizeMode(14, QHeaderView.ResizeMode.Stretch)
         self._position_history_table.itemSelectionChanged.connect(self._refresh_position_history_detail)
         layout.addWidget(self._position_history_table, 1)
 
@@ -4613,7 +4645,6 @@ class AccountPositionsHomeWidget(QWidget):
                 _format_okx_ms_timestamp(item.update_time),
                 _position_history_open_time_text(item),
                 _position_history_holding_time_text(item),
-                item.inst_type or "-",
                 item.inst_id or "-",
                 _format_margin_mode(item.mgn_mode or ""),
                 _format_history_side(None, item.pos_side or item.direction),
@@ -4637,6 +4668,14 @@ class AccountPositionsHomeWidget(QWidget):
                 if column not in {3, 14}:
                     cell.setTextAlignment(int(Qt.AlignmentFlag.AlignCenter | Qt.AlignmentFlag.AlignVCenter))
                 self._position_history_table.setItem(row, column, cell)
+            holding_item = self._position_history_table.item(row, 2)
+            if holding_item is not None:
+                holding_item = _HoldingTimeTableWidgetItem(
+                    holding_item.text(),
+                    _position_history_holding_hours(item),
+                )
+                holding_item.setTextAlignment(int(Qt.AlignmentFlag.AlignCenter | Qt.AlignmentFlag.AlignVCenter))
+                self._position_history_table.setItem(row, 2, holding_item)
         self._position_history_summary_label.setText(f"历史仓位：{len(self._position_history_items)} 条")
         target_row = -1
         if selected_key is not None:
@@ -6894,7 +6933,6 @@ class AccountPositionsHomeWidget(QWidget):
                 _format_okx_ms_timestamp(item.update_time),
                 _position_history_open_time_text(item),
                 _position_history_holding_time_text(item),
-                item.inst_type or "-",
                 item.inst_id or "-",
                 _format_margin_mode(item.mgn_mode or ""),
                 _format_history_side(None, item.pos_side or item.direction),
@@ -6913,7 +6951,15 @@ class AccountPositionsHomeWidget(QWidget):
                 _position_history_status_text(item),
                 _format_position_note_summary(self._position_history_note_text(item)),
             )
-            self._set_table_row(self._position_history_table, row, values, left_align={4, 15})
+            self._set_table_row(self._position_history_table, row, values, left_align={3, 14})
+            holding_item = self._position_history_table.item(row, 2)
+            if holding_item is not None:
+                holding_item = _HoldingTimeTableWidgetItem(
+                    holding_item.text(),
+                    _position_history_holding_hours(item),
+                )
+                holding_item.setTextAlignment(int(Qt.AlignmentFlag.AlignCenter | Qt.AlignmentFlag.AlignVCenter))
+                self._position_history_table.setItem(row, 2, holding_item)
             self._position_history_table.item(row, 0).setData(
                 Qt.ItemDataRole.UserRole,
                 self._position_history_row_key(item),
