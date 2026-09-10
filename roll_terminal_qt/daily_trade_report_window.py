@@ -254,7 +254,10 @@ class DailyTradeReportWidget(QWidget):
         markers = []
         for label, timestamp in (("开仓", trade.opened_at), ("平仓", trade.closed_at)):
             if timestamp is not None:
-                markers.append((label, int(timestamp.timestamp())))
+                # InstrumentKlineDialog and CandlestickChartView use
+                # millisecond timestamps, while datetime.timestamp() returns
+                # seconds.
+                markers.append((label, int(timestamp.timestamp() * 1000)))
         self._trade_kline_window.show_instrument(
             inst_id=symbol,
             inst_type="OPTION" if symbol.count("-") >= 3 else "SWAP",
