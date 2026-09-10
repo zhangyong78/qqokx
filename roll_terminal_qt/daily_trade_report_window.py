@@ -248,6 +248,15 @@ class DailyTradeReportWidget(QWidget):
         symbol = str(getattr(trade, "symbol", "") or (item.text() if item is not None else "")).strip().upper()
         if not symbol or symbol == "-":
             return
+        # The daily report is hosted by the launcher.  Reuse its embedded K-line
+        # page instead of creating a second top-level Qt window (the latter can
+        # compete with the WebEngine/network workers on Windows).
+        launcher = self.window()
+        show_page = getattr(launcher, "show_page", None)
+        pages = getattr(launcher, "_pages", None)
+        if callable(show_page) and isinstance(pages, dict):
+            show_page("kline")
+            self._trade_kline_window = pages.get("kline")
         if self._trade_kline_window is None:
             self._trade_kline_window = KlineAnalysisWindow()
             self._trade_kline_window.destroyed.connect(lambda: setattr(self, "_trade_kline_window", None))
@@ -278,9 +287,10 @@ class DailyTradeReportWidget(QWidget):
         best_check = getattr(self._trade_kline_window, "_best_parameter_indicators_check", None)
         if best_check is not None and not best_check.isChecked():
             best_check.setChecked(True)
-        self._trade_kline_window.show()
-        self._trade_kline_window.raise_()
-        self._trade_kline_window.activateWindow()
+        if not bool(getattr(self._trade_kline_window, "_embedded", False)):
+            self._trade_kline_window.show()
+            self._trade_kline_window.raise_()
+            self._trade_kline_window.activateWindow()
 
     def _export(self, kind: str) -> None:
         if self._report is None:
