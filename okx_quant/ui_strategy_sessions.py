@@ -2393,6 +2393,17 @@ class UiStrategySessionsMixin:
             ]
         if not matched:
             matched = [item for item in self._strategy_trade_ledger_records if item.session_id == session.session_id]
+        # A restarted strategy receives a new history/session id, while the
+        # stable strategy_group_id intentionally remains the same.  Keep the
+        # previous settled rounds visible in the Net PnL dialog and live chart
+        # after a restart without mixing other APIs or parameter sets.
+        strategy_group_id = str(getattr(session, "strategy_group_id", "") or "").strip()
+        if not matched and strategy_group_id:
+            matched = [
+                item
+                for item in self._strategy_trade_ledger_records
+                if item.strategy_group_id == strategy_group_id
+            ]
         matched.sort(
             key=lambda item: (
                 item.opened_at or item.closed_at or datetime.min,
@@ -11219,6 +11230,24 @@ class UiStrategySessionsMixin:
             self._enqueue_log(f"保存策略交易账本失败：{exc}")
 
     def _load_strategy_trade_ledger(self) -> None:
+        # Migrate closed rounds that were only present in legacy session logs
+        # (notably manual closes interrupted by a hot upgrade) before loading
+        # the in-memory ledger.  This uses local history caches only and is
+        # intentionally idempotent, so it does not add exchange requests.
+        try:
+            from okx_quant.strategy_trade_ledger_backfill import backfill_strategy_trade_ledger
+
+            backfill_result = backfill_strategy_trade_ledger(write=True)
+            if backfill_result.added_record_count or backfill_result.updated_history_count:
+                self._enqueue_log(
+                    "历史交易账本回补完成"
+                    f" | 新增={backfill_result.added_record_count}"
+                    f" | 更新历史={backfill_result.updated_history_count}"
+                )
+        except Exception as exc:
+            # A migration failure must never prevent the normal UI/strategy
+            # startup path; the next refresh or startup can retry it.
+            self._enqueue_log(f"历史交易账本回补跳过：{exc}")
         try:
             snapshot = load_strategy_trade_ledger_snapshot()
         except Exception as exc:

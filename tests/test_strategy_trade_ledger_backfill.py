@@ -9,6 +9,42 @@ from okx_quant.strategy_trade_ledger_backfill import backfill_strategy_trade_led
 
 
 class StrategyTradeLedgerBackfillTest(unittest.TestCase):
+    def test_parse_manual_close_submission_is_backfilled_only_when_cache_confirms_fill(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            state_dir = root / "state"
+            history_dir = state_dir / "history" / "reap" / "live"
+            logs_dir = root / "logs" / "strategy_sessions" / "2026-09-10"
+            history_dir.mkdir(parents=True)
+            logs_dir.mkdir(parents=True)
+            log_path = logs_dir / "20260910_030000_000000__reap__S240__session__DOGE-USDT-SWAP.log"
+            log_path.write_text(
+                "\n".join(
+                    [
+                        "[09-10 03:00:32] [reap] [S240 均线斜率做空 DOGE-USDT-SWAP] 本地下单成交 | ordId=E1 | 标的=DOGE-USDT-SWAP | 方向=SELL | 成交均价=0.08862 | 成交数量=3.17张",
+                        "[09-10 11:00:20] [reap] [S240 均线斜率做空 DOGE-USDT-SWAP] 人工提前平仓已提交 | 方式=市价平仓 | ordId=X1 | 当前轮转入人工接管收尾。",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            history_record = {
+                "record_id": "H240",
+                "session_id": "S240",
+                "api_name": "reap",
+                "strategy_id": "ema55_slope_short",
+                "strategy_name": "均线斜率做空",
+                "symbol": "DOGE-USDT-SWAP",
+                "direction_label": "只做空",
+                "run_mode_label": "交易并下单",
+                "log_file_path": str(log_path),
+                "config_snapshot": {"environment": "live", "signal_mode": "short_only"},
+            }
+            rounds = parse_trade_rounds_for_history_record(history_record, state_dir=state_dir)
+            self.assertEqual(len(rounds), 1)
+            self.assertEqual(rounds[0].exit_order_id, "X1")
+            self.assertEqual(rounds[0].close_reason, "人工平仓")
+            self.assertIn("成交由历史成交确认", rounds[0].summary_note)
+
     def test_parse_trade_rounds_collects_events_across_multiple_session_logs(self) -> None:
         with TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

@@ -34,6 +34,7 @@ from okx_quant.daily_trade_report import (
 )
 from okx_quant.persistence import list_history_cache_scopes
 from roll_terminal_qt.history_service import load_local_position_history
+from roll_terminal_qt.kline_analysis_window import KlineAnalysisWindow
 
 
 class DailyTradeReportWidget(QWidget):
@@ -45,6 +46,7 @@ class DailyTradeReportWidget(QWidget):
         self._stopping = False
         self._profile_name = str(profile_name or "").strip()
         self._history_scopes: list[tuple[str, str]] = []
+        self._trade_kline_window: KlineAnalysisWindow | None = None
         self._build_ui()
         self._refresh_profiles()
         self.refresh_report()
@@ -95,6 +97,7 @@ class DailyTradeReportWidget(QWidget):
         self._symbol_table = self._table(("日期", "API", "品种", "平仓", "盈利", "亏损", "净盈亏"))
         self._strategy_table = self._table(("日期", "API", "策略", "平仓", "盈利", "亏损", "净盈亏"))
         self._detail_table = self._table(("平仓时间", "API", "品种", "策略", "会话", "方向", "开仓时间", "开仓价", "平仓价", "数量", "净盈亏", "状态", "来源", "原因"))
+        self._detail_table.cellDoubleClicked.connect(self._open_trade_kline)
         self._tabs.addTab(self._daily_table, "每日汇总")
         self._tabs.addTab(self._symbol_table, "品种汇总")
         self._tabs.addTab(self._strategy_table, "策略汇总")
@@ -217,6 +220,9 @@ class DailyTradeReportWidget(QWidget):
                 str(trade.size or "-"),
                 format_report_decimal(trade.net_pnl, signed=True), trade.status, trade.source, trade.close_reason,
             ))
+            symbol_item = self._detail_table.item(row, 2)
+            if symbol_item is not None:
+                symbol_item.setData(Qt.ItemDataRole.UserRole, trade)
         net = sum((item.net_pnl for item in report.daily), start=Decimal("0")) if report.daily else Decimal("0")
         profile_text = self._runtime_profile_name()
         self._profile_label.setText(f"当前 API：{profile_text}")
@@ -232,6 +238,33 @@ class DailyTradeReportWidget(QWidget):
     def _clear_tables(self) -> None:
         for table in (self._daily_table, self._symbol_table, self._strategy_table, self._detail_table):
             table.setRowCount(0)
+
+    def _open_trade_kline(self, row: int, column: int) -> None:
+        """Open the clicked transaction's contract in the K-line analysis window."""
+        if column != 2:
+            return
+        item = self._detail_table.item(row, column)
+        trade = item.data(Qt.ItemDataRole.UserRole) if item is not None else None
+        symbol = str(getattr(trade, "symbol", "") or (item.text() if item is not None else "")).strip().upper()
+        if not symbol or symbol == "-":
+            return
+        if self._trade_kline_window is None:
+            self._trade_kline_window = KlineAnalysisWindow()
+            self._trade_kline_window.destroyed.connect(lambda: setattr(self, "_trade_kline_window", None))
+        combo = getattr(self._trade_kline_window, "_symbol_combo", None)
+        if combo is not None:
+            if combo.findText(symbol, Qt.MatchFlag.MatchFixedString) < 0:
+                combo.addItem(symbol)
+            combo.setCurrentText(symbol)
+        period_combo = getattr(self._trade_kline_window, "_period_combo", None)
+        if period_combo is not None:
+            period_combo.setCurrentText("1H")
+        best_check = getattr(self._trade_kline_window, "_best_parameter_indicators_check", None)
+        if best_check is not None and not best_check.isChecked():
+            best_check.setChecked(True)
+        self._trade_kline_window.show()
+        self._trade_kline_window.raise_()
+        self._trade_kline_window.activateWindow()
 
     def _export(self, kind: str) -> None:
         if self._report is None:

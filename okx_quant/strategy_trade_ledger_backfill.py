@@ -73,6 +73,8 @@ class _OpenTradeState:
     entry_client_order_id: str = ""
     entry_price_log: Decimal | None = None
     entry_size_log: Decimal | None = None
+    pending_manual_exit_order_id: str = ""
+    pending_manual_exit_at: datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -269,6 +271,13 @@ def parse_trade_rounds_for_history_record(history_record: dict[str, object], *, 
                 entry_size_log=_extract_regex_decimal(_SIZE_RE, event.message),
             )
             continue
+        if current_trade is not None and "人工提前平仓已提交" in event.message:
+            # Older builds logged the manual-close submission but could be
+            # upgraded before the follow-up fill message was written. Keep
+            # the order id so the local fills/order cache can confirm it later.
+            current_trade.pending_manual_exit_order_id = _extract_regex_text(_ORDER_ID_RE, event.message)
+            current_trade.pending_manual_exit_at = event.at
+            continue
         if current_trade is not None and "委托追踪" in event.message:
             order_id = _extract_regex_text(_ORDER_ID_RE, event.message)
             if not current_trade.entry_order_id or order_id == current_trade.entry_order_id:
@@ -299,6 +308,26 @@ def parse_trade_rounds_for_history_record(history_record: dict[str, object], *, 
             )
             current_trade = None
             pending_close_reason = ""
+    if current_trade is not None and current_trade.pending_manual_exit_order_id:
+        # Do not assume the submission was filled here. _build_ledger_record
+        # validates this synthetic close against the cached order/fill state.
+        rounds.append(
+            ParsedTradeRound(
+                session_id=session_id,
+                symbol=current_trade.symbol,
+                opened_at=current_trade.opened_at,
+                closed_at=current_trade.pending_manual_exit_at or current_trade.opened_at,
+                entry_order_id=current_trade.entry_order_id,
+                entry_client_order_id=current_trade.entry_client_order_id,
+                exit_order_id=current_trade.pending_manual_exit_order_id,
+                signal_bar_at=current_trade.signal_bar_at,
+                entry_price_log=current_trade.entry_price_log,
+                entry_size_log=current_trade.entry_size_log,
+                close_reason="人工平仓",
+                reason_confidence="medium",
+                summary_note="回补自会话日志（人工平仓成交由历史成交确认）",
+            )
+        )
     return rounds
 
 
@@ -534,6 +563,21 @@ def _build_ledger_record(
         log_size=round_info.exit_size_log,
         fallback_at=round_info.closed_at,
     )
+    if "人工平仓成交由历史成交确认" in round_info.summary_note:
+        # The source log only contains the close submission.  Refuse to
+        # create a settled ledger row until the local exchange cache confirms
+        # that the order actually filled (an unfilled limit/manual order must
+        # not be counted as realized PnL).
+        exit_fills = cache.fills_by_api_order_id.get((api_name, round_info.exit_order_id), [])
+        exit_order = cache.orders_by_api_order_id.get((api_name, round_info.exit_order_id)) or {}
+        filled_size = (
+            _parse_decimal(exit_order.get("filled_size"))
+            or _parse_decimal(exit_order.get("actual_size"))
+            or _parse_decimal(exit_order.get("acc_fill_size"))
+        )
+        order_state = str(exit_order.get("state") or exit_order.get("status") or "").strip().lower()
+        if not exit_fills and not (order_state == "filled" and filled_size is not None and filled_size > 0):
+            return None
     size = entry_size or exit_size or round_info.entry_size_log or round_info.exit_size_log
     if entry_price is None or exit_price is None or size is None or size <= 0:
         return None
