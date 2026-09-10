@@ -101,6 +101,25 @@ class _HoldingTimeTableWidgetItem(QTableWidgetItem):
             return left < right
         return super().__lt__(other)
 
+
+class _PositionHistoryPnlTableWidgetItem(QTableWidgetItem):
+    """Display the formatted P&L while sorting by its numeric value."""
+
+    def __init__(self, text: str, sort_value: Decimal | None) -> None:
+        super().__init__(text)
+        self._pnl_sort_value = sort_value
+
+    def __lt__(self, other: QTableWidgetItem) -> bool:
+        if isinstance(other, _PositionHistoryPnlTableWidgetItem):
+            left = self._pnl_sort_value
+            right = other._pnl_sort_value
+            if left is None:
+                return right is not None
+            if right is None:
+                return False
+            return left < right
+        return super().__lt__(other)
+
 from roll_terminal_qt.app_icon import apply_qt_window_icon
 from roll_terminal_qt.option_roll_window import OptionRollQtDialog
 from okx_quant.log_utils import append_log_line
@@ -1268,6 +1287,15 @@ def _position_history_holding_time_text(item: OkxPositionHistoryItem) -> str:
         return "-"
     days, hours = divmod(total_hours, 24)
     return f"{days}天{hours}小时" if days else f"{hours}小时"
+
+
+def _position_history_pnl_sort_value(
+    item: OkxPositionHistoryItem,
+    usdt_prices: dict[str, Decimal],
+) -> Decimal | None:
+    """Return the economic P&L value used by the history table sorter."""
+    converted = _position_history_realized_pnl_usdt(item, usdt_prices)
+    return converted if converted is not None else item.realized_pnl
 
 
 def _position_history_raw_size_text(
@@ -3170,6 +3198,14 @@ class AccountPositionsHomeWidget(QWidget):
                 )
                 holding_item.setTextAlignment(int(Qt.AlignmentFlag.AlignCenter | Qt.AlignmentFlag.AlignVCenter))
                 self._position_history_table.setItem(row, 2, holding_item)
+            pnl_item = self._position_history_table.item(row, 12)
+            if pnl_item is not None:
+                pnl_item = _PositionHistoryPnlTableWidgetItem(
+                    pnl_item.text(),
+                    _position_history_pnl_sort_value(item, self._position_history_usdt_prices),
+                )
+                pnl_item.setTextAlignment(int(Qt.AlignmentFlag.AlignCenter | Qt.AlignmentFlag.AlignVCenter))
+                self._position_history_table.setItem(row, 12, pnl_item)
             self._position_history_table.item(row, 0).setData(
                 Qt.ItemDataRole.UserRole,
                 self._position_history_row_key(item),
@@ -4676,6 +4712,14 @@ class AccountPositionsHomeWidget(QWidget):
                 )
                 holding_item.setTextAlignment(int(Qt.AlignmentFlag.AlignCenter | Qt.AlignmentFlag.AlignVCenter))
                 self._position_history_table.setItem(row, 2, holding_item)
+            pnl_item = self._position_history_table.item(row, 12)
+            if pnl_item is not None:
+                pnl_item = _PositionHistoryPnlTableWidgetItem(
+                    pnl_item.text(),
+                    _position_history_pnl_sort_value(item, self._position_history_usdt_prices),
+                )
+                pnl_item.setTextAlignment(int(Qt.AlignmentFlag.AlignCenter | Qt.AlignmentFlag.AlignVCenter))
+                self._position_history_table.setItem(row, 12, pnl_item)
         self._position_history_summary_label.setText(f"历史仓位：{len(self._position_history_items)} 条")
         target_row = -1
         if selected_key is not None:
@@ -6960,6 +7004,14 @@ class AccountPositionsHomeWidget(QWidget):
                 )
                 holding_item.setTextAlignment(int(Qt.AlignmentFlag.AlignCenter | Qt.AlignmentFlag.AlignVCenter))
                 self._position_history_table.setItem(row, 2, holding_item)
+            pnl_item = self._position_history_table.item(row, 12)
+            if pnl_item is not None:
+                pnl_item = _PositionHistoryPnlTableWidgetItem(
+                    pnl_item.text(),
+                    _position_history_pnl_sort_value(item, self._position_history_usdt_prices),
+                )
+                pnl_item.setTextAlignment(int(Qt.AlignmentFlag.AlignCenter | Qt.AlignmentFlag.AlignVCenter))
+                self._position_history_table.setItem(row, 12, pnl_item)
             self._position_history_table.item(row, 0).setData(
                 Qt.ItemDataRole.UserRole,
                 self._position_history_row_key(item),

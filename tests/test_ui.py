@@ -720,6 +720,19 @@ class UiHelpersTest(TestCase):
         self.assertEqual(currency, "BTC")
         self.assertEqual(amount, Decimal("0.004"))
 
+    def test_history_display_amount_doge_swap_without_instrument_uses_contract_value(self) -> None:
+        amount, currency = _history_display_amount(
+            inst_id="DOGE-USDT-SWAP",
+            inst_type="SWAP",
+            size=Decimal("3.84"),
+            reference_price=Decimal("0.07251"),
+            instruments={},
+            use_swap_contract_fallback=True,
+        )
+
+        self.assertEqual(currency, "DOGE")
+        self.assertEqual(amount, Decimal("3840"))
+
     def test_build_app_restart_command_uses_script_and_data_dir_when_not_frozen(self) -> None:
         command = _build_app_restart_command(
             executable=r"C:\Python311\python.exe",
@@ -11026,7 +11039,7 @@ class PositionTakeoverEntryTsTest(TestCase):
 
 
 class SessionTradeDetailPerformanceTest(TestCase):
-    def test_size_text_uses_contract_fallback_without_sync_instrument_request(self) -> None:
+    def test_size_text_uses_offline_doge_contract_value_without_sync_instrument_request(self) -> None:
         client = SimpleNamespace(get_instrument=MagicMock())
         app = SimpleNamespace(
             client=client,
@@ -11045,5 +11058,5 @@ class SessionTradeDetailPerformanceTest(TestCase):
 
         text = QuantApp._session_trade_detail_size_text(app, session, record, instruments={})
 
-        self.assertEqual(text, "-3.17 张")
+        self.assertEqual(text, "-3170 DOGE")
         client.get_instrument.assert_not_called()

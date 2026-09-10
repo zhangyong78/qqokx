@@ -14017,26 +14017,80 @@ def _format_position_history_filter_stats(
     usdt_prices: dict[str, Decimal],
 ) -> str:
     realized_totals: dict[str, Decimal] = {}
+    profit_totals: dict[str, Decimal] = {}
+    loss_totals: dict[str, Decimal] = {}
     realized_usdt_total = Decimal("0")
     realized_usdt_count = 0
+    profit_usdt_total = Decimal("0")
+    loss_usdt_total = Decimal("0")
+    profit_count = 0
+    loss_count = 0
+    flat_count = 0
+    valid_count = 0
 
     for _, item in filtered_items:
         currency = _infer_position_history_pnl_currency(item)
-        if item.realized_pnl is not None:
-            realized_totals[currency] = realized_totals.get(currency, Decimal("0")) + item.realized_pnl
+        realized_pnl = item.realized_pnl
+        if realized_pnl is not None:
+            valid_count += 1
+            realized_totals[currency] = realized_totals.get(currency, Decimal("0")) + realized_pnl
+            if realized_pnl > 0:
+                profit_count += 1
+                profit_totals[currency] = profit_totals.get(currency, Decimal("0")) + realized_pnl
+            elif realized_pnl < 0:
+                loss_count += 1
+                loss_totals[currency] = loss_totals.get(currency, Decimal("0")) + realized_pnl
+            else:
+                flat_count += 1
         realized_usdt = _position_history_realized_pnl_usdt(item, usdt_prices)
         if realized_usdt is not None:
             realized_usdt_total += realized_usdt
             realized_usdt_count += 1
+            if realized_usdt > 0:
+                profit_usdt_total += realized_usdt
+            elif realized_usdt < 0:
+                loss_usdt_total += realized_usdt
 
     realized_usdt_text = (
         _format_optional_usdt(realized_usdt_total)
         if realized_usdt_count
         else "-"
     )
+    amounts_are_usdt = valid_count > 0 and realized_usdt_count == valid_count
+    if amounts_are_usdt:
+        profit_amount_text = f"{_format_optional_usdt(profit_usdt_total, with_sign=True)} USDT"
+        loss_amount_text = f"{_format_optional_usdt(loss_usdt_total, with_sign=True)} USDT"
+        profit_for_ratio = profit_usdt_total
+        loss_for_ratio = abs(loss_usdt_total)
+    else:
+        profit_amount_text = _format_position_history_currency_totals(profit_totals)
+        loss_amount_text = _format_position_history_currency_totals(loss_totals)
+        if len(realized_totals) == 1:
+            profit_for_ratio = sum(profit_totals.values(), Decimal("0"))
+            loss_for_ratio = abs(sum(loss_totals.values(), Decimal("0")))
+        else:
+            profit_for_ratio = None
+            loss_for_ratio = None
+
+    if profit_for_ratio is None or loss_for_ratio is None:
+        profit_loss_ratio_text = "-"
+    elif loss_for_ratio > 0:
+        profit_loss_ratio_text = f"{format_decimal_fixed(profit_for_ratio / loss_for_ratio, 2)}:1"
+    elif profit_for_ratio > 0:
+        profit_loss_ratio_text = "∞:1"
+    else:
+        profit_loss_ratio_text = "-"
+    win_rate_text = (
+        f"{format_decimal_fixed(Decimal(profit_count) * Decimal(100) / Decimal(valid_count), 2)}%"
+        if valid_count
+        else "-"
+    )
     return (
         f"\u5df2\u5b9e\u73b0\u6536\u76ca\u5408\u8ba1 { _format_position_history_currency_totals(realized_totals) } | "
-        f"\u6298\u5408USDT\u5408\u8ba1 {realized_usdt_text}"
+        f"\u6298\u5408USDT\u5408\u8ba1 {realized_usdt_text} | "
+        f"\u76c8\u5229 {profit_count}\u7b14/{profit_amount_text} | "
+        f"\u4e8f\u635f {loss_count}\u7b14/{loss_amount_text} | "
+        f"\u6301\u5e73 {flat_count}\u7b14 | \u76c8\u4e8f\u6bd4 {profit_loss_ratio_text} | \u80dc\u7387 {win_rate_text}"
     )
 
 
@@ -14162,6 +14216,7 @@ def _history_display_amount(
     size: Decimal | None,
     reference_price: Decimal | None,
     instruments: dict[str, Instrument],
+    use_swap_contract_fallback: bool = False,
 ) -> tuple[Decimal | None, str | None]:
     if size is None:
         return None, None
@@ -14171,6 +14226,22 @@ def _history_display_amount(
         normalized_type = (inst_type or "").upper()
         quote_currency = (_extract_quote_key(inst_id) or "").upper()
         base_currency = _extract_asset_key(inst_id).upper()
+        if use_swap_contract_fallback and normalized_type == "SWAP" and quote_currency in {"USDT", "USDC"}:
+            # Keep historic quantity readable while public instrument metadata
+            # is unavailable.  This only affects presentation; live metadata
+            # takes precedence whenever it is cached.
+            linear_contract_values = {
+                "BTC": Decimal("0.01"),
+                "ETH": Decimal("0.1"),
+                "BNB": Decimal("0.01"),
+                "OKB": Decimal("0.01"),
+                "SOL": Decimal("1"),
+                "DOGE": Decimal("1000"),
+                "XRP": Decimal("100"),
+            }
+            contract_value = linear_contract_values.get(base_currency)
+            if contract_value is not None:
+                return abs(size) * contract_value, base_currency
         if normalized_type == "FUTURES" and quote_currency in {"USD", "USDT", "USDC"} and reference_price is not None and reference_price > 0 and base_currency:
             # Expired futures may not be returned by public instrument list.
             # For USD-like quoted futures, use notional/price fallback to show coin amount.

@@ -2396,37 +2396,45 @@ class UiStrategySessionsMixin:
         # A restarted strategy receives a new history/session id, while the
         # stable strategy_group_id intentionally remains the same.  Keep the
         # previous settled rounds visible in the Net PnL dialog and live chart
-        # after a restart without mixing other APIs or parameter sets.
+        # after a restart without mixing other APIs or parameter sets.  Merge
+        # this even when the current session already has trades; otherwise a
+        # long-running session appears to have less history than a restart.
         strategy_group_id = str(getattr(session, "strategy_group_id", "") or "").strip()
-        if not matched and strategy_group_id:
-            matched = [
+        if strategy_group_id:
+            group_records = [
                 item
                 for item in self._strategy_trade_ledger_records
                 if item.strategy_group_id == strategy_group_id
             ]
-        if not matched:
-            # A manually relaunched strategy can legitimately have a new
-            # parameter snapshot (and therefore a new group id) while still
-            # representing the same API/instrument/strategy stream.  Use the
-            # semantic identity as a final read-only fallback so its prior
-            # settled PnL remains accessible after a restart.
-            api_name = str(getattr(session, "api_name", "") or "").strip().casefold()
-            strategy_id = str(getattr(session, "strategy_id", "") or "").strip()
-            symbol = str(_session_trade_inst_id(session) or session.symbol or "").strip().upper()
-            direction_label = str(getattr(session, "direction_label", "") or "").strip()
-            run_mode_label = str(getattr(session, "run_mode_label", "") or "").strip()
-            if api_name and strategy_id and symbol:
-                matched = [
-                    item
-                    for item in self._strategy_trade_ledger_records
-                    if (
-                        str(item.api_name or "").strip().casefold() == api_name
-                        and str(item.strategy_id or "").strip() == strategy_id
-                        and str(item.symbol or "").strip().upper() == symbol
-                        and (not direction_label or str(item.direction_label or "").strip() == direction_label)
-                        and (not run_mode_label or str(item.run_mode_label or "").strip() == run_mode_label)
-                    )
-                ]
+            if group_records:
+                records_by_id = {item.record_id: item for item in matched}
+                records_by_id.update({item.record_id: item for item in group_records})
+                matched = list(records_by_id.values())
+        # A manual relaunch can legitimately have a changed parameter snapshot
+        # (and therefore a different group id) while still being the same
+        # API/instrument/strategy stream.  Include those settled historical
+        # rows as well, and make their owning session visible in the dialog.
+        api_name = str(getattr(session, "api_name", "") or "").strip().casefold()
+        strategy_id = str(getattr(session, "strategy_id", "") or "").strip()
+        symbol = str(_session_trade_inst_id(session) or getattr(session, "symbol", "") or "").strip().upper()
+        direction_label = str(getattr(session, "direction_label", "") or "").strip()
+        run_mode_label = str(getattr(session, "run_mode_label", "") or "").strip()
+        if api_name and strategy_id and symbol:
+            semantic_records = [
+                item
+                for item in self._strategy_trade_ledger_records
+                if (
+                    str(item.api_name or "").strip().casefold() == api_name
+                    and str(item.strategy_id or "").strip() == strategy_id
+                    and str(item.symbol or "").strip().upper() == symbol
+                    and (not direction_label or str(item.direction_label or "").strip() == direction_label)
+                    and (not run_mode_label or str(item.run_mode_label or "").strip() == run_mode_label)
+                )
+            ]
+            if semantic_records:
+                records_by_id = {item.record_id: item for item in matched}
+                records_by_id.update({item.record_id: item for item in semantic_records})
+                matched = list(records_by_id.values())
         matched.sort(
             key=lambda item: (
                 item.opened_at or item.closed_at or datetime.min,
@@ -8367,6 +8375,7 @@ class UiStrategySessionsMixin:
             size=record.size,
             reference_price=record.entry_price or record.exit_price,
             instruments=resolved_instruments,
+            use_swap_contract_fallback=True,
         )
         if amount is None:
             return _format_optional_decimal(record.size)
@@ -8400,6 +8409,7 @@ class UiStrategySessionsMixin:
                 iid=record.record_id,
                 values=(
                     index,
+                    record.session_id or "-",
                     record.direction_label or "-",
                     _format_history_datetime(record.opened_at),
                     _format_optional_decimal(record.entry_price),
@@ -8515,8 +8525,13 @@ class UiStrategySessionsMixin:
         if flat_count:
             status_parts.append(f"保本 {flat_count}")
         range_part = f"最近一笔 {len(records)} 单" if latest_only else f"累计平仓 {len(records)} 单"
+        record_session_ids = {str(item.session_id or "").strip() for item in records if str(item.session_id or "").strip()}
+        if record_session_ids == {session.session_id}:
+            scope_text = f"会话 {session.session_id}"
+        else:
+            scope_text = f"策略链路累计 {len(record_session_ids)} 个会话（当前 {session.session_id}）"
         header_text = (
-            f"会话 {session.session_id} | {session.symbol} | {bar_text} | {session.direction_label or '-'} | "
+            f"{scope_text} | {session.symbol} | {bar_text} | {session.direction_label or '-'} | "
             f"{range_part} | {' | '.join(status_parts)} | 净盈亏 {_format_optional_usdt_precise(net_total, places=2)}"
         )
         return header_text
@@ -8586,6 +8601,7 @@ class UiStrategySessionsMixin:
                 table_frame,
                 columns=(
                     "seq",
+                    "source_session",
                     "direction",
                     "opened",
                     "entry",
@@ -8603,6 +8619,7 @@ class UiStrategySessionsMixin:
             )
             headings = {
                 "seq": "序号",
+                "source_session": "所属会话",
                 "direction": "方向",
                 "opened": "进场时间",
                 "entry": "进场价格",
@@ -8618,6 +8635,7 @@ class UiStrategySessionsMixin:
             for column_id, text in headings.items():
                 tree.heading(column_id, text=text)
             tree.column("seq", width=60, anchor="center")
+            tree.column("source_session", width=82, anchor="center")
             tree.column("direction", width=72, anchor="center")
             tree.column("opened", width=150, anchor="center")
             tree.column("entry", width=102, anchor="e")

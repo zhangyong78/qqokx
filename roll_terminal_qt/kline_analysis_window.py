@@ -5637,10 +5637,13 @@ class KlineAnalysisWindow(QMainWindow):
         runtime = load_runtime(target)
         if runtime is None:
             return
+        self._invalidate_profile_loaders()
         self._runtime = runtime
         self._last_profile_name = target
         self._sync_account_context()
         self._sync_account_drawer_context()
+        self._history_trade_markers_by_context.clear()
+        self._history_trade_sync_error_by_context.clear()
         self._profile_reload_pending = True
         if self._page_active:
             self._profile_reload_pending = False
@@ -5691,6 +5694,38 @@ class KlineAnalysisWindow(QMainWindow):
             if loader is not None and loader.isRunning():
                 loader.requestInterruption()
         KlineAnalysisWindow._poll_shutdown_loaders(self)
+
+    def _invalidate_profile_loaders(self) -> None:
+        """Stop old-profile work before a workspace API runtime is replaced."""
+        # Invalidate every callback first.  A loader may finish after the
+        # interruption request, so stopping alone is not enough to prevent an
+        # old API result from being rendered into the new profile's chart.
+        self._request_id += 1
+        self._active_request_id = self._request_id
+        self._secondary_request_id += 1
+        self._active_secondary_request_id = self._secondary_request_id
+        self._tertiary_request_id += 1
+        self._active_tertiary_request_id = self._tertiary_request_id
+        self._history_trade_request_id += 1
+        self._active_history_trade_request_id = self._history_trade_request_id
+
+        history_loader = getattr(self, "_history_trade_loader", None)
+        history_loader_active = history_loader is not None and history_loader.isRunning()
+        for loader in (
+            getattr(self, "_loader", None),
+            getattr(self, "_secondary_loader", None),
+            getattr(self, "_tertiary_loader", None),
+            getattr(self, "_secondary_volatility_loader", None),
+            history_loader,
+        ):
+            if loader is not None and loader.isRunning():
+                loader.requestInterruption()
+
+        self._pending_payload = None
+        self._secondary_pending_payload = None
+        self._tertiary_pending_payload = None
+        self._pending_reload_after_load = True
+        self._pending_history_trade_reload = history_loader_active
 
     def _schedule_load_data(self, delay_ms: int = 0) -> None:
         if bool(getattr(self, "_shutdown_requested", False)):
