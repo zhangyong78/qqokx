@@ -4693,12 +4693,43 @@ class UiStrategySessionsMixin:
                 if credentials is None:
                     raise ValueError("未找到该会话对应的 API 凭证。")
                 instrument = self.client.get_instrument(_session_trade_inst_id(session))
+                algo_id = (trade.protective_algo_id or "").strip() or None
+                algo_cl_ord_id = (trade.protective_algo_cl_ord_id or "").strip() or None
+                if not algo_id and not algo_cl_ord_id:
+                    protective_order = self._find_recoverable_protective_order(
+                        credentials,
+                        session,
+                        inst_type=instrument.inst_type,
+                        inst_id=instrument.inst_id,
+                        direction=direction,
+                    )
+                    if protective_order is None:
+                        raise ValueError(
+                            "未找到当前持仓对应的 OKX 止损算法单（algoId/algoClOrdId），"
+                            "可能已触发或撤销，请先刷新持仓后重试。"
+                        )
+                    algo_id = (protective_order.algo_id or "").strip() or None
+                    algo_cl_ord_id = (
+                        (protective_order.algo_client_order_id or protective_order.client_order_id or "").strip()
+                        or None
+                    )
+                    if not algo_id and not algo_cl_ord_id:
+                        raise ValueError(
+                            "已找到保护单，但 OKX 未返回可用于改单的算法单编号，请先刷新持仓后重试。"
+                        )
+                    trade.protective_algo_id = algo_id or trade.protective_algo_id
+                    trade.protective_algo_cl_ord_id = algo_cl_ord_id or trade.protective_algo_cl_ord_id
+                    self._log_session_message(
+                        session,
+                        "修改止损前已从 OKX 恢复保护单编号"
+                        f" | algoId={algo_id or '-'} | algoClOrdId={algo_cl_ord_id or '-'}",
+                    )
                 session.engine.amend_exchange_manual_stop_loss(
                     credentials,
                     session.config,
                     trade_instrument=instrument,
-                    algo_id=(trade.protective_algo_id or "").strip() or None,
-                    algo_cl_ord_id=(trade.protective_algo_cl_ord_id or "").strip() or None,
+                    algo_id=algo_id,
+                    algo_cl_ord_id=algo_cl_ord_id,
                     stop_loss=new_stop,
                 )
             else:
@@ -9289,6 +9320,7 @@ class UiStrategySessionsMixin:
         if (
             "本轮持仓已结束，继续监控下一次信号。" in message
             or "仓位关闭已确认" in message
+            or "人工平仓已确认" in message
         ):
             trade = session.active_trade
             if trade is None or trade.reconciliation_started:
@@ -10627,6 +10659,7 @@ class UiStrategySessionsMixin:
             "推断该止损已触发，结束 OKX 动态止损监控。",
             "本轮持仓已结束，继续监控下一次信号。",
             "仓位关闭已确认",
+            "人工平仓已确认",
             "本次本地止盈止损流程已结束。",
         )
         return any(marker in text for marker in terminal_markers)
@@ -10784,6 +10817,21 @@ class UiStrategySessionsMixin:
             if take_profit is not None:
                 trade.pending_take_profit = take_profit
             return
+        if "人工提前平仓已提交" in message:
+            trade = session.active_trade
+            if trade is None:
+                return
+            # Preserve the manual-close intent when the server is hot-upgraded
+            # and the session runtime is rebuilt from its independent log.
+            trade.management_mode = "manual"
+            trade.manual_reason = "manual_flatten"
+            trade.manual_override_stop_price = None
+            trade.manual_override_at = observed_at
+            try:
+                session.engine.mark_manual_flatten()
+            except Exception:
+                pass
+            return
         local_close_reason_hint = QuantApp._strategy_trade_local_close_reason_hint(message)
         if local_close_reason_hint:
             trade = session.active_trade
@@ -10818,6 +10866,7 @@ class UiStrategySessionsMixin:
         if (
             "本轮持仓已结束，继续监控下一次信号。" in message
             or "仓位关闭已确认" in message
+            or "人工平仓已确认" in message
         ):
             trade = session.active_trade
             if trade is None or trade.reconciliation_started:
@@ -12149,7 +12198,46 @@ class UiStrategySessionsMixin:
         self._refresh_strategy_book_window()
 
     def _daily_trade_report_trades(self) -> list[DailyTrade]:
-        trades = [daily_trade_from_strategy_ledger(record) for record in self._strategy_trade_ledger_records]
+        ledger_trades = [daily_trade_from_strategy_ledger(record) for record in self._strategy_trade_ledger_records]
+        trades = list(ledger_trades)
+
+        # The server may have fresh exchange history even when a strategy row
+        # has not yet been reconciled into the strategy ledger. Include the
+        # per-API cache so the report reflects actual fills immediately.
+        history_root = Path(data_root()) / "state" / "history"
+        ledger_signatures = {
+            (trade.api_name.casefold(), trade.symbol, trade.closed_at, trade.net_pnl)
+            for trade in ledger_trades
+        }
+        if history_root.exists():
+            for profile_dir in history_root.iterdir():
+                if not profile_dir.is_dir():
+                    continue
+                for environment_dir in profile_dir.iterdir():
+                    if not environment_dir.is_dir():
+                        continue
+                    try:
+                        cached_records = load_history_cache_records(
+                            "positions", profile_dir.name, environment_dir.name
+                        )
+                        cached_records = _collapse_position_history_records(cached_records)
+                    except Exception:
+                        continue
+                    for cached_record in cached_records:
+                        item = _position_history_item_from_cache(cached_record)
+                        if item is None:
+                            continue
+                        trade = daily_trade_from_position_history(
+                            item,
+                            api_name=profile_dir.name,
+                            environment=environment_dir.name,
+                        )
+                        signature = (trade.api_name.casefold(), trade.symbol, trade.closed_at, trade.net_pnl)
+                        if signature in ledger_signatures:
+                            continue
+                        ledger_signatures.add(signature)
+                        trades.append(trade)
+
         for session in self.sessions.values():
             active = getattr(session, "active_trade", None)
             opened_at = getattr(active, "opened_logged_at", None) if active is not None else None

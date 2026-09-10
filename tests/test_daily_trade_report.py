@@ -12,10 +12,22 @@ from okx_quant.daily_trade_report import (
     report_to_csv,
     format_report_price,
 )
+from okx_quant.engine import _live_dynamic_break_even_setting_text
+from okx_quant.models import StrategyConfig
 from okx_quant.persistence import list_history_cache_scopes, save_history_cache_records
 
 
 class DailyTradeReportTests(unittest.TestCase):
+    def test_dynamic_break_even_log_includes_trigger_r(self) -> None:
+        config = StrategyConfig(
+            inst_id="DOGE-USDT-SWAP", bar="1H", ema_period=21, atr_period=10,
+            atr_stop_multiplier=Decimal("1"), atr_take_multiplier=Decimal("1"),
+            order_size=Decimal("1"), trade_mode="live", signal_mode="long_only",
+            position_mode="net", environment="live", tp_sl_trigger_type="mark",
+            dynamic_break_even_trigger_r=2,
+        )
+        self.assertEqual(_live_dynamic_break_even_setting_text(config), "nR保本=开启（n=2R）")
+
     def test_report_price_hides_excess_doge_precision(self) -> None:
         self.assertEqual(format_report_price(Decimal("0.0853998458574181"), "DOGE-USDT-SWAP"), "0.0854")
         self.assertEqual(format_report_price(Decimal("80000.123456789"), "BTC-USDT-SWAP"), "80000.12345679")

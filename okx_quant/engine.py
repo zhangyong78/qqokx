@@ -177,6 +177,12 @@ def _live_dynamic_break_even_uses_trigger_r(config: StrategyConfig) -> bool:
     )
 
 
+def _live_dynamic_break_even_setting_text(config: StrategyConfig) -> str:
+    enabled = _live_ema55_slope_dynamic_two_r_break_even_enabled(config)
+    trigger_r = _live_dynamic_break_even_trigger_r(config)
+    return f"nR保本={'开启' if enabled else '关闭'}（n={trigger_r}R）"
+
+
 def _live_dynamic_break_even_summary(config: StrategyConfig) -> str:
     rules = _live_dynamic_protection_rules(config)
     if rules:
@@ -188,7 +194,9 @@ def _live_dynamic_break_even_summary(config: StrategyConfig) -> str:
         )
         if _live_dynamic_break_even_uses_trigger_r(config):
             parts.insert(0, f"首档触发R={_live_ema55_slope_lock_profit_trigger_r(config)}")
-            parts.insert(1, f"nR保本={config.dynamic_two_r_break_even_label()}")
+            parts.insert(1, _live_dynamic_break_even_setting_text(config))
+        else:
+            parts.insert(0, _live_dynamic_break_even_setting_text(config))
         parts.append(f"时间保本={config.time_stop_break_even_enabled_label()}/{config.resolved_time_stop_break_even_bars()}根")
         return " | ".join(parts)
     if _live_dynamic_break_even_uses_trigger_r(config):
@@ -198,10 +206,9 @@ def _live_dynamic_break_even_summary(config: StrategyConfig) -> str:
             f"首档触发R={_live_ema55_slope_lock_profit_trigger_r(config)} | "
             f"首档锁盈R={_live_dynamic_first_lock_r(config) or '自动'} | "
             f"移动步长R={_live_dynamic_trailing_step_r(config)} | "
-            f"保本={config.dynamic_two_r_break_even_label()} | "
-            f"nR保本={config.dynamic_two_r_break_even_label()}"
+            f"{_live_dynamic_break_even_setting_text(config)}"
         )
-    return f"保本触发R={_live_dynamic_break_even_trigger_r(config)} | 保本={config.dynamic_two_r_break_even_label()}"
+    return f"保本触发R={_live_dynamic_break_even_trigger_r(config)} | {_live_dynamic_break_even_setting_text(config)}"
 
 
 def _live_ema55_slope_negative_entry_bars(config: StrategyConfig) -> int:
@@ -2036,7 +2043,7 @@ class StrategyEngine:
                     f"开空阈值={Decimal(str(config.trend_ema_slope_filter_min_ratio)):.6f}",
                     f"止盈方式={'动态止盈' if config.take_profit_mode == 'dynamic' else '固定止盈'}",
                     f"首档触发R={_live_ema55_slope_lock_profit_trigger_r(config)}",
-                    f"nR保本={config.dynamic_two_r_break_even_label()}",
+                    _live_dynamic_break_even_setting_text(config),
                     f"手续费偏移={config.dynamic_fee_offset_enabled_label()}",
                     f"同K线禁重开={'开启' if config.ema55_slope_same_bar_reentry_block else '关闭'}",
                     (
@@ -3656,20 +3663,38 @@ class StrategyEngine:
         ]
         if dynamic_take_profit_enabled:
             monitor_parts.append(f"首档触发R={next_trigger_r}")
-            monitor_parts.append(f"nR保本={'开启' if dynamic_two_r_break_even else '关闭'}")
+            monitor_parts.append(
+                f"nR保本={'开启' if dynamic_two_r_break_even else '关闭'}（n={_live_dynamic_break_even_trigger_r(config)}R）"
+            )
             monitor_parts.append(f"手续费偏移={'开启' if dynamic_fee_offset_enabled else '关闭'}")
             monitor_parts.append(
                 f"时间保本={config.time_stop_break_even_enabled_label()}/{config.resolved_time_stop_break_even_bars()}根"
             )
         self._logger(" | ".join(monitor_parts))
         while not self._stop_event.is_set():
+            manual_control = self.get_manual_trade_control()
+            if (
+                manual_control.management_mode == "manual"
+                and manual_control.manual_reason == "manual_flatten"
+            ):
+                # A manual market-close is submitted outside this monitor.  Keep
+                # checking the real position until OKX confirms it is gone;
+                # otherwise the monitor would keep using the original snapshot
+                # forever and the session would remain "人工平仓中".
+                live_position = self._find_managed_position(credentials, config, trade_instrument, position)
+                self._emit_runtime_heartbeat("人工平仓确认")
+                if live_position is None:
+                    self._logger("人工平仓已确认，OKX 持仓已归零。")
+                    self.resume_automatic_trade_management()
+                    return
+                self._stop_event.wait(config.poll_seconds)
+                continue
             current_price = self._get_trigger_price_with_retry(
                 protection.trigger_inst_id,
                 protection.trigger_price_type,
                 environment=config.environment,
             )
             self._emit_runtime_heartbeat("本地止盈止损")
-            manual_control = self.get_manual_trade_control()
             manual_mode = manual_control.management_mode == "manual"
             if manual_mode and manual_control.stop_loss is not None:
                 current_stop_loss = manual_control.stop_loss
@@ -3812,7 +3837,9 @@ class StrategyEngine:
         ]
         if dynamic_take_profit_enabled:
             monitor_parts.append(f"首档触发R={next_trigger_r}")
-            monitor_parts.append(f"nR保本={'开启' if dynamic_two_r_break_even else '关闭'}")
+            monitor_parts.append(
+                f"nR保本={'开启' if dynamic_two_r_break_even else '关闭'}（n={_live_dynamic_break_even_trigger_r(config)}R）"
+            )
             monitor_parts.append(f"手续费偏移={'开启' if dynamic_fee_offset_enabled else '关闭'}")
             monitor_parts.append(
                 f"时间保本={config.time_stop_break_even_enabled_label()}/{config.resolved_time_stop_break_even_bars()}根"
@@ -3820,13 +3847,25 @@ class StrategyEngine:
         self._logger(" | ".join(monitor_parts))
 
         while not self._stop_event.is_set():
+            manual_control = self.get_manual_trade_control()
+            if (
+                manual_control.management_mode == "manual"
+                and manual_control.manual_reason == "manual_flatten"
+            ):
+                live_position = self._find_managed_position(credentials, config, trade_instrument, position)
+                self._emit_runtime_heartbeat("人工平仓确认")
+                if live_position is None:
+                    self._logger("人工平仓已确认，OKX 持仓已归零。")
+                    self.resume_automatic_trade_management()
+                    return
+                self._stop_event.wait(config.poll_seconds)
+                continue
             current_price = self._get_trigger_price_with_retry(
                 protection.trigger_inst_id,
                 protection.trigger_price_type,
                 environment=config.environment,
             )
             self._emit_runtime_heartbeat("本地止盈止损")
-            manual_control = self.get_manual_trade_control()
             manual_mode = manual_control.management_mode == "manual"
             if manual_mode and manual_control.stop_loss is not None:
                 current_stop_loss = manual_control.stop_loss
