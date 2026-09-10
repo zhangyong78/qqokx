@@ -5,7 +5,7 @@ from __future__ import annotations
 import csv
 import html
 import io
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from typing import Iterable, Mapping, Sequence
@@ -52,6 +52,20 @@ def _raw_datetime(raw: Mapping[str, object], *keys: str) -> datetime | None:
         if parsed is not None:
             return parsed
     return None
+
+
+def _normalize_trade_datetimes(trade: "DailyTrade") -> "DailyTrade":
+    """Return a report trade whose timestamps are consistently timezone-aware.
+
+    Older ledger/cache records can carry naive ``datetime`` objects while newer
+    records use Asia/Shanghai-aware values.  Normalizing at the report boundary
+    keeps sorting and date grouping safe for mixed historical data.
+    """
+    opened_at = _datetime(trade.opened_at)
+    closed_at = _datetime(trade.closed_at)
+    if opened_at == trade.opened_at and closed_at == trade.closed_at:
+        return trade
+    return replace(trade, opened_at=opened_at, closed_at=closed_at)
 
 
 def _sum_decimal(*values: Decimal | None) -> Decimal | None:
@@ -220,9 +234,10 @@ def build_daily_trade_report(
     asset_filter: str = "全部币种",
 ) -> DailyTradeReport:
     selected_asset = str(asset_filter or "全部币种").strip().upper()
+    normalized_trades = (_normalize_trade_datetimes(trade) for trade in trades)
     selected = [
         trade
-        for trade in trades
+        for trade in normalized_trades
         if (_in_range(trade.opened_at, start_date, end_date) or _in_range(trade.closed_at, start_date, end_date))
         and (api_name == "全部API" or trade.api_name.casefold() == api_name.casefold())
         and (

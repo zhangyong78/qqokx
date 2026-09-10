@@ -1,3 +1,4 @@
+from dataclasses import replace
 from datetime import datetime
 from decimal import Decimal
 from types import SimpleNamespace
@@ -83,6 +84,34 @@ class DailyTradeReportTests(unittest.TestCase):
         )
         self.assertEqual(len(eth_report.trades), 1)
         self.assertEqual(eth_report.trades[0].symbol, "ETH-USDT-SWAP")
+
+    def test_report_normalizes_mixed_naive_and_aware_trade_times(self) -> None:
+        record = SimpleNamespace(
+            record_id="mixed-1", api_name="ReapAi", environment="live", symbol="BTC-USDT-SWAP",
+            strategy_name="EMA", session_id="S1", direction_label="只做多",
+            opened_at=datetime(2026, 9, 4, 10), closed_at=datetime(2026, 9, 4, 11),
+            entry_price="100", exit_price="102", size="1", entry_fee="0", exit_fee="0",
+            funding_fee="0", gross_pnl="2", net_pnl="2", close_reason="止盈",
+        )
+        naive_trade = replace(
+            daily_trade_from_strategy_ledger(record),
+            opened_at=datetime(2026, 9, 4, 10),
+            closed_at=datetime(2026, 9, 4, 11),
+        )
+        aware_trade = replace(
+            naive_trade,
+            opened_at=datetime(2026, 9, 4, 12, tzinfo=REPORT_TIMEZONE),
+            closed_at=datetime(2026, 9, 4, 13, tzinfo=REPORT_TIMEZONE),
+            trade_key="mixed-2",
+        )
+        report = build_daily_trade_report(
+            [naive_trade, aware_trade],
+            start_date=datetime(2026, 9, 4).date(),
+            end_date=datetime(2026, 9, 4).date(),
+        )
+        self.assertEqual(len(report.trades), 2)
+        self.assertEqual(report.trades[0].trade_key, "mixed-2")
+        self.assertEqual(report.trades[0].closed_at.tzinfo, REPORT_TIMEZONE)
 
 
 if __name__ == "__main__":
