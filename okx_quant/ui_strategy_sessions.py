@@ -8059,9 +8059,17 @@ class UiStrategySessionsMixin:
         if session is None:
             return
         result: StrategyTradeReconciliationResult | None = None
+        manual_close_direct_query_attempted = False
         for attempt in range(3):
             try:
                 snapshot = self._load_strategy_trade_reconciliation_snapshot_with_fallback(session, credentials)
+                if not manual_close_direct_query_attempted:
+                    manual_close_direct_query_attempted = self._append_confirmed_manual_close_to_reconciliation_snapshot(
+                        session,
+                        trade,
+                        credentials,
+                        snapshot,
+                    )
                 candidate = self._build_strategy_trade_reconciliation_result(session, trade, snapshot)
             except Exception as exc:
                 if attempt >= 2:
@@ -8084,6 +8092,101 @@ class UiStrategySessionsMixin:
                 error_message="本轮归因失败：未获取到有效结果。",
             )
         self.root.after(0, lambda: self._apply_strategy_trade_reconciliation_result(result))
+
+    def _append_confirmed_manual_close_to_reconciliation_snapshot(
+        self,
+        session: StrategySession,
+        trade: StrategyTradeRuntimeState,
+        credentials: Credentials,
+        snapshot: StrategyTradeReconciliationSnapshot,
+    ) -> bool:
+        """Recover an old manual close missing from bounded history lists.
+
+        The normal reconciliation snapshot already requests recent orders and
+        fills.  A historical manual market order may fall outside that bounded
+        list, however.  Its logged ``ordId`` is an exact and safe key, so make
+        one direct request only in that narrow recovery case; never treat a
+        submission as settled unless OKX reports it filled.
+        """
+        if str(trade.manual_reason or "").strip().lower() != "manual_flatten" and trade.close_reason_hint != "人工提前平仓":
+            return False
+        exit_order_id = str(trade.exit_order_id or "").strip()
+        trade_inst_id = (session.config.trade_inst_id or session.config.inst_id or session.symbol).strip().upper()
+        if not exit_order_id or not trade_inst_id:
+            return False
+        if any((item.order_id or "").strip() == exit_order_id for item in snapshot.order_history):
+            return False
+
+        effective_config = replace(session.config, environment=snapshot.effective_environment)
+        try:
+            status = self.client.get_order(
+                credentials,
+                effective_config,
+                inst_id=trade_inst_id,
+                ord_id=exit_order_id,
+            )
+        except Exception as exc:
+            # Do not discard usable fills/position history merely because this
+            # optional old-order lookup is unavailable.
+            note = f"人工平仓结算：ordId 定向查询失败，继续使用已有历史数据（{_format_network_error_message(str(exc))}）。"
+            snapshot.environment_note = f"{snapshot.environment_note} {note}".strip()
+            return True
+        filled_size = status.filled_size or Decimal("0")
+        state = str(status.state or "").strip().lower()
+        if state != "filled" and filled_size <= 0:
+            return True
+
+        raw = status.raw if isinstance(status.raw, dict) else {}
+
+        def _raw_decimal(*keys: str) -> Decimal | None:
+            for key in keys:
+                value = raw.get(key)
+                if value in {None, ""}:
+                    continue
+                try:
+                    return Decimal(str(value))
+                except (InvalidOperation, ValueError):
+                    continue
+            return None
+
+        def _raw_timestamp(*keys: str) -> int | None:
+            for key in keys:
+                value = raw.get(key)
+                try:
+                    parsed = int(str(value))
+                except (TypeError, ValueError):
+                    continue
+                if parsed > 0:
+                    return parsed
+            return None
+
+        confirmed_order = type(
+            "ManualCloseOrder",
+            (),
+            {
+                "client_order_id": str(raw.get("clOrdId") or ""),
+                "algo_client_order_id": str(raw.get("algoClOrdId") or ""),
+                "order_id": str(status.ord_id or exit_order_id),
+                "algo_id": str(raw.get("algoId") or ""),
+                "inst_id": trade_inst_id,
+                "side": status.side,
+                "pos_side": str(raw.get("posSide") or ""),
+                "filled_size": status.filled_size,
+                "actual_size": status.filled_size,
+                "avg_price": status.avg_price,
+                "actual_price": status.avg_price or status.price,
+                "price": status.price,
+                "fee": _raw_decimal("fee", "fillFee"),
+                "pnl": _raw_decimal("pnl", "fillPnl"),
+                "state": status.state,
+                "update_time": _raw_timestamp("uTime", "fillTime", "cTime"),
+                "created_time": _raw_timestamp("cTime", "uTime"),
+            },
+        )()
+        snapshot.order_history.append(confirmed_order)
+        note = "人工平仓结算：历史列表未包含该订单，已按 ordId 定向确认 OKX 成交。"
+        snapshot.environment_note = f"{snapshot.environment_note} {note}".strip()
+        return True
 
     def _apply_strategy_trade_reconciliation_result(self, result: StrategyTradeReconciliationResult) -> None:
         session = self.sessions.get(result.session_id)

@@ -7110,6 +7110,64 @@ class StrategyTradeTrackingTest(TestCase):
         self.assertEqual(result.ledger_record.gross_pnl, Decimal("-1.842"))
         self.assertEqual(result.ledger_record.net_pnl, Decimal("-1.882"))
 
+    def test_manual_close_reconciliation_queries_exact_order_only_when_bounded_history_misses_it(self) -> None:
+        session = self._make_session()
+        session.config = StrategyConfig(
+            inst_id="ETH-USDT-SWAP",
+            trade_inst_id="ETH-USDT-SWAP",
+            bar="1H",
+            ema_period=21,
+            atr_period=10,
+            atr_stop_multiplier=Decimal("2"),
+            atr_take_multiplier=Decimal("4"),
+            order_size=Decimal("0.1"),
+            trade_mode="cross",
+            signal_mode="long_only",
+            position_mode="long_short",
+            environment="live",
+            tp_sl_trigger_type="mark",
+        )
+        trade = StrategyTradeRuntimeState(
+            round_id="round-manual-query-1",
+            exit_order_id="MANUAL-EXIT-2",
+            manual_reason="manual_flatten",
+            close_reason_hint="人工提前平仓",
+        )
+        snapshot = StrategyTradeReconciliationSnapshot(
+            effective_environment="live",
+            order_history=[],
+            fills=[],
+            position_history=[],
+            account_bills=[],
+        )
+        status = SimpleNamespace(
+            ord_id="MANUAL-EXIT-2",
+            state="filled",
+            side="sell",
+            price=Decimal("2340"),
+            avg_price=Decimal("2339.5"),
+            size=Decimal("0.1"),
+            filled_size=Decimal("0.1"),
+            raw={"posSide": "long", "fee": "-0.04", "pnl": "-1.892", "uTime": "1789018832000", "cTime": "1789018831000"},
+        )
+        app = SimpleNamespace(client=MagicMock())
+        app.client.get_order.return_value = status
+
+        requested = QuantApp._append_confirmed_manual_close_to_reconciliation_snapshot(
+            app,
+            session,
+            trade,
+            SimpleNamespace(),
+            snapshot,
+        )
+
+        self.assertTrue(requested)
+        app.client.get_order.assert_called_once()
+        self.assertEqual(len(snapshot.order_history), 1)
+        self.assertEqual(snapshot.order_history[0].order_id, "MANUAL-EXIT-2")
+        self.assertEqual(snapshot.order_history[0].avg_price, Decimal("2339.5"))
+        self.assertIn("定向确认 OKX 成交", snapshot.environment_note)
+
     def test_build_strategy_trade_reconciliation_result_estimates_missing_net_pnl_from_prices(self) -> None:
         session = self._make_session()
         session.strategy_name = "EMA dynamic"
