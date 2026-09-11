@@ -7168,6 +7168,67 @@ class StrategyTradeTrackingTest(TestCase):
         self.assertEqual(snapshot.order_history[0].avg_price, Decimal("2339.5"))
         self.assertIn("定向确认 OKX 成交", snapshot.environment_note)
 
+    def test_historical_manual_close_repair_queries_archived_session_and_backfills(self) -> None:
+        history = SimpleNamespace(
+            record_id="H240",
+            session_id="S240",
+            api_name="ReapAi",
+            strategy_id="ema55_slope_short",
+            strategy_name="均线斜率做空",
+            symbol="DOGE-USDT-SWAP",
+            direction_label="只做空",
+            run_mode_label="交易并下单",
+            started_at=datetime(2026, 9, 10, 3, 0, 0),
+            log_file_path="D:/logs/S240.log",
+            config_snapshot={},
+        )
+        round_info = SimpleNamespace(close_reason="人工平仓", exit_order_id="EXIT-240", symbol="DOGE-USDT-SWAP")
+        config = SimpleNamespace(environment="live")
+        status = SimpleNamespace(
+            ord_id="EXIT-240",
+            state="filled",
+            side="buy",
+            ord_type="market",
+            price=None,
+            size=Decimal("3.17"),
+            filled_size=Decimal("3.17"),
+            avg_price=Decimal("0.08599"),
+            raw={"uTime": "1789047620000", "cTime": "1789047620000", "posSide": "short", "pnl": "8.31", "fee": "-0.10"},
+        )
+        finish = MagicMock()
+
+        class ImmediateRoot:
+            @staticmethod
+            def after(_delay: int, callback: object) -> None:
+                callback()
+
+        app = SimpleNamespace(
+            client=MagicMock(),
+            root=ImmediateRoot(),
+            _finish_historical_manual_close_repair=finish,
+        )
+        app.client.get_order.return_value = status
+        backfill_result = SimpleNamespace(added_record_count=1)
+        with patch("okx_quant.ui_shell._deserialize_strategy_config_snapshot", return_value=config), patch(
+            "okx_quant.ui_shell.load_history_cache_records", return_value=[]
+        ), patch("okx_quant.ui_shell.save_history_cache_records") as save_cache, patch(
+            "okx_quant.strategy_trade_ledger_backfill.parse_trade_rounds_for_history_record", return_value=[round_info]
+        ), patch(
+            "okx_quant.strategy_trade_ledger_backfill.backfill_strategy_trade_ledger", return_value=backfill_result
+        ):
+            QuantApp._historical_manual_close_repair_worker(
+                app,
+                [history],
+                set(),
+                {"ReapAi": SimpleNamespace()},
+            )
+
+        app.client.get_order.assert_called_once()
+        saved_rows = save_cache.call_args.args[3]
+        self.assertEqual(saved_rows[0]["api_name"], "ReapAi")
+        self.assertEqual(saved_rows[0]["order_id"], "EXIT-240")
+        finish.assert_called_once_with(1, 1, 0, [])
+
     def test_build_strategy_trade_reconciliation_result_estimates_missing_net_pnl_from_prices(self) -> None:
         session = self._make_session()
         session.strategy_name = "EMA dynamic"

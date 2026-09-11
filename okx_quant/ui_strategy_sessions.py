@@ -11617,6 +11617,195 @@ class UiStrategySessionsMixin:
                 " | 已优先保留原始结算数据"
             )
         self._rebuild_history_financials_from_trade_ledger()
+        self._start_historical_manual_close_repair()
+
+    def _start_historical_manual_close_repair(self) -> None:
+        """One-time startup repair for old, already-stopped manual closes.
+
+        Live recovery handles an in-flight manual close.  Once that session has
+        already been archived, only its log remains and the normal offline
+        backfill cannot repair it when bounded local history has evicted the
+        order.  This worker scans those logs and uses the exact recorded
+        ``ordId`` once per missing close.
+        """
+        if getattr(self, "_historical_manual_close_repair_started", False):
+            return
+        self._historical_manual_close_repair_started = True
+        history_records = list(getattr(self, "_strategy_history_records", []))
+        known_exit_orders = {
+            (str(record.session_id or "").strip(), str(record.exit_order_id or "").strip())
+            for record in getattr(self, "_strategy_trade_ledger_records", [])
+            if str(record.session_id or "").strip() and str(record.exit_order_id or "").strip()
+        }
+        credential_by_api = {
+            str(record.api_name or "").strip(): self._credentials_for_profile_or_none(str(record.api_name or "").strip())
+            for record in history_records
+            if str(record.api_name or "").strip()
+        }
+        threading.Thread(
+            target=self._historical_manual_close_repair_worker,
+            args=(history_records, known_exit_orders, credential_by_api),
+            daemon=True,
+        ).start()
+
+    def _historical_manual_close_repair_worker(
+        self,
+        history_records: list[StrategyHistoryRecord],
+        known_exit_orders: set[tuple[str, str]],
+        credential_by_api: dict[str, Credentials | None],
+    ) -> None:
+        from okx_quant.strategy_trade_ledger_backfill import backfill_strategy_trade_ledger, parse_trade_rounds_for_history_record
+
+        repaired_count = 0
+        queried_count = 0
+        skipped_count = 0
+        notes: list[str] = []
+        cache_rows: dict[tuple[str, str], list[dict[str, object]]] = {}
+        cache_order_ids: dict[tuple[str, str], set[str]] = {}
+        strategy_ids: set[str] = set()
+        try:
+            for history in history_records:
+                if queried_count >= 20:
+                    notes.append("待回补人工平仓超过 20 笔，本次仅处理前 20 笔。")
+                    break
+                api_name = str(history.api_name or "").strip()
+                config = _deserialize_strategy_config_snapshot(history.config_snapshot)
+                if not api_name or config is None:
+                    continue
+                history_payload = {
+                    "record_id": history.record_id,
+                    "session_id": history.session_id,
+                    "api_name": api_name,
+                    "strategy_id": history.strategy_id,
+                    "strategy_name": history.strategy_name,
+                    "symbol": history.symbol,
+                    "direction_label": history.direction_label,
+                    "run_mode_label": history.run_mode_label,
+                    "started_at": history.started_at.isoformat(timespec="seconds"),
+                    "log_file_path": history.log_file_path,
+                    "config_snapshot": history.config_snapshot,
+                }
+                rounds = parse_trade_rounds_for_history_record(history_payload)
+                for round_info in rounds:
+                    exit_order_id = str(round_info.exit_order_id or "").strip()
+                    if (
+                        round_info.close_reason != "人工平仓"
+                        or not exit_order_id
+                        or (history.session_id, exit_order_id) in known_exit_orders
+                    ):
+                        continue
+                    credentials = credential_by_api.get(api_name)
+                    if credentials is None:
+                        skipped_count += 1
+                        notes.append(f"会话={history.session_id} | 无可用 API 凭证，未核验 ordId={exit_order_id}")
+                        continue
+                    queried_count += 1
+                    try:
+                        status = self.client.get_order(
+                            credentials,
+                            config,
+                            inst_id=(round_info.symbol or history.symbol).strip().upper(),
+                            ord_id=exit_order_id,
+                        )
+                    except Exception as exc:
+                        skipped_count += 1
+                        notes.append(
+                            f"会话={history.session_id} | ordId={exit_order_id} 定向查询失败：{_format_network_error_message(str(exc))}"
+                        )
+                        continue
+                    filled_size = status.filled_size or Decimal("0")
+                    if str(status.state or "").strip().lower() != "filled" and filled_size <= 0:
+                        skipped_count += 1
+                        notes.append(f"会话={history.session_id} | ordId={exit_order_id} 未确认成交，未记账")
+                        continue
+                    environment = str(config.environment or "live").strip().lower() or "live"
+                    scope = (api_name, environment)
+                    if scope not in cache_rows:
+                        rows = load_history_cache_records("orders", api_name, environment)
+                        cache_rows[scope] = list(rows)
+                        cache_order_ids[scope] = {
+                            str(item.get("order_id") or item.get("ordId") or "").strip()
+                            for item in rows
+                            if isinstance(item, dict)
+                        }
+                    raw = status.raw if isinstance(status.raw, dict) else {}
+                    order_row = {
+                        "api_name": api_name,
+                        "source_kind": "manual_close_repair",
+                        "source_label": "人工平仓定向核验",
+                        "created_time": raw.get("cTime") or raw.get("uTime") or int(datetime.now().timestamp() * 1000),
+                        "update_time": raw.get("uTime") or raw.get("fillTime") or raw.get("cTime") or int(datetime.now().timestamp() * 1000),
+                        "inst_id": (round_info.symbol or history.symbol).strip().upper(),
+                        "inst_type": infer_inst_type((round_info.symbol or history.symbol).strip().upper()),
+                        "side": status.side or raw.get("side") or "",
+                        "pos_side": raw.get("posSide") or "",
+                        "td_mode": raw.get("tdMode") or "",
+                        "ord_type": status.ord_type or raw.get("ordType") or "",
+                        "state": status.state or "",
+                        "price": str(status.price) if status.price is not None else "",
+                        "size": str(status.size) if status.size is not None else "",
+                        "filled_size": str(status.filled_size) if status.filled_size is not None else "",
+                        "avg_price": str(status.avg_price) if status.avg_price is not None else "",
+                        "order_id": str(status.ord_id or exit_order_id),
+                        "client_order_id": raw.get("clOrdId") or "",
+                        "fee": raw.get("fee") or raw.get("fillFee") or "",
+                        "pnl": raw.get("pnl") or raw.get("fillPnl") or "",
+                        "raw": raw,
+                    }
+                    if exit_order_id in cache_order_ids[scope]:
+                        cache_rows[scope] = [
+                            order_row
+                            if str(item.get("order_id") or item.get("ordId") or "").strip() == exit_order_id
+                            else item
+                            for item in cache_rows[scope]
+                        ]
+                    else:
+                        cache_rows[scope].append(order_row)
+                        cache_order_ids[scope].add(exit_order_id)
+                    repaired_count += 1
+                    strategy_ids.add(str(history.strategy_id or "").strip())
+
+            for (api_name, environment), rows in cache_rows.items():
+                save_history_cache_records("orders", api_name, environment, rows)
+            backfill_result = backfill_strategy_trade_ledger(
+                strategy_ids=tuple(sorted(item for item in strategy_ids if item)),
+                write=bool(strategy_ids),
+            ) if strategy_ids else None
+            if backfill_result is not None:
+                repaired_count = backfill_result.added_record_count
+        except Exception as exc:
+            notes.append(f"历史人工平仓回补异常：{_format_network_error_message(str(exc))}")
+        self.root.after(
+            0,
+            lambda: self._finish_historical_manual_close_repair(
+                queried_count,
+                repaired_count,
+                skipped_count,
+                notes,
+            ),
+        )
+
+    def _finish_historical_manual_close_repair(
+        self,
+        queried_count: int,
+        repaired_count: int,
+        skipped_count: int,
+        notes: list[str],
+    ) -> None:
+        if repaired_count:
+            self._load_strategy_history()
+            self._load_strategy_trade_ledger()
+            self._enqueue_log(
+                "历史人工平仓回补完成"
+                f" | 定向核验={queried_count} | 新增账本={repaired_count} | 未确认/失败={skipped_count}"
+            )
+        elif queried_count or skipped_count:
+            self._enqueue_log(
+                "历史人工平仓回补未新增账本"
+                f" | 定向核验={queried_count} | 未确认/失败={skipped_count}"
+            )
+        for note in notes[:5]:
+            self._enqueue_log(f"历史人工平仓回补 | {note}")
 
     def _backfill_strategy_group_ids_from_history(
         self,
