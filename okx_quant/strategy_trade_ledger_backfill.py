@@ -456,7 +456,11 @@ def _sum_decimal_field(items: Iterable[dict[str, object]], field: str) -> Decima
     return total if seen else None
 
 
-def _load_history_records_map(path: Path) -> dict[tuple[str, str], list[dict[str, object]]]:
+def _load_history_records_map(
+    path: Path,
+    *,
+    scoped_api_name: str = "",
+) -> dict[tuple[str, str], list[dict[str, object]]]:
     if not path.exists():
         return {}
     payload = json.loads(path.read_text(encoding="utf-8"))
@@ -467,7 +471,9 @@ def _load_history_records_map(path: Path) -> dict[tuple[str, str], list[dict[str
     for item in raw_records:
         if not isinstance(item, dict):
             continue
-        api_name = str(item.get("api_name") or "").strip()
+        # History files are already scoped by history/<API>/<environment>.
+        # Normal UI cache rows therefore do not repeat api_name in every row.
+        api_name = str(item.get("api_name") or "").strip() or scoped_api_name
         order_id = str(item.get("order_id") or "").strip()
         if not api_name or not order_id:
             continue
@@ -475,7 +481,11 @@ def _load_history_records_map(path: Path) -> dict[tuple[str, str], list[dict[str
     return grouped
 
 
-def _load_order_records_map(path: Path) -> dict[tuple[str, str], dict[str, object]]:
+def _load_order_records_map(
+    path: Path,
+    *,
+    scoped_api_name: str = "",
+) -> dict[tuple[str, str], dict[str, object]]:
     if not path.exists():
         return {}
     payload = json.loads(path.read_text(encoding="utf-8"))
@@ -486,7 +496,7 @@ def _load_order_records_map(path: Path) -> dict[tuple[str, str], dict[str, objec
     for item in raw_records:
         if not isinstance(item, dict):
             continue
-        api_name = str(item.get("api_name") or "").strip()
+        api_name = str(item.get("api_name") or "").strip() or scoped_api_name
         order_id = str(item.get("order_id") or "").strip()
         if not api_name or not order_id:
             continue
@@ -503,8 +513,14 @@ class _ApiEnvironmentHistoryCache:
 def _load_api_environment_history_cache(state_dir: Path, *, api_name: str, environment: str) -> _ApiEnvironmentHistoryCache:
     history_root = state_dir / "history" / api_name / environment
     return _ApiEnvironmentHistoryCache(
-        fills_by_api_order_id=_load_history_records_map(history_root / "fills_history.json"),
-        orders_by_api_order_id=_load_order_records_map(history_root / "order_history.json"),
+        fills_by_api_order_id=_load_history_records_map(
+            history_root / "fills_history.json",
+            scoped_api_name=api_name,
+        ),
+        orders_by_api_order_id=_load_order_records_map(
+            history_root / "order_history.json",
+            scoped_api_name=api_name,
+        ),
     )
 
 
@@ -532,6 +548,8 @@ def _resolve_trade_fill_snapshot(
             or _parse_decimal(order.get("actual_size"))
             or _parse_decimal(order.get("size"))
         )
+    if fee is None and order is not None:
+        fee = _parse_decimal(order.get("fee")) or _parse_decimal(order.get("fill_fee"))
     at = fallback_at
     if fills:
         fill_times = [int(item.get("fill_time") or 0) for item in fills if int(item.get("fill_time") or 0) > 0]
@@ -576,6 +594,37 @@ def _trade_link_keys(record: dict[str, object]) -> set[tuple[str, ...]]:
     if exit_order_id:
         keys.add(("exit_order", session_id, exit_order_id))
     return keys
+
+
+def _manual_recovery_should_replace_existing(
+    existing: dict[str, object],
+    recovered: dict[str, object],
+) -> bool:
+    """Replace a placeholder settlement with a confirmed manual close.
+
+    Old builds could persist the opening side of a round before the manual
+    close was attributed.  The shared entry order then made the generic
+    duplicate guard skip the later complete recovery forever.
+    """
+    if "人工平仓成交由历史成交确认" not in str(recovered.get("summary_note") or ""):
+        return False
+    existing_exit_order = str(existing.get("exit_order_id") or "").strip()
+    recovered_exit_order = str(recovered.get("exit_order_id") or "").strip()
+    if existing_exit_order and existing_exit_order != recovered_exit_order:
+        return False
+    existing_complete = bool(
+        existing_exit_order
+        and existing.get("exit_price") not in {None, ""}
+        and existing.get("size") not in {None, ""}
+        and existing.get("net_pnl") not in {None, ""}
+    )
+    recovered_complete = bool(
+        recovered_exit_order
+        and recovered.get("exit_price") not in {None, ""}
+        and recovered.get("size") not in {None, ""}
+        and recovered.get("net_pnl") not in {None, ""}
+    )
+    return recovered_complete and not existing_complete
 
 
 def _build_record_id(existing_ids: set[str], *, session_id: str, closed_at: datetime) -> str:
@@ -801,7 +850,24 @@ def backfill_strategy_trade_ledger(
                 continue
             business_key = _business_key(record)
             record_trade_links = _trade_link_keys(record)
-            if business_key in existing_keys or bool(record_trade_links & existing_trade_links):
+            duplicate_index = next(
+                (
+                    index
+                    for index, existing_record in enumerate(ledger_records)
+                    if _business_key(existing_record) == business_key
+                    or bool(_trade_link_keys(existing_record) & record_trade_links)
+                ),
+                None,
+            )
+            if duplicate_index is not None:
+                existing_record = ledger_records[duplicate_index]
+                if _manual_recovery_should_replace_existing(existing_record, record):
+                    record["record_id"] = str(existing_record.get("record_id") or record["record_id"])
+                    record["round_id"] = str(existing_record.get("round_id") or record.get("round_id") or "")
+                    ledger_records[duplicate_index] = record
+                    existing_keys.add(business_key)
+                    existing_trade_links.update(record_trade_links)
+                    added_record_count += 1
                 continue
             ledger_records.append(record)
             existing_keys.add(business_key)

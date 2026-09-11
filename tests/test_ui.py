@@ -54,6 +54,7 @@ from okx_quant.ui import (
     _build_normal_strategy_book_summary,
     _build_app_restart_command,
     _build_upgrade_confirmation_message,
+    _upgrade_launch_settings_help_text,
     _build_current_position_note_record,
     _build_group_row_values,
     _build_history_position_note_record,
@@ -1074,7 +1075,30 @@ class UiHelpersTest(TestCase):
         self.assertIn("当前检测到 3 条运行中策略", message)
         self.assertIn("可自动迁移：2 条", message)
         self.assertIn("不支持自动迁移：1 条", message)
+        self.assertIn("升级后会继续等待下一次新信号，并按正常逻辑执行", message)
+        self.assertIn("升级或重启期间错过的旧信号不会补追", message)
+        self.assertIn("signal_only，升级后只恢复信号观察/通知，不会下单", message)
         self.assertIn(str(Path(r"D:\qqokx_data").resolve()), message)
+
+    def test_upgrade_launch_settings_help_text_explains_waiting_signal_behavior(self) -> None:
+        help_text = _upgrade_launch_settings_help_text()
+
+        self.assertIn("下一次新信号正常执行", help_text)
+        self.assertIn("错过的旧信号不会补追", help_text)
+        self.assertIn("signal_only 只恢复信号观察/通知，不会下单", help_text)
+        self.assertIn("需要手动启动新版本", help_text)
+
+    def test_build_upgrade_confirmation_message_always_includes_upgrade_rules(self) -> None:
+        message = _build_upgrade_confirmation_message(
+            running_count=0,
+            migratable_count=0,
+            unsupported_count=0,
+            data_dir=r"D:\qqokx_data",
+        )
+
+        self.assertIn("升级后会继续等待下一次新信号，并按正常逻辑执行", message)
+        self.assertIn("升级或重启期间错过的旧信号不会补追", message)
+        self.assertIn("signal_only，升级后只恢复信号观察/通知，不会下单", message)
 
     def test_merge_history_cache_records_prefers_remote_duplicates(self) -> None:
         local_records = [

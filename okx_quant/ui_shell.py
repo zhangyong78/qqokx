@@ -518,8 +518,26 @@ def _build_upgrade_confirmation_message(
             lines.append("可迁移策略里，有持仓/挂单的会继续接管，纯等待信号的会自动恢复监听。")
         if unsupported_count > 0:
             lines.append("不支持自动迁移的策略会先停止，需要升级后手工重新启动。")
+    lines.extend(
+        [
+            "等待信号策略的升级规则：升级后会继续等待下一次新信号，并按正常逻辑执行。",
+            "升级或重启期间错过的旧信号不会补追，避免接入已经确认的老信号。",
+            "如果运行模式是 signal_only，升级后只恢复信号观察/通知，不会下单。",
+        ]
+    )
     lines.extend(["", "现在开始程序升级吗？"])
     return "\n".join(lines)
+
+
+def _upgrade_launch_settings_help_text() -> str:
+    return "\n".join(
+        [
+            "升级说明：",
+            "• 升级前处于‘等待信号’且没有持仓/挂单的策略，升级后会自动恢复监听；下一次新信号正常执行。",
+            "• 升级或重启期间错过的旧信号不会补追。",
+            "• signal_only 只恢复信号观察/通知，不会下单。选择‘升级完成后不启动’时，需要手动启动新版本。",
+        ]
+    )
 
 
 UiBacktestEntryMixin = _bind_mixin_to_shell_globals(UiBacktestEntryMixin)
@@ -4339,21 +4357,28 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         body.columnconfigure(0, weight=1)
 
         ttk.Label(body, text="升级完成后的处理：").grid(row=0, column=0, sticky="w")
+        ttk.Label(
+            body,
+            text=_upgrade_launch_settings_help_text(),
+            justify="left",
+            anchor="w",
+            wraplength=520,
+        ).grid(row=1, column=0, sticky="w", pady=(8, 0))
         ttk.Radiobutton(
             body,
             text="自动启动当前版本",
             variable=mode_var,
             value=UPGRADE_LAUNCH_MODE_AUTO,
-        ).grid(row=1, column=0, sticky="w", pady=(8, 0))
+        ).grid(row=2, column=0, sticky="w", pady=(10, 0))
         ttk.Radiobutton(
             body,
             text="启动指定目录版本",
             variable=mode_var,
             value=UPGRADE_LAUNCH_MODE_CUSTOM,
-        ).grid(row=2, column=0, sticky="w", pady=(8, 0))
+        ).grid(row=3, column=0, sticky="w", pady=(8, 0))
 
         custom_row = ttk.Frame(body)
-        custom_row.grid(row=3, column=0, sticky="ew", pady=(6, 0))
+        custom_row.grid(row=4, column=0, sticky="ew", pady=(6, 0))
         custom_row.columnconfigure(0, weight=1)
         custom_path_entry = ttk.Entry(custom_row, textvariable=path_var, width=56)
         custom_path_entry.grid(row=0, column=0, sticky="ew")
@@ -4382,14 +4407,14 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         ttk.Label(
             body,
             text=f"会自动查找 {UPGRADE_CUSTOM_EXECUTABLE_NAME}，也可以直接填写 exe 路径。",
-        ).grid(row=4, column=0, sticky="w", pady=(4, 0))
+        ).grid(row=5, column=0, sticky="w", pady=(4, 0))
         ttk.Radiobutton(
             body,
             text="升级完成后不启动",
             variable=mode_var,
             value=UPGRADE_LAUNCH_MODE_NONE,
-        ).grid(row=5, column=0, sticky="w", pady=(10, 0))
-        ttk.Checkbutton(body, text="记住本次选择", variable=remember_var).grid(row=6, column=0, sticky="w", pady=(12, 0))
+        ).grid(row=6, column=0, sticky="w", pady=(10, 0))
+        ttk.Checkbutton(body, text="记住本次选择", variable=remember_var).grid(row=7, column=0, sticky="w", pady=(12, 0))
 
         result: dict[str, object] = {"value": None}
 
@@ -4417,7 +4442,7 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
             window.destroy()
 
         button_row = ttk.Frame(body)
-        button_row.grid(row=7, column=0, sticky="e", pady=(16, 0))
+        button_row.grid(row=8, column=0, sticky="e", pady=(16, 0))
         ttk.Button(button_row, text="取消", command=cancel).grid(row=0, column=0, padx=(0, 8))
         ttk.Button(button_row, text="确定", command=confirm).grid(row=0, column=1)
 

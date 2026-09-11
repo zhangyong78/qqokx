@@ -63,7 +63,38 @@ class StrategyTradeLedgerBackfillTest(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
-            (state_dir / "strategy_trade_ledger.json").write_text('{"records": []}', encoding="utf-8")
+            (state_dir / "strategy_trade_ledger.json").write_text(
+                json.dumps(
+                    {
+                        "records": [
+                            {
+                                "record_id": "OLD-S240",
+                                "history_record_id": "H240",
+                                "session_id": "S240",
+                                "round_id": "S240-old-round",
+                                "api_name": "reap",
+                                "strategy_id": "ema55_slope_short",
+                                "strategy_name": "均线斜率做空",
+                                "symbol": "DOGE-USDT-SWAP",
+                                "direction_label": "只做空",
+                                "run_mode_label": "交易并下单",
+                                "environment": "live",
+                                "opened_at": "2026-09-10T03:00:32",
+                                "closed_at": "2026-09-10T11:00:20",
+                                "entry_order_id": "E1",
+                                "exit_order_id": "",
+                                "entry_price": "0.08862",
+                                "size": "3.17",
+                                "gross_pnl": "0",
+                                "net_pnl": "0",
+                                "close_reason": "持仓已关闭（原因待确认）",
+                            }
+                        ]
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
             (state_dir / "strategy_history.json").write_text(
                 json.dumps(
                     {
@@ -91,8 +122,8 @@ class StrategyTradeLedgerBackfillTest(unittest.TestCase):
                 json.dumps(
                     {
                         "records": [
-                            {"api_name": "reap", "order_id": "E1", "fill_price": "0.08862", "fill_size": "3.17", "fill_fee": "-0.10", "fill_time": 1789018832000},
-                            {"api_name": "reap", "order_id": "X1", "fill_price": "0.08911", "fill_size": "3.17", "fill_fee": "-0.10", "fill_time": 1789047620000},
+                            {"order_id": "E1", "fill_price": "0.08862", "fill_size": "3.17", "fill_fee": "-0.10", "fill_time": 1789018832000},
+                            {"order_id": "X1", "fill_price": "0.08911", "fill_size": "3.17", "fill_fee": "-0.10", "fill_time": 1789047620000},
                         ]
                     },
                     ensure_ascii=False,
@@ -108,6 +139,8 @@ class StrategyTradeLedgerBackfillTest(unittest.TestCase):
 
             self.assertEqual(result.added_record_count, 1)
             ledger_record = json.loads((state_dir / "strategy_trade_ledger.json").read_text(encoding="utf-8"))["records"][0]
+            self.assertEqual(ledger_record["record_id"], "OLD-S240")
+            self.assertEqual(ledger_record["round_id"], "S240-old-round")
             self.assertEqual(ledger_record["exit_order_id"], "X1")
             self.assertEqual(ledger_record["close_reason"], "人工平仓")
             history_record = json.loads((state_dir / "strategy_history.json").read_text(encoding="utf-8"))["records"][0]
