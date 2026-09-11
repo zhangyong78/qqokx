@@ -7,6 +7,8 @@ from PySide6.QtCore import QSignalBlocker, Signal
 from PySide6.QtGui import QAction, QActionGroup
 from PySide6.QtWidgets import QComboBox, QFrame, QHBoxLayout, QLabel, QMenu, QSizePolicy, QToolButton
 
+from okx_quant.app_meta import APP_VERSION
+
 
 WorkspacePageKey = Literal["kline", "account", "roll", "daily-report", "smart-order"]
 
@@ -103,7 +105,7 @@ class WorkspaceHeader(QFrame):
         layout.setContentsMargins(12, 5, 10, 5)
         layout.setSpacing(5)
 
-        brand = QLabel("量化交易控制台 · 本地版本", self)
+        brand = QLabel(f"量化交易控制台 · 本地版本 v{APP_VERSION}", self)
         brand.setObjectName("WorkspaceBrand")
         layout.addWidget(brand)
 
