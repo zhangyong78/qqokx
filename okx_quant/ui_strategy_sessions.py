@@ -4711,6 +4711,14 @@ class UiStrategySessionsMixin:
                 result, _price, normalized_mode = self._submit_selected_position_manual_flatten(position, "market")
             finally:
                 self._positions_context_profile_name = previous_profile
+            # The manual close order has no strategy client-order-id.  Keep its
+            # exchange order id on the active round before switching the engine
+            # to manual management, otherwise later settlement only sees
+            # strategy-tagged orders and cannot attribute this close.
+            trade = session.active_trade
+            if trade is not None:
+                trade.exit_order_id = str(result.ord_id or "").strip()
+                trade.close_reason_hint = "人工提前平仓"
             session.engine.mark_manual_flatten()
             self._set_session_manual_management_state(
                 session,
@@ -4721,7 +4729,8 @@ class UiStrategySessionsMixin:
             mode_label = self._position_manual_flatten_mode_label(normalized_mode)
             self._log_session_message(
                 session,
-                f"人工提前平仓已提交 | 方式={mode_label} | ordId={result.ord_id or '-'} | 当前轮转入人工接管收尾。",
+                f"人工提前平仓已提交 | 方式={mode_label} | ordId={result.ord_id or '-'} | "
+                "等待 OKX 成交确认后结算并写入策略总账本。",
             )
         except Exception as exc:
             messagebox.showerror("提前平仓失败", str(exc), parent=self.root)
@@ -7620,10 +7629,19 @@ class UiStrategySessionsMixin:
         open_ms = int((open_anchor - timedelta(minutes=2)).timestamp() * 1000)
         close_ms_hint = int(trade.closed_logged_at.timestamp() * 1000) if trade.closed_logged_at is not None else 0
 
+        # A manual flatten is intentionally submitted without the session's
+        # client-order-id.  Its exact order id was captured at submission, so
+        # include that one order even though it does not carry a strategy tag.
+        # The instrument check prevents a same-id/mismatched record from being
+        # used in a multi-symbol API account.
+        exact_exit_order_id = str(trade.exit_order_id or "").strip()
         session_orders = [
             item
             for item in snapshot.order_history
-            if _trade_order_belongs_to_session(item, session)
+            if (
+                _trade_order_belongs_to_session(item, session)
+                or (exact_exit_order_id and (item.order_id or "").strip() == exact_exit_order_id)
+            )
             and (not trade_inst_id or item.inst_id.strip().upper() == trade_inst_id)
         ]
         recent_orders = [item for item in session_orders if _trade_order_event_time(item) >= open_ms]
@@ -7793,6 +7811,10 @@ class UiStrategySessionsMixin:
             close_reason = "OKX止损触发"
             reason_confidence = "high"
             close_order = protective_order
+        elif trade.manual_reason == "manual_flatten" or trade.close_reason_hint == "人工提前平仓":
+            close_reason = "人工提前平仓"
+            reason_confidence = "high" if direct_exit_order is not None or close_fills else "medium"
+            close_order = direct_exit_order or filled_exit_order
         elif trade.close_reason_hint:
             close_reason = trade.close_reason_hint
             reason_confidence = "high" if trade.exit_order_id or trade.exit_price is not None else "medium"
@@ -11047,6 +11069,13 @@ class UiStrategySessionsMixin:
             trade.manual_reason = "manual_flatten"
             trade.manual_override_stop_price = None
             trade.manual_override_at = observed_at
+            # Hot upgrade/recovery rebuilds the runtime from the independent
+            # log.  Restore the exact manual close order so reconciliation can
+            # match its fills even though it has no strategy clOrdId.
+            exit_order_id = _extract_log_field(message, "ordId")
+            if exit_order_id:
+                trade.exit_order_id = exit_order_id
+            trade.close_reason_hint = "人工提前平仓"
             try:
                 session.engine.mark_manual_flatten()
             except Exception:

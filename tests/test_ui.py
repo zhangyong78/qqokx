@@ -4247,6 +4247,32 @@ class StrategyTradeTrackingTest(TestCase):
         self.assertTrue(session.active_trade.reconciliation_started)
         app._start_session_trade_reconciliation.assert_called_once()
 
+    def test_track_session_trade_runtime_restores_manual_close_order_for_reconciliation(self) -> None:
+        session = self._make_session()
+        app = self._make_app_for_tracking()
+        session.active_trade = StrategyTradeRuntimeState(
+            round_id="S01-manual-1",
+            opened_logged_at=datetime(2026, 9, 10, 3, 0, 32),
+            entry_order_id="ENTRY-1",
+            entry_price=Decimal("0.08862"),
+            size=Decimal("3.17"),
+        )
+
+        QuantApp._track_session_trade_runtime(
+            app,
+            session,
+            "人工提前平仓已提交 | 方式=市价平仓 | ordId=MANUAL-EXIT-1 | 等待 OKX 成交确认后结算并写入策略总账本。",
+        )
+
+        self.assertEqual(session.active_trade.exit_order_id, "MANUAL-EXIT-1")
+        self.assertEqual(session.active_trade.close_reason_hint, "人工提前平仓")
+        self.assertEqual(session.active_trade.manual_reason, "manual_flatten")
+
+        QuantApp._track_session_trade_runtime(app, session, "人工平仓已确认，OKX 持仓已归零。")
+
+        self.assertTrue(session.active_trade.reconciliation_started)
+        app._start_session_trade_reconciliation.assert_called_once()
+
     def test_track_session_trade_runtime_starts_reconciliation_when_dynamic_stop_monitor_ends_without_position(self) -> None:
         session = self._make_session()
         app = self._make_app_for_tracking()
@@ -7026,6 +7052,63 @@ class StrategyTradeTrackingTest(TestCase):
         self.assertEqual(result.ledger_record.funding_fee, Decimal("-0.0901668329212535"))
         self.assertIn("原因=本地止损触发", result.attribution_summary)
         self.assertIn("净盈亏=-4.86", result.attribution_summary)
+
+    def test_build_strategy_trade_reconciliation_result_uses_exact_manual_close_order_without_strategy_id(self) -> None:
+        session = self._make_session()
+        trade = StrategyTradeRuntimeState(
+            round_id="round-manual-1",
+            opened_logged_at=datetime(2026, 9, 10, 3, 0, 32),
+            entry_order_id="ENTRY-1",
+            exit_order_id="MANUAL-EXIT-1",
+            entry_price=Decimal("2358.42"),
+            size=Decimal("0.1"),
+            manual_reason="manual_flatten",
+            close_reason_hint="人工提前平仓",
+            reconciliation_started=True,
+        )
+        close_ms = int(datetime(2026, 9, 10, 11, 0, 20).timestamp() * 1000)
+        snapshot = StrategyTradeReconciliationSnapshot(
+            effective_environment="demo",
+            order_history=[
+                SimpleNamespace(
+                    # Manual close orders are deliberately not assigned the
+                    # strategy's clOrdId prefix.
+                    client_order_id="",
+                    algo_client_order_id="",
+                    order_id="MANUAL-EXIT-1",
+                    algo_id="",
+                    inst_id="ETH-USDT-SWAP",
+                    side="sell",
+                    pos_side="long",
+                    filled_size=Decimal("0.1"),
+                    actual_size=Decimal("0.1"),
+                    avg_price=Decimal("2340.00"),
+                    actual_price=Decimal("2340.00"),
+                    price=Decimal("2340.00"),
+                    fee=Decimal("-0.04"),
+                    pnl=Decimal("-1.842"),
+                    state="filled",
+                    update_time=close_ms,
+                    created_time=close_ms,
+                )
+            ],
+            fills=[],
+            position_history=[],
+            account_bills=[],
+        )
+        app = SimpleNamespace(
+            _next_strategy_trade_ledger_record_id=lambda session_, round_id, closed_at: "TM01",
+            _is_funding_fee_bill=QuantApp._is_funding_fee_bill,
+            _position_instruments={},
+        )
+
+        result = QuantApp._build_strategy_trade_reconciliation_result(app, session, trade, snapshot)
+
+        self.assertEqual(result.ledger_record.close_reason, "人工提前平仓")
+        self.assertEqual(result.ledger_record.exit_order_id, "MANUAL-EXIT-1")
+        self.assertEqual(result.ledger_record.exit_price, Decimal("2340.00"))
+        self.assertEqual(result.ledger_record.gross_pnl, Decimal("-1.842"))
+        self.assertEqual(result.ledger_record.net_pnl, Decimal("-1.882"))
 
     def test_build_strategy_trade_reconciliation_result_estimates_missing_net_pnl_from_prices(self) -> None:
         session = self._make_session()

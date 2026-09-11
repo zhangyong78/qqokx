@@ -45,6 +45,75 @@ class StrategyTradeLedgerBackfillTest(unittest.TestCase):
             self.assertEqual(rounds[0].close_reason, "人工平仓")
             self.assertIn("成交由历史成交确认", rounds[0].summary_note)
 
+    def test_backfill_writes_confirmed_manual_close_to_ledger_and_history(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            state_dir = root / "state"
+            history_dir = state_dir / "history" / "reap" / "live"
+            logs_dir = root / "logs" / "strategy_sessions" / "2026-09-10"
+            history_dir.mkdir(parents=True)
+            logs_dir.mkdir(parents=True)
+            log_path = logs_dir / "20260910_030000_000000__reap__S240__session__DOGE-USDT-SWAP.log"
+            log_path.write_text(
+                "\n".join(
+                    [
+                        "[09-10 03:00:32] [reap] [S240 均线斜率做空 DOGE-USDT-SWAP] 本地下单成交 | ordId=E1 | 标的=DOGE-USDT-SWAP | 方向=SELL | 成交均价=0.08862 | 成交数量=3.17张",
+                        "[09-10 11:00:20] [reap] [S240 均线斜率做空 DOGE-USDT-SWAP] 人工提前平仓已提交 | 方式=市价平仓 | ordId=X1 | 等待 OKX 成交确认后结算并写入策略总账本。",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            (state_dir / "strategy_trade_ledger.json").write_text('{"records": []}', encoding="utf-8")
+            (state_dir / "strategy_history.json").write_text(
+                json.dumps(
+                    {
+                        "records": [
+                            {
+                                "record_id": "H240",
+                                "session_id": "S240",
+                                "api_name": "reap",
+                                "strategy_id": "ema55_slope_short",
+                                "strategy_name": "均线斜率做空",
+                                "symbol": "DOGE-USDT-SWAP",
+                                "direction_label": "只做空",
+                                "run_mode_label": "交易并下单",
+                                "started_at": "2026-09-10T03:00:00",
+                                "log_file_path": str(log_path),
+                                "config_snapshot": {"environment": "live", "signal_mode": "short_only"},
+                            }
+                        ]
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            (history_dir / "fills_history.json").write_text(
+                json.dumps(
+                    {
+                        "records": [
+                            {"api_name": "reap", "order_id": "E1", "fill_price": "0.08862", "fill_size": "3.17", "fill_fee": "-0.10", "fill_time": 1789018832000},
+                            {"api_name": "reap", "order_id": "X1", "fill_price": "0.08911", "fill_size": "3.17", "fill_fee": "-0.10", "fill_time": 1789047620000},
+                        ]
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+
+            result = backfill_strategy_trade_ledger(
+                state_dir=state_dir,
+                strategy_ids=("ema55_slope_short",),
+                write=True,
+            )
+
+            self.assertEqual(result.added_record_count, 1)
+            ledger_record = json.loads((state_dir / "strategy_trade_ledger.json").read_text(encoding="utf-8"))["records"][0]
+            self.assertEqual(ledger_record["exit_order_id"], "X1")
+            self.assertEqual(ledger_record["close_reason"], "人工平仓")
+            history_record = json.loads((state_dir / "strategy_history.json").read_text(encoding="utf-8"))["records"][0]
+            self.assertEqual(history_record["trade_count"], 1)
+            self.assertEqual(history_record["last_close_reason"], "人工平仓")
+
     def test_parse_trade_rounds_collects_events_across_multiple_session_logs(self) -> None:
         with TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
