@@ -14105,9 +14105,16 @@ def _format_position_history_filter_stats(
         profit_loss_ratio_text = "∞:1"
     else:
         profit_loss_ratio_text = "-"
+    if loss_count > 0:
+        profit_loss_count_ratio_text = f"{format_decimal_fixed(Decimal(profit_count) / Decimal(loss_count), 2)}:1"
+    elif profit_count > 0:
+        profit_loss_count_ratio_text = "∞:1"
+    else:
+        profit_loss_count_ratio_text = "-"
+    decided_count = profit_count + loss_count
     win_rate_text = (
-        f"{format_decimal_fixed(Decimal(profit_count) * Decimal(100) / Decimal(valid_count), 2)}%"
-        if valid_count
+        f"{format_decimal_fixed(Decimal(profit_count) * Decimal(100) / Decimal(decided_count), 2)}%"
+        if decided_count
         else "-"
     )
     return (
@@ -14115,7 +14122,8 @@ def _format_position_history_filter_stats(
         f"\u6298\u5408USDT\u5408\u8ba1 {realized_usdt_text} | "
         f"\u76c8\u5229 {profit_count}\u7b14/{profit_amount_text} | "
         f"\u4e8f\u635f {loss_count}\u7b14/{loss_amount_text} | "
-        f"\u6301\u5e73 {flat_count}\u7b14 | \u76c8\u4e8f\u6bd4 {profit_loss_ratio_text} | \u80dc\u7387 {win_rate_text}"
+        f"\u6301\u5e73 {flat_count}\u7b14 | \u7b14\u6570\u6bd4 {profit_loss_count_ratio_text} | "
+        f"\u91d1\u989d\u76c8\u4e8f\u6bd4 {profit_loss_ratio_text} | \u80dc\u7387 {win_rate_text}"
     )
 
 

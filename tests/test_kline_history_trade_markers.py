@@ -14,6 +14,7 @@ from roll_terminal_qt.kline_analysis_window import (
     _history_trade_markers_for_candles,
     _merge_kline_trade_markers,
 )
+from roll_terminal_qt.option_strategy_window import PositionPriceMarker, position_marker_action_label
 
 
 def _position(
@@ -72,6 +73,12 @@ def _current_position(*, inst_id: str, opened_at: int, price: str, pos_side: str
 
 
 class KlineHistoryTradeMarkersTest(TestCase):
+    def test_position_marker_action_labels_distinguish_open_and_close_side(self) -> None:
+        self.assertEqual(position_marker_action_label(PositionPriceMarker("entry", 1, Decimal("1"), "long")), "买入开仓")
+        self.assertEqual(position_marker_action_label(PositionPriceMarker("exit", 2, Decimal("1"), "long")), "卖出平仓")
+        self.assertEqual(position_marker_action_label(PositionPriceMarker("entry", 3, Decimal("1"), "short")), "卖出开仓")
+        self.assertEqual(position_marker_action_label(PositionPriceMarker("exit", 4, Decimal("1"), "short")), "买入平仓")
+
     def test_history_trades_are_available_on_one_hour_only(self) -> None:
         one_hour_window = SimpleNamespace(
             _period_combo=SimpleNamespace(currentText=lambda: "1H"),

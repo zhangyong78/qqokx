@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import Counter
+import csv
 from dataclasses import replace
 import json
 import re
@@ -25,6 +26,7 @@ from PySide6.QtWidgets import (
     QDialog,
     QDialogButtonBox,
     QFrame,
+    QFileDialog,
     QGridLayout,
     QHBoxLayout,
     QHeaderView,
@@ -243,7 +245,7 @@ from okx_quant.ui_shell import (
 from roll_terminal_qt.account_service import AccountFeedThread
 from roll_terminal_qt.history_service import FillHistoryFeedThread, OrderHistoryFeedThread, PositionHistoryFeedThread
 from roll_terminal_qt.incremental_views import keyed_row_delta
-from roll_terminal_qt.option_strategy_window import CandlestickChartView, PositionPriceMarker
+from roll_terminal_qt.option_strategy_window import CandlestickChartView, PositionPriceMarker, position_marker_action_label
 from roll_terminal_qt.order_service import OrderFeedThread, OrderStatusView
 from roll_terminal_qt.perf_metrics import measure_ui_step
 from roll_terminal_qt.profile_access import ensure_profile_unlocked, load_profile_snapshots, profile_requires_password
@@ -1234,11 +1236,14 @@ def _position_history_kline_time_markers(item: OkxPositionHistoryItem) -> tuple[
 
     opened_at = _position_kline_timestamp(raw.get("openTime"), raw.get("openTs"), raw.get("cTime"), raw.get("createdTime"))
     closed_at = _position_kline_timestamp(raw.get("closeTime"), raw.get("closeTs"), raw.get("uTime"), raw.get("updateTime"), item.update_time)
+    direction = _position_history_kline_direction(item) or ""
     markers: list[tuple[str, int]] = []
     if opened_at is not None:
-        markers.append(("开仓", opened_at))
+        marker = PositionPriceMarker("entry", opened_at, Decimal("1"), direction)
+        markers.append((position_marker_action_label(marker), opened_at))
     if closed_at is not None:
-        markers.append(("平仓", closed_at))
+        marker = PositionPriceMarker("exit", closed_at, Decimal("1"), direction)
+        markers.append((position_marker_action_label(marker), closed_at))
     return tuple(markers)
 
 
@@ -1347,7 +1352,9 @@ def _current_position_kline_time_markers(
         raw.get("createdTime"),
     )
     if opened_at is not None:
-        markers.append(("开仓", opened_at))
+        direction = "short" if _position_is_short(position) else "long"
+        marker = PositionPriceMarker("entry", opened_at, Decimal("1"), direction)
+        markers.append((position_marker_action_label(marker), opened_at))
     for item in history_items:
         if str(item.inst_id or "").strip().upper() != inst_id:
             continue
@@ -1554,6 +1561,7 @@ class InstrumentKlineDialog(QDialog):
         initial_width: int = 1280,
         initial_height: int = 760,
         prefs_changed: Callable[[str, int, int], None] | None = None,
+        linked_requested: Callable[[str], None] | None = None,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
@@ -1581,6 +1589,7 @@ class InstrumentKlineDialog(QDialog):
         self._no_more_older_candles = False
         self._bar_buttons: dict[str, QPushButton] = {}
         self._prefs_changed = prefs_changed
+        self._linked_requested = linked_requested
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(12, 12, 12, 12)
@@ -1609,6 +1618,11 @@ class InstrumentKlineDialog(QDialog):
             button.clicked.connect(lambda _checked=False, target_bar=bar: self._select_bar(target_bar))
             self._bar_buttons[bar] = button
             bar_row.addWidget(button)
+        self._linked_button = QPushButton("切换联动 K 线")
+        self._linked_button.setToolTip("切换到左侧期权、标底 DVOL、右侧期权联动 K 线")
+        self._linked_button.clicked.connect(self._request_linked_kline)
+        self._linked_button.setVisible(False)
+        bar_row.addWidget(self._linked_button)
         bar_row.addStretch(1)
         layout.addLayout(bar_row)
 
@@ -1633,6 +1647,7 @@ class InstrumentKlineDialog(QDialog):
     ) -> None:
         self._inst_id = inst_id.strip().upper()
         self._inst_type = inst_type.strip().upper()
+        self._linked_button.setVisible(self._inst_type == "OPTION" and self._linked_requested is not None)
         self._underlying_usdt_price = underlying_usdt_price if underlying_usdt_price is not None and underlying_usdt_price > 0 else None
         self._underlying_usdt_basis = underlying_usdt_basis.strip() if self._underlying_usdt_price is not None else ""
         self._option_entry_price = option_entry_price if option_entry_price is not None and option_entry_price > 0 else None
@@ -1644,6 +1659,12 @@ class InstrumentKlineDialog(QDialog):
         self.show()
         self.raise_()
         self.activateWindow()
+
+    @Slot()
+    def _request_linked_kline(self) -> None:
+        if self._inst_type != "OPTION" or not self._inst_id or self._linked_requested is None:
+            return
+        self._linked_requested(self._inst_id)
 
     def closeEvent(self, event) -> None:  # noqa: ANN001
         if self._load_thread is not None and self._load_thread.isRunning():
@@ -5748,6 +5769,7 @@ class AccountPositionsHomeWidget(QWidget):
                 initial_width=self._position_kline_window_width,
                 initial_height=self._position_kline_window_height,
                 prefs_changed=self._on_position_kline_prefs_changed,
+                linked_requested=self._open_option_linked_kline,
                 parent=self,
             )
         if not time_markers:
@@ -5791,6 +5813,33 @@ class AccountPositionsHomeWidget(QWidget):
             time_markers=time_markers,
             position_price_markers=position_price_markers,
         )
+
+    def _open_option_linked_kline(self, inst_id: str) -> None:
+        normalized_id = str(inst_id or "").strip().upper()
+        instrument = self._position_instruments.get(normalized_id) or self._position_history_instruments.get(normalized_id)
+        if instrument is None:
+            try:
+                instrument = self._shared_client.get_instrument(normalized_id)
+            except Exception as exc:  # noqa: BLE001
+                QMessageBox.critical(self, "切换联动 K 线", f"读取期权合约信息失败：{exc}")
+                return
+        if str(getattr(instrument, "inst_type", "") or "").strip().upper() != "OPTION":
+            QMessageBox.information(self, "切换联动 K 线", "只有期权合约可以切换到期权联动 K 线。")
+            return
+        from roll_terminal_qt.option_strategy_window import OptionChainLinkedChartDialog
+
+        dialog = getattr(self, "_option_chain_linked_chart_dialog", None)
+        if dialog is None:
+            dialog = OptionChainLinkedChartDialog(
+                client=self._shared_client,
+                profile_name=self._last_profile_name or "",
+                parent=self,
+            )
+            dialog.destroyed.connect(lambda *_args: setattr(self, "_option_chain_linked_chart_dialog", None))
+            self._option_chain_linked_chart_dialog = dialog
+        else:
+            dialog.apply_workspace_profile(self._last_profile_name or "")
+        dialog.show_single_option(instrument=instrument, bar=self._position_kline_last_bar)
 
     @Slot(int, int)
     def _on_position_history_table_clicked(self, row: int, column: int) -> None:
@@ -6185,6 +6234,10 @@ class AccountPositionsHomeWidget(QWidget):
         edit_button = QPushButton("编辑备注")
         edit_button.clicked.connect(self.edit_selected_position_history_note)
         top.addWidget(edit_button)
+        export_button = QPushButton("导出筛选结果")
+        export_button.setToolTip("导出当前筛选后的历史仓位，并附带原始数值供分析")
+        export_button.clicked.connect(self.export_filtered_position_history)
+        top.addWidget(export_button)
         layout.addLayout(top)
 
         filter_row = QGridLayout()
@@ -7041,6 +7094,131 @@ class AccountPositionsHomeWidget(QWidget):
                 note=self._position_history_note_text(item),
             )
         )
+
+    def export_filtered_position_history(self) -> None:
+        """Export the currently filtered history-position rows for analysis."""
+        filtered = self._filtered_position_history_items()
+        if not filtered:
+            QMessageBox.information(self, "导出历史仓位", "当前筛选没有可导出的历史仓位。")
+            return
+
+        default_name = f"历史仓位_筛选结果_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        target, _ = QFileDialog.getSaveFileName(
+            self,
+            "导出历史仓位筛选结果",
+            default_name,
+            "CSV 文件 (*.csv)",
+        )
+        if not target:
+            return
+        if not target.lower().endswith(".csv"):
+            target += ".csv"
+
+        def raw_value(raw: dict[str, object], *keys: str) -> str:
+            for key in keys:
+                value = raw.get(key)
+                if value is not None and str(value).strip() != "":
+                    return str(value)
+            return ""
+
+        def decimal_text(value: Decimal | None) -> str:
+            return "" if value is None else str(value)
+
+        headers = (
+            "平仓时间",
+            "开仓时间",
+            "持仓时间",
+            "类型",
+            "合约",
+            "保证金模式",
+            "持仓模式",
+            "交易方向",
+            "开仓均价",
+            "平仓均价",
+            "最大持仓量",
+            "已平仓量",
+            "手续费",
+            "盈亏",
+            "仓位状态",
+            "备注",
+            "开仓时间戳_ms",
+            "平仓时间戳_ms",
+            "更新时间戳_ms",
+            "开仓均价_raw",
+            "平仓均价_raw",
+            "平仓数量_raw",
+            "pnl_raw",
+            "realized_pnl_raw",
+            "settle_pnl_raw",
+            "fee_raw",
+            "fee_currency",
+            "funding_fee_raw",
+            "raw_json",
+        )
+        rows: list[list[str]] = []
+        for item in filtered:
+            raw = item.raw if isinstance(item.raw, dict) else {}
+            opened_at = _position_kline_timestamp(
+                raw.get("openTime"),
+                raw.get("openTs"),
+                raw.get("cTime"),
+                raw.get("createdTime"),
+            )
+            closed_at = _position_kline_timestamp(
+                raw.get("closeTime"),
+                raw.get("closeTs"),
+                raw.get("uTime"),
+                raw.get("updateTime"),
+                item.update_time,
+            )
+            rows.append(
+                [
+                    _format_okx_ms_timestamp(item.update_time),
+                    _position_history_open_time_text(item),
+                    _position_history_holding_time_text(item),
+                    item.inst_type or "-",
+                    item.inst_id or "-",
+                    _format_margin_mode(item.mgn_mode or ""),
+                    _format_history_side(None, item.pos_side or item.direction),
+                    _format_position_history_trade_side(item),
+                    _format_position_history_price(item.open_avg_price, item.inst_id, item.inst_type),
+                    _format_position_history_price(item.close_avg_price, item.inst_id, item.inst_type),
+                    _position_history_raw_size_text(item, self._position_history_instruments, "openMaxPos", "maxPos", "openPos"),
+                    _position_history_raw_size_text(item, self._position_history_instruments, "closeTotalPos", "closePos", "closeSz"),
+                    _format_position_history_fee_cell(item, self._position_history_usdt_prices),
+                    _format_position_history_pnl(
+                        item.realized_pnl,
+                        item,
+                        with_sign=True,
+                        usdt_prices=self._position_history_usdt_prices,
+                    ),
+                    _position_history_status_text(item),
+                    _normalize_position_note_text(self._position_history_note_text(item)),
+                    str(opened_at or ""),
+                    str(closed_at or ""),
+                    str(item.update_time or ""),
+                    decimal_text(item.open_avg_price),
+                    decimal_text(item.close_avg_price),
+                    raw_value(raw, "closeTotalPos", "closePos", "closeSz"),
+                    decimal_text(item.pnl),
+                    decimal_text(item.realized_pnl),
+                    decimal_text(item.settle_pnl),
+                    decimal_text(item.fee),
+                    item.fee_currency or "",
+                    decimal_text(item.funding_fee),
+                    json.dumps(raw, ensure_ascii=False, sort_keys=True),
+                ]
+            )
+
+        try:
+            with open(target, "w", encoding="utf-8-sig", newline="") as handle:
+                writer = csv.writer(handle)
+                writer.writerow(headers)
+                writer.writerows(rows)
+        except OSError as exc:
+            QMessageBox.critical(self, "导出失败", f"无法写入 CSV 文件：{exc}")
+            return
+        QMessageBox.information(self, "导出成功", f"已导出 {len(rows)} 条筛选结果：\n{target}")
 
     def _selected_position_history_item(self) -> OkxPositionHistoryItem | None:
         row = self._position_history_table.currentRow() if hasattr(self, "_position_history_table") else -1

@@ -1360,6 +1360,23 @@ class PositionPriceMarker:
     exit_value_usdt: Decimal | None = None
 
 
+def position_marker_action_label(marker: PositionPriceMarker) -> str:
+    """Return the actual buy/sell action represented by a position marker."""
+    if marker.kind == "entry":
+        if marker.direction == "short":
+            return "卖出开仓"
+        if marker.direction == "long":
+            return "买入开仓"
+        return "开仓"
+    if marker.kind == "exit":
+        if marker.direction == "short":
+            return "买入平仓"
+        if marker.direction == "long":
+            return "卖出平仓"
+        return "平仓"
+    return ""
+
+
 @dataclass(frozen=True)
 class OptionTradeRecordSnapshot:
     """Opening/closing markers grouped by the option contract they belong to."""
@@ -1870,7 +1887,7 @@ class CandlestickChartView(QChartView):
                 ]
             candle_markers = self._position_markers_for_candle(candle)
             for position_marker in candle_markers:
-                marker_label = "开仓" if position_marker.kind == "entry" else "平仓"
+                marker_label = position_marker_action_label(position_marker)
                 tooltip_lines.append(f"{marker_label}价 {_format_compact_number(position_marker.price)}")
                 tooltip_lines.extend(self._position_marker_quantity_label_lines(position_marker))
                 tooltip_lines.extend(self._position_marker_entry_value_label_lines(position_marker))
@@ -1901,7 +1918,12 @@ class CandlestickChartView(QChartView):
         for label, timestamp in self._time_markers:
             if timestamp < start_ts or timestamp > end_ts:
                 continue
-            color = QColor("#0969da" if label == "开仓" else "#cf222e")
+            if label.startswith("买入"):
+                color = QColor("#1a7f37")
+            elif label.startswith("卖出"):
+                color = QColor("#cf222e")
+            else:
+                color = QColor("#0969da" if label == "开仓" else "#cf222e")
             pen = QPen(color, 1)
             pen.setStyle(Qt.PenStyle.DashLine)
             painter.setPen(pen)
@@ -2002,7 +2024,7 @@ class CandlestickChartView(QChartView):
             candle_top = self._y_for_value(float(nearby_candle.high), plot_area)
             candle_bottom = self._y_for_value(float(nearby_candle.low), plot_area)
             time_text = QDateTime.fromMSecsSinceEpoch(marker.timestamp).toString("MM-dd HH:mm")
-            label = "开仓" if marker.kind == "entry" else "平仓"
+            label = position_marker_action_label(marker)
             label_lines = [label, _format_compact_number(marker.price)]
             label_lines.extend(self._position_marker_quantity_label_lines(marker))
             if marker.kind == "entry":
@@ -2512,6 +2534,7 @@ class OptionChainLinkedChartDialog(QDialog):
         self._side_position_combos: dict[str, QComboBox] = {}
         self._current_bar = "1H"
         self._syncing_viewport = False
+        self._pending_linked_candles_reload = False
         self._bar_buttons: dict[str, QPushButton] = {}
 
         layout = QVBoxLayout(self)
@@ -2637,6 +2660,7 @@ class OptionChainLinkedChartDialog(QDialog):
     def show_pair(self, *, call_quote: OptionQuote | None, put_quote: OptionQuote | None, bar: str = "1H") -> None:
         self._call_quote = call_quote
         self._put_quote = put_quote
+        self._pending_linked_candles_reload = False
         self._option_positions = ()
         self._refresh_side_position_options()
         normalized_bar = bar.strip().upper()
@@ -2654,6 +2678,14 @@ class OptionChainLinkedChartDialog(QDialog):
         self.show()
         self.raise_()
         self.activateWindow()
+
+    def show_single_option(self, *, instrument: Instrument, bar: str = "1H") -> None:
+        """Open the linked view from one option contract and find its paired leg."""
+        quote = _build_option_quote(instrument, None)
+        if quote.parsed.option_type == "C":
+            self.show_pair(call_quote=quote, put_quote=None, bar=bar)
+        else:
+            self.show_pair(call_quote=None, put_quote=quote, bar=bar)
 
     def _update_linked_title(self) -> None:
         left_id = self._call_quote.instrument.inst_id if self._call_quote is not None else "—"
@@ -2981,6 +3013,27 @@ class OptionChainLinkedChartDialog(QDialog):
         self._side_tickers_by_inst_id[side] = payload.tickers_by_inst_id
         current_quote = self._side_quote(side)
         current = current_quote.parsed if current_quote is not None else None
+        if current is not None:
+            other_side = "right" if side == "left" else "left"
+            if self._side_quote(other_side) is None:
+                for candidate in payload.instruments:
+                    try:
+                        parsed_candidate = parse_option_contract(candidate.inst_id)
+                    except ValueError:
+                        continue
+                    if (
+                        parsed_candidate.expiry_code == current.expiry_code
+                        and parsed_candidate.strike == current.strike
+                        and parsed_candidate.option_type != current.option_type
+                    ):
+                        ticker = payload.tickers_by_inst_id.get(candidate.inst_id.strip().upper())
+                        self._set_side_quote(other_side, _build_option_quote(candidate, ticker))
+                        self._pending_linked_candles_reload = True
+                        self._update_linked_title()
+                        self._load_side_contract_options(other_side)
+                        self._load_trade_records()
+                        QTimer.singleShot(0, self._load_candles)
+                        break
         expiry = current.expiry_code if current is not None else payload.current_expiry
         if expiry not in payload.expiries:
             expiry = payload.expiries[0] if payload.expiries else ""
@@ -3289,6 +3342,8 @@ class OptionChainLinkedChartDialog(QDialog):
                 tooltip_close_usdt_basis=self._option_chart_usdt_context("right")[1],
             )
             self._apply_side_trade_record_markers("right")
+        if self._pending_linked_candles_reload and self._call_quote is not None and self._put_quote is not None:
+            QTimer.singleShot(0, self._load_candles)
         if payload.volatility_candles:
             note = f" | {payload.volatility_resolution_note}" if payload.volatility_resolution_note else ""
             self._volatility_chart.set_candles(
@@ -3347,6 +3402,9 @@ class OptionChainLinkedChartDialog(QDialog):
         if self._load_thread is not None:
             self._load_thread.deleteLater()
             self._load_thread = None
+        if self._pending_linked_candles_reload and self._call_quote is not None and self._put_quote is not None:
+            self._pending_linked_candles_reload = False
+            QTimer.singleShot(0, self._load_candles)
 
     def _sync_initial_viewport(self) -> None:
         populated = [chart for chart in self._charts if chart._candles]
