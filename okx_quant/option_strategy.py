@@ -239,6 +239,15 @@ def option_contract_value(instrument: Instrument) -> Decimal:
     return value if value > 0 else Decimal("1")
 
 
+def option_contract_coin_quantity(instrument: Instrument, contracts: Decimal) -> Decimal | None:
+    """Return the underlying-coin amount represented by option contracts."""
+    base_ccy = instrument.inst_id.split("-", 1)[0].strip().upper()
+    value_ccy = (instrument.ct_val_ccy or base_ccy).strip().upper()
+    if instrument.ct_val is None or instrument.ct_val <= 0 or value_ccy != base_ccy:
+        return None
+    return contracts * option_contract_value(instrument)
+
+
 def build_option_chain_rows(quotes: list[OptionQuote]) -> list[OptionChainRow]:
     grouped: dict[Decimal, dict[str, OptionQuote]] = {}
     for quote in quotes:
@@ -669,6 +678,25 @@ def estimate_leg_greeks(
         "theta": theta,
         "vega": vega,
     }
+
+
+def inverse_greeks_to_pa(
+    *,
+    delta_coin_per_usd: Decimal,
+    gamma_coin_per_usd2: Decimal,
+    underlying_price: Decimal,
+) -> tuple[Decimal, Decimal]:
+    """Convert inverse-option price Greeks to OKX PA delta/gamma.
+
+    The model price is coin-denominated. PA delta is its sensitivity to a
+    percentage move in the underlying (S * dV/dS); PA gamma is the change in
+    PA delta for a percentage move (S * d(PA delta)/dS).
+    """
+    if underlying_price <= 0:
+        return Decimal("0"), Decimal("0")
+    delta_pa = underlying_price * delta_coin_per_usd
+    gamma_pa = delta_pa + (underlying_price * underlying_price * gamma_coin_per_usd2)
+    return delta_pa, gamma_pa
 
 
 def option_time_to_expiry_years(expiry_code: str, *, valuation_time: datetime) -> Decimal:

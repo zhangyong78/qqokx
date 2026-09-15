@@ -45,7 +45,12 @@ from roll_terminal_qt.line_trading_window import (
 from roll_terminal_qt.line_trading_core import LineAnnotation, RiskRewardAnnotation
 from roll_terminal_qt.profile_access import profile_requires_password
 from roll_terminal_qt.smart_order_window import _safe_text as smart_safe_text
-from roll_terminal_qt.option_strategy_window import CandlestickChartView, OptionStrategyQtWindow, PositionPriceMarker
+from roll_terminal_qt.option_strategy_window import (
+    CandlestickChartView,
+    OptionStrategyQtWindow,
+    PositionPriceMarker,
+    _option_position_coin_texts,
+)
 from okx_quant.option_strategy import OptionChainRow, OptionQuote
 from roll_terminal_qt.perf_metrics import measure_ui_step
 from roll_terminal_qt.kline_account_drawer import AccountDrawerLoadThread
@@ -278,6 +283,30 @@ class RollTerminalQtWindowHelperTests(QtWidgetTestCase):
             ("平仓价值 ≈ 554.00 USDT",),
         )
 
+    def test_position_marker_price_label_includes_usdt_equivalent(self) -> None:
+        marker = PositionPriceMarker(
+            "entry",
+            1,
+            Decimal("0.012"),
+            "short",
+        )
+
+        self.assertEqual(
+            CandlestickChartView._position_marker_price_label_line(
+                marker,
+                usdt_rate=Decimal("76390"),
+            ),
+            "0.012 ≈ 916.68 USDT",
+        )
+        self.assertEqual(
+            CandlestickChartView._position_marker_price_label_line(
+                marker,
+                action_label="卖出开仓",
+                usdt_rate=Decimal("76390"),
+            ),
+            "卖出开仓价 0.012 ≈ 916.68 USDT",
+        )
+
     def test_option_chain_mark_columns_resolve_the_matching_contract(self) -> None:
         instrument_kwargs = {
             "inst_type": "OPTION",
@@ -293,6 +322,29 @@ class RollTerminalQtWindowHelperTests(QtWidgetTestCase):
         self.assertIs(OptionStrategyQtWindow._chain_quote_for_clicked_column(chain_row, 0), call)
         self.assertIs(OptionStrategyQtWindow._chain_quote_for_clicked_column(chain_row, 6), put)
         self.assertIsNone(OptionStrategyQtWindow._chain_quote_for_clicked_column(chain_row, 3))
+
+    def test_option_chain_position_cells_show_coin_equivalent_by_direction(self) -> None:
+        inst_id = "BTC-USD-260728-62500-C"
+        instrument = Instrument(
+            inst_id=inst_id,
+            inst_type="OPTION",
+            tick_size=Decimal("0.0001"),
+            lot_size=Decimal("1"),
+            min_size=Decimal("1"),
+            state="live",
+            ct_val=Decimal("1"),
+            ct_mult=Decimal("0.01"),
+            ct_val_ccy="BTC",
+        )
+        positions = [
+            SimpleNamespace(inst_id=inst_id, pos_side="long", position=Decimal("50")),
+            SimpleNamespace(inst_id=inst_id, pos_side="short", position=Decimal("10")),
+        ]
+
+        self.assertEqual(
+            _option_position_coin_texts(positions, {inst_id: instrument}),
+            {inst_id: "多 0.5 / 空 0.1 BTC"},
+        )
 
     def test_option_chain_mark_click_opens_the_linked_call_put_chart(self) -> None:
         call = OptionQuote(

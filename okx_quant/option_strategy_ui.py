@@ -5,8 +5,9 @@ from datetime import datetime
 from decimal import Decimal
 import math
 from pathlib import Path
+import time
 
-from okx_quant.deribit_client import DeribitVolatilityCandle
+from okx_quant.deribit_client import DeribitRestClient, DeribitVolatilityCandle
 from okx_quant.models import Candle, Instrument
 from okx_quant.okx_client import OkxPosition, OkxTicker
 from okx_quant.option_strategy import (
@@ -366,6 +367,52 @@ def _load_deribit_option_chart_candles(
         bar=bar,
         requested_limit=requested_limit,
     )
+
+
+def _load_latest_deribit_option_chart_candles(
+    currency: str,
+    *,
+    bar: str,
+    requested_limit: int,
+    client: DeribitRestClient | None = None,
+    now_ts: int | None = None,
+) -> tuple[list[Candle], str, str]:
+    normalized_currency = currency.strip().upper()
+    cached = _load_deribit_hourly_series_from_cache(normalized_currency)
+    now_ms = now_ts if now_ts is not None else int(time.time() * 1000)
+    cached = [item for item in cached if item.ts <= now_ms]
+    lookback_hours = max(48, max(0, requested_limit) + 24)
+    start_ts = max(0, now_ms - (lookback_hours * 3_600_000))
+    if cached:
+        start_ts = min(now_ms, max(start_ts, cached[-1].ts - (2 * 3_600_000)))
+
+    try:
+        latest = (client or DeribitRestClient()).get_volatility_index_candles(
+            normalized_currency,
+            "3600",
+            start_ts=start_ts,
+            end_ts=now_ms,
+            max_records=lookback_hours + 2,
+        )
+    except Exception as exc:  # noqa: BLE001
+        candles, resolution_label, resolution_note = _build_deribit_option_chart_candles(
+            cached,
+            bar=bar,
+            requested_limit=requested_limit,
+        )
+        failure_note = f"DVOL 自动补齐失败，暂用缓存（{type(exc).__name__}）"
+        return candles, resolution_label, "；".join(part for part in (resolution_note, failure_note) if part)
+
+    merged_by_ts = {item.ts: item for item in cached}
+    merged_by_ts.update({item.ts: item for item in latest})
+    merged = [merged_by_ts[ts] for ts in sorted(merged_by_ts)]
+    candles, resolution_label, resolution_note = _build_deribit_option_chart_candles(
+        merged,
+        bar=bar,
+        requested_limit=requested_limit,
+    )
+    update_note = "DVOL 已自动补齐到最新" if latest else "DVOL 暂无新小时线，显示缓存"
+    return candles, resolution_label, "；".join(part for part in (resolution_note, update_note) if part)
 
 
 def _annualization_factor_for_bar(bar: str) -> float:

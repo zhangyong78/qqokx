@@ -68,6 +68,8 @@ from okx_quant.option_strategy import (
     evaluate_linear_formula,
     format_option_expiry_label,
     infer_implied_volatility_for_leg,
+    inverse_greeks_to_pa,
+    option_contract_coin_quantity,
     option_contract_value,
     parse_linear_formula,
     parse_option_contract,
@@ -91,6 +93,7 @@ from okx_quant.option_strategy_ui import (
     _format_signed_percent,
     _index_markers,
     _load_deribit_option_chart_candles,
+    _load_latest_deribit_option_chart_candles,
     _native_display_currency,
     _position_side_and_quantity,
     _spot_usdt_inst_id,
@@ -109,6 +112,49 @@ def _shared_client() -> OkxRestClient:
     return _SHARED_CLIENT
 
 
+def _format_greek_number(value: Decimal | None) -> str:
+    if value is None:
+        return "-"
+    rounded = value.quantize(Decimal("0.00000001"))
+    if rounded == 0:
+        return "0"
+    return format_decimal_fixed(rounded, 8).rstrip("0").rstrip(".")
+
+
+def _option_position_coin_texts(
+    positions: list[OkxPosition],
+    instruments_by_inst_id: dict[str, Instrument],
+) -> dict[str, str]:
+    instrument_lookup = {key.strip().upper(): value for key, value in instruments_by_inst_id.items()}
+    amounts_by_inst_id: dict[str, dict[str, Decimal]] = {}
+    for position in positions:
+        inst_id = position.inst_id.strip().upper()
+        instrument = instrument_lookup.get(inst_id)
+        if instrument is None:
+            continue
+        side, contracts = _position_side_and_quantity(position)
+        coin_quantity = option_contract_coin_quantity(instrument, contracts)
+        if side not in {"buy", "sell"} or coin_quantity is None or coin_quantity <= 0:
+            continue
+        amounts = amounts_by_inst_id.setdefault(
+            inst_id,
+            {"buy": Decimal("0"), "sell": Decimal("0")},
+        )
+        amounts[side] += coin_quantity
+
+    result: dict[str, str] = {}
+    for inst_id, amounts in amounts_by_inst_id.items():
+        instrument = instrument_lookup[inst_id]
+        currency = str(instrument.ct_val_ccy or inst_id.split("-", 1)[0]).strip().upper()
+        side_text = []
+        if amounts["buy"] > 0:
+            side_text.append(f"多 {format_decimal(amounts['buy'])}")
+        if amounts["sell"] > 0:
+            side_text.append(f"空 {format_decimal(amounts['sell'])}")
+        result[inst_id] = f"{' / '.join(side_text)} {currency}"
+    return result
+
+
 @dataclass(frozen=True)
 class ChainSnapshot:
     family: str
@@ -119,6 +165,7 @@ class ChainSnapshot:
     family_instruments: tuple[Instrument, ...]
     tickers_by_inst_id: dict[str, OkxTicker]
     underlying_price: Decimal | None
+    position_coin_text_by_inst_id: dict[str, str]
 
 
 @dataclass(frozen=True)
@@ -177,6 +224,14 @@ class ChainLinkedChartSnapshot:
 
 
 @dataclass(frozen=True)
+class ChainLinkedVolatilitySnapshot:
+    currency: str
+    candles: tuple[Candle, ...]
+    resolution_label: str
+    resolution_note: str
+
+
+@dataclass(frozen=True)
 class LinkedContractSnapshot:
     family: str
     option_type: str
@@ -190,6 +245,7 @@ class LinkedContractSnapshot:
 
 class _ChainLinkedChartThread(QThread):
     snapshot_ready = Signal(int, object)
+    volatility_ready = Signal(int, object)
     error_raised = Signal(int, str)
 
     def __init__(
@@ -218,7 +274,7 @@ class _ChainLinkedChartThread(QThread):
             currency = (self._call_inst_id or self._put_inst_id).split("-", 1)[0].strip().upper()
             underlying_inst_id = _spot_usdt_inst_id(currency) or ""
             underlying_candles, underlying_error = self._load_underlying_candles(underlying_inst_id)
-            volatility_candles, resolution_label, resolution_note = _load_deribit_option_chart_candles(
+            cached_volatility_candles, resolution_label, resolution_note = _load_deribit_option_chart_candles(
                 currency,
                 bar=self._bar,
                 requested_limit=self._candle_limit,
@@ -232,13 +288,27 @@ class _ChainLinkedChartThread(QThread):
                     put_candles=tuple(put_candles),
                     underlying_inst_id=underlying_inst_id,
                     underlying_candles=tuple(underlying_candles),
-                    volatility_candles=tuple(volatility_candles),
+                    volatility_candles=tuple(cached_volatility_candles),
                     volatility_currency=currency,
                     volatility_resolution_label=resolution_label,
                     volatility_resolution_note=resolution_note,
                     call_error=call_error,
                     put_error=put_error,
                     underlying_error=underlying_error,
+                ),
+            )
+            volatility_candles, resolution_label, resolution_note = _load_latest_deribit_option_chart_candles(
+                currency,
+                bar=self._bar,
+                requested_limit=self._candle_limit,
+            )
+            self.volatility_ready.emit(
+                self._request_id,
+                ChainLinkedVolatilitySnapshot(
+                    currency=currency,
+                    candles=tuple(volatility_candles),
+                    resolution_label=resolution_label,
+                    resolution_note=resolution_note,
                 ),
             )
         except Exception as exc:  # noqa: BLE001
@@ -560,11 +630,21 @@ class _OptionChainThread(QThread):
     snapshot_ready = Signal(int, object)
     error_raised = Signal(int, str)
 
-    def __init__(self, *, request_id: int, family: str, preferred_expiry: str, client: OkxRestClient, parent: QObject | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        request_id: int,
+        family: str,
+        preferred_expiry: str,
+        profile_name: str,
+        client: OkxRestClient,
+        parent: QObject | None = None,
+    ) -> None:
         super().__init__(parent)
         self._request_id = request_id
         self._family = family
         self._preferred_expiry = preferred_expiry
+        self._profile_name = profile_name
         self._client = client
 
     def run(self) -> None:
@@ -579,6 +659,24 @@ class _OptionChainThread(QThread):
             ]
             quotes = tuple(_build_option_quote(item, tickers_by_inst_id.get(item.inst_id)) for item in selected_instruments)
             underlying_price = next((item.index_price for item in quotes if item.index_price is not None), None)
+            position_coin_text_by_inst_id: dict[str, str] = {}
+            try:
+                runtime = load_runtime(self._profile_name or None)
+                if runtime is not None:
+                    positions = self._client.get_positions(
+                        runtime.credentials,
+                        environment=runtime.environment,
+                        inst_type="OPTION",
+                        prefer_cache=False,
+                    )
+                    family_positions = _filter_option_positions(positions, family=self._family)
+                    position_coin_text_by_inst_id = _option_position_coin_texts(
+                        family_positions,
+                        {item.inst_id: item for item in family_instruments},
+                    )
+            except Exception:
+                # Keep the public option chain available if private positions cannot be fetched.
+                position_coin_text_by_inst_id = {}
             snapshot = ChainSnapshot(
                 family=self._family,
                 expiry=selected_expiry,
@@ -588,6 +686,7 @@ class _OptionChainThread(QThread):
                 family_instruments=tuple(family_instruments),
                 tickers_by_inst_id=tickers_by_inst_id,
                 underlying_price=underlying_price,
+                position_coin_text_by_inst_id=position_coin_text_by_inst_id,
             )
             self.snapshot_ready.emit(self._request_id, snapshot)
         except Exception as exc:  # noqa: BLE001
@@ -1358,6 +1457,7 @@ class PositionPriceMarker:
     quantity_base: Decimal | None = None
     entry_value_usdt: Decimal | None = None
     exit_value_usdt: Decimal | None = None
+    price_usdt: Decimal | None = None
 
 
 def position_marker_action_label(marker: PositionPriceMarker) -> str:
@@ -1888,7 +1988,13 @@ class CandlestickChartView(QChartView):
             candle_markers = self._position_markers_for_candle(candle)
             for position_marker in candle_markers:
                 marker_label = position_marker_action_label(position_marker)
-                tooltip_lines.append(f"{marker_label}价 {_format_compact_number(position_marker.price)}")
+                tooltip_lines.append(
+                    self._position_marker_price_label_line(
+                        position_marker,
+                        action_label=marker_label,
+                        usdt_rate=self._tooltip_close_usdt_rate,
+                    )
+                )
                 tooltip_lines.extend(self._position_marker_quantity_label_lines(position_marker))
                 tooltip_lines.extend(self._position_marker_entry_value_label_lines(position_marker))
                 tooltip_lines.extend(self._position_marker_exit_value_label_lines(position_marker))
@@ -2025,7 +2131,10 @@ class CandlestickChartView(QChartView):
             candle_bottom = self._y_for_value(float(nearby_candle.low), plot_area)
             time_text = QDateTime.fromMSecsSinceEpoch(marker.timestamp).toString("MM-dd HH:mm")
             label = position_marker_action_label(marker)
-            label_lines = [label, _format_compact_number(marker.price)]
+            label_lines = [
+                label,
+                self._position_marker_price_label_line(marker, usdt_rate=self._tooltip_close_usdt_rate),
+            ]
             label_lines.extend(self._position_marker_quantity_label_lines(marker))
             if marker.kind == "entry":
                 label_lines.extend(self._position_marker_entry_value_label_lines(marker))
@@ -2120,6 +2229,21 @@ class CandlestickChartView(QChartView):
         usdt_value = marker.realized_pnl_usdt
         usdt_sign = "+" if usdt_value > 0 else ""
         return (actual_text, f"≈ {usdt_sign}{format_decimal_fixed(usdt_value, 2)} USDT")
+
+    @staticmethod
+    def _position_marker_price_label_line(
+        marker: PositionPriceMarker,
+        *,
+        action_label: str = "",
+        usdt_rate: Decimal | None = None,
+    ) -> str:
+        price_text = _format_compact_number(marker.price)
+        price_usdt = marker.price_usdt
+        if price_usdt is None and usdt_rate is not None and usdt_rate > 0:
+            price_usdt = marker.price * usdt_rate
+        if price_usdt is not None:
+            price_text += f" ≈ {_format_compact_number(price_usdt)} USDT"
+        return f"{action_label}价 {price_text}" if action_label else price_text
 
     @staticmethod
     def _position_marker_entry_value_label_lines(marker: PositionPriceMarker) -> tuple[str, ...]:
@@ -2541,7 +2665,7 @@ class OptionChainLinkedChartDialog(QDialog):
         layout.setContentsMargins(12, 12, 12, 12)
         layout.setSpacing(8)
         header = QHBoxLayout()
-        self._title_label = QLabel("选择期权链中的认购或认沽标记以查看联动 K 线。")
+        self._title_label = QLabel("点击期权链左右两侧的仓位单元格可查看联动 K 线。")
         self._title_label.setObjectName("SectionTitle")
         self._status_label = QLabel("")
         self._status_label.setObjectName("Subtle")
@@ -2812,6 +2936,7 @@ class OptionChainLinkedChartDialog(QDialog):
             if rate is None:
                 result.append(rendered)
                 continue
+            rendered = replace(rendered, price_usdt=marker.price * rate)
             if (
                 marker.kind == "exit"
                 and marker.realized_pnl is not None
@@ -3283,6 +3408,7 @@ class OptionChainLinkedChartDialog(QDialog):
     @Slot()
     def _load_candles(self) -> None:
         if self._load_thread is not None and self._load_thread.isRunning():
+            self._pending_linked_candles_reload = True
             self._status_label.setText("正在加载上一轮数据，请稍候…")
             return
         call_id = self._call_quote.instrument.inst_id if self._call_quote is not None else ""
@@ -3303,6 +3429,7 @@ class OptionChainLinkedChartDialog(QDialog):
         )
         self._load_thread = thread
         thread.snapshot_ready.connect(self._apply_snapshot)
+        thread.volatility_ready.connect(self._apply_volatility_snapshot)
         thread.error_raised.connect(self._apply_load_error)
         thread.finished.connect(self._clear_finished_thread)
         thread.start()
@@ -3352,9 +3479,7 @@ class OptionChainLinkedChartDialog(QDialog):
                 show_moving_averages=True,
             )
         else:
-            self._volatility_chart.show_message(
-                f"Deribit {payload.volatility_currency or '—'} DVOL 暂无缓存；请先在“Deribit 波动率指数”页面同步数据。"
-            )
+            self._volatility_chart.show_message("正在从 Deribit 自动补齐最新 DVOL 波动率 K 线…")
         # The left option chart is applied before the underlying chart above;
         # refresh both overlays once more so both sides can use the linked
         # underlying close as a fallback conversion basis.
@@ -3366,6 +3491,33 @@ class OptionChainLinkedChartDialog(QDialog):
             f"波动率 {len(payload.volatility_candles)} / 右侧 {len(payload.put_candles)}"
         )
         self._status_label.setText(f"{self._current_bar} 联动 K 线已加载（{counts} 根）。")
+
+    @Slot(int, object)
+    def _apply_volatility_snapshot(self, request_id: int, payload: object) -> None:
+        if request_id != self._request_id or not isinstance(payload, ChainLinkedVolatilitySnapshot):
+            return
+        current_quote = self._call_quote or self._put_quote
+        current_currency = (
+            current_quote.instrument.inst_id.split("-", 1)[0].strip().upper()
+            if current_quote is not None
+            else ""
+        )
+        if current_currency != payload.currency:
+            return
+        if payload.candles:
+            note = f" | {payload.resolution_note}" if payload.resolution_note else ""
+            self._volatility_chart.set_candles(
+                title=f"Deribit {payload.currency} DVOL 波动率K线 | {payload.resolution_label}{note}",
+                candles=list(payload.candles),
+                show_moving_averages=True,
+            )
+        else:
+            detail = f"（{payload.resolution_note}）" if payload.resolution_note else ""
+            self._volatility_chart.show_message(f"Deribit {payload.currency} DVOL 暂无可用数据{detail}")
+        self._sync_initial_viewport()
+        self._status_label.setText(
+            f"{self._current_bar} 联动 K 线已加载；DVOL 已自动更新（{len(payload.candles)} 根）。"
+        )
 
     @staticmethod
     def _set_option_chart(
@@ -3552,6 +3704,7 @@ class OptionStrategyQtWindow(QMainWindow):
         self._instrument_map: dict[str, Instrument] = {}
         self._quotes_by_inst_id: dict[str, OptionQuote] = {}
         self._chain_rows: list[OptionChainRow] = []
+        self._chain_position_coin_text_by_inst_id: dict[str, str] = {}
         self._legs: list[StrategyLegDefinition] = []
         self._current_underlying_price: Decimal | None = None
         self._latest_spot_usdt_price: Decimal | None = None
@@ -3612,6 +3765,11 @@ class OptionStrategyQtWindow(QMainWindow):
         if not target or target == self._profile_name:
             return
         self._profile_name = target
+        self._chain_position_coin_text_by_inst_id.clear()
+        if self._chain_rows:
+            self._render_chain_rows()
+        if hasattr(self, "_family_combo") and self._family_combo.currentText().strip():
+            self.refresh_chain()
         if self._chain_linked_chart_dialog is not None:
             self._chain_linked_chart_dialog.apply_workspace_profile(target)
 
@@ -3709,11 +3867,14 @@ class OptionStrategyQtWindow(QMainWindow):
 
         chain_panel = QWidget()
         chain_layout = QVBoxLayout(chain_panel)
-        self._chain_context_label = QLabel("点击认购 / 认沽标记可查看 K 线；选择一个行权价后，可直接加入策略腿。")
+        self._chain_context_label = QLabel("点击左右两侧仓位单元格可查看 K 线；选择一个行权价后，可直接加入策略腿。")
         self._chain_context_label.setWordWrap(True)
         chain_layout.addWidget(self._chain_context_label)
         self._chain_table = QTableWidget(0, 7)
-        self._chain_table.setHorizontalHeaderLabels(("认购标记", "认购买一", "认购卖一", "行权价", "认沽买一", "认沽卖一", "认沽标记"))
+        self._chain_table.setHorizontalHeaderLabels(("仓位（折合币数量）", "认购买一", "认购卖一", "行权价", "认沽买一", "认沽卖一", "仓位（折合币数量）"))
+        strike_header = self._chain_table.horizontalHeaderItem(3)
+        if strike_header is not None:
+            strike_header.setBackground(QColor("#dce8f5"))
         self._chain_table.verticalHeader().setVisible(False)
         self._chain_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self._chain_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
@@ -3738,7 +3899,7 @@ class OptionStrategyQtWindow(QMainWindow):
         self._strategy_summary_label = QLabel("暂无策略腿。")
         self._strategy_summary_label.setWordWrap(True)
         legs_layout.addWidget(self._strategy_summary_label)
-        self._legs_table = QTableWidget(0, 18)
+        self._legs_table = QTableWidget(0, 19)
         self._legs_table.setHorizontalHeaderLabels(
             (
                 "别名",
@@ -3747,19 +3908,30 @@ class OptionStrategyQtWindow(QMainWindow):
                 "到期日",
                 "行权价",
                 "买卖",
-                "数量",
+                "数量（张）",
+                "折合币数",
                 "持仓价",
                 "持仓价≈USDT",
                 "标记价",
                 "标记价≈USDT",
                 "每张面值",
                 "权利金合计",
-                "Delta",
-                "Gamma",
+                "Delta(PA)",
+                "Gamma(PA)",
+                "Vega",
                 "Theta",
                 "Theta≈USDT",
-                "Vega",
             )
+        )
+        self._legs_table.horizontalHeaderItem(14).setToolTip(
+            "PA Delta：期权币本位价值对标的百分比变动的敏感度；已乘买卖方向和持仓数量。"
+        )
+        self._legs_table.horizontalHeaderItem(15).setToolTip(
+            "PA Gamma：PA Delta 对标的百分比变动的敏感度；已乘买卖方向和持仓数量。"
+        )
+        self._legs_table.horizontalHeaderItem(6).setToolTip("合约张数，单位：张。")
+        self._legs_table.horizontalHeaderItem(7).setToolTip(
+            "折合币数 = 张数 × ctVal × ctMult；按合约面值币种显示，不用 BTC/ETH 价格换算。"
         )
         self._legs_table.verticalHeader().setVisible(False)
         self._legs_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
@@ -3980,6 +4152,7 @@ class OptionStrategyQtWindow(QMainWindow):
             family_instruments=tuple(family_instruments),
             tickers_by_inst_id=dict(tickers_by_inst_id),
             underlying_price=next((item.index_price for item in quotes if item.index_price is not None), self._current_underlying_price),
+            position_coin_text_by_inst_id=dict(self._chain_position_coin_text_by_inst_id),
         )
         self._apply_chain_snapshot(self._chain_request_id, snapshot)
         self._status_label.setText(f"已切换到 {family} {expiry}，期权链已按当前到期日更新。")
@@ -4045,6 +4218,7 @@ class OptionStrategyQtWindow(QMainWindow):
             request_id=request_id,
             family=family,
             preferred_expiry=self._selected_expiry_code(),
+            profile_name=self._profile_name,
             client=self._client,
             parent=self,
         )
@@ -4060,6 +4234,7 @@ class OptionStrategyQtWindow(QMainWindow):
             return
         self._chain_rows = list(snapshot.chain_rows)
         self._current_underlying_price = snapshot.underlying_price
+        self._chain_position_coin_text_by_inst_id = dict(snapshot.position_coin_text_by_inst_id)
         self._family_instruments_cache[snapshot.family] = list(snapshot.family_instruments)
         self._family_tickers_cache[snapshot.family] = dict(snapshot.tickers_by_inst_id)
         self._all_option_instruments = list(snapshot.family_instruments)
@@ -4081,20 +4256,40 @@ class OptionStrategyQtWindow(QMainWindow):
 
     def _render_chain_rows(self) -> None:
         self._chain_table.setRowCount(len(self._chain_rows))
+        atm_strike = None
+        if self._chain_rows and self._current_underlying_price is not None and self._current_underlying_price > 0:
+            atm_strike = min(
+                self._chain_rows,
+                key=lambda item: abs(item.strike - self._current_underlying_price),
+            ).strike
         for row_index, row in enumerate(self._chain_rows):
             call_tick = row.call_quote.instrument.tick_size if row.call_quote is not None else None
             put_tick = row.put_quote.instrument.tick_size if row.put_quote is not None else None
+            call_inst_id = row.call_quote.instrument.inst_id if row.call_quote is not None else ""
+            put_inst_id = row.put_quote.instrument.inst_id if row.put_quote is not None else ""
             values = (
-                _format_price(row.call_quote.mark_price if row.call_quote is not None else None, call_tick),
+                self._chain_position_coin_text_by_inst_id.get(call_inst_id, "-") if call_inst_id else "-",
                 _format_price(row.call_quote.bid_price if row.call_quote is not None else None, call_tick),
                 _format_price(row.call_quote.ask_price if row.call_quote is not None else None, call_tick),
                 format_decimal(row.strike),
                 _format_price(row.put_quote.bid_price if row.put_quote is not None else None, put_tick),
                 _format_price(row.put_quote.ask_price if row.put_quote is not None else None, put_tick),
-                _format_price(row.put_quote.mark_price if row.put_quote is not None else None, put_tick),
+                self._chain_position_coin_text_by_inst_id.get(put_inst_id, "-") if put_inst_id else "-",
             )
             for column_index, value in enumerate(values):
-                self._chain_table.setItem(row_index, column_index, QTableWidgetItem(str(value)))
+                item = QTableWidgetItem(str(value))
+                if column_index == 3:
+                    item.setBackground(QColor("#eef4fb"))
+                    if row.strike == atm_strike:
+                        item.setText(f"{value} 平值")
+                        item.setForeground(QColor("#d93025"))
+                        font = item.font()
+                        font.setBold(True)
+                        item.setFont(font)
+                        item.setToolTip(
+                            f"平值行权价：最接近当前标的指数价 {format_decimal(self._current_underlying_price)}"
+                        )
+                self._chain_table.setItem(row_index, column_index, item)
         self._update_chain_context_ui(row_count=len(self._chain_rows))
         if self._chain_rows:
             self._chain_table.selectRow(0)
@@ -4299,25 +4494,62 @@ class OptionStrategyQtWindow(QMainWindow):
                     base_implied_volatility=implied_volatility,
                 )
                 direction = Decimal("1") if leg.side == "buy" else Decimal("-1")
-                leg.delta = greeks["delta"] * direction * leg.quantity
-                leg.gamma = greeks["gamma"] * direction * leg.quantity
+                delta_pa, gamma_pa = inverse_greeks_to_pa(
+                    delta_coin_per_usd=greeks["delta"],
+                    gamma_coin_per_usd2=greeks["gamma"],
+                    underlying_price=settlement_price,
+                )
+                leg.delta = delta_pa * direction * leg.quantity
+                leg.gamma = gamma_pa * direction * leg.quantity
                 leg.theta = greeks["theta"] * direction * leg.quantity
                 leg.vega = greeks["vega"] * direction * leg.quantity
             except Exception:
                 continue
 
     def _render_legs(self) -> None:
-        self._legs_table.setRowCount(len(self._legs))
+        self._legs_table.setRowCount(len(self._legs) + (1 if self._legs else 0))
+        greek_totals = {key: Decimal("0") for key in ("delta", "gamma", "theta", "theta_usdt", "vega")}
+        greek_counts = {key: 0 for key in greek_totals}
+        missing_greeks = False
+        greek_currencies: set[str] = set()
+        coin_quantity_totals: dict[str, Decimal] = {}
         for row_index, leg in enumerate(self._legs):
             instrument = self._instrument_map.get(leg.inst_id)
             parsed = parse_option_contract(leg.inst_id)
+            currency = str(
+                getattr(instrument, "ct_val_ccy", None) or leg.inst_id.split("-", 1)[0]
+            ).strip().upper()
+            if currency:
+                greek_currencies.add(currency)
             premium = leg.premium
             mark_price = self._leg_mark_price(leg.inst_id)
             premium_usdt = self._option_value_approx_usdt(leg.inst_id, premium)
             mark_price_usdt = self._option_value_approx_usdt(leg.inst_id, mark_price)
             theta_usdt = self._option_value_approx_usdt(leg.inst_id, leg.theta)
+            for key, value in (
+                ("delta", leg.delta),
+                ("gamma", leg.gamma),
+                ("theta", leg.theta),
+                ("theta_usdt", theta_usdt),
+                ("vega", leg.vega),
+            ):
+                if value is None:
+                    missing_greeks = True
+                else:
+                    greek_totals[key] += value
+                    greek_counts[key] += 1
             contract_value = option_contract_value(instrument) if instrument is not None else Decimal("1")
             premium_total = premium * contract_value * leg.quantity if premium is not None else None
+            coin_quantity = (
+                option_contract_coin_quantity(instrument, leg.quantity)
+                if instrument is not None
+                else None
+            )
+            coin_currency = str(
+                getattr(instrument, "ct_val_ccy", None) or leg.inst_id.split("-", 1)[0]
+            ).strip().upper()
+            if coin_quantity is not None:
+                coin_quantity_totals[coin_currency] = coin_quantity_totals.get(coin_currency, Decimal("0")) + coin_quantity
             values = (
                 leg.alias,
                 leg.inst_id,
@@ -4326,20 +4558,64 @@ class OptionStrategyQtWindow(QMainWindow):
                 format_decimal(parsed.strike),
                 "买入" if leg.side == "buy" else "卖出",
                 format_decimal(leg.quantity),
+                f"{format_decimal(coin_quantity)} {coin_currency}" if coin_quantity is not None else "-",
                 _format_price(premium, instrument.tick_size if instrument is not None else None),
                 _format_compact_number(premium_usdt),
                 _format_price(mark_price, instrument.tick_size if instrument is not None else None),
                 _format_compact_number(mark_price_usdt),
                 format_decimal(contract_value),
                 format_decimal(premium_total) if premium_total is not None else "-",
-                _format_compact_number(leg.delta),
-                _format_compact_number(leg.gamma),
-                _format_compact_number(leg.theta),
+                _format_greek_number(leg.delta),
+                _format_greek_number(leg.gamma),
+                _format_greek_number(leg.vega),
+                _format_greek_number(leg.theta),
                 _format_compact_number(theta_usdt),
-                _format_compact_number(leg.vega),
             )
             for column_index, value in enumerate(values):
                 self._legs_table.setItem(row_index, column_index, QTableWidgetItem(str(value)))
+
+        if self._legs:
+            total_row = len(self._legs)
+            mixed_greek_currencies = len(greek_currencies) > 1
+            label = "组合合计（多币种）" if mixed_greek_currencies else ("组合合计*" if missing_greeks else "组合合计")
+
+            def total_text(key: str, *, coin_denominated: bool = True) -> str:
+                if coin_denominated and mixed_greek_currencies:
+                    return "跨币种"
+                if greek_counts[key] == 0:
+                    return "-"
+                return _format_greek_number(greek_totals[key])
+
+            coin_total_text = " | ".join(
+                f"{currency} {format_decimal(amount)}"
+                for currency, amount in sorted(coin_quantity_totals.items())
+            ) or "-"
+            totals = (
+                (label,)
+                + ("",) * 6
+                + (coin_total_text,)
+                + ("",) * 6
+                + (
+                    total_text("delta"),
+                    total_text("gamma"),
+                    total_text("vega"),
+                    total_text("theta"),
+                    _format_compact_number(greek_totals["theta_usdt"]) if greek_counts["theta_usdt"] else "-",
+                )
+            )
+            for column_index, value in enumerate(totals):
+                cell = QTableWidgetItem(value)
+                cell.setBackground(QColor("#e8f0fb"))
+                font = cell.font()
+                font.setBold(True)
+                cell.setFont(font)
+                if column_index in {14, 15, 16, 17, 18}:
+                    cell.setToolTip(
+                        "所有策略腿按买卖方向和数量求和；Delta/Gamma 为 PA 口径。"
+                        + (" *有未计算腿，当前合计只包含已计算腿。" if missing_greeks else "")
+                        + (" 多种结算币的 Greeks 单位不同，因此不直接相加。" if mixed_greek_currencies and column_index != 16 else "")
+                    )
+                self._legs_table.setItem(total_row, column_index, cell)
 
     def _refresh_strategy_summary(self) -> None:
         if not self._legs:

@@ -1,6 +1,6 @@
 from datetime import datetime
 from decimal import Decimal
-from unittest import TestCase
+from unittest import TestCase, mock
 
 from okx_quant.deribit_client import DeribitVolatilityCandle
 from okx_quant.models import Candle, Instrument
@@ -19,6 +19,7 @@ from okx_quant.option_strategy_ui import (
     _pan_kline_view,
     _zoom_kline_view,
     _format_compact_number,
+    _load_latest_deribit_option_chart_candles,
 )
 from okx_quant.option_strategy import (
     OptionQuote,
@@ -38,7 +39,9 @@ from okx_quant.option_strategy import (
     estimate_strategy_greeks,
     infer_implied_volatility_for_leg,
     infer_inverse_implied_volatility,
+    inverse_greeks_to_pa,
     inverse_black_scholes_price,
+    option_contract_coin_quantity,
     option_intrinsic_value_at_expiry,
     option_contract_value,
     option_time_to_expiry_years,
@@ -138,6 +141,74 @@ class OptionStrategyTest(TestCase):
         self.assertEqual(resolution_label, "1小时")
         self.assertIn("最小周期为1小时", resolution_note)
         self.assertEqual(candles[-1].close, Decimal("41.2"))
+
+    def test_latest_deribit_option_chart_candles_merges_fresh_bars_over_cache(self) -> None:
+        cached = [
+            DeribitVolatilityCandle(
+                ts=3_600_000,
+                open=Decimal("40"),
+                high=Decimal("41"),
+                low=Decimal("39"),
+                close=Decimal("40"),
+            )
+        ]
+        fresh = [
+            DeribitVolatilityCandle(
+                ts=3_600_000,
+                open=Decimal("40"),
+                high=Decimal("43"),
+                low=Decimal("39"),
+                close=Decimal("42"),
+            ),
+            DeribitVolatilityCandle(
+                ts=7_200_000,
+                open=Decimal("42"),
+                high=Decimal("44"),
+                low=Decimal("41"),
+                close=Decimal("43"),
+            ),
+        ]
+
+        with mock.patch("okx_quant.option_strategy_ui._load_deribit_hourly_series_from_cache", return_value=cached):
+            candles, resolution_label, resolution_note = _load_latest_deribit_option_chart_candles(
+                "BTC",
+                bar="1H",
+                requested_limit=50,
+                client=mock.Mock(get_volatility_index_candles=mock.Mock(return_value=fresh)),
+                now_ts=7_300_000,
+            )
+
+        self.assertEqual(resolution_label, "1小时")
+        self.assertEqual([item.ts for item in candles], [3_600_000, 7_200_000])
+        self.assertEqual(candles[0].close, Decimal("42"))
+        self.assertEqual(candles[-1].close, Decimal("43"))
+        self.assertIn("自动补齐到最新", resolution_note)
+
+    def test_latest_deribit_option_chart_candles_falls_back_to_cache_on_network_error(self) -> None:
+        cached = [
+            DeribitVolatilityCandle(
+                ts=3_600_000,
+                open=Decimal("40"),
+                high=Decimal("41"),
+                low=Decimal("39"),
+                close=Decimal("40"),
+            )
+        ]
+        client = mock.Mock()
+        client.get_volatility_index_candles.side_effect = TimeoutError("network timeout")
+
+        with mock.patch("okx_quant.option_strategy_ui._load_deribit_hourly_series_from_cache", return_value=cached):
+            candles, _resolution_label, resolution_note = _load_latest_deribit_option_chart_candles(
+                "BTC",
+                bar="1H",
+                requested_limit=50,
+                client=client,
+                now_ts=7_300_000,
+            )
+
+        self.assertEqual(len(candles), 1)
+        self.assertEqual(candles[0].close, Decimal("40"))
+        self.assertIn("DVOL 自动补齐失败，暂用缓存", resolution_note)
 
     def test_aggregate_deribit_option_chart_candles_builds_4h_bar(self) -> None:
         hourly = [
@@ -432,6 +503,26 @@ class OptionStrategyTest(TestCase):
         value = option_contract_value(_make_instrument("BTC-USD-260626-90000-C"))
         self.assertEqual(value, Decimal("0.1"))
 
+    def test_option_contract_coin_quantity_uses_btc_and_eth_contract_multipliers(self) -> None:
+        btc = Instrument(
+            **{
+                **_make_instrument("BTC-USD-260626-90000-C").__dict__,
+                "ct_mult": Decimal("0.01"),
+                "ct_val_ccy": "BTC",
+            }
+        )
+        eth = Instrument(
+            **{
+                **_make_instrument("ETH-USD-260626-3000-C").__dict__,
+                "ct_mult": Decimal("0.1"),
+                "ct_val_ccy": "ETH",
+                "inst_family": "ETH-USD",
+            }
+        )
+
+        self.assertEqual(option_contract_coin_quantity(btc, Decimal("50")), Decimal("0.5"))
+        self.assertEqual(option_contract_coin_quantity(eth, Decimal("50")), Decimal("5.0"))
+
     def test_option_intrinsic_value_at_expiry_uses_coin_settled_formula(self) -> None:
         intrinsic = option_intrinsic_value_at_expiry(
             settlement_price=Decimal("120000"),
@@ -719,6 +810,16 @@ class OptionStrategyTest(TestCase):
         self.assertIn("theta", greeks)
         self.assertIn("vega", greeks)
         self.assertGreater(greeks["delta"], Decimal("0"))
+
+    def test_inverse_option_greeks_convert_to_pa_percentage_move_units(self) -> None:
+        delta, gamma = inverse_greeks_to_pa(
+            delta_coin_per_usd=Decimal("0.0001"),
+            gamma_coin_per_usd2=Decimal("0.00000002"),
+            underlying_price=Decimal("10000"),
+        )
+
+        self.assertEqual(delta, Decimal("1.0000"))
+        self.assertEqual(gamma, Decimal("3.00000000"))
 
     def test_filter_option_instruments_by_family_drops_usdt_when_usd_selected(self) -> None:
         coin = _make_instrument("BTC-USD-260626-90000-C")
