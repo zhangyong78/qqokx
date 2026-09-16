@@ -305,6 +305,16 @@ POSITION_TYPE_OPTIONS: tuple[tuple[str, str], ...] = (
     ("期权 OPTION", "OPTION"),
 )
 
+POSITION_OPTION_SIDE_OPTIONS: tuple[tuple[str, str], ...] = (
+    ("全部方向", ""),
+    ("购", "购"),
+    ("沽", "沽"),
+    ("买购", "买购"),
+    ("卖购", "卖购"),
+    ("买沽", "买沽"),
+    ("卖沽", "卖沽"),
+)
+
 def _current_order_view_source_kind(order: OrderStatusView) -> str:
     raw = order.raw if isinstance(order.raw, dict) else {}
     return str(raw.get("_source_kind") or "").strip().lower() or "normal"
@@ -3416,6 +3426,11 @@ class AccountPositionsHomeWidget(QWidget):
             self._type_combo.addItem(label, value)
         self._type_combo.currentIndexChanged.connect(self._apply_filters)
 
+        self._option_side_combo = QComboBox()
+        for label, value in POSITION_OPTION_SIDE_OPTIONS:
+            self._option_side_combo.addItem(label, value)
+        self._option_side_combo.currentIndexChanged.connect(self._apply_filters)
+
         self._keyword_edit = QLineEdit()
         self._keyword_edit.setPlaceholderText("搜索合约 / 币种 / 到期日 / 模式")
         self._keyword_edit.textChanged.connect(self._apply_filters)
@@ -3437,14 +3452,16 @@ class AccountPositionsHomeWidget(QWidget):
 
         layout.addWidget(QLabel("类型"), 0, 0)
         layout.addWidget(self._type_combo, 0, 1)
-        layout.addWidget(QLabel("搜索"), 0, 2)
-        layout.addWidget(self._keyword_edit, 0, 3, 1, 4)
-        layout.addWidget(self._apply_contract_button, 0, 7)
-        layout.addWidget(self._apply_expiry_button, 0, 8)
-        layout.addWidget(apply_button, 0, 9)
-        layout.addWidget(clear_button, 0, 10)
-        layout.addWidget(self._filter_hint, 1, 0, 1, 11)
-        layout.setColumnStretch(3, 1)
+        layout.addWidget(QLabel("期权方向"), 0, 2)
+        layout.addWidget(self._option_side_combo, 0, 3)
+        layout.addWidget(QLabel("搜索"), 0, 4)
+        layout.addWidget(self._keyword_edit, 0, 5, 1, 3)
+        layout.addWidget(self._apply_contract_button, 0, 8)
+        layout.addWidget(self._apply_expiry_button, 0, 9)
+        layout.addWidget(apply_button, 0, 10)
+        layout.addWidget(clear_button, 0, 11)
+        layout.addWidget(self._filter_hint, 1, 0, 1, 12)
+        layout.setColumnStretch(5, 1)
         return panel
 
     def _build_positions_panel(self) -> QWidget:
@@ -4983,12 +5000,27 @@ class AccountPositionsHomeWidget(QWidget):
     def _visible_position_list(self) -> list[OkxPosition]:
         inst_type = str(self._type_combo.currentData() or "").strip().upper()
         keyword = self._keyword_edit.text()
-        return _filter_positions(
+        option_side = str(self._option_side_combo.currentData() or "").strip()
+        positions = _filter_positions(
             self._raw_positions,
             inst_type=inst_type,
             keyword=keyword,
             note_texts=self._current_note_map(),
         )
+        if option_side:
+            positions = [
+                item
+                for item in positions
+                if str(item.inst_type or "").strip().upper() == "OPTION"
+                and (
+                    _format_option_trade_side_display(item) == option_side
+                    or (
+                        option_side in {"购", "沽"}
+                        and _format_option_trade_side_display(item).endswith(option_side)
+                    )
+                )
+            ]
+        return positions
 
     def _render_positions_tree(self) -> None:
         self._visible_positions = self._visible_position_list()
@@ -5291,8 +5323,18 @@ class AccountPositionsHomeWidget(QWidget):
             parts.append("当前没有持仓")
         keyword = self._keyword_edit.text().strip().upper()
         type_label = self._type_combo.currentText().strip()
-        if keyword or type_label != "全部类型":
-            parts.append(f"筛选：{type_label if type_label != '全部类型' else ''} {'| ' + keyword if keyword else ''}".strip())
+        option_side_label = self._option_side_combo.currentText().strip()
+        if keyword or type_label != "全部类型" or option_side_label != "全部方向":
+            filters = [
+                item
+                for item in (
+                    type_label if type_label != "全部类型" else "",
+                    f"期权方向={option_side_label}" if option_side_label != "全部方向" else "",
+                    keyword,
+                )
+                if item
+            ]
+            parts.append(f"筛选：{' | '.join(filters)}")
         self._summary_label.setText(" | ".join(part for part in parts if part))
 
     def _update_filter_shortcuts(self) -> None:
@@ -5324,6 +5366,7 @@ class AccountPositionsHomeWidget(QWidget):
 
     def _clear_filters(self) -> None:
         self._type_combo.setCurrentIndex(0)
+        self._option_side_combo.setCurrentIndex(0)
         self._keyword_edit.clear()
 
     def _sync_order_watchlist(self) -> None:
@@ -5473,6 +5516,7 @@ class AccountPositionsHomeWidget(QWidget):
         option_short = sum(1 for item in raw_positions if str(item.inst_type or "").upper() == "OPTION" and derive_position_direction(item) == "short")
         keyword = self._keyword_edit.text().strip()
         type_filter = self._type_combo.currentText().strip() or "全部类型"
+        option_side_filter = self._option_side_combo.currentText().strip() or "全部方向"
         runtime = self._runtime
         environment = getattr(runtime, "environment", "") if runtime is not None else ""
         environment_label = "实盘 live" if str(environment).lower() == "live" else ("模拟 demo" if str(environment).lower() == "demo" else "-")
@@ -5484,7 +5528,7 @@ class AccountPositionsHomeWidget(QWidget):
             f"持仓总数：{len(raw_positions)}",
             f"当前显示：{len(visible_positions)}",
             f"当前委托：{len(self._visible_orders)}",
-            f"当前筛选：类型={type_filter} | 关键字={keyword or '-'}",
+            f"当前筛选：类型={type_filter} | 期权方向={option_side_filter} | 关键字={keyword or '-'}",
             "",
             "持仓结构",
             "全部持仓类型分布："
@@ -6303,7 +6347,7 @@ class AccountPositionsHomeWidget(QWidget):
         layout.addLayout(filter_row)
 
         self._position_history_table = self._build_history_table(
-            ("平仓时间", "开仓时间", "类型", "合约", "保证金模式", "持仓模式", "交易方向", "开仓均价", "平仓均价", "最大持仓量", "已平仓量", "手续费", "盈亏", "仓位状态", "备注"),
+            ("平仓时间", "开仓时间", "持仓时间", "合约", "保证金模式", "持仓模式", "交易方向", "开仓均价", "平仓均价", "最大持仓量", "已平仓量", "手续费", "盈亏", "仓位状态", "备注"),
             stretch_columns={3, 14},
         )
         self._position_history_table.cellDoubleClicked.connect(self._on_position_history_table_clicked)
