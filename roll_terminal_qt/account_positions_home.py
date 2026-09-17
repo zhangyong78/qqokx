@@ -3231,11 +3231,19 @@ class AccountPositionsHomeWidget(QWidget):
                 self._position_history_table.setItem(row, 2, holding_item)
             pnl_item = self._position_history_table.item(row, 12)
             if pnl_item is not None:
-                pnl_item = _PositionHistoryPnlTableWidgetItem(
-                    pnl_item.text(),
-                    _position_history_pnl_sort_value(item, self._position_history_usdt_prices),
-                )
+                pnl_sort_value = _position_history_pnl_sort_value(item, self._position_history_usdt_prices)
+                pnl_item = _PositionHistoryPnlTableWidgetItem(pnl_item.text(), pnl_sort_value)
                 pnl_item.setTextAlignment(int(Qt.AlignmentFlag.AlignCenter | Qt.AlignmentFlag.AlignVCenter))
+                if pnl_sort_value is not None:
+                    pnl_item.setForeground(
+                        QColor(
+                            "#13803d"
+                            if pnl_sort_value > 0
+                            else "#c23b3b"
+                            if pnl_sort_value < 0
+                            else "#1f2937"
+                        )
+                    )
                 self._position_history_table.setItem(row, 12, pnl_item)
             self._position_history_table.item(row, 0).setData(
                 Qt.ItemDataRole.UserRole,
@@ -4752,11 +4760,19 @@ class AccountPositionsHomeWidget(QWidget):
                 self._position_history_table.setItem(row, 2, holding_item)
             pnl_item = self._position_history_table.item(row, 12)
             if pnl_item is not None:
-                pnl_item = _PositionHistoryPnlTableWidgetItem(
-                    pnl_item.text(),
-                    _position_history_pnl_sort_value(item, self._position_history_usdt_prices),
-                )
+                pnl_sort_value = _position_history_pnl_sort_value(item, self._position_history_usdt_prices)
+                pnl_item = _PositionHistoryPnlTableWidgetItem(pnl_item.text(), pnl_sort_value)
                 pnl_item.setTextAlignment(int(Qt.AlignmentFlag.AlignCenter | Qt.AlignmentFlag.AlignVCenter))
+                if pnl_sort_value is not None:
+                    pnl_item.setForeground(
+                        QColor(
+                            "#13803d"
+                            if pnl_sort_value > 0
+                            else "#c23b3b"
+                            if pnl_sort_value < 0
+                            else "#1f2937"
+                        )
+                    )
                 self._position_history_table.setItem(row, 12, pnl_item)
         self._position_history_summary_label.setText(f"历史仓位：{len(self._position_history_items)} 条")
         target_row = -1
@@ -7167,11 +7183,19 @@ class AccountPositionsHomeWidget(QWidget):
                 self._position_history_table.setItem(row, 2, holding_item)
             pnl_item = self._position_history_table.item(row, 12)
             if pnl_item is not None:
-                pnl_item = _PositionHistoryPnlTableWidgetItem(
-                    pnl_item.text(),
-                    _position_history_pnl_sort_value(item, self._position_history_usdt_prices),
-                )
+                pnl_sort_value = _position_history_pnl_sort_value(item, self._position_history_usdt_prices)
+                pnl_item = _PositionHistoryPnlTableWidgetItem(pnl_item.text(), pnl_sort_value)
                 pnl_item.setTextAlignment(int(Qt.AlignmentFlag.AlignCenter | Qt.AlignmentFlag.AlignVCenter))
+                if pnl_sort_value is not None:
+                    pnl_item.setForeground(
+                        QColor(
+                            "#13803d"
+                            if pnl_sort_value > 0
+                            else "#c23b3b"
+                            if pnl_sort_value < 0
+                            else "#1f2937"
+                        )
+                    )
                 self._position_history_table.setItem(row, 12, pnl_item)
             self._position_history_table.item(row, 0).setData(
                 Qt.ItemDataRole.UserRole,
