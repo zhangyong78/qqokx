@@ -6143,6 +6143,11 @@ class KlineAnalysisWindow(QMainWindow):
         self._chart_fullscreen_button.clicked.connect(self._toggle_chart_fullscreen)
         action_row.addWidget(self._chart_fullscreen_button)
 
+        self._chart_screenshot_button = QPushButton("截图到剪贴板")
+        self._chart_screenshot_button.setToolTip("将当前双图或三图 K 线布局复制到系统剪贴板。")
+        self._chart_screenshot_button.clicked.connect(self._copy_chart_screenshot_to_clipboard)
+        action_row.addWidget(self._chart_screenshot_button)
+
         self._orders_drawer_button = QPushButton("委托")
         self._orders_drawer_button.clicked.connect(lambda: self._show_account_drawer("orders"))
         action_row.addWidget(self._orders_drawer_button)
@@ -6848,6 +6853,23 @@ class KlineAnalysisWindow(QMainWindow):
     @Slot()
     def _toggle_chart_fullscreen(self) -> None:
         self._set_chart_fullscreen(not self._chart_fullscreen_enabled)
+
+    @Slot()
+    def _copy_chart_screenshot_to_clipboard(self) -> None:
+        chart_host = self._chart_host
+        if chart_host is None or not chart_host.isVisible():
+            self._set_status("当前没有可截图的图表区域。")
+            return
+        screenshot = chart_host.grab()
+        if screenshot.isNull():
+            self._set_status("图表截图失败，请稍后重试。")
+            return
+        clipboard = QGuiApplication.clipboard()
+        if clipboard is None:
+            self._set_status("系统剪贴板不可用，无法复制截图。")
+            return
+        clipboard.setPixmap(screenshot)
+        self._set_status("当前 K 线图表已复制到剪贴板。")
 
     def _set_chart_fullscreen(self, enabled: bool) -> None:
         enabled = bool(enabled)

@@ -3500,6 +3500,10 @@ class AccountPositionsHomeWidget(QWidget):
         self._positions_hint.setObjectName("Subtle")
         title_row.addWidget(title)
         title_row.addStretch(1)
+        self._positions_screenshot_button = QPushButton("截图到剪贴板")
+        self._positions_screenshot_button.setToolTip("将当前可见的持仓页面复制到系统剪贴板。")
+        self._positions_screenshot_button.clicked.connect(self._copy_current_positions_screenshot_to_clipboard)
+        title_row.addWidget(self._positions_screenshot_button)
         self._expand_toggle_button = QPushButton("展开全部")
         self._expand_toggle_button.clicked.connect(self._toggle_all_positions)
         title_row.addWidget(self._expand_toggle_button)
@@ -3549,6 +3553,7 @@ class AccountPositionsHomeWidget(QWidget):
         detail_layout.addWidget(self._detail_text, 1)
         self._detail_panel.setVisible(False)
         layout.addWidget(self._detail_panel)
+        self._positions_screenshot_target = wrapper
         return wrapper
 
     def _build_history_tabs(self) -> QWidget:
@@ -5288,6 +5293,22 @@ class AccountPositionsHomeWidget(QWidget):
             self._collapse_all_positions()
             return
         self._expand_all_positions()
+
+    def _copy_current_positions_screenshot_to_clipboard(self) -> None:
+        target = getattr(self, "_positions_screenshot_target", None)
+        if not isinstance(target, QWidget) or not target.isVisible():
+            self._positions_hint.setText("当前没有可截图的持仓区域。")
+            return
+        screenshot = target.grab()
+        if screenshot.isNull():
+            self._positions_hint.setText("当前持仓截图失败，请稍后重试。")
+            return
+        clipboard = QApplication.clipboard()
+        if clipboard is None:
+            self._positions_hint.setText("系统剪贴板不可用，无法复制截图。")
+            return
+        clipboard.setPixmap(screenshot)
+        self._positions_hint.setText("当前持仓截图已复制到剪贴板。")
 
     def _expand_all_positions(self) -> None:
         for item in self._group_tree_items():
