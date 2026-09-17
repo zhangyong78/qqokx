@@ -6058,6 +6058,8 @@ class AccountPositionsHomeWidget(QWidget):
         top.addWidget(self._orders_summary_label, 1)
         for text, handler in (
             ("刷新", self.refresh_view),
+            ("带入合约", self.apply_selected_option_to_current_order_search),
+            ("带入到期前缀", self.apply_selected_option_expiry_prefix_to_current_order_search),
             ("从选中条件单接管动态止盈", self._show_not_ready_action),
             ("撤单选中", self._cancel_selected_current_order),
             ("批量撤当前筛选", self._show_not_ready_action),
@@ -6136,6 +6138,12 @@ class AccountPositionsHomeWidget(QWidget):
         sync_button = QPushButton("同步")
         sync_button.clicked.connect(self._refresh_order_history)
         top.addWidget(sync_button)
+        contract_button = QPushButton("带入合约")
+        contract_button.clicked.connect(self.apply_selected_option_to_order_history_search)
+        top.addWidget(contract_button)
+        expiry_button = QPushButton("带入到期前缀")
+        expiry_button.clicked.connect(self.apply_selected_option_expiry_prefix_to_order_history_search)
+        top.addWidget(expiry_button)
         layout.addLayout(top)
 
         filter_row = QGridLayout()
@@ -6445,6 +6453,42 @@ class AccountPositionsHomeWidget(QWidget):
         self._fill_history_expiry_edit.setText(expiry_prefix)
         self._refresh_fill_history_table()
 
+    def apply_selected_option_to_current_order_search(self) -> None:
+        inst_id = self._selected_option_inst_id_for_current_order_shortcut()
+        contract, _expiry_prefix = _option_search_shortcuts(inst_id)
+        if not contract:
+            QMessageBox.information(self, "带入合约", "请先在当前委托里选中一条期权委托，或在当前持仓里选中一条期权持仓。")
+            return
+        self._pending_asset_edit.setText(contract)
+        self._refresh_current_orders_table()
+
+    def apply_selected_option_expiry_prefix_to_current_order_search(self) -> None:
+        inst_id = self._selected_option_inst_id_for_current_order_shortcut()
+        _contract, expiry_prefix = _option_search_shortcuts(inst_id)
+        if not expiry_prefix:
+            QMessageBox.information(self, "带入到期前缀", "请先在当前委托里选中一条期权委托，或在当前持仓里选中一条期权持仓。")
+            return
+        self._pending_expiry_edit.setText(expiry_prefix)
+        self._refresh_current_orders_table()
+
+    def apply_selected_option_to_order_history_search(self) -> None:
+        inst_id = self._selected_option_inst_id_for_order_history_shortcut()
+        contract, _expiry_prefix = _option_search_shortcuts(inst_id)
+        if not contract:
+            QMessageBox.information(self, "带入合约", "请先在历史委托里选中一条期权委托，或在当前持仓里选中一条期权持仓。")
+            return
+        self._order_history_asset_edit.setText(contract)
+        self._refresh_order_history_table()
+
+    def apply_selected_option_expiry_prefix_to_order_history_search(self) -> None:
+        inst_id = self._selected_option_inst_id_for_order_history_shortcut()
+        _contract, expiry_prefix = _option_search_shortcuts(inst_id)
+        if not expiry_prefix:
+            QMessageBox.information(self, "带入到期前缀", "请先在历史委托里选中一条期权委托，或在当前持仓里选中一条期权持仓。")
+            return
+        self._order_history_expiry_edit.setText(expiry_prefix)
+        self._refresh_order_history_table()
+
     def apply_selected_option_to_position_history_search(self) -> None:
         inst_id = self._selected_option_inst_id_for_position_history_shortcut()
         contract, _expiry_prefix = _option_search_shortcuts(inst_id)
@@ -6467,6 +6511,26 @@ class AccountPositionsHomeWidget(QWidget):
         row = self._fill_history_table.currentRow() if hasattr(self, "_fill_history_table") else -1
         if 0 <= row < len(self._visible_fill_history_items):
             item = self._visible_fill_history_items[row]
+            if (item.inst_type or "").strip().upper() == "OPTION":
+                return item.inst_id or ""
+        position = self._selected_option_for_shortcut()
+        return position.inst_id if position is not None else ""
+
+    def _selected_option_inst_id_for_current_order_shortcut(self) -> str:
+        items = getattr(self, "_current_order_rows", [])
+        row = self._orders_table.currentRow() if hasattr(self, "_orders_table") else -1
+        if 0 <= row < len(items):
+            item = items[row]
+            if (getattr(item, "inst_type", "") or "").strip().upper() == "OPTION":
+                return getattr(item, "inst_id", "") or ""
+        position = self._selected_option_for_shortcut()
+        return position.inst_id if position is not None else ""
+
+    def _selected_option_inst_id_for_order_history_shortcut(self) -> str:
+        items = getattr(self, "_visible_order_history_items", [])
+        row = self._order_history_table.currentRow() if hasattr(self, "_order_history_table") else -1
+        if 0 <= row < len(items):
+            item = items[row]
             if (item.inst_type or "").strip().upper() == "OPTION":
                 return item.inst_id or ""
         position = self._selected_option_for_shortcut()
