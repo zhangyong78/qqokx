@@ -2660,6 +2660,9 @@ class OptionChainLinkedChartDialog(QDialog):
         self._syncing_viewport = False
         self._pending_linked_candles_reload = False
         self._bar_buttons: dict[str, QPushButton] = {}
+        self._auto_refresh_timer = QTimer(self)
+        self._auto_refresh_timer.setInterval(60_000)
+        self._auto_refresh_timer.timeout.connect(self._load_candles)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(12, 12, 12, 12)
@@ -2685,6 +2688,11 @@ class OptionChainLinkedChartDialog(QDialog):
         self._trade_records_button.setCheckable(True)
         self._trade_records_button.toggled.connect(self._on_trade_records_toggled)
         toolbar.addWidget(self._trade_records_button)
+        self._auto_refresh_button = QPushButton("自动刷新:开")
+        self._auto_refresh_button.setCheckable(True)
+        self._auto_refresh_button.setChecked(True)
+        self._auto_refresh_button.toggled.connect(self._toggle_auto_refresh)
+        toolbar.addWidget(self._auto_refresh_button)
         toolbar.addStretch(1)
         screenshot_button = QPushButton("截图到剪贴板")
         screenshot_button.clicked.connect(self._copy_charts_screenshot_to_clipboard)
@@ -2820,6 +2828,8 @@ class OptionChainLinkedChartDialog(QDialog):
             self._load_side_contract_options(side)
         self._load_candles()
         self._load_trade_records()
+        if self._auto_refresh_button.isChecked():
+            self._auto_refresh_timer.start()
         self.show()
         self.raise_()
         self.activateWindow()
@@ -2836,6 +2846,17 @@ class OptionChainLinkedChartDialog(QDialog):
         left_id = self._call_quote.instrument.inst_id if self._call_quote is not None else "—"
         right_id = self._put_quote.instrument.inst_id if self._put_quote is not None else "—"
         self._title_label.setText(f"左侧 {left_id}  ·  中间 Deribit DVOL  ·  右侧 {right_id}")
+
+    @Slot(bool)
+    def _toggle_auto_refresh(self, enabled: bool) -> None:
+        if enabled:
+            self._auto_refresh_button.setText("自动刷新:开")
+            if self._call_quote is not None or self._put_quote is not None:
+                self._auto_refresh_timer.start()
+                self._load_candles()
+        else:
+            self._auto_refresh_button.setText("自动刷新:关")
+            self._auto_refresh_timer.stop()
 
     def apply_workspace_profile(self, profile_name: str) -> None:
         """Keep trade records on the same API selected by the parent workspace."""
@@ -3393,6 +3414,7 @@ class OptionChainLinkedChartDialog(QDialog):
             QTimer.singleShot(0, lambda target=side: self._load_side_option_candles(target))
 
     def closeEvent(self, event) -> None:  # noqa: ANN001
+        self._auto_refresh_timer.stop()
         threads: list[QThread | None] = [self._load_thread]
         threads.extend(self._side_contract_threads.values())
         threads.extend(self._side_candle_threads.values())
@@ -3618,6 +3640,8 @@ class OptionChainLinkedChartDialog(QDialog):
 
 
 class OptionStrategyBigChartDialog(QDialog):
+    auto_refresh_requested = Signal()
+
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         apply_qt_window_icon(self)
@@ -3627,6 +3651,14 @@ class OptionStrategyBigChartDialog(QDialog):
         self.resize(1560, 980)
         layout = QVBoxLayout(self)
         self._tabs = QTabWidget()
+        self._auto_refresh_timer = QTimer(self)
+        self._auto_refresh_timer.setInterval(60_000)
+        self._auto_refresh_timer.timeout.connect(self.auto_refresh_requested)
+        self._auto_refresh_button = QPushButton("自动刷新:开")
+        self._auto_refresh_button.setCheckable(True)
+        self._auto_refresh_button.setChecked(True)
+        self._auto_refresh_button.toggled.connect(self._toggle_auto_refresh)
+        self._tabs.setCornerWidget(self._auto_refresh_button, Qt.Corner.TopRightCorner)
         layout.addWidget(self._tabs, 1)
 
         self._payoff_note = QLabel("")
@@ -3729,6 +3761,23 @@ class OptionStrategyBigChartDialog(QDialog):
     def _set_overlay_moving_averages_visible(self, visible: bool) -> None:
         for chart in (self._overlay_combo_chart, self._overlay_vol_chart, self._overlay_spot_chart):
             chart.set_moving_averages_visible(visible)
+
+    @Slot(bool)
+    def _toggle_auto_refresh(self, enabled: bool) -> None:
+        self._auto_refresh_button.setText("自动刷新:开" if enabled else "自动刷新:关")
+        if enabled and self.isVisible():
+            self._auto_refresh_timer.start()
+        else:
+            self._auto_refresh_timer.stop()
+
+    def showEvent(self, event) -> None:  # noqa: ANN001
+        super().showEvent(event)
+        if self._auto_refresh_button.isChecked():
+            self._auto_refresh_timer.start()
+
+    def closeEvent(self, event) -> None:  # noqa: ANN001
+        self._auto_refresh_timer.stop()
+        super().closeEvent(event)
 
     def _copy_page_screenshot_to_clipboard(self, target: QWidget, button: QPushButton) -> None:
         if not target.isVisible():
@@ -5327,6 +5376,7 @@ class OptionStrategyQtWindow(QMainWindow):
     def open_big_chart_window(self) -> None:
         if self._big_dialog is None:
             self._big_dialog = OptionStrategyBigChartDialog(self)
+            self._big_dialog.auto_refresh_requested.connect(self._auto_refresh_big_chart_window)
             self._big_dialog._overlay_refresh_button.clicked.connect(self._request_overlay_chart_refresh)
             self._big_dialog._overlay_period_combo.currentIndexChanged.connect(self._request_overlay_chart_refresh)
             self._big_dialog._overlay_combo_chart.hover_changed.connect(self._sync_overlay_chart_hover)
@@ -5339,6 +5389,16 @@ class OptionStrategyQtWindow(QMainWindow):
         self._big_dialog.raise_()
         self._big_dialog.activateWindow()
         self._refresh_big_chart_window()
+
+    @Slot()
+    def _auto_refresh_big_chart_window(self) -> None:
+        dialog = self._big_dialog
+        if dialog is None or not dialog.isVisible() or not self._legs:
+            return
+        if "chart" not in self._worker_threads:
+            self.refresh_charts()
+        if "overlay" not in self._worker_threads:
+            self._request_overlay_chart_refresh()
 
     def _refresh_big_chart_window(self) -> None:
         dialog = self._big_dialog

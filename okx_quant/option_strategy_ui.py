@@ -270,6 +270,39 @@ def _load_deribit_hourly_series_from_cache(currency: str) -> list[DeribitVolatil
     return candles
 
 
+def _save_deribit_hourly_series_to_cache(currency: str, candles: list[DeribitVolatilityCandle]) -> None:
+    """Persist the merged DVOL hourly series without replacing cached spot data."""
+    if not candles:
+        return
+    normalized_currency = currency.strip().upper()
+    if not normalized_currency:
+        return
+    try:
+        cache_path = _option_strategy_deribit_cache_file_path()
+        payload = _load_deribit_option_chart_cache_payload()
+        cache_key = f"{normalized_currency}|hourly_base"
+        existing = payload.get(cache_key)
+        item = dict(existing) if isinstance(existing, dict) else {}
+        item["fetched_at"] = datetime.now().isoformat()
+        item["volatility_hourly"] = [
+            {
+                "ts": candle.ts,
+                "open": str(candle.open),
+                "high": str(candle.high),
+                "low": str(candle.low),
+                "close": str(candle.close),
+            }
+            for candle in candles
+        ]
+        payload[cache_key] = item
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        cache_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    except OSError:
+        # Charts remain usable with the just-loaded in-memory data if the
+        # local cache is temporarily unavailable.
+        return
+
+
 def _aggregate_deribit_option_chart_candles(
     candles: list[DeribitVolatilityCandle],
     resolution_ms: int,
@@ -406,6 +439,8 @@ def _load_latest_deribit_option_chart_candles(
     merged_by_ts = {item.ts: item for item in cached}
     merged_by_ts.update({item.ts: item for item in latest})
     merged = [merged_by_ts[ts] for ts in sorted(merged_by_ts)]
+    if latest:
+        _save_deribit_hourly_series_to_cache(normalized_currency, merged)
     candles, resolution_label, resolution_note = _build_deribit_option_chart_candles(
         merged,
         bar=bar,

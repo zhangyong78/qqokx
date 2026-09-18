@@ -1600,6 +1600,8 @@ class InstrumentKlineDialog(QDialog):
         self._bar_buttons: dict[str, QPushButton] = {}
         self._prefs_changed = prefs_changed
         self._linked_requested = linked_requested
+        self._auto_refresh_timer = QTimer(self)
+        self._auto_refresh_timer.timeout.connect(self._load_current_bar)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(12, 12, 12, 12)
@@ -1633,6 +1635,11 @@ class InstrumentKlineDialog(QDialog):
         self._linked_button.clicked.connect(self._request_linked_kline)
         self._linked_button.setVisible(False)
         bar_row.addWidget(self._linked_button)
+        self._auto_refresh_button = QPushButton("自动刷新:开")
+        self._auto_refresh_button.setCheckable(True)
+        self._auto_refresh_button.setChecked(True)
+        self._auto_refresh_button.toggled.connect(self._toggle_auto_refresh)
+        bar_row.addWidget(self._auto_refresh_button)
         screenshot_button = QPushButton("截图到剪贴板")
         screenshot_button.clicked.connect(self._copy_chart_screenshot_to_clipboard)
         bar_row.addWidget(screenshot_button)
@@ -1669,6 +1676,7 @@ class InstrumentKlineDialog(QDialog):
         self._no_more_older_candles = False
         self._update_title()
         self._load_current_bar()
+        self._sync_auto_refresh_timer()
         self.show()
         self.raise_()
         self.activateWindow()
@@ -1678,6 +1686,29 @@ class InstrumentKlineDialog(QDialog):
         if self._inst_type != "OPTION" or not self._inst_id or self._linked_requested is None:
             return
         self._linked_requested(self._inst_id)
+
+    @staticmethod
+    def _auto_refresh_interval_ms(bar: str) -> int:
+        return {
+            "15m": 45_000,
+            "1H": 60_000,
+            "4H": 3 * 60_000,
+            "1D": 10 * 60_000,
+        }.get(bar, 60_000)
+
+    def _sync_auto_refresh_timer(self) -> None:
+        self._auto_refresh_timer.setInterval(self._auto_refresh_interval_ms(self._current_bar))
+        if self._auto_refresh_button.isChecked() and self._inst_id:
+            self._auto_refresh_timer.start()
+        else:
+            self._auto_refresh_timer.stop()
+
+    @Slot(bool)
+    def _toggle_auto_refresh(self, enabled: bool) -> None:
+        self._auto_refresh_button.setText("自动刷新:开" if enabled else "自动刷新:关")
+        self._sync_auto_refresh_timer()
+        if enabled and self._inst_id:
+            self._load_current_bar()
 
     @Slot()
     def _copy_chart_screenshot_to_clipboard(self) -> None:
@@ -1696,6 +1727,7 @@ class InstrumentKlineDialog(QDialog):
         self._status_label.setText("当前 K 线图表已复制到剪贴板。")
 
     def closeEvent(self, event) -> None:  # noqa: ANN001
+        self._auto_refresh_timer.stop()
         if self._load_thread is not None and self._load_thread.isRunning():
             self._load_thread.requestInterruption()
             self._load_thread.wait(1500)
@@ -1709,6 +1741,7 @@ class InstrumentKlineDialog(QDialog):
     def _select_bar(self, bar: str) -> None:
         self._current_bar = bar
         self._sync_bar_buttons()
+        self._sync_auto_refresh_timer()
         self._emit_prefs_changed()
         self._load_current_bar()
 
