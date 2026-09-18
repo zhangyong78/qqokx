@@ -2596,6 +2596,9 @@ class AccountPositionsHomeWidget(QWidget):
         self._position_tickers: dict[str, object] = {}
         self._upl_usdt_prices: dict[str, Decimal] = {}
         self._position_row_payloads: dict[str, dict[str, object]] = {}
+        self._unchecked_position_row_keys: set[str] = set()
+        self._show_checked_positions_only = False
+        self._position_tree_building = False
         self._visible_column_ids: set[str] = set(DEFAULT_VISIBLE_COLUMNS)
         self._tree_column_width_overrides: dict[str, int] = {}
         self._expanded_row_keys: set[str] = set()
@@ -2632,6 +2635,9 @@ class AccountPositionsHomeWidget(QWidget):
         self._position_history_render_timer = QTimer(self)
         self._position_history_render_timer.setSingleShot(True)
         self._position_history_render_timer.timeout.connect(self._render_position_history_table)
+        self._positions_tree_render_timer = QTimer(self)
+        self._positions_tree_render_timer.setSingleShot(True)
+        self._positions_tree_render_timer.timeout.connect(self._render_positions_tree)
         self._refresh_profiles()
         self._populate_profile_combo()
 
@@ -3410,6 +3416,7 @@ class AccountPositionsHomeWidget(QWidget):
             ("停止接管", self._show_not_ready_action, ""),
             ("设置期权保护", self._open_position_protection_dialog, ""),
             ("展期建议", self._open_option_roll_window, ""),
+
             ("列设置", self.open_positions_column_window, ""),
         ):
             button = QPushButton(text)
@@ -3452,6 +3459,9 @@ class AccountPositionsHomeWidget(QWidget):
         self._apply_expiry_button = QPushButton("带入到期前缀")
         self._apply_expiry_button.clicked.connect(self.apply_selected_option_expiry_prefix_to_position_search)
         self._apply_expiry_button.setEnabled(False)
+        self._apply_checked_button = QPushButton("带入选中")
+        self._apply_checked_button.setToolTip("勾选仅暂存；点击后才显示并统计当前筛选结果中仍勾选的仓位。")
+        self._apply_checked_button.clicked.connect(self.apply_checked_positions_to_filter)
 
         apply_button = QPushButton("应用筛选")
         apply_button.clicked.connect(self._apply_filters)
@@ -3466,9 +3476,10 @@ class AccountPositionsHomeWidget(QWidget):
         layout.addWidget(self._keyword_edit, 0, 5, 1, 3)
         layout.addWidget(self._apply_contract_button, 0, 8)
         layout.addWidget(self._apply_expiry_button, 0, 9)
-        layout.addWidget(apply_button, 0, 10)
-        layout.addWidget(clear_button, 0, 11)
-        layout.addWidget(self._filter_hint, 1, 0, 1, 12)
+        layout.addWidget(self._apply_checked_button, 0, 10)
+        layout.addWidget(apply_button, 0, 11)
+        layout.addWidget(clear_button, 0, 12)
+        layout.addWidget(self._filter_hint, 1, 0, 1, 13)
         layout.setColumnStretch(5, 1)
         return panel
 
@@ -3518,6 +3529,7 @@ class AccountPositionsHomeWidget(QWidget):
         self._position_tree.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self._position_tree.setItemDelegate(_PositionTreeDelegate(self._position_tree))
         self._position_tree.itemSelectionChanged.connect(self._on_position_selected)
+        self._position_tree.itemChanged.connect(self._on_position_tree_item_changed)
         self._position_tree.itemDoubleClicked.connect(self._on_position_tree_clicked)
         self._position_tree.itemExpanded.connect(self._on_tree_item_expanded)
         self._position_tree.itemCollapsed.connect(self._on_tree_item_collapsed)
@@ -4871,6 +4883,7 @@ class AccountPositionsHomeWidget(QWidget):
         window.show()
         window.raise_()
         window.activateWindow()
+
     def edit_selected_position_note(self) -> None:
         position = self._selected_position()
         if position is None:
@@ -5041,7 +5054,15 @@ class AccountPositionsHomeWidget(QWidget):
                     )
                 )
             ]
+        if self._show_checked_positions_only:
+            positions = self._checked_positions(positions)
         return positions
+
+    def _is_position_checked(self, position: OkxPosition) -> bool:
+        return _position_tree_row_id(position) not in self._unchecked_position_row_keys
+
+    def _checked_positions(self, positions: list[OkxPosition]) -> list[OkxPosition]:
+        return [item for item in positions if self._is_position_checked(item)]
 
     def _render_positions_tree(self) -> None:
         self._visible_positions = self._visible_position_list()
@@ -5052,6 +5073,8 @@ class AccountPositionsHomeWidget(QWidget):
             if isinstance(data, str):
                 selected_key = data
 
+        self._position_tree_building = True
+        tree_signals_were_blocked = self._position_tree.blockSignals(True)
         self._position_tree.clear()
         self._position_row_payloads.clear()
         groups = _group_positions_for_tree(self._visible_positions)
@@ -5065,9 +5088,10 @@ class AccountPositionsHomeWidget(QWidget):
         for asset_label, buckets in groups.items():
             asset_id = _asset_group_row_id(asset_label)
             asset_positions = [item for bucket in buckets.values() for item in bucket]
-            asset_metrics = _aggregate_position_metrics(asset_positions, self._upl_usdt_prices, self._position_instruments)
+            selected_asset_positions = self._checked_positions(asset_positions)
+            asset_metrics = _aggregate_position_metrics(selected_asset_positions, self._upl_usdt_prices, self._position_instruments)
             asset_metrics["estimated_close_fee"] = _format_group_estimated_close_fee(
-                asset_positions,
+                selected_asset_positions,
                 self._position_instruments,
                 self._position_tickers,
                 self._upl_usdt_prices,
@@ -5078,7 +5102,7 @@ class AccountPositionsHomeWidget(QWidget):
                 label=f"{asset_label} 风险单元",
                 values=_group_row_values_with_break_even("组合", asset_metrics),
                 kind="group",
-                payload_item=asset_positions,
+                payload_item=selected_asset_positions,
                 payload_metrics=asset_metrics,
             )
             asset_item.setFont(0, bold_font)
@@ -5091,13 +5115,14 @@ class AccountPositionsHomeWidget(QWidget):
                         asset_item.addChild(self._build_position_item(position))
                     continue
                 bucket_id = _bucket_group_row_id(asset_label, bucket_label)
+                selected_bucket_positions = self._checked_positions(bucket_positions)
                 bucket_metrics = _aggregate_position_metrics(
-                    bucket_positions,
+                    selected_bucket_positions,
                     self._upl_usdt_prices,
                     self._position_instruments,
                 )
                 bucket_metrics["estimated_close_fee"] = _format_group_estimated_close_fee(
-                    bucket_positions,
+                    selected_bucket_positions,
                     self._position_instruments,
                     self._position_tickers,
                     self._upl_usdt_prices,
@@ -5108,7 +5133,7 @@ class AccountPositionsHomeWidget(QWidget):
                     label=bucket_label,
                     values=_group_row_values_with_break_even("分组", bucket_metrics),
                     kind="group",
-                    payload_item=bucket_positions,
+                    payload_item=selected_bucket_positions,
                     payload_metrics=bucket_metrics,
                 )
                 bucket_item.setFont(0, bold_font)
@@ -5117,6 +5142,8 @@ class AccountPositionsHomeWidget(QWidget):
                 for position in bucket_positions:
                     bucket_item.addChild(self._build_position_item(position))
 
+        self._position_tree.blockSignals(tree_signals_were_blocked)
+        self._position_tree_building = False
         self._positions_hint.setText(f"当前显示 {len(self._visible_positions)} 条持仓 | 点击任一行查看详情。")
         self._update_summary_text()
         self._restore_tree_selection(selected_key)
@@ -5145,6 +5172,8 @@ class AccountPositionsHomeWidget(QWidget):
             "item": payload_item,
             "metrics": payload_metrics,
         }
+        if kind == "group":
+            item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsUserCheckable)
         for index, (_column_id, _heading, _width, alignment) in enumerate(POSITION_COLUMNS, start=1):
             item.setTextAlignment(index, int(alignment | Qt.AlignmentFlag.AlignVCenter))
         return item
@@ -5218,6 +5247,11 @@ class AccountPositionsHomeWidget(QWidget):
             kind="position",
             payload_item=position,
             payload_metrics=None,
+        )
+        item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+        item.setCheckState(
+            0,
+            Qt.CheckState.Unchecked if row_key in self._unchecked_position_row_keys else Qt.CheckState.Checked,
         )
         pnl_color = None
         if position.unrealized_pnl is not None:
@@ -5347,6 +5381,7 @@ class AccountPositionsHomeWidget(QWidget):
     def _update_summary_text(self) -> None:
         total_count = len(self._raw_positions)
         visible_count = len(self._visible_positions)
+        checked_count = len(self._checked_positions(self._raw_positions))
         parts = [
             f"API配置：{self._last_profile_name or '-'}",
             self._account_status.text(),
@@ -5358,6 +5393,10 @@ class AccountPositionsHomeWidget(QWidget):
             parts.append(text)
         else:
             parts.append("当前没有持仓")
+        if total_count:
+            parts.append(f"统计选中 {checked_count}/{total_count}")
+        if self._show_checked_positions_only:
+            parts.append("仅显示已勾选")
         keyword = self._keyword_edit.text().strip().upper()
         type_label = self._type_combo.currentText().strip()
         option_side_label = self._option_side_combo.currentText().strip()
@@ -5401,10 +5440,26 @@ class AccountPositionsHomeWidget(QWidget):
             return
         self._keyword_edit.setText(expiry_prefix)
 
+    def apply_checked_positions_to_filter(self) -> None:
+        checked_count = len(self._checked_positions(self._visible_positions))
+        if checked_count <= 0:
+            QMessageBox.information(self, "带入选中", "当前筛选结果中没有勾选的仓位。")
+            return
+        self._show_checked_positions_only = True
+        self._render_positions_tree()
+
     def _clear_filters(self) -> None:
-        self._type_combo.setCurrentIndex(0)
-        self._option_side_combo.setCurrentIndex(0)
-        self._keyword_edit.clear()
+        # 连续点击时只保留最后一次刷新，避免 QTreeWidget 被重复清空和重建。
+        self._show_checked_positions_only = False
+        self._unchecked_position_row_keys.clear()
+        with QSignalBlocker(self._type_combo), QSignalBlocker(self._option_side_combo), QSignalBlocker(self._keyword_edit):
+            self._type_combo.setCurrentIndex(0)
+            self._option_side_combo.setCurrentIndex(0)
+            self._keyword_edit.clear()
+        self._schedule_positions_tree_render()
+
+    def _schedule_positions_tree_render(self) -> None:
+        self._positions_tree_render_timer.start(80)
 
     def _sync_order_watchlist(self) -> None:
         if self._order_feed is None:
@@ -5693,6 +5748,7 @@ class AccountPositionsHomeWidget(QWidget):
         QMessageBox.information(self, "迁移", "这个入口已经预留到主页上，下一步会按旧页面逻辑继续接入。")
 
     def _apply_filters(self, *_args: object) -> None:
+        self._show_checked_positions_only = False
         self._render_positions_tree()
 
     def _on_profile_changed(self, *_args: object) -> None:
@@ -5815,6 +5871,21 @@ class AccountPositionsHomeWidget(QWidget):
     def _on_position_selected(self) -> None:
         self._update_filter_shortcuts()
         self._refresh_detail()
+
+    @Slot(QTreeWidgetItem, int)
+    def _on_position_tree_item_changed(self, item: QTreeWidgetItem, column: int) -> None:
+        if column != 0 or self._position_tree_building:
+            return
+        position = self._position_for_tree_item(item)
+        if position is None:
+            return
+        row_key = _position_tree_row_id(position)
+        if item.checkState(0) == Qt.CheckState.Checked:
+            self._unchecked_position_row_keys.discard(row_key)
+        else:
+            self._unchecked_position_row_keys.add(row_key)
+        # 勾选状态只暂存；点击“带入选中”后再统一重建表格和统计，
+        # 避免连续点击时在 Qt 的 itemChanged 回调里重复刷新树控件。
 
     def _position_for_tree_item(self, item: QTreeWidgetItem | None) -> OkxPosition | None:
         if item is None:
@@ -5996,6 +6067,8 @@ class AccountPositionsHomeWidget(QWidget):
         ):
             return
         self._raw_positions = next_positions
+        active_position_keys = {_position_tree_row_id(item) for item in self._raw_positions}
+        self._unchecked_position_row_keys.intersection_update(active_position_keys)
         self._position_instruments = next_instruments
         self._position_tickers = next_tickers
         self._upl_usdt_prices = next_prices
