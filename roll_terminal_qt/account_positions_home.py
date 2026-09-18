@@ -1633,6 +1633,9 @@ class InstrumentKlineDialog(QDialog):
         self._linked_button.clicked.connect(self._request_linked_kline)
         self._linked_button.setVisible(False)
         bar_row.addWidget(self._linked_button)
+        screenshot_button = QPushButton("截图到剪贴板")
+        screenshot_button.clicked.connect(self._copy_chart_screenshot_to_clipboard)
+        bar_row.addWidget(screenshot_button)
         bar_row.addStretch(1)
         layout.addLayout(bar_row)
 
@@ -1675,6 +1678,22 @@ class InstrumentKlineDialog(QDialog):
         if self._inst_type != "OPTION" or not self._inst_id or self._linked_requested is None:
             return
         self._linked_requested(self._inst_id)
+
+    @Slot()
+    def _copy_chart_screenshot_to_clipboard(self) -> None:
+        if not self._chart.isVisible():
+            self._status_label.setText("当前没有可截图的 K 线区域。")
+            return
+        screenshot = self._chart.grab()
+        if screenshot.isNull():
+            self._status_label.setText("K 线截图失败，请稍后重试。")
+            return
+        clipboard = QApplication.clipboard()
+        if clipboard is None:
+            self._status_label.setText("系统剪贴板不可用，无法复制截图。")
+            return
+        clipboard.setPixmap(screenshot)
+        self._status_label.setText("当前 K 线图表已复制到剪贴板。")
 
     def closeEvent(self, event) -> None:  # noqa: ANN001
         if self._load_thread is not None and self._load_thread.isRunning():

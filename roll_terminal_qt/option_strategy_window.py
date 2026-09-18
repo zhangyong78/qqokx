@@ -16,7 +16,7 @@ from PySide6.QtCharts import (
     QValueAxis,
 )
 from PySide6.QtCore import QDateTime, QObject, QPointF, QRectF, Qt, QThread, QTimer, Signal, Slot
-from PySide6.QtGui import QColor, QPainter, QPainterPath, QPen, QPolygonF
+from PySide6.QtGui import QColor, QGuiApplication, QPainter, QPainterPath, QPen, QPolygonF
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QButtonGroup,
@@ -2686,6 +2686,9 @@ class OptionChainLinkedChartDialog(QDialog):
         self._trade_records_button.toggled.connect(self._on_trade_records_toggled)
         toolbar.addWidget(self._trade_records_button)
         toolbar.addStretch(1)
+        screenshot_button = QPushButton("截图到剪贴板")
+        screenshot_button.clicked.connect(self._copy_charts_screenshot_to_clipboard)
+        toolbar.addWidget(screenshot_button)
         refresh_button = QPushButton("刷新")
         refresh_button.clicked.connect(self._load_candles)
         toolbar.addWidget(refresh_button)
@@ -2717,6 +2720,7 @@ class OptionChainLinkedChartDialog(QDialog):
         put_panel = self._build_side_panel("right", "右侧期权", self._put_chart)
         charts.addWidget(put_panel)
         charts.setSizes([600, 600, 600])
+        self._charts_screenshot_target = charts
         layout.addWidget(charts, 1)
         for chart in self._charts:
             chart.hover_time_changed.connect(lambda timestamp, ratio, source=chart: self._sync_hover(source, timestamp, ratio))
@@ -2724,6 +2728,23 @@ class OptionChainLinkedChartDialog(QDialog):
             chart.viewport_changed.connect(lambda start, end, source=chart: self._sync_viewport(source, start, end))
         self._sync_bar_buttons()
         self._show_empty_messages()
+
+    @Slot()
+    def _copy_charts_screenshot_to_clipboard(self) -> None:
+        target = self._charts_screenshot_target
+        if not target.isVisible():
+            self._status_label.setText("当前没有可截图的联动图表区域。")
+            return
+        screenshot = target.grab()
+        if screenshot.isNull():
+            self._status_label.setText("联动图表截图失败，请稍后重试。")
+            return
+        clipboard = QGuiApplication.clipboard()
+        if clipboard is None:
+            self._status_label.setText("系统剪贴板不可用，无法复制截图。")
+            return
+        clipboard.setPixmap(screenshot)
+        self._status_label.setText("当前联动 K 线图表已复制到剪贴板。")
 
     def _build_side_panel(self, side: str, title: str, chart: CandlestickChartView) -> QGroupBox:
         panel = QGroupBox(title)
@@ -3614,6 +3635,14 @@ class OptionStrategyBigChartDialog(QDialog):
         payoff_page = QWidget()
         payoff_layout = QVBoxLayout(payoff_page)
         payoff_layout.addWidget(self._payoff_note)
+        payoff_toolbar = QHBoxLayout()
+        payoff_toolbar.addStretch(1)
+        payoff_screenshot_button = QPushButton("截图到剪贴板")
+        payoff_screenshot_button.clicked.connect(
+            lambda _checked=False, target=payoff_page, button=payoff_screenshot_button: self._copy_page_screenshot_to_clipboard(target, button)
+        )
+        payoff_toolbar.addWidget(payoff_screenshot_button)
+        payoff_layout.addLayout(payoff_toolbar)
         payoff_layout.addWidget(self._payoff_chart, 1)
         self._tabs.addTab(payoff_page, "到期盈亏图")
 
@@ -3630,6 +3659,11 @@ class OptionStrategyBigChartDialog(QDialog):
         self._combo_chart.set_moving_averages_visible(True)
         self._combo_moving_average_check.toggled.connect(self._combo_chart.set_moving_averages_visible)
         combo_toolbar.addWidget(self._combo_moving_average_check)
+        combo_screenshot_button = QPushButton("截图到剪贴板")
+        combo_screenshot_button.clicked.connect(
+            lambda _checked=False, target=combo_page, button=combo_screenshot_button: self._copy_page_screenshot_to_clipboard(target, button)
+        )
+        combo_toolbar.addWidget(combo_screenshot_button)
         combo_layout.addLayout(combo_toolbar)
         combo_layout.addWidget(self._combo_chart, 1)
         self._tabs.addTab(combo_page, "组合K线")
@@ -3647,6 +3681,11 @@ class OptionStrategyBigChartDialog(QDialog):
         self._vol_chart.set_moving_averages_visible(True)
         self._vol_moving_average_check.toggled.connect(self._vol_chart.set_moving_averages_visible)
         vol_toolbar.addWidget(self._vol_moving_average_check)
+        vol_screenshot_button = QPushButton("截图到剪贴板")
+        vol_screenshot_button.clicked.connect(
+            lambda _checked=False, target=vol_page, button=vol_screenshot_button: self._copy_page_screenshot_to_clipboard(target, button)
+        )
+        vol_toolbar.addWidget(vol_screenshot_button)
         vol_layout.addLayout(vol_toolbar)
         vol_layout.addWidget(self._vol_chart, 1)
         self._tabs.addTab(vol_page, "波动率K线")
@@ -3667,6 +3706,11 @@ class OptionStrategyBigChartDialog(QDialog):
         toolbar.addWidget(self._overlay_moving_average_check)
         self._overlay_refresh_button = QPushButton("刷新叠加对比")
         toolbar.addWidget(self._overlay_refresh_button)
+        overlay_screenshot_button = QPushButton("截图到剪贴板")
+        overlay_screenshot_button.clicked.connect(
+            lambda _checked=False, target=overlay_page, button=overlay_screenshot_button: self._copy_page_screenshot_to_clipboard(target, button)
+        )
+        toolbar.addWidget(overlay_screenshot_button)
         overlay_layout.addLayout(toolbar)
         self._overlay_note = QLabel("")
         self._overlay_note.setWordWrap(True)
@@ -3685,6 +3729,26 @@ class OptionStrategyBigChartDialog(QDialog):
     def _set_overlay_moving_averages_visible(self, visible: bool) -> None:
         for chart in (self._overlay_combo_chart, self._overlay_vol_chart, self._overlay_spot_chart):
             chart.set_moving_averages_visible(visible)
+
+    def _copy_page_screenshot_to_clipboard(self, target: QWidget, button: QPushButton) -> None:
+        if not target.isVisible():
+            self._flash_screenshot_button(button, "当前页不可截图")
+            return
+        screenshot = target.grab()
+        if screenshot.isNull():
+            self._flash_screenshot_button(button, "截图失败")
+            return
+        clipboard = QGuiApplication.clipboard()
+        if clipboard is None:
+            self._flash_screenshot_button(button, "剪贴板不可用")
+            return
+        clipboard.setPixmap(screenshot)
+        self._flash_screenshot_button(button, "已复制到剪贴板")
+
+    @staticmethod
+    def _flash_screenshot_button(button: QPushButton, text: str) -> None:
+        button.setText(text)
+        QTimer.singleShot(1600, lambda: button.setText("截图到剪贴板"))
 
     @property
     def overlay_period(self) -> str:
