@@ -2226,6 +2226,22 @@ class PositionProtectionDialog(QDialog):
             return current
         return self._selected_position
 
+    @staticmethod
+    def _protection_position_size_text(position: OkxPosition) -> str:
+        """Show option contracts together with their underlying-coin amount."""
+
+        position_text = _format_optional_decimal(position.position)
+        if str(position.inst_type or "").strip().upper() != "OPTION":
+            return position_text
+        contract_value, contract_currency = _position_contract_value_snapshot(position, None)
+        if contract_value is None or contract_value <= 0 or not contract_currency:
+            return f"{position_text}张"
+        converted = abs(position.position) * contract_value
+        return (
+            f"{position_text}张（折合 {_format_optional_decimal(converted)} "
+            f"{contract_currency.upper()}）"
+        )
+
     def _refresh_from_selection(self, *, force: bool) -> None:
         position = self._current_position()
         if position is None and self._selected_position is None:
@@ -2238,7 +2254,9 @@ class PositionProtectionDialog(QDialog):
         position_key = _position_tree_row_id(position)
         direction = derive_position_direction(position)
         self._title_label.setText(
-            f"当前选中：{position.inst_id} | 方向={direction.upper()} | 持仓={_format_optional_decimal(position.position)} | 开仓均价={_format_optional_decimal(position.avg_price)}"
+            f"当前选中：{position.inst_id} | 方向={direction.upper()} | "
+            f"持仓={self._protection_position_size_text(position)} | "
+            f"开仓均价={_format_optional_decimal(position.avg_price)}"
         )
         if force or position_key != self._form_position_key:
             self._form_position_key = position_key

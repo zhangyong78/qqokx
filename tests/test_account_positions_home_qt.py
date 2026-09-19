@@ -31,6 +31,27 @@ from roll_terminal_qt.shared_order_store import SharedOrderSnapshot
 
 
 class PositionDisplayForegroundColorsTest(TestCase):
+    def test_protection_position_size_shows_option_contracts_as_underlying_coin(self) -> None:
+        btc_position = SimpleNamespace(
+            position=Decimal("20"),
+            inst_id="BTC-USD-260925-79000-C",
+            inst_type="OPTION",
+        )
+        eth_position = SimpleNamespace(
+            position=Decimal("3"),
+            inst_id="ETH-USD-260925-2500-C",
+            inst_type="OPTION",
+        )
+
+        self.assertEqual(
+            PositionProtectionDialog._protection_position_size_text(btc_position),
+            "20张（折合 0.2 BTC）",
+        )
+        self.assertEqual(
+            PositionProtectionDialog._protection_position_size_text(eth_position),
+            "3张（折合 0.3 ETH）",
+        )
+
     def test_estimated_close_fee_formats_usdt_equivalent_with_two_decimals(self) -> None:
         position = SimpleNamespace(
             position=Decimal("1"),
