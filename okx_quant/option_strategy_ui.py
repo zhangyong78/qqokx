@@ -1,12 +1,14 @@
 ﻿from __future__ import annotations
 
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 from decimal import Decimal
 import math
 from pathlib import Path
 import time
+from typing import Any
 
+from okx_quant.candle_cache import load_candle_cache
 from okx_quant.deribit_client import DeribitRestClient, DeribitVolatilityCandle
 from okx_quant.models import Candle, Instrument
 from okx_quant.okx_client import OkxPosition, OkxTicker
@@ -33,6 +35,8 @@ DERIBIT_OPTION_CHART_BAR_TO_RESOLUTION = {
     "4H": "14400",
     "1D": "86400",
 }
+DERIBIT_OPTION_HISTORY_START_TS = int(datetime(2021, 1, 1, tzinfo=timezone.utc).timestamp() * 1000)
+DERIBIT_OPTION_HISTORY_REFRESH_OVERLAP_HOURS = 240
 
 
 def _build_option_quote(instrument: Instrument, ticker: OkxTicker | None) -> OptionQuote:
@@ -301,6 +305,68 @@ def _save_deribit_hourly_series_to_cache(currency: str, candles: list[DeribitVol
         # Charts remain usable with the just-loaded in-memory data if the
         # local cache is temporarily unavailable.
         return
+
+
+def supplement_deribit_option_history(
+    currency: str,
+    *,
+    market_client: Any,
+    client: DeribitRestClient | None = None,
+    start_ts: int | None = None,
+    end_ts: int | None = None,
+) -> tuple[int, int]:
+    """Fill the local DVOL and same-currency spot caches for linked charts."""
+
+    normalized_currency = currency.strip().upper()
+    if not normalized_currency:
+        raise ValueError("缺少波动率币种")
+    spot_inst_id = _spot_usdt_inst_id(normalized_currency)
+    if not spot_inst_id:
+        raise ValueError(f"暂不支持 {normalized_currency} 的标底历史补充")
+    history_start = max(0, int(start_ts)) if start_ts is not None else DERIBIT_OPTION_HISTORY_START_TS
+    history_end = max(history_start, int(end_ts)) if end_ts is not None else int(time.time() * 1000)
+
+    cached_volatility = [
+        item
+        for item in _load_deribit_hourly_series_from_cache(normalized_currency)
+        if history_start <= item.ts <= history_end
+    ]
+    overlap_ms = DERIBIT_OPTION_HISTORY_REFRESH_OVERLAP_HOURS * 3_600_000
+    volatility_start = history_start
+    if cached_volatility and cached_volatility[0].ts <= history_start + 3_600_000:
+        volatility_start = max(history_start, cached_volatility[-1].ts - overlap_ms)
+
+    fetched_volatility = (client or DeribitRestClient()).get_volatility_index_candles(
+        normalized_currency,
+        "3600",
+        start_ts=volatility_start,
+        end_ts=history_end,
+        max_records=None,
+    )
+    fetched_volatility = [
+        item for item in fetched_volatility if volatility_start <= item.ts <= history_end
+    ]
+    merged_volatility_by_ts = {item.ts: item for item in cached_volatility}
+    merged_volatility_by_ts.update({item.ts: item for item in fetched_volatility})
+    merged_volatility = [merged_volatility_by_ts[ts] for ts in sorted(merged_volatility_by_ts)]
+    if merged_volatility:
+        _save_deribit_hourly_series_to_cache(normalized_currency, merged_volatility)
+
+    cached_spot = load_candle_cache(spot_inst_id, "1H", limit=None)
+    spot_start = history_start
+    spot_limit = 0
+    if cached_spot and cached_spot[0].ts <= history_start + 3_600_000:
+        spot_start = max(history_start, cached_spot[-1].ts - overlap_ms)
+        spot_limit = DERIBIT_OPTION_HISTORY_REFRESH_OVERLAP_HOURS + 24
+    market_client.get_candles_history_range(
+        spot_inst_id,
+        "1H",
+        start_ts=spot_start,
+        end_ts=history_end,
+        limit=spot_limit,
+    )
+    spot_candles = [item for item in load_candle_cache(spot_inst_id, "1H", limit=None) if item.confirmed]
+    return len(merged_volatility), len(spot_candles)
 
 
 def _aggregate_deribit_option_chart_candles(

@@ -164,7 +164,7 @@ function Get-ChangedFiles {
     foreach ($path in ($raw -split "`0")) {
         if ([string]::IsNullOrWhiteSpace($path)) { continue }
         $normalized = $path.Trim().Replace('\', '/')
-        if ($normalized -match '^(dist|reports|\.codex|__pycache__)' -or $normalized -like '*.pyc') { continue }
+        if ($normalized -match '^(dist|reports|data|\.codex|__pycache__)' -or $normalized -like '*.pyc') { continue }
         if ($seen.Add($normalized)) { $files.Add($normalized) }
     }
     return $files

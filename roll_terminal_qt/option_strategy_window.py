@@ -98,6 +98,7 @@ from okx_quant.option_strategy_ui import (
     _position_side_and_quantity,
     _spot_usdt_inst_id,
     _strategy_leg_quote_currency,
+    supplement_deribit_option_history,
 )
 from roll_terminal_qt.runtime import load_runtime
 
@@ -222,6 +223,7 @@ class ChainLinkedChartSnapshot:
     put_error: str = ""
     underlying_error: str = ""
     prepend: bool = False
+    incremental: bool = False
 
 
 @dataclass(frozen=True)
@@ -231,6 +233,7 @@ class ChainLinkedVolatilitySnapshot:
     resolution_label: str
     resolution_note: str
     prepend: bool = False
+    incremental: bool = False
 
 
 @dataclass(frozen=True)
@@ -260,6 +263,7 @@ class _ChainLinkedChartThread(QThread):
         candle_limit: int,
         client: OkxRestClient,
         before_ts: int | None = None,
+        incremental: bool = False,
         parent: QObject | None = None,
     ) -> None:
         super().__init__(parent)
@@ -270,6 +274,7 @@ class _ChainLinkedChartThread(QThread):
         self._candle_limit = max(50, min(int(candle_limit), MAX_OPTION_COMBO_CANDLES))
         self._client = client
         self._before_ts = before_ts if before_ts is not None and before_ts > 0 else None
+        self._incremental = bool(incremental)
 
     def run(self) -> None:
         try:
@@ -308,6 +313,7 @@ class _ChainLinkedChartThread(QThread):
                     put_error=put_error,
                     underlying_error=underlying_error,
                     prepend=self._before_ts is not None,
+                    incremental=self._incremental,
                 ),
             )
             if self._before_ts is not None:
@@ -324,6 +330,7 @@ class _ChainLinkedChartThread(QThread):
                     candles=tuple(volatility_candles),
                     resolution_label=resolution_label,
                     resolution_note=resolution_note,
+                    incremental=self._incremental,
                 ),
             )
         except Exception as exc:  # noqa: BLE001
@@ -354,6 +361,35 @@ class _ChainLinkedChartThread(QThread):
             return [item for item in candles if item.confirmed], ""
         except Exception as exc:  # noqa: BLE001
             return [], str(exc)
+
+
+class _ChainHistoricalDataSupplementThread(QThread):
+    completed = Signal(int, int, int)
+    error_raised = Signal(int, str)
+
+    def __init__(
+        self,
+        *,
+        request_id: int,
+        currency: str,
+        market_client: OkxRestClient,
+        parent: QObject | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self._request_id = request_id
+        self._currency = currency.strip().upper()
+        self._market_client = market_client
+
+    def run(self) -> None:
+        try:
+            volatility_count, spot_count = supplement_deribit_option_history(
+                self._currency,
+                market_client=self._market_client,
+            )
+        except Exception as exc:  # noqa: BLE001
+            self.error_raised.emit(self._request_id, str(exc))
+            return
+        self.completed.emit(self._request_id, volatility_count, spot_count)
 
 
 class _LinkedContractThread(QThread):
@@ -1548,6 +1584,11 @@ class CandlestickChartView(QChartView):
         self._full_y_min = 0.0
         self._full_y_max = 1.0
         self._pan_anchor_x: float | None = None
+        # Defer historical loading until the drag event has fully ended.
+        # Rebuilding QChart series during mouseMoveEvent can crash the native
+        # chart backend while it is still dispatching the drag.
+        self._deferred_older_data_request_ts: int | None = None
+        self._historical_load_locked = False
         self._linked_hover_index: int | None = None
         self._linked_hover_y_ratio: float | None = None
         self._linked_hover_timestamp: int | None = None
@@ -1577,6 +1618,7 @@ class CandlestickChartView(QChartView):
         self._position_price_markers = ()
         self._hover_pos = None
         self._pan_anchor_x = None
+        self._deferred_older_data_request_ts = None
         self._linked_hover_index = None
         self._linked_hover_y_ratio = None
         self._linked_hover_timestamp = None
@@ -1734,6 +1776,63 @@ class CandlestickChartView(QChartView):
             f"C {_format_compact_number(latest.close)}{suffix}{moving_average_title}"
         )
 
+    def set_candles_if_new_bar(
+        self,
+        *,
+        title: str,
+        candles: list[Candle],
+        hide_wicks: bool = False,
+        show_moving_averages: bool | None = None,
+        tooltip_close_usdt_rate: Decimal | None = None,
+        tooltip_close_usdt_basis: str = "",
+        tooltip_entry_price: Decimal | None = None,
+        time_markers: tuple[tuple[str, int], ...] = (),
+        position_price_markers: tuple[PositionPriceMarker, ...] = (),
+    ) -> bool:
+        """Refresh only when a new bar arrives, preserving the current viewport."""
+
+        if not candles:
+            return False
+        if self._candles and self._candles[-1].ts == candles[-1].ts:
+            return False
+        previous_range = self._current_x_range() if self._candles else None
+        previous_span = (
+            max(previous_range[1] - previous_range[0], 1.0)
+            if previous_range is not None
+            else 0.0
+        )
+        followed_latest = bool(
+            previous_range is not None
+            and previous_range[1] >= self._full_x_max_ms - 1.0
+        )
+        self.set_candles(
+            title=title,
+            candles=candles,
+            hide_wicks=hide_wicks,
+            show_moving_averages=show_moving_averages,
+            tooltip_close_usdt_rate=tooltip_close_usdt_rate,
+            tooltip_close_usdt_basis=tooltip_close_usdt_basis,
+            tooltip_entry_price=tooltip_entry_price,
+            time_markers=time_markers,
+            position_price_markers=position_price_markers,
+        )
+        if previous_range is not None and self._axis_x is not None:
+            if followed_latest:
+                new_max = self._full_x_max_ms
+                new_min = max(self._full_x_min_ms, new_max - previous_span)
+            else:
+                new_min = max(self._full_x_min_ms, previous_range[0])
+                new_max = min(self._full_x_max_ms, previous_range[1])
+                if new_max - new_min < previous_span:
+                    new_min = max(self._full_x_min_ms, new_max - previous_span)
+            self._axis_x.setRange(
+                QDateTime.fromMSecsSinceEpoch(int(new_min)),
+                QDateTime.fromMSecsSinceEpoch(int(new_max)),
+            )
+            self._fit_y_axis_to_visible_range()
+            self.viewport().update()
+        return True
+
     @staticmethod
     def _normalized_position_price_markers(
         markers: tuple[PositionPriceMarker, ...] | list[PositionPriceMarker],
@@ -1772,6 +1871,14 @@ class CandlestickChartView(QChartView):
             entry_price if self._tooltip_close_usdt_rate is not None and entry_price is not None and entry_price > 0 else None
         )
         self.viewport().update()
+
+    def set_historical_load_locked(self, locked: bool) -> None:
+        """Prevent chart interaction while historical series are rebuilt."""
+
+        self._historical_load_locked = bool(locked)
+        if self._historical_load_locked:
+            self._pan_anchor_x = None
+            self._deferred_older_data_request_ts = None
 
     def prepend_candles(self, candles: list[Candle]) -> bool:
         """Prepend an older page while keeping the current chart settings and zoom."""
@@ -1871,6 +1978,9 @@ class CandlestickChartView(QChartView):
         event.accept()
 
     def mousePressEvent(self, event) -> None:  # type: ignore[override]
+        if self._historical_load_locked:
+            event.accept()
+            return
         plot_area = self.chart().plotArea()
         if event.button() == Qt.MouseButton.LeftButton and plot_area.contains(event.position()):
             self._pan_anchor_x = float(event.position().x())
@@ -1917,6 +2027,9 @@ class CandlestickChartView(QChartView):
         self.viewport().update()
 
     def mouseMoveEvent(self, event) -> None:  # type: ignore[override]
+        if self._historical_load_locked:
+            event.accept()
+            return
         plot_area = self.chart().plotArea()
         if self._pan_anchor_x is not None and event.buttons() & Qt.MouseButton.LeftButton:
             current_x = float(event.position().x())
@@ -1941,11 +2054,21 @@ class CandlestickChartView(QChartView):
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event) -> None:  # type: ignore[override]
+        deferred_before_ts = self._deferred_older_data_request_ts
+        self._deferred_older_data_request_ts = None
         self._pan_anchor_x = None
         super().mouseReleaseEvent(event)
+        if deferred_before_ts is not None:
+            # Let Qt finish dispatching the mouse release before the dialog
+            # starts a worker that will replace the chart series.
+            QTimer.singleShot(
+                0,
+                lambda before_ts=deferred_before_ts: self.older_data_requested.emit(before_ts),
+            )
 
     def leaveEvent(self, event) -> None:  # type: ignore[override]
         self._pan_anchor_x = None
+        self._deferred_older_data_request_ts = None
         self._hover_pos = None
         self.hover_cleared.emit()
         self._hide_hover_overlays()
@@ -2440,7 +2563,7 @@ class CandlestickChartView(QChartView):
         self._fit_y_axis_to_visible_range()
         self._emit_viewport_changed()
         if delta_px > 0 and new_x_min <= self._full_x_min_ms + 1.0:
-            self.older_data_requested.emit(int(self._full_x_min_ms))
+            self._deferred_older_data_request_ts = int(self._full_x_min_ms)
 
     def _emit_viewport_changed(self) -> None:
         start_ts, end_ts = self._current_x_range()
@@ -2685,10 +2808,16 @@ class OptionChainLinkedChartDialog(QDialog):
         self._bar_buttons: dict[str, QPushButton] = {}
         self._auto_refresh_timer = QTimer(self)
         self._auto_refresh_timer.setInterval(60_000)
-        self._auto_refresh_timer.timeout.connect(self._load_candles)
+        self._auto_refresh_timer.timeout.connect(lambda: self._load_candles(incremental=True))
         self._loading_older_candles = False
         self._no_more_older_candles = False
         self._pending_older_candles_before_ts: int | None = None
+        self._older_candles_request_timer = QTimer(self)
+        self._older_candles_request_timer.setSingleShot(True)
+        self._older_candles_request_timer.setInterval(160)
+        self._older_candles_request_timer.timeout.connect(self._start_older_candles_load)
+        self._history_supplement_request_id = 0
+        self._history_supplement_thread: _ChainHistoricalDataSupplementThread | None = None
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(12, 12, 12, 12)
@@ -2719,6 +2848,10 @@ class OptionChainLinkedChartDialog(QDialog):
         self._auto_refresh_button.setChecked(True)
         self._auto_refresh_button.toggled.connect(self._toggle_auto_refresh)
         toolbar.addWidget(self._auto_refresh_button)
+        supplement_button = QPushButton("补充本地历史")
+        supplement_button.clicked.connect(self._supplement_local_history)
+        self._history_supplement_button = supplement_button
+        toolbar.addWidget(supplement_button)
         toolbar.addStretch(1)
         screenshot_button = QPushButton("截图到剪贴板")
         screenshot_button.clicked.connect(self._copy_charts_screenshot_to_clipboard)
@@ -3442,7 +3575,8 @@ class OptionChainLinkedChartDialog(QDialog):
 
     def closeEvent(self, event) -> None:  # noqa: ANN001
         self._auto_refresh_timer.stop()
-        threads: list[QThread | None] = [self._load_thread]
+        self._older_candles_request_timer.stop()
+        threads: list[QThread | None] = [self._load_thread, self._history_supplement_thread]
         threads.extend(self._side_contract_threads.values())
         threads.extend(self._side_candle_threads.values())
         threads.append(self._trade_record_thread)
@@ -3476,19 +3610,27 @@ class OptionChainLinkedChartDialog(QDialog):
             button.style().polish(button)
 
     @Slot()
-    def _load_candles(self) -> None:
+    def _load_candles(self, incremental: bool = False) -> None:
+        if self._pending_older_candles_before_ts is not None and not self._loading_older_candles:
+            self._older_candles_request_timer.start()
+            return
         if self._load_thread is not None and self._load_thread.isRunning():
+            if incremental:
+                return
             self._pending_linked_candles_reload = True
             self._status_label.setText("正在加载上一轮数据，请稍候…")
             return
         call_id = self._call_quote.instrument.inst_id if self._call_quote is not None else ""
         put_id = self._put_quote.instrument.inst_id if self._put_quote is not None else ""
         if not call_id and not put_id:
+            self._set_older_candles_interaction_locked(False)
             return
         self._request_id += 1
         request_id = self._request_id
         self._loading_older_candles = False
         self._no_more_older_candles = False
+        self._pending_older_candles_before_ts = None
+        self._older_candles_request_timer.stop()
         self._status_label.setText(f"正在加载 {self._current_bar} 左侧、DVOL、右侧联动 K 线…")
         thread = _ChainLinkedChartThread(
             request_id=request_id,
@@ -3497,6 +3639,7 @@ class OptionChainLinkedChartDialog(QDialog):
             bar=self._current_bar,
             candle_limit=240,
             client=self._client,
+            incremental=incremental,
             parent=self,
         )
         self._load_thread = thread
@@ -3506,6 +3649,62 @@ class OptionChainLinkedChartDialog(QDialog):
         thread.finished.connect(self._clear_finished_thread)
         thread.start()
 
+    @Slot()
+    def _supplement_local_history(self) -> None:
+        if self._history_supplement_thread is not None and self._history_supplement_thread.isRunning():
+            self._status_label.setText("本地历史数据正在补充，请稍候…")
+            return
+        if self._load_thread is not None and self._load_thread.isRunning():
+            self._status_label.setText("联动 K 线正在加载，请完成后再补充本地历史数据。")
+            return
+        current_quote = self._call_quote or self._put_quote
+        if current_quote is None:
+            self._status_label.setText("请先选择左右两侧期权合约，再补充本地历史数据。")
+            return
+        currency = current_quote.instrument.inst_id.split("-", 1)[0].strip().upper()
+        if not currency:
+            self._status_label.setText("无法识别当前期权对应的币种。")
+            return
+        self._history_supplement_request_id += 1
+        request_id = self._history_supplement_request_id
+        self._history_supplement_button.setEnabled(False)
+        self._status_label.setText(f"正在补充 {currency} 的 DVOL 和标底历史数据，请稍候…")
+        thread = _ChainHistoricalDataSupplementThread(
+            request_id=request_id,
+            currency=currency,
+            market_client=self._client,
+            parent=self,
+        )
+        self._history_supplement_thread = thread
+        thread.completed.connect(self._apply_history_supplement_result)
+        thread.error_raised.connect(self._apply_history_supplement_error)
+        thread.finished.connect(self._clear_history_supplement_thread)
+        thread.start()
+
+    @Slot(int, int, int)
+    def _apply_history_supplement_result(self, request_id: int, volatility_count: int, spot_count: int) -> None:
+        if request_id != self._history_supplement_request_id:
+            return
+        self._status_label.setText(
+            f"本地历史数据补充完成：DVOL {volatility_count} 根，标底 {spot_count} 根；正在刷新联动 K 线…"
+        )
+        QTimer.singleShot(0, self._load_candles)
+
+    @Slot(int, str)
+    def _apply_history_supplement_error(self, request_id: int, message: str) -> None:
+        if request_id != self._history_supplement_request_id:
+            return
+        self._status_label.setText(f"本地历史数据补充失败：{message}")
+
+    @Slot()
+    def _clear_history_supplement_thread(self) -> None:
+        thread = self._history_supplement_thread
+        if thread is None or thread.isRunning():
+            return
+        thread.deleteLater()
+        self._history_supplement_thread = None
+        self._history_supplement_button.setEnabled(True)
+
     @Slot(object)
     def _request_older_candles(self, before_ts: object) -> None:
         try:
@@ -3514,18 +3713,34 @@ class OptionChainLinkedChartDialog(QDialog):
             return
         if before <= 0 or self._no_more_older_candles or self._loading_older_candles:
             return
+        pending = self._pending_older_candles_before_ts
+        self._pending_older_candles_before_ts = before if pending is None else min(pending, before)
+        self._set_older_candles_interaction_locked(True)
+        self._older_candles_request_timer.start()
         if self._load_thread is not None and self._load_thread.isRunning():
-            pending = self._pending_older_candles_before_ts
-            self._pending_older_candles_before_ts = before if pending is None else min(pending, before)
+            self._status_label.setText("正在加载上一轮数据，请稍候；历史 K 线请求已排队…")
             return
+        self._status_label.setText("已到达历史边界，准备加载更早的联动 K 线…")
+
+    @Slot()
+    def _start_older_candles_load(self) -> None:
+        if self._loading_older_candles or self._no_more_older_candles:
+            return
+        before = self._pending_older_candles_before_ts
+        if before is None or before <= 0:
+            return
+        if self._load_thread is not None and self._load_thread.isRunning():
+            return
+        self._pending_older_candles_before_ts = None
         call_id = self._call_quote.instrument.inst_id if self._call_quote is not None else ""
         put_id = self._put_quote.instrument.inst_id if self._put_quote is not None else ""
         if not call_id and not put_id:
+            self._set_older_candles_interaction_locked(False)
             return
         self._loading_older_candles = True
         self._request_id += 1
         request_id = self._request_id
-        self._status_label.setText("正在加载更早的联动 K 线，可继续向左拖动…")
+        self._status_label.setText("正在加载更早的联动 K 线，完成后可继续向左拖动…")
         thread = _ChainLinkedChartThread(
             request_id=request_id,
             call_inst_id=call_id,
@@ -3542,6 +3757,10 @@ class OptionChainLinkedChartDialog(QDialog):
         thread.error_raised.connect(self._apply_load_error)
         thread.finished.connect(self._clear_finished_thread)
         thread.start()
+
+    def _set_older_candles_interaction_locked(self, locked: bool) -> None:
+        for chart in self._charts:
+            chart.set_historical_load_locked(locked)
 
     @Slot(int, object)
     def _apply_snapshot(self, request_id: int, payload: object) -> None:
@@ -3567,12 +3786,14 @@ class OptionChainLinkedChartDialog(QDialog):
                 for chart in populated:
                     chart.set_linked_viewport(int(start), int(end))
             self._loading_older_candles = False
+            self._set_older_candles_interaction_locked(False)
             if loaded_any:
                 self._status_label.setText("已加载更早的联动 K 线，可继续向左拖动。")
             else:
                 self._no_more_older_candles = True
                 self._status_label.setText("已加载到可用的最早联动 K 线。")
             return
+        incremental = payload.incremental
         if payload.call_inst_id == current_call_id:
             self._set_option_chart(
                 self._call_chart,
@@ -3582,14 +3803,17 @@ class OptionChainLinkedChartDialog(QDialog):
                 "左侧",
                 tooltip_close_usdt_rate=self._option_chart_usdt_context("left")[0],
                 tooltip_close_usdt_basis=self._option_chart_usdt_context("left")[1],
+                incremental=incremental,
             )
-            self._apply_side_trade_record_markers("left")
+            if not incremental:
+                self._apply_side_trade_record_markers("left")
         self._set_option_chart(
             self._underlying_chart,
             payload.underlying_inst_id,
             payload.underlying_candles,
             payload.underlying_error,
             "标底",
+            incremental=incremental,
         )
         if payload.put_inst_id == current_put_id:
             self._set_option_chart(
@@ -3600,30 +3824,45 @@ class OptionChainLinkedChartDialog(QDialog):
                 "右侧",
                 tooltip_close_usdt_rate=self._option_chart_usdt_context("right")[0],
                 tooltip_close_usdt_basis=self._option_chart_usdt_context("right")[1],
+                incremental=incremental,
             )
-            self._apply_side_trade_record_markers("right")
+            if not incremental:
+                self._apply_side_trade_record_markers("right")
         if self._pending_linked_candles_reload and self._call_quote is not None and self._put_quote is not None:
             QTimer.singleShot(0, self._load_candles)
         if payload.volatility_candles:
             note = f" | {payload.volatility_resolution_note}" if payload.volatility_resolution_note else ""
-            self._volatility_chart.set_candles(
-                title=f"Deribit {payload.volatility_currency} DVOL 波动率K线 | {payload.volatility_resolution_label}{note}",
-                candles=list(payload.volatility_candles),
-                show_moving_averages=True,
+            volatility_title = (
+                f"Deribit {payload.volatility_currency} DVOL 波动率K线 | "
+                f"{payload.volatility_resolution_label}{note}"
             )
-        else:
+            if incremental:
+                self._volatility_chart.set_candles_if_new_bar(
+                    title=volatility_title,
+                    candles=list(payload.volatility_candles),
+                    show_moving_averages=True,
+                )
+            else:
+                self._volatility_chart.set_candles(
+                    title=volatility_title,
+                    candles=list(payload.volatility_candles),
+                    show_moving_averages=True,
+                )
+        elif not incremental:
             self._volatility_chart.show_message("正在从 Deribit 自动补齐最新 DVOL 波动率 K 线…")
         # The left option chart is applied before the underlying chart above;
         # refresh both overlays once more so both sides can use the linked
         # underlying close as a fallback conversion basis.
-        self._apply_side_trade_record_markers("left")
-        self._apply_side_trade_record_markers("right")
-        self._sync_initial_viewport()
+        if not incremental:
+            self._apply_side_trade_record_markers("left")
+            self._apply_side_trade_record_markers("right")
+            self._sync_initial_viewport()
         counts = (
             f"左侧 {len(payload.call_candles)} / 标底 {len(payload.underlying_candles)} / "
             f"波动率 {len(payload.volatility_candles)} / 右侧 {len(payload.put_candles)}"
         )
-        self._status_label.setText(f"{self._current_bar} 联动 K 线已加载（{counts} 根）。")
+        if not incremental:
+            self._status_label.setText(f"{self._current_bar} 联动 K 线已加载（{counts} 根）。")
 
     @Slot(int, object)
     def _apply_volatility_snapshot(self, request_id: int, payload: object) -> None:
@@ -3644,18 +3883,27 @@ class OptionChainLinkedChartDialog(QDialog):
             return
         if payload.candles:
             note = f" | {payload.resolution_note}" if payload.resolution_note else ""
-            self._volatility_chart.set_candles(
-                title=f"Deribit {payload.currency} DVOL 波动率K线 | {payload.resolution_label}{note}",
-                candles=list(payload.candles),
-                show_moving_averages=True,
-            )
-        else:
+            volatility_title = f"Deribit {payload.currency} DVOL 波动率K线 | {payload.resolution_label}{note}"
+            if payload.incremental:
+                self._volatility_chart.set_candles_if_new_bar(
+                    title=volatility_title,
+                    candles=list(payload.candles),
+                    show_moving_averages=True,
+                )
+            else:
+                self._volatility_chart.set_candles(
+                    title=volatility_title,
+                    candles=list(payload.candles),
+                    show_moving_averages=True,
+                )
+        elif not payload.incremental:
             detail = f"（{payload.resolution_note}）" if payload.resolution_note else ""
             self._volatility_chart.show_message(f"Deribit {payload.currency} DVOL 暂无可用数据{detail}")
-        self._sync_initial_viewport()
-        self._status_label.setText(
-            f"{self._current_bar} 联动 K 线已加载；DVOL 已自动更新（{len(payload.candles)} 根）。"
-        )
+        if not payload.incremental:
+            self._sync_initial_viewport()
+            self._status_label.setText(
+                f"{self._current_bar} 联动 K 线已加载；DVOL 已自动更新（{len(payload.candles)} 根）。"
+            )
 
     @staticmethod
     def _set_option_chart(
@@ -3667,15 +3915,22 @@ class OptionChainLinkedChartDialog(QDialog):
         *,
         tooltip_close_usdt_rate: Decimal | None = None,
         tooltip_close_usdt_basis: str = "",
+        incremental: bool = False,
     ) -> None:
         if candles:
-            chart.set_candles(
-                title=f"{side_label} {inst_id} 标记价格K线",
-                candles=list(candles),
-                show_moving_averages=True,
-                tooltip_close_usdt_rate=tooltip_close_usdt_rate,
-                tooltip_close_usdt_basis=tooltip_close_usdt_basis,
-            )
+            kwargs = {
+                "title": f"{side_label} {inst_id} 标记价格K线",
+                "candles": list(candles),
+                "show_moving_averages": True,
+                "tooltip_close_usdt_rate": tooltip_close_usdt_rate,
+                "tooltip_close_usdt_basis": tooltip_close_usdt_basis,
+            }
+            if incremental:
+                chart.set_candles_if_new_bar(**kwargs)
+            else:
+                chart.set_candles(**kwargs)
+            return
+        if incremental:
             return
         detail = f"：{error}" if error else ""
         chart.show_message(f"{side_label} {inst_id or '—'} 暂无可用标记价格 K 线{detail}")
@@ -3686,6 +3941,7 @@ class OptionChainLinkedChartDialog(QDialog):
             return
         if self._loading_older_candles:
             self._loading_older_candles = False
+            self._set_older_candles_interaction_locked(False)
             self._status_label.setText(f"更早的联动 K 线加载失败：{message}；继续向左拖动可重试")
             return
         self._status_label.setText(f"联动 K 线加载失败：{message}")
@@ -3701,9 +3957,7 @@ class OptionChainLinkedChartDialog(QDialog):
             QTimer.singleShot(0, self._load_candles)
             return
         if self._pending_older_candles_before_ts is not None and not self._loading_older_candles:
-            before = self._pending_older_candles_before_ts
-            self._pending_older_candles_before_ts = None
-            QTimer.singleShot(0, lambda before=before: self._request_older_candles(before))
+            self._older_candles_request_timer.start()
 
     def _sync_initial_viewport(self) -> None:
         populated = [chart for chart in self._charts if chart._candles]

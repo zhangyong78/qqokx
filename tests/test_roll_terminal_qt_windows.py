@@ -164,6 +164,38 @@ class RollTerminalQtWindowHelperTests(QtWidgetTestCase):
         finally:
             self.dispose_widget(chart)
 
+    def test_candlestick_chart_incremental_refresh_skips_same_bar_and_keeps_viewport(self) -> None:
+        chart = CandlestickChartView()
+        candles = [
+            Candle(1_752_210_000_000, Decimal("0.01"), Decimal("0.02"), Decimal("0.009"), Decimal("0.015"), Decimal("1"), True),
+            Candle(1_752_213_600_000, Decimal("0.015"), Decimal("0.021"), Decimal("0.014"), Decimal("0.018"), Decimal("1"), True),
+        ]
+        try:
+            chart.set_candles(title="测试", candles=candles)
+            chart.set_linked_viewport(1_752_211_000_000, 1_752_214_000_000)
+            previous_range = chart._current_x_range()
+
+            same_bar = list(candles)
+            same_bar[-1] = Candle(
+                same_bar[-1].ts,
+                Decimal("0.015"),
+                Decimal("0.022"),
+                Decimal("0.014"),
+                Decimal("0.019"),
+                Decimal("1"),
+                True,
+            )
+            self.assertFalse(chart.set_candles_if_new_bar(title="测试", candles=same_bar))
+            self.assertEqual(chart._current_x_range(), previous_range)
+
+            next_bar = same_bar + [
+                Candle(1_752_217_200_000, Decimal("0.019"), Decimal("0.023"), Decimal("0.018"), Decimal("0.022"), Decimal("1"), True),
+            ]
+            self.assertTrue(chart.set_candles_if_new_bar(title="测试", candles=next_bar))
+            self.assertEqual(chart._current_x_range(), previous_range)
+        finally:
+            self.dispose_widget(chart)
+
     def test_candlestick_chart_linked_hover_uses_source_timestamp_for_crosshair(self) -> None:
         chart = CandlestickChartView()
         candles = [

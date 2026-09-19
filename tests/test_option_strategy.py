@@ -20,6 +20,7 @@ from okx_quant.option_strategy_ui import (
     _zoom_kline_view,
     _format_compact_number,
     _load_latest_deribit_option_chart_candles,
+    supplement_deribit_option_history,
 )
 from okx_quant.option_strategy import (
     OptionQuote,
@@ -209,6 +210,64 @@ class OptionStrategyTest(TestCase):
         self.assertEqual(len(candles), 1)
         self.assertEqual(candles[0].close, Decimal("40"))
         self.assertIn("DVOL 自动补齐失败，暂用缓存", resolution_note)
+
+    def test_supplement_deribit_option_history_merges_dvol_and_spot_history(self) -> None:
+        cached = [
+            DeribitVolatilityCandle(
+                ts=3_600_000,
+                open=Decimal("40"),
+                high=Decimal("41"),
+                low=Decimal("39"),
+                close=Decimal("40"),
+            )
+        ]
+        fetched = [
+            DeribitVolatilityCandle(
+                ts=7_200_000,
+                open=Decimal("41"),
+                high=Decimal("42"),
+                low=Decimal("40"),
+                close=Decimal("41"),
+            )
+        ]
+        spot = [
+            Candle(
+                ts=7_200_000,
+                open=Decimal("100"),
+                high=Decimal("101"),
+                low=Decimal("99"),
+                close=Decimal("100.5"),
+                volume=Decimal("1"),
+                confirmed=True,
+            )
+        ]
+        deribit_client = mock.Mock(get_volatility_index_candles=mock.Mock(return_value=fetched))
+        market_client = mock.Mock(get_candles_history_range=mock.Mock(return_value=spot))
+        with (
+            mock.patch("okx_quant.option_strategy_ui._load_deribit_hourly_series_from_cache", return_value=cached),
+            mock.patch("okx_quant.option_strategy_ui._save_deribit_hourly_series_to_cache") as save_cache,
+            mock.patch(
+                "okx_quant.option_strategy_ui.load_candle_cache",
+                side_effect=[[], spot],
+            ),
+        ):
+            result = supplement_deribit_option_history(
+                "BTC",
+                market_client=market_client,
+                client=deribit_client,
+                start_ts=3_600_000,
+                end_ts=7_200_000,
+            )
+
+        self.assertEqual(result, (2, 1))
+        save_cache.assert_called_once_with("BTC", cached + fetched)
+        market_client.get_candles_history_range.assert_called_once_with(
+            "BTC-USDT",
+            "1H",
+            start_ts=3_600_000,
+            end_ts=7_200_000,
+            limit=0,
+        )
 
     def test_aggregate_deribit_option_chart_candles_builds_4h_bar(self) -> None:
         hourly = [
