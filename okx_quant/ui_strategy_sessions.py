@@ -7,7 +7,7 @@ from datetime import datetime, timedelta
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
 import threading
-from tkinter import Canvas, StringVar, Toplevel, ttk
+from tkinter import Canvas, StringVar, TclError, Toplevel, ttk
 
 from okx_quant.strategy_runtime_registry import (
     get_strategy_runtime_profile,
@@ -11918,15 +11918,39 @@ class UiStrategySessionsMixin:
                 repaired_count = backfill_result.added_record_count
         except Exception as exc:
             notes.append(f"历史人工平仓回补异常：{_format_network_error_message(str(exc))}")
-        self.root.after(
-            0,
-            lambda: self._finish_historical_manual_close_repair(
-                queried_count,
-                repaired_count,
-                skipped_count,
-                notes,
-            ),
+        UiStrategySessionsMixin._schedule_historical_manual_close_repair_finish(
+            self,
+            queried_count,
+            repaired_count,
+            skipped_count,
+            notes,
         )
+
+    def _schedule_historical_manual_close_repair_finish(
+        self,
+        queried_count: int,
+        repaired_count: int,
+        skipped_count: int,
+        notes: list[str],
+    ) -> None:
+        """Post the repair result only while the Tk interpreter is alive."""
+        root = getattr(self, "root", None)
+        if root is None:
+            return
+        callback = lambda: self._finish_historical_manual_close_repair(
+            queried_count,
+            repaired_count,
+            skipped_count,
+            notes,
+        )
+        try:
+            if hasattr(root, "winfo_exists") and not root.winfo_exists():
+                return
+            root.after(0, callback)
+        except (RuntimeError, TclError):
+            # The worker can finish after the window has begun shutting down.
+            # There is no UI result to deliver in that state.
+            return
 
     def _finish_historical_manual_close_repair(
         self,
