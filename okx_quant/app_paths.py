@@ -77,6 +77,11 @@ def analysis_reports_dir_path() -> Path:
     return reports_dir_path() / "analysis"
 
 
+def ai_snapshots_dir_path() -> Path:
+    """Permanent, account-separated exports intended for read-only AI review."""
+    return reports_dir_path() / "ai_snapshots"
+
+
 def deribit_reports_dir_path() -> Path:
     return reports_dir_path() / "deribit"
 

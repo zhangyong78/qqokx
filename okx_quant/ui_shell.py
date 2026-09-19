@@ -1023,6 +1023,7 @@ class AccountEquityCurveWindowState:
     canvas: Canvas
     summary_text: StringVar
     range_var: StringVar
+    timeframe_var: StringVar
     event_mode_var: StringVar
     detail_text: StringVar
     selected_trade_record_ids: tuple[str, ...] = ()
@@ -5481,6 +5482,7 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
                 "last_pnl",
                 "status",
                 "started",
+                "stop_amount",
             ),
             show="headings",
             selectmode="browse",
@@ -5500,6 +5502,7 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         self.session_tree.heading("open_qty", text="开仓数量")
         self.session_tree.heading("entry_price", text="开仓价")
         self.session_tree.heading("stop_price", text="止损价")
+        self.session_tree.heading("stop_amount", text="止损金额")
         self.session_tree.heading("take_profit", text="止盈价")
         self.session_tree.heading("live_pnl", text="实时浮盈亏")
         self.session_tree.heading("pnl", text="净盈亏")
@@ -5522,6 +5525,7 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         self.session_tree.column("open_qty", width=92, anchor="e")
         self.session_tree.column("entry_price", width=76, anchor="e")
         self.session_tree.column("stop_price", width=76, anchor="e")
+        self.session_tree.column("stop_amount", width=128, anchor="e")
         self.session_tree.column("take_profit", width=76, anchor="e")
         self.session_tree.column("live_pnl", width=96, anchor="e")
         self.session_tree.column("pnl", width=88, anchor="e")
@@ -6305,6 +6309,44 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
             "#4d7c0f",
         )
 
+    @staticmethod
+    def _account_equity_curve_candle_bucket_start(recorded_at: datetime, timeframe: str) -> datetime:
+        """Return a local-time bucket boundary, normalized back to UTC."""
+        local_time = recorded_at.astimezone()
+        normalized = str(timeframe or "1h").strip().lower()
+        if normalized == "day":
+            bucket_hour = 0
+        elif normalized == "4h":
+            bucket_hour = (local_time.hour // 4) * 4
+        else:
+            bucket_hour = local_time.hour
+        bucket_local = local_time.replace(hour=bucket_hour, minute=0, second=0, microsecond=0)
+        return bucket_local.astimezone(timezone.utc)
+
+    @classmethod
+    def _account_equity_curve_candles(
+        cls,
+        points: list[tuple[datetime, Decimal]],
+        timeframe: str,
+    ) -> list[dict[str, object]]:
+        """Aggregate account-equity samples into OHLC candles without new API calls."""
+        buckets: dict[datetime, list[Decimal]] = {}
+        for recorded_at, value in points:
+            bucket = cls._account_equity_curve_candle_bucket_start(recorded_at, timeframe)
+            buckets.setdefault(bucket, []).append(value)
+        candles: list[dict[str, object]] = []
+        for bucket, values in sorted(buckets.items()):
+            candles.append(
+                {
+                    "time": bucket,
+                    "open": values[0],
+                    "high": max(values),
+                    "low": min(values),
+                    "close": values[-1],
+                }
+            )
+        return candles
+
     @classmethod
     def _account_equity_curve_symbol_color(cls, symbol: str) -> str:
         """Return the preferred stable color for one instrument."""
@@ -6782,6 +6824,16 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
                 variable=event_mode_var,
                 command=lambda target_key=key: self._set_account_equity_curve_event_mode(target_key),
             ).grid(row=0, column=5 + index, padx=(0, 5) if index < 2 else (0, 0))
+        timeframe_var = StringVar(value="1h")
+        ttk.Label(tools, text="周期").grid(row=0, column=8, padx=(12, 3))
+        for index, (label, value) in enumerate((("1H", "1h"), ("4H", "4h"), ("日线", "day"), ("折线", "line"))):
+            ttk.Radiobutton(
+                tools,
+                text=label,
+                value=value,
+                variable=timeframe_var,
+                command=lambda target_key=key: self._render_account_equity_curve_window(target_key),
+            ).grid(row=0, column=9 + index, padx=(0, 5) if index < 3 else (0, 0))
         ttk.Button(
             tools,
             text="刷新",
@@ -6789,10 +6841,10 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
                 force=True,
                 target_keys=(target_key,),
             ),
-        ).grid(row=0, column=8, padx=(12, 6))
+        ).grid(row=0, column=13, padx=(12, 6))
         ttk.Button(tools, text="关闭", command=lambda target_key=key: self._close_account_equity_curve_window(target_key)).grid(
             row=0,
-            column=9,
+            column=14,
         )
         detail_text = StringVar(value="提示：点击平仓点查看策略、品种、本轮盈亏和持仓期间的账户权益变化。")
         ttk.Label(header, textvariable=detail_text, anchor="w", justify="left", foreground="#4b5563").grid(
@@ -6812,6 +6864,7 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
             canvas=canvas,
             summary_text=summary_text,
             range_var=range_var,
+            timeframe_var=timeframe_var,
             event_mode_var=event_mode_var,
             detail_text=detail_text,
         )
@@ -6891,6 +6944,9 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
                 continue
             points.append((recorded_at, equity_value))
 
+        timeframe = str(getattr(state, "timeframe_var", None).get() if getattr(state, "timeframe_var", None) is not None else "line").strip().lower()
+        candles = self._account_equity_curve_candles(points, timeframe) if timeframe in {"1h", "4h", "day"} else []
+
         canvas = state.canvas
         canvas.delete("all")
         width = max(int(canvas.winfo_width() or 0), int(float(canvas.cget("width") or 0) or 980))
@@ -6908,8 +6964,16 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         top = 46
         right = max(left + 120, width - 24)
         bottom = max(top + 120, height - 52)
-        min_value = min(value for _, value in points)
-        max_value = max(value for _, value in points)
+        plot_values = [value for _, value in points]
+        if candles:
+            plot_values = [
+                value
+                for candle in candles
+                for value in (candle["high"], candle["low"])
+                if isinstance(value, Decimal)
+            ]
+        min_value = min(plot_values)
+        max_value = max(plot_values)
         if min_value == max_value:
             padding = max(abs(float(max_value)) * 0.02, 1.0)
             min_plot = float(min_value) - padding
@@ -6921,6 +6985,10 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
             max_plot = float(max_value) + padding
         start_time = points[0][0]
         end_time = points[-1][0]
+        if candles:
+            candle_duration = {"1h": timedelta(hours=1), "4h": timedelta(hours=4), "day": timedelta(days=1)}[timeframe]
+            start_time = min(start_time, candles[0]["time"])
+            end_time = max(end_time, candles[-1]["time"] + candle_duration)
         span_seconds = max((end_time - start_time).total_seconds(), 1.0)
 
         def _x(recorded_at: datetime) -> float:
@@ -6937,15 +7005,56 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
             y = top + ((bottom - top) * step / 4.0)
             canvas.create_line(left, y, right, y, fill="#eef2f7")
 
-        line_points: list[float] = []
-        for recorded_at, value in points:
-            line_points.extend((_x(recorded_at), _y(value)))
-        if len(line_points) >= 4:
-            canvas.create_line(*line_points, fill="#2563eb", width=2, smooth=False)
-        for recorded_at, value in (points[0], points[-1]) if len(points) > 1 else (points[0],):
-            x = _x(recorded_at)
-            y = _y(value)
-            canvas.create_oval(x - 3, y - 3, x + 3, y + 3, fill="#2563eb", outline="")
+        if candles:
+            candle_width = max(4.0, min(18.0, (right - left) / max(len(candles) * 2.4, 1)))
+            for candle in candles:
+                candle_time = candle["time"]
+                candle_open = candle["open"]
+                candle_high = candle["high"]
+                candle_low = candle["low"]
+                candle_close = candle["close"]
+                if not isinstance(candle_time, datetime) or not all(
+                    isinstance(value, Decimal)
+                    for value in (candle_open, candle_high, candle_low, candle_close)
+                ):
+                    continue
+                x = _x(candle_time)
+                y_high = _y(candle_high)
+                y_low = _y(candle_low)
+                y_open = _y(candle_open)
+                y_close = _y(candle_close)
+                color = "#16a34a" if candle_close >= candle_open else "#dc2626"
+                canvas.create_line(x, y_high, x, y_low, fill=color, width=1)
+                body_top = min(y_open, y_close)
+                body_bottom = max(y_open, y_close)
+                if body_bottom - body_top < 1.5:
+                    canvas.create_line(
+                        x - candle_width / 2,
+                        y_close,
+                        x + candle_width / 2,
+                        y_close,
+                        fill=color,
+                        width=2,
+                    )
+                else:
+                    canvas.create_rectangle(
+                        x - candle_width / 2,
+                        body_top,
+                        x + candle_width / 2,
+                        body_bottom,
+                        fill=color,
+                        outline=color,
+                    )
+        else:
+            line_points: list[float] = []
+            for recorded_at, value in points:
+                line_points.extend((_x(recorded_at), _y(value)))
+            if len(line_points) >= 4:
+                canvas.create_line(*line_points, fill="#2563eb", width=2, smooth=False)
+            for recorded_at, value in (points[0], points[-1]) if len(points) > 1 else (points[0],):
+                x = _x(recorded_at)
+                y = _y(value)
+                canvas.create_oval(x - 3, y - 3, x + 3, y + 3, fill="#2563eb", outline="")
 
         visible_records = self._account_equity_curve_trade_records(key, start_time=start_time, end_time=end_time)
         visible_record_ids = {record.record_id for record in visible_records}
@@ -6998,10 +7107,12 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         canvas.create_text(left, bottom + 28, text=start_time.astimezone().strftime("%m-%d %H:%M"), anchor="w", fill="#6b7280", font=("Microsoft YaHei UI", 9))
         canvas.create_text(right, bottom + 28, text=end_time.astimezone().strftime("%m-%d %H:%M"), anchor="e", fill="#6b7280", font=("Microsoft YaHei UI", 9))
         latest_value = points[-1][1]
+        latest_label = f"{len(candles)} 根" if candles else f"{len(points)} 点"
+        mode_label = {"1h": "1H", "4h": "4H", "day": "日线"}.get(timeframe, "折线")
         canvas.create_text(
             right,
             top - 10,
-            text=f"{len(points)} 点 | 最新 {_format_optional_usdt_precise(latest_value, places=2, with_sign=False)}",
+            text=f"{latest_label} | {mode_label} | 最新 {_format_optional_usdt_precise(latest_value, places=2, with_sign=False)}",
             anchor="e",
             fill="#2563eb",
             font=("Microsoft YaHei UI", 9, "bold"),
@@ -8463,9 +8574,20 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         self._upgrade_custom_launch_path_setting = UpgradeLaunchManager.normalize_custom_launch_path(
             snapshot.get("upgrade_custom_launch_path", "")
         )
-        self._running_session_display_columns = UiStrategySessionsMixin._normalize_running_session_display_columns(
-            snapshot.get("running_session_display_columns", ())
+        saved_running_columns = snapshot.get("running_session_display_columns", ())
+        normalized_running_columns = list(
+            UiStrategySessionsMixin._normalize_running_session_display_columns(saved_running_columns)
         )
+        # Older settings snapshots predate the stop-amount column.  Add it
+        # once during migration while still allowing the column menu to hide
+        # it afterwards.
+        if normalized_running_columns and "stop_amount" not in normalized_running_columns:
+            try:
+                insert_at = normalized_running_columns.index("stop_price") + 1
+            except ValueError:
+                insert_at = len(normalized_running_columns)
+            normalized_running_columns.insert(insert_at, "stop_amount")
+        self._running_session_display_columns = tuple(normalized_running_columns)
         self._sync_current_api_sender_email_override(self._current_credential_profile())
         self._refresh_global_email_toggle_text()
         self._default_environment_label = self._normalized_environment_label(str(snapshot["environment_label"]))

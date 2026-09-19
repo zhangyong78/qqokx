@@ -509,6 +509,7 @@ class UiStrategySessionsMixin:
             "last_pnl",
             "status",
             "started",
+            "stop_amount",
         )
 
     @staticmethod
@@ -526,6 +527,7 @@ class UiStrategySessionsMixin:
             "open_qty",
             "entry_price",
             "stop_price",
+            "stop_amount",
             "take_profit",
             "live_pnl",
             "pnl",
@@ -552,6 +554,7 @@ class UiStrategySessionsMixin:
             "open_qty": "开仓数量",
             "entry_price": "开仓价",
             "stop_price": "止损价",
+            "stop_amount": "止损金额",
             "take_profit": "止盈价",
             "live_pnl": "实时浮盈亏",
             "pnl": "净盈亏",
@@ -663,6 +666,141 @@ class UiStrategySessionsMixin:
         if value is None:
             value = trade.pending_stop_price
         return _format_optional_decimal(value)
+
+    def _session_runtime_price_delta_amount(
+        self,
+        session: StrategySession,
+        *,
+        entry_price: Decimal | None,
+        size: Decimal | None,
+    ) -> Decimal | None:
+        """Return the base-asset amount used by linear contract price PnL."""
+        if entry_price is None or entry_price <= 0 or size is None or size <= 0:
+            return None
+        trade_inst_id = _session_trade_inst_id(session)
+        if not trade_inst_id:
+            return None
+        instruments: dict[str, Instrument] = {}
+        snapshot_provider = getattr(self, "_positions_snapshot_for_session", None)
+        if callable(snapshot_provider):
+            try:
+                snapshot = snapshot_provider(session)
+            except Exception:
+                snapshot = None
+            if snapshot is not None:
+                instruments = dict(getattr(snapshot, "position_instruments", {}) or {})
+        if not instruments:
+            instruments = dict(getattr(self, "_position_instruments", {}) or {})
+        amount, currency = _history_display_amount(
+            inst_id=trade_inst_id,
+            inst_type=infer_inst_type(trade_inst_id),
+            size=abs(size),
+            reference_price=entry_price,
+            instruments=instruments,
+            use_swap_contract_fallback=True,
+        )
+        base_currency = _extract_asset_key(trade_inst_id).upper()
+        quote_currency = (_extract_quote_key(trade_inst_id) or "").upper()
+        if (
+            amount is None
+            or amount <= 0
+            or not base_currency
+            or currency != base_currency
+            or quote_currency not in {"USDT", "USD", "USDC"}
+        ):
+            return None
+        return amount
+
+    def _session_runtime_risk_basis_usdt(self, session: StrategySession) -> Decimal | None:
+        trade = getattr(session, "active_trade", None)
+        planned = getattr(trade, "planned_risk_usdt", None) if trade is not None else None
+        if planned is not None and planned > 0:
+            return planned
+        entry_price = (
+            getattr(trade, "entry_price", None)
+            or getattr(trade, "pending_entry_reference", None)
+            if trade is not None
+            else None
+        )
+        initial_stop = (
+            getattr(trade, "initial_stop_price", None)
+            or getattr(trade, "pending_stop_price", None)
+            if trade is not None
+            else None
+        )
+        size = getattr(trade, "size", None) if trade is not None else None
+        amount = UiStrategySessionsMixin._session_runtime_price_delta_amount(
+            self,
+            session,
+            entry_price=entry_price,
+            size=abs(size) if size is not None else None,
+        )
+        direction_sign = UiStrategySessionsMixin._strategy_trade_direction_sign(session)
+        if (
+            amount is not None
+            and entry_price is not None
+            and initial_stop is not None
+            and initial_stop > 0
+            and direction_sign
+        ):
+            calculated = abs(initial_stop - entry_price) * amount
+            if calculated > 0:
+                return calculated
+        configured = getattr(getattr(session, "config", None), "risk_amount", None)
+        return configured if configured is not None and configured > 0 else None
+
+    def _session_runtime_stop_loss_amount(self, session: StrategySession) -> Decimal | None:
+        trade = getattr(session, "active_trade", None)
+        if trade is None:
+            return None
+        entry_price = trade.entry_price or trade.pending_entry_reference
+        stop_price = trade.current_stop_price or trade.initial_stop_price or trade.pending_stop_price
+        size = trade.size
+        direction_sign = UiStrategySessionsMixin._strategy_trade_direction_sign(session)
+        amount = UiStrategySessionsMixin._session_runtime_price_delta_amount(
+            self,
+            session,
+            entry_price=entry_price,
+            size=abs(size) if size is not None else None,
+        )
+        if (
+            amount is None
+            or entry_price is None
+            or stop_price is None
+            or stop_price <= 0
+            or not direction_sign
+        ):
+            return None
+        return (stop_price - entry_price) * amount * Decimal(direction_sign)
+
+    @staticmethod
+    def _session_runtime_r_text(value: Decimal | None, risk_basis: Decimal | None) -> str:
+        if value is None or risk_basis is None or risk_basis <= 0:
+            return ""
+        return f"{_format_optional_decimal_fixed(value / risk_basis, places=2, with_sign=True)}R"
+
+    def _session_runtime_usdt_with_r_text(
+        self,
+        session: StrategySession,
+        value: Decimal | None,
+    ) -> str:
+        amount_text = _format_optional_usdt_precise(value, places=2)
+        if value is None:
+            return amount_text
+        r_text = UiStrategySessionsMixin._session_runtime_r_text(
+            value,
+            UiStrategySessionsMixin._session_runtime_risk_basis_usdt(self, session),
+        )
+        return f"{amount_text} U（{r_text}）" if r_text else f"{amount_text} U"
+
+    def _session_runtime_stop_loss_text(self, session: StrategySession) -> str:
+        amount = UiStrategySessionsMixin._session_runtime_stop_loss_amount(self, session)
+        if amount is None:
+            return "-"
+        risk_basis = UiStrategySessionsMixin._session_runtime_risk_basis_usdt(self, session)
+        r_text = UiStrategySessionsMixin._session_runtime_r_text(amount, risk_basis)
+        amount_text = _format_optional_usdt_precise(amount, places=2)
+        return f"{amount_text} U（{r_text}）" if r_text else f"{amount_text} U"
 
     @staticmethod
     def _session_runtime_take_profit_text(session: StrategySession) -> str:
@@ -8346,11 +8484,12 @@ class UiStrategySessionsMixin:
             self._session_runtime_entry_price_text(session),
             self._session_runtime_stop_price_text(session),
             self._session_runtime_take_profit_text(session),
-            _format_optional_usdt_precise(live_pnl, places=2),
+            UiStrategySessionsMixin._session_runtime_usdt_with_r_text(self, session, live_pnl),
             _format_optional_usdt_precise(display_net_pnl, places=2),
             _format_optional_usdt_precise(display_last_pnl, places=2),
             status_text,
             self._format_session_started_at(session.started_at),
+            UiStrategySessionsMixin._session_runtime_stop_loss_text(self, session),
         )
         if self.session_tree.exists(session.session_id):
             self.session_tree.item(session.session_id, values=values, tags=tags)
@@ -8939,9 +9078,13 @@ class UiStrategySessionsMixin:
         if region != "heading":
             self._hide_session_tree_hover_tip()
             return
-        tip_text = QuantApp._session_tree_double_click_hint(
-            QuantApp._session_tree_column_key(tree, column_id)
-        ) or QuantApp._session_tree_double_click_hint(column_id)
+        resolved_key = QuantApp._session_tree_column_key(tree, column_id)
+        tip_text = QuantApp._session_tree_double_click_hint(resolved_key)
+        # Numeric hints are kept for older integrations, but must not be
+        # applied to the newly inserted stop/risk columns after display-column
+        # reordering.
+        if not tip_text and resolved_key not in {"stop_price", "stop_amount", "take_profit"}:
+            tip_text = QuantApp._session_tree_double_click_hint(column_id)
         if not tip_text:
             self._hide_session_tree_hover_tip()
             return

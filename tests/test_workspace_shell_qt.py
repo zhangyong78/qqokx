@@ -65,6 +65,7 @@ class WorkspaceShellQtTests(QtWidgetTestCase):
                 "tool:smart-order",
                 "option:option-strategy",
                 "option:deribit-volatility",
+                "tool:ai-snapshot",
                 "settings:font-standard",
                 "settings:font-large",
                 "settings:font-extra_large",

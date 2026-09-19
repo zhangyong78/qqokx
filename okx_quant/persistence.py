@@ -54,6 +54,7 @@ HISTORY_POSITIONS_FILE_NAME = "position_history.json"
 ACCOUNT_EQUITY_CURVE_FILE_NAME = "account_equity_curve.json"
 POSITION_HISTORY_VIEW_PREFS_FILE_NAME = "position_history_view_prefs.json"
 ACCOUNT_POSITIONS_HOME_VIEW_PREFS_FILE_NAME = "account_positions_home_view_prefs.json"
+AI_SNAPSHOT_WATCHLIST_FILE_NAME = "ai_snapshot_watchlist.json"
 DEFAULT_CREDENTIAL_PROFILE_NAME = "api1"
 PROFILE_ENVIRONMENTS = {"demo", "live"}
 _CREDENTIAL_CIPHER_PREFIX = "dpapi:"
@@ -110,6 +111,12 @@ def deribit_volatility_cache_file_path(base_dir: Path | None = None) -> Path:
     if base_dir is not None:
         return Path(base_dir) / DERIBIT_VOLATILITY_CACHE_FILE_NAME
     return cache_dir_path() / DERIBIT_VOLATILITY_CACHE_FILE_NAME
+
+
+def ai_snapshot_watchlist_file_path(base_dir: Path | None = None) -> Path:
+    if base_dir is not None:
+        return Path(base_dir) / AI_SNAPSHOT_WATCHLIST_FILE_NAME
+    return state_dir_path() / AI_SNAPSHOT_WATCHLIST_FILE_NAME
 
 
 def instrument_metadata_cache_file_path(base_dir: Path | None = None) -> Path:

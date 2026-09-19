@@ -221,6 +221,7 @@ class ChainLinkedChartSnapshot:
     call_error: str = ""
     put_error: str = ""
     underlying_error: str = ""
+    prepend: bool = False
 
 
 @dataclass(frozen=True)
@@ -229,6 +230,7 @@ class ChainLinkedVolatilitySnapshot:
     candles: tuple[Candle, ...]
     resolution_label: str
     resolution_note: str
+    prepend: bool = False
 
 
 @dataclass(frozen=True)
@@ -257,6 +259,7 @@ class _ChainLinkedChartThread(QThread):
         bar: str,
         candle_limit: int,
         client: OkxRestClient,
+        before_ts: int | None = None,
         parent: QObject | None = None,
     ) -> None:
         super().__init__(parent)
@@ -266,6 +269,7 @@ class _ChainLinkedChartThread(QThread):
         self._bar = bar.strip() or "1H"
         self._candle_limit = max(50, min(int(candle_limit), MAX_OPTION_COMBO_CANDLES))
         self._client = client
+        self._before_ts = before_ts if before_ts is not None and before_ts > 0 else None
 
     def run(self) -> None:
         try:
@@ -274,11 +278,19 @@ class _ChainLinkedChartThread(QThread):
             currency = (self._call_inst_id or self._put_inst_id).split("-", 1)[0].strip().upper()
             underlying_inst_id = _spot_usdt_inst_id(currency) or ""
             underlying_candles, underlying_error = self._load_underlying_candles(underlying_inst_id)
-            cached_volatility_candles, resolution_label, resolution_note = _load_deribit_option_chart_candles(
-                currency,
-                bar=self._bar,
-                requested_limit=self._candle_limit,
-            )
+            if self._before_ts is None:
+                cached_volatility_candles, resolution_label, resolution_note = _load_deribit_option_chart_candles(
+                    currency,
+                    bar=self._bar,
+                    requested_limit=self._candle_limit,
+                )
+            else:
+                cached_volatility_candles, resolution_label, resolution_note = _load_latest_deribit_option_chart_candles(
+                    currency,
+                    bar=self._bar,
+                    requested_limit=self._candle_limit,
+                    now_ts=max(0, self._before_ts - 1),
+                )
             self.snapshot_ready.emit(
                 self._request_id,
                 ChainLinkedChartSnapshot(
@@ -295,8 +307,11 @@ class _ChainLinkedChartThread(QThread):
                     call_error=call_error,
                     put_error=put_error,
                     underlying_error=underlying_error,
+                    prepend=self._before_ts is not None,
                 ),
             )
+            if self._before_ts is not None:
+                return
             volatility_candles, resolution_label, resolution_note = _load_latest_deribit_option_chart_candles(
                 currency,
                 bar=self._bar,
@@ -318,7 +333,11 @@ class _ChainLinkedChartThread(QThread):
         if not inst_id:
             return [], "该行缺少对应期权合约。"
         try:
-            candles = self._client.get_mark_price_candles(inst_id, self._bar, limit=self._candle_limit)
+            candles = (
+                self._client.get_mark_price_candles_before(inst_id, self._bar, self._before_ts, limit=self._candle_limit)
+                if self._before_ts is not None
+                else self._client.get_mark_price_candles(inst_id, self._bar, limit=self._candle_limit)
+            )
             return [item for item in candles if item.confirmed], ""
         except Exception as exc:  # noqa: BLE001
             return [], str(exc)
@@ -327,7 +346,11 @@ class _ChainLinkedChartThread(QThread):
         if not inst_id:
             return [], "该期权系列没有可映射的 USDT 标底。"
         try:
-            candles = self._client.get_candles_history(inst_id, self._bar, limit=self._candle_limit)
+            candles = (
+                self._client.get_candles_history_before(inst_id, self._bar, self._before_ts, limit=self._candle_limit)
+                if self._before_ts is not None
+                else self._client.get_candles_history(inst_id, self._bar, limit=self._candle_limit)
+            )
             return [item for item in candles if item.confirmed], ""
         except Exception as exc:  # noqa: BLE001
             return [], str(exc)
@@ -2663,6 +2686,9 @@ class OptionChainLinkedChartDialog(QDialog):
         self._auto_refresh_timer = QTimer(self)
         self._auto_refresh_timer.setInterval(60_000)
         self._auto_refresh_timer.timeout.connect(self._load_candles)
+        self._loading_older_candles = False
+        self._no_more_older_candles = False
+        self._pending_older_candles_before_ts: int | None = None
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(12, 12, 12, 12)
@@ -2734,6 +2760,7 @@ class OptionChainLinkedChartDialog(QDialog):
             chart.hover_time_changed.connect(lambda timestamp, ratio, source=chart: self._sync_hover(source, timestamp, ratio))
             chart.hover_cleared.connect(self._clear_hover)
             chart.viewport_changed.connect(lambda start, end, source=chart: self._sync_viewport(source, start, end))
+            chart.older_data_requested.connect(self._request_older_candles)
         self._sync_bar_buttons()
         self._show_empty_messages()
 
@@ -3460,6 +3487,8 @@ class OptionChainLinkedChartDialog(QDialog):
             return
         self._request_id += 1
         request_id = self._request_id
+        self._loading_older_candles = False
+        self._no_more_older_candles = False
         self._status_label.setText(f"正在加载 {self._current_bar} 左侧、DVOL、右侧联动 K 线…")
         thread = _ChainLinkedChartThread(
             request_id=request_id,
@@ -3477,11 +3506,73 @@ class OptionChainLinkedChartDialog(QDialog):
         thread.finished.connect(self._clear_finished_thread)
         thread.start()
 
+    @Slot(object)
+    def _request_older_candles(self, before_ts: object) -> None:
+        try:
+            before = int(before_ts)
+        except (TypeError, ValueError):
+            return
+        if before <= 0 or self._no_more_older_candles or self._loading_older_candles:
+            return
+        if self._load_thread is not None and self._load_thread.isRunning():
+            pending = self._pending_older_candles_before_ts
+            self._pending_older_candles_before_ts = before if pending is None else min(pending, before)
+            return
+        call_id = self._call_quote.instrument.inst_id if self._call_quote is not None else ""
+        put_id = self._put_quote.instrument.inst_id if self._put_quote is not None else ""
+        if not call_id and not put_id:
+            return
+        self._loading_older_candles = True
+        self._request_id += 1
+        request_id = self._request_id
+        self._status_label.setText("正在加载更早的联动 K 线，可继续向左拖动…")
+        thread = _ChainLinkedChartThread(
+            request_id=request_id,
+            call_inst_id=call_id,
+            put_inst_id=put_id,
+            bar=self._current_bar,
+            candle_limit=240,
+            client=self._client,
+            before_ts=before,
+            parent=self,
+        )
+        self._load_thread = thread
+        thread.snapshot_ready.connect(self._apply_snapshot)
+        thread.volatility_ready.connect(self._apply_volatility_snapshot)
+        thread.error_raised.connect(self._apply_load_error)
+        thread.finished.connect(self._clear_finished_thread)
+        thread.start()
+
     @Slot(int, object)
     def _apply_snapshot(self, request_id: int, payload: object) -> None:
         if request_id != self._request_id or not isinstance(payload, ChainLinkedChartSnapshot):
             return
         current_call_id = self._call_quote.instrument.inst_id if self._call_quote is not None else ""
+        current_put_id = self._put_quote.instrument.inst_id if self._put_quote is not None else ""
+        if payload.prepend:
+            loaded_any = False
+            if payload.call_inst_id == current_call_id and payload.call_candles:
+                loaded_any = self._call_chart.prepend_candles(list(payload.call_candles)) or loaded_any
+                self._apply_side_trade_record_markers("left")
+            if payload.underlying_candles:
+                loaded_any = self._underlying_chart.prepend_candles(list(payload.underlying_candles)) or loaded_any
+            if payload.put_inst_id == current_put_id and payload.put_candles:
+                loaded_any = self._put_chart.prepend_candles(list(payload.put_candles)) or loaded_any
+                self._apply_side_trade_record_markers("right")
+            if payload.volatility_candles:
+                loaded_any = self._volatility_chart.prepend_candles(list(payload.volatility_candles)) or loaded_any
+            populated = [chart for chart in self._charts if chart._candles]
+            if populated:
+                start, end = populated[0]._current_x_range()
+                for chart in populated:
+                    chart.set_linked_viewport(int(start), int(end))
+            self._loading_older_candles = False
+            if loaded_any:
+                self._status_label.setText("已加载更早的联动 K 线，可继续向左拖动。")
+            else:
+                self._no_more_older_candles = True
+                self._status_label.setText("已加载到可用的最早联动 K 线。")
+            return
         if payload.call_inst_id == current_call_id:
             self._set_option_chart(
                 self._call_chart,
@@ -3500,7 +3591,6 @@ class OptionChainLinkedChartDialog(QDialog):
             payload.underlying_error,
             "标底",
         )
-        current_put_id = self._put_quote.instrument.inst_id if self._put_quote is not None else ""
         if payload.put_inst_id == current_put_id:
             self._set_option_chart(
                 self._put_chart,
@@ -3547,6 +3637,11 @@ class OptionChainLinkedChartDialog(QDialog):
         )
         if current_currency != payload.currency:
             return
+        if payload.prepend:
+            if payload.candles:
+                self._volatility_chart.prepend_candles(list(payload.candles))
+            self._loading_older_candles = False
+            return
         if payload.candles:
             note = f" | {payload.resolution_note}" if payload.resolution_note else ""
             self._volatility_chart.set_candles(
@@ -3589,6 +3684,10 @@ class OptionChainLinkedChartDialog(QDialog):
     def _apply_load_error(self, request_id: int, message: str) -> None:
         if request_id != self._request_id:
             return
+        if self._loading_older_candles:
+            self._loading_older_candles = False
+            self._status_label.setText(f"更早的联动 K 线加载失败：{message}；继续向左拖动可重试")
+            return
         self._status_label.setText(f"联动 K 线加载失败：{message}")
         self._show_empty_messages()
 
@@ -3600,6 +3699,11 @@ class OptionChainLinkedChartDialog(QDialog):
         if self._pending_linked_candles_reload and self._call_quote is not None and self._put_quote is not None:
             self._pending_linked_candles_reload = False
             QTimer.singleShot(0, self._load_candles)
+            return
+        if self._pending_older_candles_before_ts is not None and not self._loading_older_candles:
+            before = self._pending_older_candles_before_ts
+            self._pending_older_candles_before_ts = None
+            QTimer.singleShot(0, lambda before=before: self._request_older_candles(before))
 
     def _sync_initial_viewport(self) -> None:
         populated = [chart for chart in self._charts if chart._candles]

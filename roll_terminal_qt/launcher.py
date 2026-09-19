@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import sys
 from datetime import datetime
+from pathlib import Path
 from typing import Iterable
 
 from PySide6.QtCore import QCoreApplication, QSettings, QTimer, Qt, QUrl, Slot
@@ -17,6 +18,8 @@ from PySide6.QtWidgets import (
     QLabel,
     QMainWindow,
     QMessageBox,
+    QInputDialog,
+    QProgressDialog,
     QPushButton,
     QTextEdit,
     QVBoxLayout,
@@ -25,7 +28,8 @@ from PySide6.QtWidgets import (
 )
 
 from okx_quant.app_meta import APP_VERSION, build_version_info_text
-from okx_quant.app_paths import config_dir_path, data_root, logs_dir_path, state_dir_path
+from okx_quant.ai_snapshot import load_ai_watchlist, normalize_watchlist, save_ai_watchlist
+from okx_quant.app_paths import ai_snapshots_dir_path, config_dir_path, data_root, logs_dir_path, state_dir_path
 from okx_quant.log_utils import append_log_line
 from roll_terminal_qt.account_positions_home import AccountPositionsHomeWidget
 from roll_terminal_qt.daily_trade_report_window import DailyTradeReportWidget
@@ -36,6 +40,7 @@ from roll_terminal_qt.line_trading_window import LineTradingQtWindow
 from roll_terminal_qt.module_overview import ModuleOverview, build_module_overview, launcher_module_specs
 from roll_terminal_qt.option_strategy_window import OptionStrategyQtWindow
 from roll_terminal_qt.kline_analysis_window import KlineAnalysisWindow
+from roll_terminal_qt.ai_snapshot_service import AISnapshotWorker
 from roll_terminal_qt.perf_metrics import measure_ui_step
 from roll_terminal_qt.profile_access import ensure_profile_unlocked, load_profile_snapshots
 from roll_terminal_qt.runtime import load_runtime
@@ -89,6 +94,7 @@ class SharedDataDialog(QDialog):
                 ("配置目录", str(config_dir_path())),
                 ("状态目录", str(state_dir_path())),
                 ("日志目录", str(logs_dir_path())),
+                ("AI 快照目录", str(ai_snapshots_dir_path())),
             )
         ):
             key_label = QLabel(label)
@@ -269,6 +275,8 @@ class LauncherWindow(QMainWindow):
         self._profile_snapshots: dict[str, dict[str, str]] = {}
         self._unlocked_profiles: set[str] = set()
         self._workspace_profile_serial = 0
+        self._ai_snapshot_worker: AISnapshotWorker | None = None
+        self._ai_snapshot_progress_dialog: QProgressDialog | None = None
         workspace_root = QWidget(self)
         workspace_layout = QVBoxLayout(workspace_root)
         workspace_layout.setContentsMargins(0, 0, 0, 0)
@@ -644,6 +652,9 @@ class LauncherWindow(QMainWindow):
         if normalized in {"option-strategy", "deribit-volatility"}:
             self.open_module_window(normalized)
             return
+        if normalized == "ai-snapshot":
+            self._start_ai_snapshot()
+            return
         if normalized == "paths":
             self._show_shared_data_dialog()
             return
@@ -654,6 +665,84 @@ class LauncherWindow(QMainWindow):
             self._show_version_info()
             return
         raise KeyError(f"unknown workspace tool: {tool_key}")
+
+    def _start_ai_snapshot(self) -> None:
+        if self._ai_snapshot_worker is not None and self._ai_snapshot_worker.isRunning():
+            QMessageBox.information(self, "AI 快照", "当前已有快照任务在后台生成，请稍候。")
+            return
+        profile_name = self._active_profile_name.strip()
+        runtime = load_runtime(profile_name) if profile_name else None
+        if runtime is None:
+            QMessageBox.warning(self, "AI 快照", "当前没有可用的 API Profile。")
+            return
+        existing = load_ai_watchlist(profile_name)
+        text, accepted = QInputDialog.getText(
+            self,
+            "关注品种",
+            "输入要关注的衍生品基础品种（逗号分隔，例如 BTC, ETH, SOL）。\n\n持仓品种会自动加入；现货不会导出。",
+            text=", ".join(existing),
+        )
+        if not accepted:
+            return
+        watchlist = normalize_watchlist(part.strip() for part in text.replace("，", ",").split(","))
+        try:
+            save_ai_watchlist(profile_name, watchlist)
+        except Exception as exc:
+            QMessageBox.critical(self, "AI 快照", f"保存关注品种失败：{exc}")
+            return
+        worker = AISnapshotWorker(runtime, profile_name=profile_name, watchlist=watchlist)
+        self._ai_snapshot_worker = worker
+        progress_dialog = QProgressDialog("正在补充最新行情…", "", 0, 0, self)
+        progress_dialog.setWindowTitle("AI 快照")
+        progress_dialog.setCancelButton(None)
+        progress_dialog.setMinimumDuration(0)
+        progress_dialog.setWindowModality(Qt.WindowModality.WindowModal)
+        progress_dialog.setAutoClose(False)
+        progress_dialog.setAutoReset(False)
+        progress_dialog.show()
+        self._ai_snapshot_progress_dialog = progress_dialog
+        worker.progress.connect(progress_dialog.setLabelText)
+        worker.progress.connect(lambda message: self.statusBar().showMessage(message))
+        worker.succeeded.connect(self._on_ai_snapshot_succeeded)
+        worker.failed.connect(self._on_ai_snapshot_failed)
+        worker.finished.connect(lambda: self.statusBar().clearMessage())
+        worker.finished.connect(self._close_ai_snapshot_progress)
+        worker.finished.connect(worker.deleteLater)
+        self.statusBar().showMessage("正在生成 AI 快照…")
+        worker.start()
+
+    @Slot(object)
+    def _on_ai_snapshot_succeeded(self, payload: object) -> None:
+        if not isinstance(payload, dict):
+            return
+        target = str(payload.get("file_path", ""))
+        summary = payload.get("portfolio_summary", {})
+        assets = len(payload.get("assets", {}) or {}) if isinstance(payload.get("assets"), dict) else 0
+        positions = int(summary.get("position_count", 0) or 0) if isinstance(summary, dict) else 0
+        quality = payload.get("data_quality", {})
+        quality_status = str(quality.get("status", "")) if isinstance(quality, dict) else ""
+        self._ai_snapshot_worker = None
+        box = QMessageBox(self)
+        box.setWindowTitle("AI 快照已生成")
+        box.setText(f"已导出 {assets} 个品种、{positions} 条持仓。\n数据质量：{quality_status or '未知'}\n\n{target}")
+        open_button = box.addButton("打开所在目录", QMessageBox.ButtonRole.ActionRole)
+        box.addButton("关闭", QMessageBox.ButtonRole.RejectRole)
+        box.exec()
+        if box.clickedButton() is open_button and target:
+            self._open_local_path(Path(target).parent, title="打开快照目录")
+
+    @Slot(str)
+    def _on_ai_snapshot_failed(self, message: str) -> None:
+        self._ai_snapshot_worker = None
+        QMessageBox.critical(self, "AI 快照失败", message or "未知错误")
+
+    @Slot()
+    def _close_ai_snapshot_progress(self) -> None:
+        dialog = self._ai_snapshot_progress_dialog
+        self._ai_snapshot_progress_dialog = None
+        if dialog is not None:
+            dialog.close()
+            dialog.deleteLater()
 
     def _set_global_font_mode(self, mode: str) -> None:
         app = QApplication.instance()
