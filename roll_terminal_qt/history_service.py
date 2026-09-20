@@ -203,6 +203,8 @@ class PositionHistoryFeedThread(QThread):
     def _build_usdt_prices(self, items: list[OkxPositionHistoryItem]) -> dict[str, Decimal]:
         currencies: set[str] = set()
         for item in items:
+            if str(item.inst_type or "").strip().upper() == "OPTION" and item.inst_id:
+                currencies.add(item.inst_id.split("-", 1)[0].strip().upper())
             if item.pnl is not None:
                 currencies.add(_infer_position_history_pnl_currency(item))
             if item.realized_pnl is not None:

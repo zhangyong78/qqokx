@@ -94,6 +94,10 @@ class DailyTrade:
     close_reason: str
     status: str
     source: str
+    # The planned initial risk for this trade, used as the R denominator.
+    # Legacy exchange-history rows may not be associated with a strategy and
+    # therefore legitimately have no risk basis.
+    risk_amount: Decimal | None = None
 
 
 @dataclass(frozen=True)
@@ -109,6 +113,7 @@ class DailyTradeSummary:
     funding_fee: Decimal
     net_pnl: Decimal
     open_count: int
+    risk_amount: Decimal = Decimal("0")
 
 
 @dataclass(frozen=True)
@@ -121,6 +126,7 @@ class DailyGroupSummary:
     win_count: int
     loss_count: int
     net_pnl: Decimal
+    risk_amount: Decimal = Decimal("0")
 
 
 @dataclass(frozen=True)
@@ -142,6 +148,14 @@ def daily_trade_from_strategy_ledger(record: object, *, source: str = "策略账
         gross = net - fee - funding_fee
     if net is None and gross is not None:
         net = gross + fee + funding_fee
+    risk_amount = _decimal(getattr(record, "planned_initial_risk_usdt", None))
+    if risk_amount is None:
+        for field_name in ("risk_amount_usdt", "risk_amount", "planned_risk_usdt"):
+            risk_amount = _decimal(getattr(record, field_name, None))
+            if risk_amount is not None:
+                break
+    if risk_amount is not None and risk_amount <= 0:
+        risk_amount = None
     return DailyTrade(
         trade_key=str(getattr(record, "record_id", "") or getattr(record, "round_id", "") or "trade"),
         api_name=str(getattr(record, "api_name", "") or "-").strip() or "-",
@@ -162,6 +176,7 @@ def daily_trade_from_strategy_ledger(record: object, *, source: str = "策略账
         close_reason=str(getattr(record, "close_reason", "") or "-").strip() or "-",
         status="已结算" if getattr(record, "closed_at", None) is not None else "持仓中",
         source=source,
+        risk_amount=risk_amount,
     )
 
 
@@ -182,6 +197,14 @@ def daily_trade_from_position_history(
     fee = _decimal(getattr(item, "fee", None)) or Decimal("0")
     funding_fee = _decimal(getattr(item, "funding_fee", None)) or Decimal("0")
     gross = net - fee - funding_fee if net is not None else None
+    risk_amount = _decimal(getattr(item, "risk_amount", None))
+    if risk_amount is None:
+        for key in ("riskAmount", "plannedRiskUsdt", "planned_initial_risk_usdt"):
+            risk_amount = _decimal(raw.get(key))
+            if risk_amount is not None:
+                break
+    if risk_amount is not None and risk_amount <= 0:
+        risk_amount = None
     return DailyTrade(
         trade_key=str(raw.get("posId") or raw.get("cTime") or f"{api_name}:{getattr(item, 'inst_id', '')}:{closed_at or '-'}"),
         api_name=str(api_name or "-").strip() or "-",
@@ -202,6 +225,7 @@ def daily_trade_from_position_history(
         close_reason=str(raw.get("closeType") or raw.get("closeReason") or "-").strip() or "-",
         status="已结算" if closed_at is not None else "待核对",
         source=source,
+        risk_amount=risk_amount,
     )
 
 
@@ -218,6 +242,7 @@ def _empty_daily(report_date: date, api_name: str) -> dict[str, object]:
         "funding_fee": Decimal("0"),
         "net_pnl": Decimal("0"),
         "open_count": 0,
+        "risk_amount": Decimal("0"),
     }
 
 
@@ -271,6 +296,8 @@ def build_daily_trade_report(
         daily["fee"] = daily["fee"] + (trade.fee or Decimal("0"))
         daily["funding_fee"] = daily["funding_fee"] + (trade.funding_fee or Decimal("0"))
         daily["net_pnl"] = daily["net_pnl"] + net
+        if trade.risk_amount is not None and trade.risk_amount > 0:
+            daily["risk_amount"] = daily["risk_amount"] + trade.risk_amount
         for bucket, group_name in ((symbol_values, trade.symbol), (strategy_values, trade.strategy_name)):
             group_key = (report_date, api, group_name)
             row = bucket.setdefault(
@@ -284,12 +311,15 @@ def build_daily_trade_report(
                     "win_count": 0,
                     "loss_count": 0,
                     "net_pnl": Decimal("0"),
+                    "risk_amount": Decimal("0"),
                 },
             )
             row["closed_count"] = int(row["closed_count"]) + 1
             row["win_count"] = int(row["win_count"]) + (1 if net > 0 else 0)
             row["loss_count"] = int(row["loss_count"]) + (1 if net < 0 else 0)
             row["net_pnl"] = row["net_pnl"] + net
+            if trade.risk_amount is not None and trade.risk_amount > 0:
+                row["risk_amount"] = row["risk_amount"] + trade.risk_amount
 
     daily = tuple(
         DailyTradeSummary(**row)
@@ -314,6 +344,16 @@ def format_report_decimal(value: Decimal | None, *, signed: bool = False) -> str
     return f"{prefix}{quantized:.2f}U"
 
 
+def format_report_pnl_with_r(value: Decimal | None, risk_amount: Decimal | None) -> str:
+    """Format a PnL amount and its R multiple when a valid risk basis exists."""
+    amount_text = format_report_decimal(value, signed=True)
+    if value is None or risk_amount is None or risk_amount <= 0:
+        return amount_text
+    ratio = (value / risk_amount).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    prefix = "+" if ratio > 0 else ""
+    return f"{amount_text}（{prefix}{ratio:.2f}R）"
+
+
 def format_report_price(value: Decimal | None, symbol: str = "") -> str:
     """Format report prices without exposing raw average-fill float noise."""
     if value is None:
@@ -328,7 +368,7 @@ def format_report_price(value: Decimal | None, symbol: str = "") -> str:
 def report_to_csv(report: DailyTradeReport) -> str:
     output = io.StringIO(newline="")
     writer = csv.writer(output)
-    writer.writerow(("平仓日期", "API", "品种", "策略", "会话", "方向", "开仓时间", "平仓时间", "开仓价", "平仓价", "数量", "净盈亏", "手续费", "资金费", "状态", "来源", "平仓原因"))
+    writer.writerow(("平仓日期", "API", "品种", "策略", "会话", "方向", "开仓时间", "平仓时间", "开仓价", "平仓价", "数量", "净盈亏", "净盈亏R", "风险金", "手续费", "资金费", "状态", "来源", "平仓原因"))
     for trade in report.trades:
         writer.writerow(
             (
@@ -344,6 +384,8 @@ def report_to_csv(report: DailyTradeReport) -> str:
                 str(trade.exit_price or ""),
                 str(trade.size or ""),
                 str(trade.net_pnl or ""),
+                format_report_pnl_with_r(trade.net_pnl, trade.risk_amount),
+                str(trade.risk_amount or ""),
                 str(trade.fee or ""),
                 str(trade.funding_fee or ""),
                 trade.status,
@@ -363,12 +405,12 @@ def report_to_html(report: DailyTradeReport) -> str:
             trade.symbol,
             trade.strategy_name,
             trade.session_id,
-            format_report_decimal(trade.net_pnl, signed=True),
+            format_report_pnl_with_r(trade.net_pnl, trade.risk_amount),
             trade.status,
         )
         rows.append("<tr>" + "".join(f"<td>{html.escape(str(cell))}</td>" for cell in cells) + "</tr>")
     summary = "；".join(
-        f"{item.report_date} {item.api_name}：平仓{item.closed_count}笔，净盈亏{format_report_decimal(item.net_pnl, signed=True)}"
+        f"{item.report_date} {item.api_name}：平仓{item.closed_count}笔，净盈亏{format_report_pnl_with_r(item.net_pnl, item.risk_amount)}"
         for item in report.daily
     ) or "该日期范围没有交易记录。"
     return (

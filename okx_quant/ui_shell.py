@@ -14511,13 +14511,40 @@ def _format_history_amount(value: Decimal | None, currency: str | None, *, with_
     return _format_optional_decimal_capped(value, places=8, with_sign=with_sign)
 
 
-def _format_position_history_price(value: Decimal | None, inst_id: str, inst_type: str) -> str:
-    if inst_type == "OPTION":
-        return _format_optional_decimal_capped(value, places=8)
-    quote_currency = _extract_quote_key(inst_id)
-    if quote_currency in {"USDT", "USD", "USDC"}:
-        return _format_optional_decimal_fixed(value, places=2)
-    return _format_optional_decimal_capped(value, places=8)
+def _format_position_history_price(
+    value: Decimal | None,
+    inst_id: str,
+    inst_type: str,
+    *,
+    instrument: Instrument | None = None,
+    usdt_prices: dict[str, Decimal] | None = None,
+) -> str:
+    base_text: str
+    normalized_inst_type = str(inst_type or "").strip().upper()
+    if normalized_inst_type == "OPTION":
+        base_text = _format_optional_decimal_capped(value, places=8)
+    else:
+        quote_currency = _extract_quote_key(inst_id)
+        if quote_currency in {"USDT", "USD", "USDC"}:
+            base_text = _format_optional_decimal_fixed(value, places=2)
+        else:
+            base_text = _format_optional_decimal_capped(value, places=8)
+    if (
+        normalized_inst_type != "OPTION"
+        or value is None
+        or value <= 0
+        or not usdt_prices
+    ):
+        return base_text
+    asset_currency = _extract_asset_key(inst_id).strip().upper()
+    usdt_rate = usdt_prices.get(asset_currency)
+    if usdt_rate is None or usdt_rate <= 0:
+        return base_text
+    # An option premium is quoted per one underlying unit (BTC/ETH), while
+    # the contract face value is only used when converting a number of
+    # contracts into coin quantity. Do not multiply ctVal here.
+    usdt_value = value * usdt_rate
+    return f"{base_text}（≈{_format_optional_decimal_fixed(usdt_value, places=2)} USDT）"
 
 
 def _format_position_history_pnl(

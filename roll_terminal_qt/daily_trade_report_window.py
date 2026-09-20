@@ -26,7 +26,7 @@ from okx_quant.daily_trade_report import (
     DailyTradeReport,
     build_daily_trade_report,
     daily_trade_from_position_history,
-    format_report_decimal,
+    format_report_pnl_with_r,
     format_report_price,
     report_to_csv,
     report_to_html,
@@ -199,19 +199,19 @@ class DailyTradeReportWidget(QWidget):
         for row, item in enumerate(report.daily):
             self._set_row(self._daily_table, row, (
                 item.report_date.isoformat(), item.api_name, str(item.opened_count), str(item.closed_count),
-                str(item.win_count), str(item.loss_count), format_report_decimal(item.net_pnl, signed=True), str(item.open_count),
+                str(item.win_count), str(item.loss_count), format_report_pnl_with_r(item.net_pnl, item.risk_amount), str(item.open_count),
             ))
         self._symbol_table.setRowCount(len(report.by_symbol))
         for row, item in enumerate(report.by_symbol):
             self._set_row(self._symbol_table, row, (
                 item.report_date.isoformat(), item.api_name, item.group_name, str(item.closed_count),
-                str(item.win_count), str(item.loss_count), format_report_decimal(item.net_pnl, signed=True),
+                str(item.win_count), str(item.loss_count), format_report_pnl_with_r(item.net_pnl, item.risk_amount),
             ))
         self._strategy_table.setRowCount(len(report.by_strategy))
         for row, item in enumerate(report.by_strategy):
             self._set_row(self._strategy_table, row, (
                 item.report_date.isoformat(), item.api_name, item.group_name, str(item.closed_count),
-                str(item.win_count), str(item.loss_count), format_report_decimal(item.net_pnl, signed=True),
+                str(item.win_count), str(item.loss_count), format_report_pnl_with_r(item.net_pnl, item.risk_amount),
             ))
         self._detail_table.setRowCount(len(report.trades))
         for row, trade in enumerate(report.trades):
@@ -222,15 +222,16 @@ class DailyTradeReportWidget(QWidget):
                 format_report_price(trade.entry_price, trade.symbol),
                 format_report_price(trade.exit_price, trade.symbol),
                 str(trade.size or "-"),
-                format_report_decimal(trade.net_pnl, signed=True), trade.status, trade.source, trade.close_reason,
+                format_report_pnl_with_r(trade.net_pnl, trade.risk_amount), trade.status, trade.source, trade.close_reason,
             ))
             symbol_item = self._detail_table.item(row, 2)
             if symbol_item is not None:
                 symbol_item.setData(Qt.ItemDataRole.UserRole, trade)
         net = sum((item.net_pnl for item in report.daily), start=Decimal("0")) if report.daily else Decimal("0")
+        risk = sum((item.risk_amount for item in report.daily), start=Decimal("0")) if report.daily else Decimal("0")
         profile_text = self._runtime_profile_name()
         self._profile_label.setText(f"当前 API：{profile_text}")
-        self._status.setText(f"{profile_text} | {report.start_date} 至 {report.end_date} | 交易记录 {len(report.trades)} 条 | 已结算净盈亏 {format_report_decimal(net, signed=True)}")
+        self._status.setText(f"{profile_text} | {report.start_date} 至 {report.end_date} | 交易记录 {len(report.trades)} 条 | 已结算净盈亏 {format_report_pnl_with_r(net, risk)}")
 
     @staticmethod
     def _set_row(table: QTableWidget, row: int, values: tuple[str, ...]) -> None:

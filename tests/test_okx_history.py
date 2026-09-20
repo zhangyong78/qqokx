@@ -1198,6 +1198,21 @@ class OkxHistoryParsingTest(TestCase):
         self.assertEqual(_format_position_history_pnl(item.pnl, item), "12.30")
         self.assertEqual(_format_position_history_pnl(item.realized_pnl, item, with_sign=True), "+8.50")
 
+    def test_option_history_prices_include_usdt_equivalent(self) -> None:
+        inst_id = "BTC-USD-260626-100000-C"
+        instrument = self._option_instruments()[inst_id]
+
+        self.assertEqual(
+            _format_position_history_price(
+                Decimal("0.0300"),
+                inst_id,
+                "OPTION",
+                instrument=instrument,
+                usdt_prices={"BTC": Decimal("70000")},
+            ),
+            "0.03（≈2100.00 USDT）",
+        )
+
     def test_position_history_formats_coin_margined_futures_pnl_using_okx_currency(self) -> None:
         item = OkxPositionHistoryItem(
             update_time=1710000000300,

@@ -10,6 +10,7 @@ from okx_quant.daily_trade_report import (
     REPORT_TIMEZONE,
     build_daily_trade_report,
     daily_trade_from_strategy_ledger,
+    format_report_pnl_with_r,
     report_to_csv,
     format_report_price,
 )
@@ -112,6 +113,24 @@ class DailyTradeReportTests(unittest.TestCase):
         self.assertEqual(len(report.trades), 2)
         self.assertEqual(report.trades[0].trade_key, "mixed-2")
         self.assertEqual(report.trades[0].closed_at.tzinfo, REPORT_TIMEZONE)
+
+    def test_report_formats_net_pnl_as_r_using_planned_risk(self) -> None:
+        record = SimpleNamespace(
+            record_id="risk-1", api_name="ReapAi", environment="live", symbol="BTC-USDT-SWAP",
+            strategy_name="EMA", session_id="S1", direction_label="只做多",
+            opened_at=datetime(2026, 9, 4, 10), closed_at=datetime(2026, 9, 4, 11),
+            entry_price="100", exit_price="102", size="1", entry_fee="0", exit_fee="0",
+            funding_fee="0", gross_pnl="12", net_pnl="12", close_reason="止盈",
+            planned_initial_risk_usdt="4",
+        )
+        trade = daily_trade_from_strategy_ledger(record)
+        report = build_daily_trade_report(
+            [trade], start_date=datetime(2026, 9, 4).date(), end_date=datetime(2026, 9, 4).date()
+        )
+        self.assertEqual(trade.risk_amount, Decimal("4"))
+        self.assertEqual(format_report_pnl_with_r(trade.net_pnl, trade.risk_amount), "+12.00U（+3.00R）")
+        self.assertEqual(format_report_pnl_with_r(report.daily[0].net_pnl, report.daily[0].risk_amount), "+12.00U（+3.00R）")
+        self.assertIn("净盈亏R", report_to_csv(report).splitlines()[0])
 
 
 if __name__ == "__main__":

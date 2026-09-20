@@ -65,6 +65,8 @@ from okx_quant.stop_execution import assess_stop_execution
 from okx_quant.daily_trade_report import (
     daily_trade_from_position_history,
     daily_trade_from_strategy_ledger,
+    format_report_decimal,
+    format_report_pnl_with_r,
 )
 
 _SESSION_RUNTIME_HEARTBEAT_PREFIX = "__qqokx_runtime_heartbeat__|"
@@ -13140,7 +13142,8 @@ class UiStrategySessionsMixin:
             tree = ttk.Treeview(frame, columns=columns, show="headings", selectmode="browse")
             for column in columns:
                 tree.heading(column, text=column)
-                tree.column(column, width=105, anchor="e" if column in {"开仓", "平仓", "盈利", "亏损", "毛盈亏", "手续费", "资金费", "净盈亏", "未平仓", "数量", "开仓价", "平仓价"} else "w")
+                width = 170 if column == "净盈亏" else 105
+                tree.column(column, width=width, anchor="e" if column in {"开仓", "平仓", "盈利", "亏损", "毛盈亏", "手续费", "资金费", "净盈亏", "未平仓", "数量", "开仓价", "平仓价"} else "w")
             tree.grid(row=0, column=0, sticky="nsew")
             scrollbar = ttk.Scrollbar(frame, orient="vertical", command=tree.yview)
             scrollbar.grid(row=0, column=1, sticky="ns")
@@ -13179,18 +13182,19 @@ class UiStrategySessionsMixin:
         daily_tree = trees["daily"]
         daily_tree.delete(*daily_tree.get_children())
         for row in report.daily:
-            daily_tree.insert("", "end", values=(row.report_date.isoformat(), row.api_name, row.opened_count, row.closed_count, row.win_count, row.loss_count, format_report_decimal(row.gross_pnl, signed=True), format_report_decimal(row.fee, signed=True), format_report_decimal(row.funding_fee, signed=True), format_report_decimal(row.net_pnl, signed=True), row.open_count))
+            daily_tree.insert("", "end", values=(row.report_date.isoformat(), row.api_name, row.opened_count, row.closed_count, row.win_count, row.loss_count, format_report_decimal(row.gross_pnl, signed=True), format_report_decimal(row.fee, signed=True), format_report_decimal(row.funding_fee, signed=True), format_report_pnl_with_r(row.net_pnl, row.risk_amount), row.open_count))
         for key, rows in (("symbol", report.by_symbol), ("strategy", report.by_strategy)):
             tree = trees[key]
             tree.delete(*tree.get_children())
             for row in rows:
-                tree.insert("", "end", values=(row.report_date.isoformat(), row.api_name, row.group_name, row.closed_count, row.win_count, row.loss_count, format_report_decimal(row.net_pnl, signed=True)))
+                tree.insert("", "end", values=(row.report_date.isoformat(), row.api_name, row.group_name, row.closed_count, row.win_count, row.loss_count, format_report_pnl_with_r(row.net_pnl, row.risk_amount)))
         detail_tree = trees["detail"]
         detail_tree.delete(*detail_tree.get_children())
         for trade in report.trades:
-            detail_tree.insert("", "end", values=((trade.closed_at or trade.opened_at).strftime("%Y-%m-%d %H:%M") if (trade.closed_at or trade.opened_at) else "-", trade.api_name, trade.symbol, trade.strategy_name, trade.session_id, trade.direction, trade.opened_at.strftime("%Y-%m-%d %H:%M") if trade.opened_at else "-", trade.entry_price or "-", trade.exit_price or "-", trade.size or "-", format_report_decimal(trade.net_pnl, signed=True), trade.status, trade.source, trade.close_reason))
+            detail_tree.insert("", "end", values=((trade.closed_at or trade.opened_at).strftime("%Y-%m-%d %H:%M") if (trade.closed_at or trade.opened_at) else "-", trade.api_name, trade.symbol, trade.strategy_name, trade.session_id, trade.direction, trade.opened_at.strftime("%Y-%m-%d %H:%M") if trade.opened_at else "-", trade.entry_price or "-", trade.exit_price or "-", trade.size or "-", format_report_pnl_with_r(trade.net_pnl, trade.risk_amount), trade.status, trade.source, trade.close_reason))
         net = sum((row.net_pnl for row in report.daily), Decimal("0"))
-        self._daily_trade_report_status_var.set(f"{report.start_date} 至 {report.end_date} | 记录 {len(report.trades)} 条 | 已结算净盈亏 {format_report_decimal(net, signed=True)}")
+        risk = sum((row.risk_amount for row in report.daily), Decimal("0"))
+        self._daily_trade_report_status_var.set(f"{report.start_date} 至 {report.end_date} | 记录 {len(report.trades)} 条 | 已结算净盈亏 {format_report_pnl_with_r(net, risk)}")
 
     def _export_daily_trade_report(self, kind: str) -> None:
         report = getattr(self, "_daily_trade_report", None)
