@@ -83,6 +83,7 @@ class WorkspaceHeader(QFrame):
         ("option:deribit-volatility", "Deribit 波动率"),
         ("tool:ai-snapshot", "生成 AI 快照"),
         ("settings:paths", "数据目录与路径"),
+        ("settings:history-sync", "历史数据同步"),
         ("settings:logs", "日志"),
         ("settings:version", "版本信息"),
     )

@@ -2048,7 +2048,17 @@ class OkxRestClient:
         environment: str,
         inst_types: tuple[str, ...] = ("SWAP", "FUTURES", "OPTION", "SPOT"),
         limit: int = 100,
+        progress_callback: Callable[[str], None] | None = None,
     ) -> list[OkxFillHistoryItem]:
+        def report(message: str) -> None:
+            if progress_callback is None:
+                return
+            try:
+                progress_callback(message)
+            except Exception:
+                # Progress reporting must never make a successful REST sync fail.
+                pass
+
         items: list[OkxFillHistoryItem] = []
         normalized_types = tuple(dict.fromkeys(inst_type.upper() for inst_type in inst_types))
         # Fills are often concentrated in a single instType (for example OPTION).
@@ -2056,9 +2066,12 @@ class OkxRestClient:
         # truncated too aggressively and recent fills disappear from the UI.
         per_type_target = max(min(limit, 100), math.ceil(limit / max(len(normalized_types), 1)))
         for inst_type in normalized_types:
+            report(f"历史成交同步：正在读取 {inst_type} 成交...")
             collected_for_type = 0
             after: str | None = None
+            page_number = 0
             while collected_for_type < per_type_target:
+                page_number += 1
                 request_limit = min(100, max(1, per_type_target - collected_for_type))
                 params = {"instType": inst_type, "limit": str(request_limit)}
                 if after:
@@ -2094,14 +2107,22 @@ class OkxRestClient:
                         )
                     )
                 collected_for_type += len(batch)
+                report(
+                    f"历史成交同步：{inst_type} 已读取 {collected_for_type} 条"
+                    f"（第 {page_number} 页）"
+                )
                 after = str(batch[-1].get("billId") or batch[-1].get("ts") or "")
                 if not after or len(batch) < request_limit:
                     break
+            if collected_for_type == 0:
+                report(f"历史成交同步：{inst_type} 没有新成交")
+        report("历史成交同步：正在补充期权行权/交割账单...")
         items = self._merge_exercise_and_delivery_history(
             items,
             credentials=credentials,
             environment=environment,
             limit=limit,
+            progress_callback=progress_callback,
         )
         items.sort(key=lambda item: item.fill_time or 0, reverse=True)
         return items[:limit]
@@ -2113,15 +2134,22 @@ class OkxRestClient:
         credentials: Credentials,
         environment: str,
         limit: int,
+        progress_callback: Callable[[str], None] | None = None,
     ) -> list[OkxFillHistoryItem]:
         existing_keys = {_fill_history_dedupe_key(item) for item in fills}
         merged = list(fills)
         for inst_type in ("OPTION", "FUTURES"):
+            if progress_callback is not None:
+                try:
+                    progress_callback(f"历史成交同步：正在读取 {inst_type} 行权/交割账单...")
+                except Exception:
+                    pass
             bills = self._fetch_execution_bill_history(
                 credentials=credentials,
                 environment=environment,
                 inst_type=inst_type,
                 target_count=max(limit, 100),
+                progress_callback=progress_callback,
             )
             for bill in bills:
                 synthetic = _build_fill_history_item_from_bill(bill)
@@ -2143,13 +2171,25 @@ class OkxRestClient:
         environment: str,
         inst_type: str,
         target_count: int,
+        progress_callback: Callable[[str], None] | None = None,
     ) -> list[dict[str, Any]]:
         collected: list[dict[str, Any]] = []
         seen_bill_ids: set[str] = set()
         archive_page_limit = 100
         after: str | None = None
+        page_number = 0
+        last_error: str | None = None
+
+        def report(message: str) -> None:
+            if progress_callback is None:
+                return
+            try:
+                progress_callback(message)
+            except Exception:
+                pass
 
         while len(collected) < target_count:
+            page_number += 1
             params = {"instType": inst_type, "limit": str(archive_page_limit)}
             if after:
                 params["after"] = after
@@ -2162,7 +2202,9 @@ class OkxRestClient:
                     credentials=credentials,
                     simulated=environment == "demo",
                 ).get("data", [])
-            except Exception:
+            except Exception as exc:
+                last_error = str(exc)
+                report(f"历史成交同步：{inst_type} 历史账单读取失败，继续读取其他数据：{exc}")
                 batch = []
             if not batch:
                 break
@@ -2173,6 +2215,10 @@ class OkxRestClient:
                 if bill_id:
                     seen_bill_ids.add(bill_id)
                 collected.append(bill)
+            report(
+                f"历史成交同步：{inst_type} 账单已读取 {len(collected)} 条"
+                f"（第 {page_number} 页）"
+            )
             last_bill_id = str(batch[-1].get("billId") or "")
             if not last_bill_id or len(batch) < archive_page_limit:
                 break
@@ -2187,7 +2233,9 @@ class OkxRestClient:
                 credentials=credentials,
                 simulated=environment == "demo",
             ).get("data", [])
-        except Exception:
+        except Exception as exc:
+            last_error = str(exc)
+            report(f"历史成交同步：{inst_type} 最新账单读取失败，继续导出已有成交：{exc}")
             recent_bills = []
 
         for bill in recent_bills:
@@ -2197,6 +2245,11 @@ class OkxRestClient:
             if bill_id:
                 seen_bill_ids.add(bill_id)
             collected.append(bill)
+
+        if last_error:
+            report(f"历史成交同步：{inst_type} 账单阶段结束，共取得 {len(collected)} 条（部分请求失败）")
+        else:
+            report(f"历史成交同步：{inst_type} 账单补充完成，共 {len(collected)} 条")
 
         collected.sort(key=lambda item: _to_int(item.get("ts"), item.get("cTime"), item.get("uTime")) or 0, reverse=True)
         return collected
@@ -2208,12 +2261,14 @@ class OkxRestClient:
         environment: str,
         inst_type: str,
         target_count: int,
+        progress_callback: Callable[[str], None] | None = None,
     ) -> list[dict[str, Any]]:
         return self._fetch_account_bill_history(
             credentials=credentials,
             environment=environment,
             inst_type=inst_type,
             target_count=target_count,
+            progress_callback=progress_callback,
         )
 
     def get_account_bills_history(

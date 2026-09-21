@@ -115,6 +115,31 @@ def _merge_fill_history_cache(
     return items[:limit]
 
 
+def merge_position_history_cache(
+    *,
+    profile_name: str,
+    environment: str,
+    remote_items: list[OkxPositionHistoryItem],
+    limit: int,
+) -> list[OkxPositionHistoryItem]:
+    """Merge remote closed-position rows into the shared local cache."""
+    local_records = load_history_cache_records("positions", profile_name, environment)
+    merged_records = _merge_history_cache_records(
+        local_records=local_records,
+        remote_records=[_serialize_history_item(item) for item in remote_items],
+        dedup_fields=("update_time", "inst_id", "pos_side", "direction", "close_size", "close_avg_price"),
+    )
+    collapsed_records = _collapse_position_history_records(merged_records)
+    save_history_cache_records("positions", profile_name, environment, collapsed_records)
+    parsed_items = [
+        item
+        for record in collapsed_records
+        if isinstance(record, dict) and (item := _position_history_item_from_cache(record)) is not None
+    ]
+    parsed_items.sort(key=lambda item: item.update_time or 0, reverse=True)
+    return parsed_items[: max(20, int(limit))]
+
+
 class PositionHistoryFeedThread(QThread):
     data_ready = Signal(object)
     status_changed = Signal(str)
@@ -193,21 +218,12 @@ class PositionHistoryFeedThread(QThread):
         environment: str,
         remote_items: list[OkxPositionHistoryItem],
     ) -> list[OkxPositionHistoryItem]:
-        local_records = load_history_cache_records("positions", profile_name, environment)
-        merged_records = _merge_history_cache_records(
-            local_records=local_records,
-            remote_records=[_serialize_history_item(item) for item in remote_items],
-            dedup_fields=("update_time", "inst_id", "pos_side", "direction", "close_size", "close_avg_price"),
+        return merge_position_history_cache(
+            profile_name=profile_name,
+            environment=environment,
+            remote_items=remote_items,
+            limit=self._limit,
         )
-        collapsed_records = _collapse_position_history_records(merged_records)
-        save_history_cache_records("positions", profile_name, environment, collapsed_records)
-        parsed_items = [
-            item
-            for record in collapsed_records
-            if isinstance(record, dict) and (item := _position_history_item_from_cache(record)) is not None
-        ]
-        parsed_items.sort(key=lambda item: item.update_time or 0, reverse=True)
-        return parsed_items[: self._limit]
 
     def _build_instrument_map(self, items: list[OkxPositionHistoryItem]) -> dict[str, Instrument]:
         result: dict[str, Instrument] = {}
@@ -324,12 +340,15 @@ class FillHistoryFeedThread(QThread):
         cached_items = _load_cached_fill_history(profile_name, environment, self._limit)
         if cached_items and self._running:
             self.data_ready.emit({"items": cached_items, "instruments": {}, "usdt_prices": {}})
-            self.status_changed.emit(f"历史成交 {len(cached_items)} 条 | 本地缓存")
+            self.status_changed.emit(f"历史成交同步：已显示本地缓存 {len(cached_items)} 条，正在查询最新数据...")
+        else:
+            self.status_changed.emit("历史成交同步：正在查询最新数据（成交、分页和行权/交割账单）...")
         try:
             remote_items = self._client.get_fills_history(
                 self._runtime.credentials,
                 environment=environment,
                 limit=self._limit,
+                progress_callback=self.status_changed.emit,
             )
             if not self._running:
                 return
@@ -346,12 +365,12 @@ class FillHistoryFeedThread(QThread):
                     "usdt_prices": self._build_usdt_prices(items),
                 }
             )
-            self.status_changed.emit(f"历史成交 {len(items)} 条")
+            self.status_changed.emit(f"历史成交同步完成：本地共 {len(items)} 条")
         except Exception as exc:
             if cached_items:
-                self.status_changed.emit(f"历史成交 {len(cached_items)} 条 | 本地缓存（后台同步失败：{exc}）")
+                self.status_changed.emit(f"历史成交同步失败，保留本地缓存 {len(cached_items)} 条：{exc}")
                 return
-            self.status_changed.emit(f"历史成交读取异常：{exc}")
+            self.status_changed.emit(f"历史成交同步失败：{exc}")
 
     def _build_instrument_map(self, items: list[OkxFillHistoryItem]) -> dict[str, Instrument]:
         result: dict[str, Instrument] = {}

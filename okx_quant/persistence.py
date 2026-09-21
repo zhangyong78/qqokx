@@ -51,6 +51,7 @@ HISTORY_CACHE_DIR_NAME = "history"
 HISTORY_ORDER_FILE_NAME = "order_history.json"
 HISTORY_FILLS_FILE_NAME = "fills_history.json"
 HISTORY_POSITIONS_FILE_NAME = "position_history.json"
+HISTORY_SYNC_STATE_FILE_NAME = "history_sync_state.json"
 ACCOUNT_EQUITY_CURVE_FILE_NAME = "account_equity_curve.json"
 POSITION_HISTORY_VIEW_PREFS_FILE_NAME = "position_history_view_prefs.json"
 ACCOUNT_POSITIONS_HOME_VIEW_PREFS_FILE_NAME = "account_positions_home_view_prefs.json"
@@ -776,6 +777,59 @@ def history_cache_file_path(
     if not file_name:
         raise ValueError(f"Unsupported history cache kind: {history_kind}")
     return history_cache_dir_path(profile_name, environment, base_dir=base_dir) / file_name
+
+
+def history_sync_state_file_path(
+    profile_name: str,
+    environment: str,
+    *,
+    base_dir: Path | None = None,
+) -> Path:
+    return history_cache_dir_path(profile_name, environment, base_dir=base_dir) / HISTORY_SYNC_STATE_FILE_NAME
+
+
+def load_history_sync_state(
+    profile_name: str,
+    environment: str,
+    *,
+    base_dir: Path | None = None,
+) -> dict[str, object]:
+    target = history_sync_state_file_path(profile_name, environment, base_dir=base_dir)
+    if not target.exists():
+        return {"version": 1, "sources": {}}
+    try:
+        payload = json.loads(target.read_text(encoding="utf-8"))
+    except Exception:
+        return {"version": 1, "sources": {}}
+    if not isinstance(payload, dict):
+        return {"version": 1, "sources": {}}
+    sources = payload.get("sources")
+    return {
+        "version": int(payload.get("version", 1) or 1),
+        "sources": dict(sources) if isinstance(sources, dict) else {},
+        "updated_at": str(payload.get("updated_at", "") or ""),
+    }
+
+
+def save_history_sync_state(
+    profile_name: str,
+    environment: str,
+    state: dict[str, object],
+    *,
+    base_dir: Path | None = None,
+) -> Path:
+    target = history_sync_state_file_path(profile_name, environment, base_dir=base_dir)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    sources = state.get("sources") if isinstance(state, dict) else {}
+    payload = {
+        "version": 1,
+        "sources": dict(sources) if isinstance(sources, dict) else {},
+        "updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
+    }
+    temp_path = target.with_suffix(target.suffix + ".tmp")
+    temp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    temp_path.replace(target)
+    return target
 
 
 def account_equity_curve_file_path(

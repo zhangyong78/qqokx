@@ -24,7 +24,7 @@ from roll_terminal_qt.account_positions_home import (
     _group_row_values_with_break_even,
     _position_display_foreground_colors,
 )
-from okx_quant.okx_client import Instrument, OkxOrderResult
+from okx_quant.okx_client import Instrument, OkxFillHistoryItem, OkxOrderResult
 from okx_quant.models import OptionTickBand
 from okx_quant.position_protection import ProtectionSessionSnapshot
 from roll_terminal_qt.order_service import OrderStatusView
@@ -412,6 +412,58 @@ class AccountPositionsHistoryTabWiringTest(QtWidgetTestCase):
             try:
                 widget._position_history_table.cellDoubleClicked.emit(0, 3)
                 handler.assert_called_once_with(0, 3)
+            finally:
+                self.dispose_widget(widget)
+
+    def test_fill_history_refresh_keeps_cells_together_when_column_is_sorted(self) -> None:
+        fills = [
+            OkxFillHistoryItem(
+                fill_time=20,
+                inst_id="DOGE-USDT-SWAP",
+                inst_type="SWAP",
+                side="sell",
+                pos_side="long",
+                fill_price=Decimal("0.10"),
+                fill_size=Decimal("0.06"),
+                fill_fee=None,
+                fee_currency=None,
+                pnl=Decimal("0.59"),
+                order_id="order-2",
+                trade_id="trade-2",
+                exec_type="T",
+                raw={},
+            ),
+            OkxFillHistoryItem(
+                fill_time=10,
+                inst_id="ETH-USDT-SWAP",
+                inst_type="SWAP",
+                side="buy",
+                pos_side="long",
+                fill_price=Decimal("2700"),
+                fill_size=Decimal("0.4"),
+                fill_fee=None,
+                fee_currency=None,
+                pnl=None,
+                order_id="order-1",
+                trade_id="trade-1",
+                exec_type="T",
+                raw={},
+            ),
+        ]
+        with patch.object(AccountPositionsHomeWidget, "_start_private_threads"):
+            widget = AccountPositionsHomeWidget()
+            try:
+                widget._fill_history_items = fills
+                widget._fill_history_instruments = {}
+                widget._fill_history_usdt_prices = {}
+                widget._fill_history_table.sortItems(0)
+                widget._refresh_fill_history_table()
+
+                self.assertEqual(widget._fill_history_table.rowCount(), 2)
+                for row in range(2):
+                    self.assertTrue(widget._fill_history_table.item(row, 1).text())
+                    self.assertTrue(widget._fill_history_table.item(row, 2).text())
+                    self.assertTrue(widget._fill_history_table.item(row, 5).text())
             finally:
                 self.dispose_widget(widget)
 

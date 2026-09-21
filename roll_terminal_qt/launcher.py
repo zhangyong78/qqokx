@@ -4,12 +4,13 @@ import argparse
 import sys
 from datetime import datetime
 from pathlib import Path
-from typing import Iterable
+from typing import Callable, Iterable
 
 from PySide6.QtCore import QCoreApplication, QSettings, QTimer, Qt, QUrl, Slot
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
     QApplication,
+    QCheckBox,
     QDialog,
     QDialogButtonBox,
     QFrame,
@@ -32,6 +33,7 @@ from okx_quant.ai_snapshot import load_ai_watchlist, normalize_watchlist, save_a
 from okx_quant.app_paths import ai_snapshots_dir_path, config_dir_path, data_root, logs_dir_path, state_dir_path
 from okx_quant.log_utils import append_log_line
 from roll_terminal_qt.account_positions_home import AccountPositionsHomeWidget
+from roll_terminal_qt.history_sync_manager import HISTORY_SYNC_SOURCES, get_history_sync_manager
 from roll_terminal_qt.daily_trade_report_window import DailyTradeReportWidget
 from roll_terminal_qt.app_icon import apply_qt_application_identity, apply_qt_window_icon
 from roll_terminal_qt.auto_channel_window import AutoChannelWindow
@@ -111,6 +113,162 @@ class SharedDataDialog(QDialog):
         buttons.accepted.connect(self.accept)
         buttons.button(QDialogButtonBox.StandardButton.Close).setText("关闭")
         layout.addWidget(buttons)
+
+
+class HistorySyncDialog(QDialog):
+    def __init__(
+        self,
+        *,
+        parent: QWidget,
+        profile_provider,
+        runtime_provider,
+        export_fills_callback: Callable[[], None],
+        export_positions_callback: Callable[[], None],
+    ) -> None:  # noqa: ANN001
+        super().__init__(parent)
+        apply_qt_window_icon(self)
+        self.setWindowTitle("历史数据同步中心")
+        self.resize(760, 520)
+        self._profile_provider = profile_provider
+        self._runtime_provider = runtime_provider
+        self._export_fills_callback = export_fills_callback
+        self._export_positions_callback = export_positions_callback
+        self._manager = get_history_sync_manager()
+        self._source_checks: dict[str, QCheckBox] = {}
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(18, 18, 18, 18)
+        layout.setSpacing(12)
+        title = QLabel("历史数据同步中心")
+        title.setObjectName("SectionTitle")
+        layout.addWidget(title)
+        hint = QLabel(
+            "快速增量同步只检查最近数据；深度检查才会分页补齐历史成交、历史委托和历史仓位。"
+            "关闭窗口不会停止后台同步。"
+        )
+        hint.setWordWrap(True)
+        hint.setObjectName("Subtle")
+        layout.addWidget(hint)
+
+        source_panel = QFrame()
+        source_panel.setObjectName("Guide")
+        source_layout = QHBoxLayout(source_panel)
+        source_layout.addWidget(QLabel("同步内容："))
+        for source, label in (("fills", "历史成交"), ("orders", "历史委托"), ("positions", "历史仓位")):
+            check = QCheckBox(label)
+            check.setChecked(True)
+            self._source_checks[source] = check
+            source_layout.addWidget(check)
+        source_layout.addStretch(1)
+        layout.addWidget(source_panel)
+
+        self._status = QLabel("等待操作。")
+        self._status.setWordWrap(True)
+        self._status.setMinimumHeight(46)
+        layout.addWidget(self._status)
+        self._log = QTextEdit()
+        self._log.setReadOnly(True)
+        self._log.setMinimumHeight(220)
+        layout.addWidget(self._log, 1)
+
+        export_panel = QFrame()
+        export_panel.setObjectName("Guide")
+        export_layout = QHBoxLayout(export_panel)
+        export_layout.addWidget(QLabel("完整导出："))
+        export_fills_button = QPushButton("同步最新并导出全部复盘成交")
+        export_fills_button.setToolTip("快速增量同步成交和委托后，导出本地全部成交记录")
+        export_fills_button.clicked.connect(self._export_fills)
+        export_layout.addWidget(export_fills_button)
+        export_positions_button = QPushButton("同步最新并导出全部历史仓位")
+        export_positions_button.setToolTip("快速增量同步历史仓位后，导出本地全部已结束仓位")
+        export_positions_button.clicked.connect(self._export_positions)
+        export_layout.addWidget(export_positions_button)
+        export_layout.addStretch(1)
+        layout.addWidget(export_panel)
+
+        buttons = QHBoxLayout()
+        quick_button = QPushButton("快速增量同步")
+        quick_button.clicked.connect(lambda: self._start(False))
+        buttons.addWidget(quick_button)
+        deep_button = QPushButton("深度检查 / 补历史")
+        deep_button.clicked.connect(lambda: self._start(True))
+        buttons.addWidget(deep_button)
+        stop_button = QPushButton("停止当前同步")
+        stop_button.clicked.connect(self._stop)
+        buttons.addWidget(stop_button)
+        buttons.addStretch(1)
+        close_button = QPushButton("关闭")
+        close_button.clicked.connect(self.close)
+        buttons.addWidget(close_button)
+        layout.addLayout(buttons)
+
+        self._manager.status_changed.connect(self._on_status)
+        self._manager.sync_failed.connect(self._on_failed)
+        self._manager.sync_finished.connect(self._on_finished)
+
+    def _current_context(self):  # noqa: ANN202
+        runtime = self._runtime_provider()
+        profile_name = str(self._profile_provider() or "").strip()
+        environment = str(getattr(runtime, "environment", "") or "").strip()
+        return profile_name, environment, runtime
+
+    def _selected_sources(self) -> tuple[str, ...]:
+        return tuple(source for source in HISTORY_SYNC_SOURCES if self._source_checks[source].isChecked())
+
+    def _start(self, deep: bool) -> None:
+        profile_name, _environment, runtime = self._current_context()
+        sources = self._selected_sources()
+        if runtime is None or not profile_name:
+            self._status.setText("当前没有可用的 API 账户。")
+            return
+        if not sources:
+            self._status.setText("请至少选择一种历史数据。")
+            return
+        accepted = self._manager.request_sync(
+            runtime=runtime,
+            profile_name=profile_name,
+            sources=sources,
+            deep=deep,
+        )
+        self._status.setText("已启动深度检查。" if deep and accepted else ("已启动快速增量同步。" if accepted else "当前已有同步任务，请等待完成。"))
+
+    def _stop(self) -> None:
+        profile_name, environment, _runtime = self._current_context()
+        self._manager.stop(profile_name=profile_name, environment=environment)
+        self._status.setText("已请求停止；当前网络请求结束后停止。")
+
+    def _export_fills(self) -> None:
+        self._status.setText("正在准备同步最新成交和委托，完成后打开导出窗口...")
+        self._export_fills_callback()
+
+    def _export_positions(self) -> None:
+        self._status.setText("正在准备同步最新历史仓位，完成后打开导出窗口...")
+        self._export_positions_callback()
+
+    def _matches(self, profile_name: str, environment: str) -> bool:
+        current_profile, current_environment, _runtime = self._current_context()
+        return profile_name == current_profile and environment == current_environment
+
+    def _on_status(self, profile_name: str, environment: str, source: str, message: str) -> None:
+        if not self._matches(profile_name, environment):
+            return
+        self._status.setText(message)
+        self._log.append(message)
+
+    def _on_failed(self, profile_name: str, environment: str, source: str, message: str) -> None:
+        if not self._matches(profile_name, environment):
+            return
+        text = f"{source} 同步失败：{message}"
+        self._status.setText(text)
+        self._log.append(text)
+
+    def _on_finished(self, profile_name: str, environment: str, completed: object) -> None:
+        if not self._matches(profile_name, environment):
+            return
+        completed_items = completed.get("completed", ()) if isinstance(completed, dict) else completed
+        text = f"同步完成：{', '.join(str(item) for item in completed_items) or '没有完成的项目'}"
+        self._status.setText(text)
+        self._log.append(text)
 
 
 class ModuleOverviewWindow(QMainWindow):
@@ -262,6 +420,8 @@ class LauncherWindow(QMainWindow):
             self._global_font_mode = apply_global_font_mode(app, self._global_font_mode)
         self._child_windows: list[QWidget] = []
         self._shared_data_dialog: SharedDataDialog | None = None
+        self._history_sync_dialog: HistorySyncDialog | None = None
+        self._history_sync_manager = get_history_sync_manager()
         self._shutdown_in_progress = False
         self._home_shutdown_started = False
         self._shutdown_pending_page_keys: set[str] = set()
@@ -286,6 +446,8 @@ class LauncherWindow(QMainWindow):
         self._workspace_header.page_requested.connect(self.show_page)
         self._workspace_header.tool_requested.connect(self._handle_workspace_tool)
         self._workspace_header.profile_requested.connect(self._request_workspace_profile)
+        self._history_sync_manager.status_changed.connect(self._on_history_sync_status)
+        self._history_sync_manager.sync_failed.connect(self._on_history_sync_failed)
         self._page_stack = QStackedWidget(workspace_root)
         workspace_layout.addWidget(self._workspace_header)
         workspace_layout.addWidget(self._page_stack, 1)
@@ -301,6 +463,7 @@ class LauncherWindow(QMainWindow):
         self.setCentralWidget(workspace_root)
         self._build_menu()
         self._initialize_workspace_profiles()
+        QTimer.singleShot(1500, self._start_background_history_sync)
         with measure_ui_step("launcher_first_show"):
             self.show_page("kline")
 
@@ -328,6 +491,12 @@ class LauncherWindow(QMainWindow):
         previous = self._active_profile_name
         if not target or target == previous:
             return
+        previous_runtime = load_runtime(previous) if previous else None
+        if previous_runtime is not None:
+            self._history_sync_manager.stop(
+                profile_name=previous,
+                environment=str(getattr(previous_runtime, "environment", "") or "").strip(),
+            )
         self._profile_snapshots, _selected = load_profile_snapshots()
         runtime = load_runtime(target)
         if runtime is None or not ensure_profile_unlocked(
@@ -357,6 +526,32 @@ class LauncherWindow(QMainWindow):
             apply_profile = getattr(window, "apply_workspace_profile", None)
             if callable(apply_profile):
                 apply_profile(target)
+        QTimer.singleShot(500, self._start_background_history_sync)
+
+    @Slot()
+    def _start_background_history_sync(self) -> None:
+        profile_name = str(self._active_profile_name or "").strip()
+        runtime = load_runtime(profile_name) if profile_name else None
+        if runtime is None:
+            return
+        self._history_sync_manager.request_sync(
+            runtime=runtime,
+            profile_name=profile_name,
+            sources=HISTORY_SYNC_SOURCES,
+            deep=False,
+        )
+
+    @Slot(str, str, str, str)
+    def _on_history_sync_status(self, profile_name: str, environment: str, source: str, message: str) -> None:
+        if profile_name != str(self._active_profile_name or "").strip():
+            return
+        self.statusBar().showMessage(message, 5000)
+
+    @Slot(str, str, str, str)
+    def _on_history_sync_failed(self, profile_name: str, environment: str, source: str, message: str) -> None:
+        if profile_name != str(self._active_profile_name or "").strip():
+            return
+        self.statusBar().showMessage(f"{source} 同步失败：{message}", 12000)
 
     @staticmethod
     def _is_chart_page(page: QWidget) -> bool:
@@ -624,6 +819,7 @@ class LauncherWindow(QMainWindow):
             )
         except Exception:
             pass
+        self._history_sync_manager.shutdown()
         self.deleteLater()
         app = QApplication.instance()
         if app is not None:
@@ -657,6 +853,9 @@ class LauncherWindow(QMainWindow):
             return
         if normalized == "paths":
             self._show_shared_data_dialog()
+            return
+        if normalized == "history-sync":
+            self._show_history_sync_dialog()
             return
         if normalized == "logs":
             self._open_roll_terminal_logs_directory()
@@ -764,6 +963,40 @@ class LauncherWindow(QMainWindow):
         self._shared_data_dialog.show()
         self._shared_data_dialog.raise_()
         self._shared_data_dialog.activateWindow()
+
+    @Slot()
+    def _show_history_sync_dialog(self) -> None:
+        if self._history_sync_dialog is None:
+            self._history_sync_dialog = HistorySyncDialog(
+                parent=self,
+                profile_provider=self.active_profile_name,
+                runtime_provider=lambda: load_runtime(self.active_profile_name()),
+                export_fills_callback=self._export_all_fills_from_history_center,
+                export_positions_callback=self._export_all_positions_from_history_center,
+            )
+        self._history_sync_dialog.show()
+        self._history_sync_dialog.raise_()
+        self._history_sync_dialog.activateWindow()
+
+    def _account_home_for_history_export(self) -> AccountPositionsHomeWidget | None:
+        self.show_page("account")
+        return self._home_widget
+
+    @Slot()
+    def _export_all_fills_from_history_center(self) -> None:
+        page = self._account_home_for_history_export()
+        if page is None:
+            self.statusBar().showMessage("持仓页面尚未准备完成，暂时无法导出历史成交。", 8000)
+            return
+        page.sync_and_export_all_local_fill_history()
+
+    @Slot()
+    def _export_all_positions_from_history_center(self) -> None:
+        page = self._account_home_for_history_export()
+        if page is None:
+            self.statusBar().showMessage("持仓页面尚未准备完成，暂时无法导出历史仓位。", 8000)
+            return
+        page.sync_and_export_position_history(all_local=True)
 
     @Slot()
     def _show_home_summary_hint(self) -> None:
