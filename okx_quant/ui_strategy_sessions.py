@@ -12067,19 +12067,34 @@ class UiStrategySessionsMixin:
 
         A native settlement has a round ID, while a recovered old log normally
         does not.  They can nevertheless be the same trade because OKX's entry
-        or exit order ID is shared.  Keep this separate from the primary key so
-        legacy rows with no usable exchange IDs still retain their old behavior.
+        or exit order ID is shared.  A recovery session may have a different
+        session ID from the original strategy session, so the exchange scope
+        (API/environment/instrument) is used instead of the local session ID.
+        Keep this separate from the primary key so legacy rows with no usable
+        exchange IDs still retain their old behavior.
         """
-        session_id = str(record.session_id or "").strip()
-        if not session_id:
+        api_name = str(record.api_name or "").strip()
+        environment = str(record.environment or "").strip().lower()
+        symbol = str(record.symbol or "").strip().upper()
+        if not (api_name or environment or symbol):
             return set()
+        scope = (api_name, environment, symbol)
         keys: set[tuple[str, ...]] = set()
         entry_order_id = str(record.entry_order_id or "").strip()
         exit_order_id = str(record.exit_order_id or "").strip()
+        entry_client_order_id = str(record.entry_client_order_id or "").strip()
+        protective_algo_id = str(record.protective_algo_id or "").strip()
+        protective_algo_cl_ord_id = str(record.protective_algo_cl_ord_id or "").strip()
         if entry_order_id:
-            keys.add(("entry_order", session_id, entry_order_id))
+            keys.add(("entry_order", *scope, entry_order_id))
         if exit_order_id:
-            keys.add(("exit_order", session_id, exit_order_id))
+            keys.add(("exit_order", *scope, exit_order_id))
+        if entry_client_order_id:
+            keys.add(("entry_client_order", *scope, entry_client_order_id))
+        if protective_algo_id:
+            keys.add(("protective_algo", *scope, protective_algo_id))
+        if protective_algo_cl_ord_id:
+            keys.add(("protective_algo_client", *scope, protective_algo_cl_ord_id))
         return keys
 
     @classmethod

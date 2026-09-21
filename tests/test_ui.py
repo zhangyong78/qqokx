@@ -7562,6 +7562,54 @@ class StrategyTradeTrackingTest(TestCase):
         self.assertEqual(len(result), 1)
         self.assertEqual(result[0].record_id, "S01-round-1")
 
+    def test_dedupe_strategy_trade_ledger_matches_recovery_session_by_exchange_order(self) -> None:
+        original = StrategyTradeLedgerRecord(
+            record_id="S238-round-1",
+            history_record_id="H238",
+            session_id="S238",
+            api_name="fanxiaodong",
+            strategy_id="ema_dynamic_order_long",
+            strategy_name="EMA 动态委托做多",
+            symbol="ETH-USDT-SWAP",
+            direction_label="只做多",
+            run_mode_label="交易并下单",
+            environment="live",
+            closed_at=datetime(2026, 9, 21, 19, 15, 15),
+            round_id="S238-20260918061639",
+            opened_at=datetime(2026, 9, 18, 6, 16, 39),
+            entry_order_id="3900000000000000001",
+            entry_client_order_id="entry-original",
+            exit_order_id="3900000000000000002",
+            protective_algo_id="algo-original",
+        )
+        recovery = StrategyTradeLedgerRecord(
+            record_id="S250-round-1",
+            history_record_id="H250",
+            session_id="S250",
+            api_name="fanxiaodong",
+            strategy_id="ema_dynamic_order_long",
+            strategy_name="EMA 动态委托做多",
+            symbol="ETH-USDT-SWAP",
+            direction_label="只做多",
+            run_mode_label="交易并下单",
+            environment="live",
+            closed_at=datetime(2026, 9, 21, 19, 15, 15),
+            round_id="S250-recovered",
+            opened_at=datetime(2026, 9, 18, 6, 16, 39),
+            entry_order_id="3900000000000000001",
+            entry_client_order_id="entry-recovery",
+            exit_order_id="3900000000000000002",
+            protective_algo_id="algo-recovery",
+        )
+        app = SimpleNamespace(
+            _strategy_trade_ledger_same_trade=lambda left, right: QuantApp._strategy_trade_ledger_same_trade(left, right),
+            _strategy_trade_ledger_record_quality=lambda record: QuantApp._strategy_trade_ledger_record_quality(record),
+        )
+
+        result = QuantApp._dedupe_strategy_trade_ledger_records(app, [original, recovery])
+
+        self.assertEqual(len(result), 1)
+
     def test_session_display_financials_uses_same_ledger_scope_as_pnl_dialog(self) -> None:
         older = StrategyTradeLedgerRecord(
             record_id="old",
