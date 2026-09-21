@@ -286,6 +286,20 @@ def _resolve_close_reduce_only_pos_side(client: OkxRestClient, runtime: Arbitrag
     return "short" if runtime.position_mode == "long_short" else None
 
 
+def _is_missing_order_query_error(exc: BaseException) -> bool:
+    message = str(exc or "")
+    lowered = message.lower()
+    markers = (
+        "订单不存在",
+        "查询订单不存在",
+        "未返回订单状态",
+        "order not found",
+        "does not exist",
+        "not exist",
+    )
+    return any(marker in message or marker in lowered for marker in markers)
+
+
 def _wait_order_fill(
     client: OkxRestClient,
     *,
@@ -296,18 +310,51 @@ def _wait_order_fill(
     expected_size: Decimal,
     logger: Logger,
     label: str,
+    cl_ord_id: str | None = None,
 ) -> tuple[Decimal, Decimal | None]:
     deadline = time.time() + FillWaitSeconds
     last_filled = Decimal("0")
     avg_price: Decimal | None = None
     while time.time() < deadline:
-        status = client.get_order(
-            credentials,
-            config,
-            inst_id=inst_id,
-            ord_id=ord_id,
-            request_timeout=ORDER_STATUS_REQUEST_TIMEOUT_SECONDS,
-        )
+        try:
+            status = client.get_order(
+                credentials,
+                config,
+                inst_id=inst_id,
+                ord_id=ord_id,
+                request_timeout=ORDER_STATUS_REQUEST_TIMEOUT_SECONDS,
+            )
+        except OkxApiError as exc:
+            if not _is_missing_order_query_error(exc):
+                raise
+            status = None
+            if cl_ord_id:
+                try:
+                    status = client.get_order(
+                        credentials,
+                        config,
+                        inst_id=inst_id,
+                        cl_ord_id=cl_ord_id,
+                        request_timeout=ORDER_STATUS_REQUEST_TIMEOUT_SECONDS,
+                    )
+                except (OkxApiError, TypeError) as retry_exc:
+                    if not isinstance(retry_exc, TypeError) and not _is_missing_order_query_error(retry_exc):
+                        raise
+            if status is None:
+                cached_status = _get_cached_private_order_status(
+                    client,
+                    credentials=credentials,
+                    environment=config.environment,
+                    inst_id=inst_id,
+                    ord_id=ord_id,
+                    cl_ord_id=cl_ord_id,
+                )
+                if cached_status is not None:
+                    _version, status = cached_status
+            if status is None:
+                logger(f"{label} 查询订单暂时不存在，保留已知成交并继续确认。")
+                time.sleep(PollSeconds)
+                continue
         filled = status.filled_size or Decimal("0")
         avg_price = status.avg_price
         state = (status.state or "").lower()
@@ -337,6 +384,7 @@ def _wait_order_fill_with_private_ws(
     expected_size: Decimal,
     logger: Logger,
     label: str,
+    cl_ord_id: str | None = None,
 ) -> tuple[Decimal, Decimal | None]:
     deadline = time.time() + FillWaitSeconds
     last_filled = Decimal("0")
@@ -436,6 +484,7 @@ def _wait_order_fill_with_private_ws(
     expected_size: Decimal,
     logger: Logger,
     label: str,
+    cl_ord_id: str | None = None,
 ) -> tuple[Decimal, Decimal | None]:
     deadline = time.time() + FillWaitSeconds
     last_filled = Decimal("0")
@@ -449,6 +498,7 @@ def _wait_order_fill_with_private_ws(
         environment=config.environment,
         inst_id=inst_id,
         ord_id=ord_id,
+        cl_ord_id=cl_ord_id,
     )
     if cached_status is not None:
         ws_version, status = cached_status
@@ -484,13 +534,42 @@ def _wait_order_fill_with_private_ws(
                     ws_version, status = ws_payload
         if status is None:
             if not private_ws_connected or time.time() >= rest_fallback_at:
-                status = client.get_order(
-                    credentials,
-                    config,
-                    inst_id=inst_id,
-                    ord_id=ord_id,
-                    request_timeout=ORDER_STATUS_REQUEST_TIMEOUT_SECONDS,
-                )
+                try:
+                    status = client.get_order(
+                        credentials,
+                        config,
+                        inst_id=inst_id,
+                        ord_id=ord_id,
+                        request_timeout=ORDER_STATUS_REQUEST_TIMEOUT_SECONDS,
+                    )
+                except OkxApiError as exc:
+                    if not _is_missing_order_query_error(exc):
+                        raise
+                    if cl_ord_id:
+                        try:
+                            status = client.get_order(
+                                credentials,
+                                config,
+                                inst_id=inst_id,
+                                cl_ord_id=cl_ord_id,
+                                request_timeout=ORDER_STATUS_REQUEST_TIMEOUT_SECONDS,
+                            )
+                        except (OkxApiError, TypeError) as retry_exc:
+                            if not isinstance(retry_exc, TypeError) and not _is_missing_order_query_error(retry_exc):
+                                raise
+                    if status is None:
+                        cached_status = _get_cached_private_order_status(
+                            client,
+                            credentials=credentials,
+                            environment=config.environment,
+                            inst_id=inst_id,
+                            ord_id=ord_id,
+                            cl_ord_id=cl_ord_id,
+                        )
+                        if cached_status is not None:
+                            ws_version, status = cached_status
+                    if status is None:
+                        logger(f"{label} 查询订单暂时不存在，保留已知成交并继续确认。")
                 rest_fallback_at = time.time() + PRIVATE_WS_STALE_REST_FALLBACK_SECONDS
             else:
                 cached_status = _get_cached_private_order_status(
@@ -1080,7 +1159,9 @@ class ArbitrageExecutor:
     def _is_missing_order_status_message(message: str) -> bool:
         lowered = str(message or "").lower()
         return (
-            "未返回订单状态" in str(message or "")
+            "订单不存在" in str(message or "")
+            or "查询订单不存在" in str(message or "")
+            or "未返回订单状态" in str(message or "")
             or "order not found" in lowered
             or "does not exist" in lowered
             or "not exist" in lowered
@@ -1600,6 +1681,7 @@ class ArbitrageExecutor:
         pos_side: str | None = None,
         reduce_only: bool = False,
     ) -> tuple[Decimal, Decimal | None]:
+        cl_ord_id = with_custom_order_id_prefix(f"arb{uuid.uuid4().hex[:14]}")
         result = self._place_simple_order_with_recovery(
             credentials,
             config,
@@ -1610,7 +1692,7 @@ class ArbitrageExecutor:
             ord_type="market",
             pos_side=pos_side,
             reduce_only=reduce_only,
-            cl_ord_id=with_custom_order_id_prefix(f"arb{uuid.uuid4().hex[:14]}"),
+            cl_ord_id=cl_ord_id,
         )
         return _wait_order_fill(
             self._client,
@@ -1621,6 +1703,7 @@ class ArbitrageExecutor:
             expected_size=size,
             logger=self._logger,
             label=label,
+            cl_ord_id=cl_ord_id,
         )
 
     def _execute_roll_completion_taker_pair(
@@ -4247,6 +4330,7 @@ class ArbitrageExecutor:
         )
         current_ord_type = "limit" if request.use_limit_orders else "market"
         target_ord_type = "limit" if request.use_limit_orders else "market"
+        current_cl_ord_id = with_custom_order_id_prefix(f"arb{uuid.uuid4().hex[:14]}")
         current_result = self._place_simple_order_with_recovery(
             credentials,
             current_config,
@@ -4258,7 +4342,7 @@ class ArbitrageExecutor:
             price=current_order_price if current_ord_type == "limit" else None,
             reduce_only=True,
             pos_side=derivative_pos_side,
-            cl_ord_id=with_custom_order_id_prefix(f"arb{uuid.uuid4().hex[:14]}"),
+            cl_ord_id=current_cl_ord_id,
         )
         current_filled, current_avg = _wait_order_fill(
             self._client,
@@ -4269,9 +4353,11 @@ class ArbitrageExecutor:
             expected_size=planned_derivative_qty,
             logger=self._logger,
             label="移仓旧合约腿",
+            cl_ord_id=current_cl_ord_id,
         )
         if current_filled <= 0:
             raise OkxApiError("旧合约腿未成交。")
+        target_cl_ord_id = with_custom_order_id_prefix(f"arb{uuid.uuid4().hex[:14]}")
         target_result = self._place_simple_order_with_recovery(
             credentials,
             target_config,
@@ -4283,7 +4369,7 @@ class ArbitrageExecutor:
             price=target_order_price if target_ord_type == "limit" else None,
             reduce_only=False,
             pos_side=derivative_pos_side,
-            cl_ord_id=with_custom_order_id_prefix(f"arb{uuid.uuid4().hex[:14]}"),
+            cl_ord_id=target_cl_ord_id,
         )
         target_filled, target_avg = _wait_order_fill(
             self._client,
@@ -4294,6 +4380,7 @@ class ArbitrageExecutor:
             expected_size=current_filled,
             logger=self._logger,
             label="移仓目标合约腿",
+            cl_ord_id=target_cl_ord_id,
         )
         return current_filled, current_avg, target_filled, target_avg
 

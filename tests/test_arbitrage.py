@@ -346,6 +346,59 @@ class ArbitrageWaitOrderFillTest(unittest.TestCase):
         self.assertEqual(client.rest_calls, 0)
         self.assertGreaterEqual(client.ws_calls, 1)
 
+    def test_wait_order_fill_recovers_transient_missing_order(self) -> None:
+        class _TransientMissingOrderClient:
+            def __init__(self) -> None:
+                self.calls: list[str] = []
+
+            def get_order(  # noqa: ANN001
+                self,
+                credentials,
+                config,
+                *,
+                inst_id: str,
+                ord_id: str | None = None,
+                cl_ord_id: str | None = None,
+                request_timeout: float | None = None,
+            ):
+                self.calls.append("ord_id" if ord_id else "cl_ord_id")
+                if ord_id:
+                    raise OkxApiError("查询订单不存在")
+                return OkxOrderStatus(
+                    ord_id="ord-1",
+                    state="filled",
+                    side="buy",
+                    ord_type="market",
+                    price=Decimal("100"),
+                    avg_price=Decimal("100.2"),
+                    size=Decimal("2"),
+                    filled_size=Decimal("2"),
+                    raw={},
+                )
+
+        client = _TransientMissingOrderClient()
+        runtime = ArbitrageTradeRuntime(
+            credentials=Credentials("k", "s", "p"),
+            environment="demo",
+            trade_mode="cross",
+            position_mode="net",
+        )
+        config = arbitrage_executor_module._build_strategy_config("BTC-USDT-SWAP", runtime)  # noqa: SLF001
+        filled, avg_price = arbitrage_executor_module._wait_order_fill(
+            client,
+            credentials=runtime.credentials,
+            config=config,
+            inst_id="BTC-USDT-SWAP",
+            ord_id="ord-1",
+            cl_ord_id="cl-1",
+            expected_size=Decimal("2"),
+            logger=lambda _message: None,
+            label="测试订单",
+        )
+        self.assertEqual(filled, Decimal("2"))
+        self.assertEqual(avg_price, Decimal("100.2"))
+        self.assertEqual(client.calls, ["ord_id", "cl_ord_id"])
+
 
 class ArbitrageAutoOpenMoreTest(unittest.TestCase):
     def test_limit_trigger(self) -> None:
