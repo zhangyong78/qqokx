@@ -15,6 +15,7 @@ from okx_quant.engine import (
     StrategyEngine,
     _advance_dynamic_stop_live,
     _format_size_with_contract_equivalent,
+    _infer_dynamic_next_trigger_r_from_stop,
     _idle_signal_wait_seconds,
     _is_exchange_dynamic_stop_candidate_valid,
     _should_skip_startup_signal,
@@ -1713,6 +1714,45 @@ class StrategyEngineTest(TestCase):
         self.assertEqual(stop_loss, Decimal("120.1"))
         self.assertEqual(next_take_profit, Decimal("140.1"))
         self.assertEqual(next_trigger_r, 4)
+
+    def test_dynamic_stop_recovery_infers_next_stage_from_exchange_stop(self) -> None:
+        config = StrategyConfig(
+            inst_id="BTC-USDT-SWAP",
+            bar="1H",
+            ema_period=21,
+            trend_ema_period=55,
+            big_ema_period=233,
+            atr_period=10,
+            atr_stop_multiplier=Decimal("2"),
+            atr_take_multiplier=Decimal("4"),
+            order_size=Decimal("1"),
+            trade_mode="cross",
+            signal_mode="long_only",
+            position_mode="net",
+            environment="demo",
+            tp_sl_trigger_type="mark",
+            strategy_id=STRATEGY_DYNAMIC_LONG_ID,
+        )
+
+        first_stage = _infer_dynamic_next_trigger_r_from_stop(
+            direction="long",
+            entry_price=Decimal("100"),
+            current_stop_loss=Decimal("90"),
+            risk_per_unit=Decimal("10"),
+            tick_size=Decimal("0.1"),
+            config=config,
+        )
+        after_break_even = _infer_dynamic_next_trigger_r_from_stop(
+            direction="long",
+            entry_price=Decimal("100"),
+            current_stop_loss=Decimal("100.1"),
+            risk_per_unit=Decimal("10"),
+            tick_size=Decimal("0.1"),
+            config=config,
+        )
+
+        self.assertEqual(first_stage, 2)
+        self.assertGreater(after_break_even, first_stage)
 
     def test_dynamic_live_stop_can_move_to_break_even_plus_two_taker_fees_at_2r(self) -> None:
         stop_loss, next_take_profit, next_trigger_r, moved = _advance_dynamic_stop_live(

@@ -244,7 +244,13 @@ from okx_quant.ui_shell import (
     PROTECTION_TRIGGER_SOURCE_OPTIONS,
 )
 from roll_terminal_qt.account_service import AccountFeedThread
-from roll_terminal_qt.history_service import FillHistoryFeedThread, OrderHistoryFeedThread, PositionHistoryFeedThread
+from roll_terminal_qt.history_service import (
+    FillHistoryFeedThread,
+    OrderHistoryFeedThread,
+    PositionHistoryFeedThread,
+    load_local_fill_history,
+    load_local_position_history_all,
+)
 from roll_terminal_qt.incremental_views import keyed_row_delta
 from roll_terminal_qt.option_strategy_window import CandlestickChartView, PositionPriceMarker, position_marker_action_label
 from roll_terminal_qt.order_service import OrderFeedThread, OrderStatusView
@@ -6490,6 +6496,10 @@ class AccountPositionsHomeWidget(QWidget):
         more_button = QPushButton("增加100条")
         more_button.clicked.connect(self._expand_fill_history_limit)
         top.addWidget(more_button)
+        export_button = QPushButton("导出全部本地成交")
+        export_button.setToolTip("导出本地缓存中的全部历史成交，不受当前显示数量和筛选条件限制")
+        export_button.clicked.connect(lambda _checked=False: self.export_all_local_fill_history())
+        top.addWidget(export_button)
         layout.addLayout(top)
 
         filter_row = QGridLayout()
@@ -6565,8 +6575,12 @@ class AccountPositionsHomeWidget(QWidget):
         top.addWidget(edit_button)
         export_button = QPushButton("导出筛选结果")
         export_button.setToolTip("导出当前筛选后的历史仓位，并附带原始数值供分析")
-        export_button.clicked.connect(self.export_filtered_position_history)
+        export_button.clicked.connect(lambda _checked=False: self.export_filtered_position_history())
         top.addWidget(export_button)
+        export_all_button = QPushButton("导出全部本地仓位")
+        export_all_button.setToolTip("导出本地缓存中的全部历史仓位，不受当前显示数量和筛选条件限制")
+        export_all_button.clicked.connect(lambda _checked=False: self.export_all_local_position_history())
+        top.addWidget(export_all_button)
         layout.addLayout(top)
 
         filter_row = QGridLayout()
@@ -7500,17 +7514,26 @@ class AccountPositionsHomeWidget(QWidget):
             )
         )
 
-    def export_filtered_position_history(self) -> None:
-        """Export the currently filtered history-position rows for analysis."""
-        filtered = self._filtered_position_history_items()
+    def export_filtered_position_history(self, *, all_local: bool = False) -> None:
+        """Export filtered positions, or every locally cached position when requested."""
+        filtered = (
+            load_local_position_history_all(
+                str(self._last_profile_name or "").strip(),
+                self._note_environment(),
+            )
+            if all_local
+            else self._filtered_position_history_items()
+        )
         if not filtered:
             QMessageBox.information(self, "导出历史仓位", "当前筛选没有可导出的历史仓位。")
             return
 
-        default_name = f"历史仓位_筛选结果_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        export_label = "全部本地历史仓位" if all_local else "历史仓位筛选结果"
+        filename_label = "全部本地" if all_local else "筛选结果"
+        default_name = f"历史仓位_{filename_label}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
         target, _ = QFileDialog.getSaveFileName(
             self,
-            "导出历史仓位筛选结果",
+            f"导出{export_label}",
             default_name,
             "CSV 文件 (*.csv)",
         )
@@ -7635,7 +7658,101 @@ class AccountPositionsHomeWidget(QWidget):
         except OSError as exc:
             QMessageBox.critical(self, "导出失败", f"无法写入 CSV 文件：{exc}")
             return
-        QMessageBox.information(self, "导出成功", f"已导出 {len(rows)} 条筛选结果：\n{target}")
+        QMessageBox.information(self, "导出成功", f"已导出 {len(rows)} 条{export_label}：\n{target}")
+
+    def export_all_local_position_history(self) -> None:
+        self.export_filtered_position_history(all_local=True)
+
+    def export_all_local_fill_history(self) -> None:
+        """Export every locally cached fill row, including rows beyond the page limit."""
+        profile_name = str(self._last_profile_name or "").strip()
+        if not profile_name:
+            QMessageBox.information(self, "导出历史成交", "当前没有可用的本地账户配置。")
+            return
+        items = load_local_fill_history(profile_name, self._note_environment())
+        if not items:
+            QMessageBox.information(self, "导出历史成交", "本地缓存中没有可导出的历史成交。")
+            return
+
+        default_name = f"历史成交_全部本地_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        target, _ = QFileDialog.getSaveFileName(
+            self,
+            "导出全部本地历史成交",
+            default_name,
+            "CSV 文件 (*.csv)",
+        )
+        if not target:
+            return
+        if not target.lower().endswith(".csv"):
+            target += ".csv"
+
+        def raw_value(raw: dict[str, object], *keys: str) -> str:
+            for key in keys:
+                value = raw.get(key)
+                if value is not None and str(value).strip() != "":
+                    return str(value)
+            return ""
+
+        def decimal_text(value: Decimal | None) -> str:
+            return "" if value is None else str(value)
+
+        headers = (
+            "成交时间",
+            "成交时间戳_ms",
+            "类型",
+            "合约",
+            "方向",
+            "持仓方向",
+            "成交价",
+            "成交量",
+            "手续费",
+            "已实现盈亏",
+            "成交类型",
+            "订单ID",
+            "成交ID",
+            "成交价_raw",
+            "成交量_raw",
+            "手续费_raw",
+            "手续费币种",
+            "盈亏_raw",
+            "raw_json",
+        )
+        rows: list[list[str]] = []
+        for item in items:
+            raw = item.raw if isinstance(item.raw, dict) else {}
+            rows.append(
+                [
+                    _format_okx_ms_timestamp(item.fill_time),
+                    str(item.fill_time or ""),
+                    item.inst_type or "-",
+                    item.inst_id or "-",
+                    _format_history_side(item.side, item.pos_side),
+                    item.pos_side or "",
+                    _format_fill_history_price(item),
+                    _format_fill_history_size(item, self._fill_history_instruments),
+                    _format_fill_history_fee_cell(item, self._fill_history_usdt_prices),
+                    _format_fill_history_pnl(item, self._fill_history_usdt_prices),
+                    _format_fill_history_exec_type(item.exec_type),
+                    item.order_id or raw_value(raw, "ordId", "orderId"),
+                    item.trade_id or raw_value(raw, "tradeId"),
+                    decimal_text(item.fill_price),
+                    decimal_text(item.fill_size),
+                    decimal_text(item.fill_fee),
+                    item.fee_currency or raw_value(raw, "feeCcy", "fillFeeCcy"),
+                    decimal_text(item.pnl),
+                    json.dumps(raw, ensure_ascii=False, sort_keys=True),
+                ]
+            )
+
+        try:
+            with open(target, "w", encoding="utf-8-sig", newline="") as handle:
+                writer = csv.writer(handle)
+                writer.writerow(headers)
+                writer.writerows(rows)
+        except OSError as exc:
+            QMessageBox.critical(self, "导出失败", f"无法写入 CSV 文件：{exc}")
+            return
+        QMessageBox.information(self, "导出成功", f"已导出 {len(rows)} 条全部本地历史成交：\n{target}")
 
     def _selected_position_history_item(self) -> OkxPositionHistoryItem | None:
         row = self._position_history_table.currentRow() if hasattr(self, "_position_history_table") else -1

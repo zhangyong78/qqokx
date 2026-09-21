@@ -60,6 +60,7 @@ from roll_terminal_qt.models import ArbitrageOpportunityView, LegMarket, MarketP
 from roll_terminal_qt.opportunity_service import (
     append_custom_opportunity,
     filter_opportunities,
+    is_professional_spot_derivative_pair,
     is_manual_instrument_active,
     load_all_opportunities,
     manual_instrument_label,
@@ -1459,7 +1460,11 @@ class RollTerminalWindow(QMainWindow):
         if mode == "roll":
             mode_items = [item for item in self._all_opportunities if item.template == "roll"]
         else:
-            mode_items = [item for item in self._all_opportunities if item.template == "professional"]
+            mode_items = [
+                item
+                for item in self._all_opportunities
+                if is_professional_spot_derivative_pair(item)
+            ]
         self._filtered_opportunities = filter_opportunities(mode_items, text)
         self._reload_opportunity_list()
 

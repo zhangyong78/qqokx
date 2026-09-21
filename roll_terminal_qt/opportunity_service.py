@@ -270,6 +270,20 @@ def infer_instrument_kind(inst_id: str) -> str:
     return "标的"
 
 
+def is_professional_spot_derivative_pair(item: ArbitrageOpportunityView) -> bool:
+    """Return whether a professional pair is executable by the spot/derivative legs."""
+    if item.template != "professional":
+        return False
+    # Persisted custom opportunities may carry stale display labels; the instrument
+    # IDs are the source of truth for deciding which execution path is available.
+    left_kind = infer_instrument_kind(item.left_inst_id)
+    right_kind = infer_instrument_kind(item.right_inst_id)
+    derivative_kinds = {"交割", "永续"}
+    return (left_kind == "现货" and right_kind in derivative_kinds) or (
+        right_kind == "现货" and left_kind in derivative_kinds
+    )
+
+
 def _default_custom_title(
     *,
     left_inst_id: str,

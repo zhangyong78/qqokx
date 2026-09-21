@@ -4143,11 +4143,17 @@ class StrategyEngine:
                 else min(initial_stop_loss, recovered_stop_loss)
             )
         current_stop_loss = effective_current_stop_loss
-        next_trigger_r = _live_dynamic_initial_trigger_r(config)
+        risk_per_unit = abs(position.entry_price - initial_stop_loss)
+        next_trigger_r = _infer_dynamic_next_trigger_r_from_stop(
+            direction=direction,
+            entry_price=position.entry_price,
+            current_stop_loss=current_stop_loss,
+            risk_per_unit=risk_per_unit,
+            tick_size=trade_instrument.tick_size,
+            config=config,
+        )
         amend_failures = 0
         consecutive_read_failures = 0
-        risk_per_unit = abs(position.entry_price - initial_stop_loss)
-        direction: Literal["long", "short"] = "long" if position.side == "buy" else "short"
         next_trigger_price_text = _dynamic_next_trigger_price_text(
             direction=direction,
             entry_price=position.entry_price,
@@ -4155,6 +4161,11 @@ class StrategyEngine:
             next_trigger_r=next_trigger_r,
             tick_size=trade_instrument.tick_size,
             dynamic_fee_offset_enabled=_live_ema55_slope_dynamic_fee_offset_enabled(config),
+        )
+        recovery_stage_text = (
+            f"恢复阶段依据=当前OKX止损，推断下一次上移={next_trigger_r}R"
+            if recovered_stop_loss is not None
+            else f"下一次上移阶段={next_trigger_r}R"
         )
         ref_parts: list[str] = []
         if algo_cl_norm:
@@ -4176,7 +4187,7 @@ class StrategyEngine:
             f"初始止损={format_decimal(initial_stop_loss)}",
             f"恢复当前止损={format_decimal(current_stop_loss)}",
             _live_dynamic_break_even_summary(config),
-            f"下一次上移阶段={next_trigger_r}R",
+            recovery_stage_text,
             f"下一次上移触发价={next_trigger_price_text}",
             f"手续费偏移={config.dynamic_fee_offset_enabled_label()}",
             f"时间保本={config.time_stop_break_even_enabled_label()}/{config.resolved_time_stop_break_even_bars()}根",
@@ -7249,6 +7260,81 @@ def _live_dynamic_next_event_after_trailing(
     next_trailing_r = current_trigger_r + active_rule.resolved_trail_every_r() if active_rule.trailing_enabled() else 0
     candidates = [value for value in (next_explicit_r, next_trailing_r) if value > 0]
     return min(candidates) if candidates else 0
+
+
+def _infer_dynamic_next_trigger_r_from_stop(
+    *,
+    direction: Literal["long", "short"],
+    entry_price: Decimal,
+    current_stop_loss: Decimal,
+    risk_per_unit: Decimal,
+    tick_size: Decimal,
+    config: StrategyConfig,
+) -> int:
+    """Recover the next dynamic-stop stage from the exchange's current stop.
+
+    A process restart restores the current OKX algorithm-stop price, but the
+    in-memory ``next_trigger_r`` is not persisted. Replay the configured
+    protection events up to that price so recovery continues from the next
+    unapplied stage instead of starting at the first stage again.
+    """
+    if risk_per_unit <= 0:
+        return _live_dynamic_initial_trigger_r(config)
+    resolved_rules = _live_resolved_dynamic_rules(
+        dynamic_protection_rules=_live_dynamic_protection_rules(config),
+        two_r_break_even=_live_ema55_slope_dynamic_two_r_break_even_enabled(config),
+        break_even_trigger_r=_live_dynamic_break_even_trigger_r(config),
+        trailing_start_r=_live_ema55_slope_lock_profit_trigger_r(config),
+        first_lock_r=_live_dynamic_first_lock_r(config),
+        trailing_step_r=_live_dynamic_trailing_step_r(config),
+    )
+    trigger_r = _live_dynamic_initial_trigger_r(config)
+    fee_offset_enabled = _live_ema55_slope_dynamic_fee_offset_enabled(config)
+    # A malformed rule set must never block recovery. The finite guard also
+    # protects against a future rule configuration that does not advance.
+    for _ in range(512):
+        if not resolved_rules:
+            return trigger_r
+        next_rule_index = _live_dynamic_next_rule_index(resolved_rules, trigger_r)
+        if next_rule_index < len(resolved_rules) and resolved_rules[next_rule_index].resolved_trigger_r() == trigger_r:
+            rule = resolved_rules[next_rule_index]
+            lock_r = _live_dynamic_rule_lock_r(rule, trigger_r)
+            next_trigger_r = _live_dynamic_next_event_after_rule(resolved_rules, next_rule_index)
+        elif next_rule_index > 0:
+            active_rule_index = next_rule_index - 1
+            active_rule = resolved_rules[active_rule_index]
+            lock_r = _live_dynamic_rule_lock_r(active_rule, trigger_r)
+            next_trigger_r = _live_dynamic_next_event_after_trailing(
+                resolved_rules,
+                active_rule_index=active_rule_index,
+                current_trigger_r=trigger_r,
+            )
+        else:
+            return trigger_r
+        candidate_stop = _dynamic_stop_price_live_for_lock_r(
+            direction=direction,
+            entry_price=entry_price,
+            risk_per_unit=risk_per_unit,
+            lock_r=lock_r,
+            tick_size=tick_size,
+            dynamic_fee_offset_enabled=fee_offset_enabled,
+        )
+        passed = (
+            candidate_stop <= current_stop_loss
+            if direction == "long"
+            else candidate_stop >= current_stop_loss
+        )
+        if not passed:
+            return trigger_r
+        if next_trigger_r <= 0:
+            # The current exchange stop has already reached the final configured
+            # protection event.  Keep the monitor in the terminal stage instead
+            # of replaying the last event forever after a restart.
+            return 0
+        if next_trigger_r <= trigger_r:
+            return trigger_r
+        trigger_r = next_trigger_r
+    return trigger_r
 
 
 def _advance_dynamic_stop_live(

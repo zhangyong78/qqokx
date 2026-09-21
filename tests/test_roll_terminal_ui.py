@@ -14,6 +14,7 @@ from roll_terminal_qt.opportunity_service import (
     is_manual_instrument_active,
     is_manual_instrument_allowed,
     is_quarterly_expiry_code,
+    is_professional_spot_derivative_pair,
     manual_instrument_label,
 )
 
@@ -169,6 +170,33 @@ class RollTerminalUiTests(unittest.TestCase):
             manual_instrument_label("BTC-USD-260925", "FUTURES", "BTC-USD"),
             "BTC-USD 币本位季度交割 · BTC-USD-260925",
         )
+
+    def test_professional_execution_pair_requires_one_spot_and_one_derivative(self) -> None:
+        spot_derivative = type(
+            "_Item",
+            (),
+            {
+                "template": "professional",
+                "left_kind": "交割",
+                "right_kind": "现货",
+                "left_inst_id": "BTC-USD-260925",
+                "right_inst_id": "BTC-USDT",
+            },
+        )()
+        futures_pair = type(
+            "_Item",
+            (),
+            {
+                "template": "professional",
+                "left_kind": "交割",
+                "right_kind": "交割",
+                "left_inst_id": "BTC-USD-260925",
+                "right_inst_id": "BTC-USD-261225",
+            },
+        )()
+
+        self.assertTrue(is_professional_spot_derivative_pair(spot_derivative))
+        self.assertFalse(is_professional_spot_derivative_pair(futures_pair))
 
     def test_runtime_thread_callback_ignores_stale_generation(self) -> None:
         window = self._build_window()

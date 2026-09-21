@@ -63,6 +63,11 @@ from okx_quant.strategy_live_chart import (
     render_strategy_live_chart,
 )
 from okx_quant.stop_execution import assess_stop_execution
+from okx_quant.engine import (
+    _dynamic_next_trigger_price_text,
+    _infer_dynamic_next_trigger_r_from_stop,
+    _live_ema55_slope_dynamic_fee_offset_enabled,
+)
 from okx_quant.daily_trade_report import (
     daily_trade_from_position_history,
     daily_trade_from_strategy_ledger,
@@ -562,7 +567,7 @@ class UiStrategySessionsMixin:
             "stop_amount": "止损金额",
             "take_profit": "止盈价",
             "live_pnl": "实时浮盈亏",
-            "current_r": "当前R",
+            "current_r": "1R风险额",
             "pnl": "净盈亏",
             "last_pnl": "上次净盈亏",
             "status": "状态",
@@ -8473,10 +8478,12 @@ class UiStrategySessionsMixin:
             _trade_count, _win_count, _gross_pnl, _fee_total, _funding_total, display_net_pnl, display_last_pnl, _last_reason = display_financials(session)
         else:
             display_net_pnl, display_last_pnl = session.net_pnl_total, session.last_net_pnl
-        live_pnl_risk_basis = None
-        current_r_text = "-"
+        runtime_risk_basis = None
+        if getattr(session, "active_trade", None) is not None:
+            runtime_risk_basis = UiStrategySessionsMixin._session_runtime_risk_basis_usdt(self, session)
+        current_r_text = _format_optional_decimal(runtime_risk_basis)
+        live_pnl_risk_basis = runtime_risk_basis if live_pnl is not None else None
         if live_pnl is not None:
-            live_pnl_risk_basis = UiStrategySessionsMixin._session_runtime_risk_basis_usdt(self, session)
             r_text = UiStrategySessionsMixin._session_runtime_r_text(
                 live_pnl,
                 live_pnl_risk_basis,

@@ -42,17 +42,7 @@ def load_local_position_history(
     limit: int = 500,
 ) -> list[OkxPositionHistoryItem]:
     """Load the same local position-history cache used by the positions page."""
-    local_records = load_history_cache_records("positions", profile_name, environment)
-    collapsed_records = _collapse_position_history_records(local_records)
-    if collapsed_records != local_records:
-        save_history_cache_records("positions", profile_name, environment, collapsed_records)
-    items = [
-        item
-        for record in collapsed_records
-        if isinstance(record, dict) and (item := _position_history_item_from_cache(record)) is not None
-    ]
-    items.sort(key=lambda item: item.update_time or 0, reverse=True)
-    return items[: max(20, int(limit))]
+    return load_local_position_history_all(profile_name, environment)[: max(20, int(limit))]
 
 
 def load_cached_order_history(profile_name: str, environment: str, limit: int) -> list[OkxTradeOrderItem]:
@@ -77,10 +67,33 @@ def merge_order_history_cache(
 
 
 def _load_cached_fill_history(profile_name: str, environment: str, limit: int) -> list[OkxFillHistoryItem]:
+    return load_local_fill_history(profile_name, environment)[:limit]
+
+
+def load_local_fill_history(profile_name: str, environment: str) -> list[OkxFillHistoryItem]:
+    """Load every locally cached fill-history row for export and analysis."""
     records = load_history_cache_records("fills", profile_name, environment)
     items = [item for record in records if (item := _fill_item_from_cache(record)) is not None]
     items.sort(key=lambda item: item.fill_time or 0, reverse=True)
-    return items[:limit]
+    return items
+
+
+def load_local_position_history_all(
+    profile_name: str,
+    environment: str,
+) -> list[OkxPositionHistoryItem]:
+    """Load every locally cached, collapsed position-history row."""
+    local_records = load_history_cache_records("positions", profile_name, environment)
+    collapsed_records = _collapse_position_history_records(local_records)
+    if collapsed_records != local_records:
+        save_history_cache_records("positions", profile_name, environment, collapsed_records)
+    items = [
+        item
+        for record in collapsed_records
+        if isinstance(record, dict) and (item := _position_history_item_from_cache(record)) is not None
+    ]
+    items.sort(key=lambda item: item.update_time or 0, reverse=True)
+    return items
 
 
 def _merge_fill_history_cache(
