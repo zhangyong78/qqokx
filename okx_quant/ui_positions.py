@@ -6111,6 +6111,7 @@ class UiPositionsMixin:
                     trade_instrument=instrument,
                     position=filled,
                     initial_stop_loss=sl_px,
+                    current_stop_loss=sl_px,
                     stop_loss_algo_id=algo_id,
                     stop_loss_algo_cl_ord_id=algo_cl,
                 )

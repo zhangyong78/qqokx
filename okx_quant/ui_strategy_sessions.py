@@ -10962,6 +10962,7 @@ class UiStrategySessionsMixin:
                     protection,
                 )
         elif take_profit_mode == "dynamic":
+            recovered_current_stop_loss: Decimal | None = None
             if auto_restore_probe is not None and auto_restore_probe.get("protective_order_checked"):
                 protective_order = auto_restore_probe.get("protective_order")
             else:
@@ -10975,10 +10976,11 @@ class UiStrategySessionsMixin:
             if protective_order is not None:
                 stop_price = protective_order.stop_loss_trigger_price or protective_order.trigger_price
                 if stop_price is not None:
+                    # 恢复时以 OKX 当前算法单的触发价为准，不能继续使用可能落后的会话缓存。
+                    recovered_current_stop_loss = stop_price
                     if trade.initial_stop_price is None:
                         trade.initial_stop_price = stop_price
-                    if trade.current_stop_price is None:
-                        trade.current_stop_price = stop_price
+                    trade.current_stop_price = stop_price
                 if not trade.protective_algo_id:
                     trade.protective_algo_id = (protective_order.algo_id or "").strip() or None
                 if not trade.protective_algo_cl_ord_id:
@@ -11018,6 +11020,7 @@ class UiStrategySessionsMixin:
                         trade_instrument=trade_instrument,
                         position=position,
                         initial_stop_loss=trade.initial_stop_price,
+                        current_stop_loss=recovered_current_stop_loss or trade.current_stop_price,
                         stop_loss_algo_cl_ord_id=trade.protective_algo_cl_ord_id,
                         stop_loss_algo_id=trade.protective_algo_id,
                     )

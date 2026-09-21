@@ -4092,6 +4092,7 @@ class StrategyEngine:
         trade_instrument: Instrument,
         position: FilledPosition,
         initial_stop_loss: Decimal,
+        current_stop_loss: Decimal | None = None,
         stop_loss_algo_cl_ord_id: str | None,
         stop_loss_algo_id: str | None = None,
     ) -> None:
@@ -4100,7 +4101,20 @@ class StrategyEngine:
         if not algo_id_norm and not algo_cl_norm:
             raise RuntimeError("动态止盈模式缺少 OKX 止损委托标识（algoId 或 algoClOrdId），无法继续动态上移。")
 
-        current_stop_loss = initial_stop_loss
+        direction: Literal["long", "short"] = "long" if position.side == "buy" else "short"
+        initial_stop_loss = Decimal(str(initial_stop_loss))
+        recovered_stop_loss = current_stop_loss
+        if recovered_stop_loss is None:
+            effective_current_stop_loss = initial_stop_loss
+        else:
+            recovered_stop_loss = Decimal(str(recovered_stop_loss))
+            # 恢复接管时，OKX 当前保护价是权威值；同时做方向性夹紧，避免历史缓存把保护价恢复到初始止损之外。
+            effective_current_stop_loss = (
+                max(initial_stop_loss, recovered_stop_loss)
+                if direction == "long"
+                else min(initial_stop_loss, recovered_stop_loss)
+            )
+        current_stop_loss = effective_current_stop_loss
         next_trigger_r = _live_dynamic_initial_trigger_r(config)
         amend_failures = 0
         consecutive_read_failures = 0
@@ -4132,6 +4146,7 @@ class StrategyEngine:
             ref_label,
             f"触发价格类型={config.tp_sl_trigger_type}",
             f"初始止损={format_decimal(initial_stop_loss)}",
+            f"恢复当前止损={format_decimal(current_stop_loss)}",
             _live_dynamic_break_even_summary(config),
             f"下一次上移阶段={next_trigger_r}R",
             f"下一次上移触发价={next_trigger_price_text}",
@@ -4214,6 +4229,7 @@ class StrategyEngine:
         trade_instrument: Instrument,
         position: FilledPosition,
         initial_stop_loss: Decimal,
+        current_stop_loss: Decimal | None = None,
         stop_loss_algo_id: str | None,
         stop_loss_algo_cl_ord_id: str | None,
     ) -> None:
@@ -4230,6 +4246,7 @@ class StrategyEngine:
             trade_instrument=trade_instrument,
             position=position,
             initial_stop_loss=initial_stop_loss,
+            current_stop_loss=current_stop_loss,
             stop_loss_algo_cl_ord_id=(stop_loss_algo_cl_ord_id or "").strip() or None,
             stop_loss_algo_id=(stop_loss_algo_id or "").strip() or None,
         )
