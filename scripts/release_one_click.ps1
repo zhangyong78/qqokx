@@ -92,7 +92,7 @@ function Get-CurrentVersion {
 }
 
 function Format-Version([version]$v) {
-    return "{0}.{1}.{2:000}" -f $v.Major, $v.Minor, $v.Build
+    return "{0}.{1}.{2:00}" -f $v.Major, $v.Minor, $v.Build
 }
 
 function Get-NextVersion([version]$current, [string]$bump) {
