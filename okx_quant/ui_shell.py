@@ -6824,7 +6824,9 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
                 variable=event_mode_var,
                 command=lambda target_key=key: self._set_account_equity_curve_event_mode(target_key),
             ).grid(row=0, column=5 + index, padx=(0, 5) if index < 2 else (0, 0))
-        timeframe_var = StringVar(value="1h")
+        # Daily candles are the most readable default for the account-level
+        # equity curve; users can still switch to 1H/4H/折线 after opening.
+        timeframe_var = StringVar(value="day")
         ttk.Label(tools, text="周期").grid(row=0, column=8, padx=(12, 3))
         for index, (label, value) in enumerate((("1H", "1h"), ("4H", "4h"), ("日线", "day"), ("折线", "line"))):
             ttk.Radiobutton(
