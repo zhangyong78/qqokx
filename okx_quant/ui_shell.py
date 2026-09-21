@@ -1184,6 +1184,7 @@ class StrategySession:
     semi_auto_mode: str = ""
     email_notifications_enabled: bool = True
     strategy_group_id: str = ""
+    runtime_state: dict[str, object] = field(default_factory=dict)
     pause_after_cleanup: bool = False
     market_condition_paused: bool = False
     market_condition_last_allowed: bool | None = None
@@ -1348,6 +1349,7 @@ class RecoverableStrategySessionRecord:
     log_file_path: Path | None = None
     recovery_root_dir: Path | None = None
     config_snapshot: dict[str, object] = field(default_factory=dict)
+    runtime_state: dict[str, object] = field(default_factory=dict)
     updated_at: datetime | None = None
 
 

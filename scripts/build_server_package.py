@@ -236,6 +236,10 @@ def build_package(version: str) -> tuple[Path, Path]:
             "- Preferred: keep the same sibling `qqokx_data/` and replace only the code package\n"
             "- Or copy the whole `qqokx_data/` directory to the new machine / new version\n"
             "- Enhanced live strategy sessions can be resumed from the preserved data directory after restart\n"
+            f"- v{APP_VERSION}+ also persists each strategy wave, direction, and per-wave entry count for upgrade continuity\n"
+            "- If the old session has no usable continuity state, recovery is conservative and will not chase an old signal\n"
+            "- In that fallback case, after confirming the position is flat and no entry order remains, stop and start the strategy manually with current-wave chase enabled\n"
+            "- Upgrade active strategies gracefully; avoid closing the console window while strategies are running\n"
         ),
     )
 

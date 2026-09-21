@@ -1,6 +1,7 @@
 ﻿from __future__ import annotations
 
 import json
+import re
 import time
 from dataclasses import replace
 from datetime import datetime, timedelta
@@ -9808,6 +9809,7 @@ class UiStrategySessionsMixin:
             log_file_path=_coerce_log_file_path(payload.get("log_file_path")),
             recovery_root_dir=recovery_root_dir,
             config_snapshot=dict(config_snapshot) if isinstance(config_snapshot, dict) else {},
+            runtime_state=dict(payload.get("runtime_state", {})) if isinstance(payload.get("runtime_state"), dict) else {},
             updated_at=_parse_datetime_snapshot(payload.get("updated_at")),
         )
 
@@ -9826,6 +9828,7 @@ class UiStrategySessionsMixin:
             "log_file_path": str(record.log_file_path) if record.log_file_path is not None else "",
             "recovery_root_dir": str(record.recovery_root_dir) if record.recovery_root_dir is not None else "",
             "config_snapshot": dict(record.config_snapshot),
+            "runtime_state": dict(record.runtime_state),
             "updated_at": record.updated_at.isoformat(timespec="seconds") if record.updated_at is not None else None,
         }
 
@@ -10056,6 +10059,7 @@ class UiStrategySessionsMixin:
             return session.active_trade
         self._clear_session_manual_management_state(session)
         session.active_trade = None
+        session.runtime_state = {}
         for line in lines:
             text = str(line or "").strip()
             if not text:
@@ -10253,6 +10257,7 @@ class UiStrategySessionsMixin:
             log_file_path=_coerce_log_file_path(session.log_file_path),
             recovery_root_dir=recovery_root_dir,
             config_snapshot=_serialize_strategy_config_snapshot(session.config),
+            runtime_state=dict(getattr(session, "runtime_state", {}) or {}),
             updated_at=datetime.now(),
         )
 
@@ -10316,6 +10321,7 @@ class UiStrategySessionsMixin:
                 runtime_status="待恢复",
                 recovery_root_dir=record.recovery_root_dir,
                 recovery_supported=self._strategy_session_supports_recovery(config),
+                runtime_state=dict(record.runtime_state),
                 strategy_group_id=(
                     getattr(
                         getattr(self, "_strategy_history_by_id", {}).get(record.history_record_id),
@@ -10564,6 +10570,106 @@ class UiStrategySessionsMixin:
         )
 
     @staticmethod
+    def _update_session_continuity_state(
+        session: StrategySession,
+        message: str,
+        *,
+        observed_at: datetime,
+    ) -> None:
+        """Track the minimum wave state needed for a safe upgrade resume."""
+        text = str(message or "")
+        state = getattr(session, "runtime_state", None)
+        if not isinstance(state, dict):
+            state = {}
+            session.runtime_state = state
+
+        def mark_updated() -> None:
+            state["schema"] = 1
+            state["updated_at"] = observed_at.isoformat(timespec="seconds")
+
+        wave_start = re.search(r"第\s*(\d+)\s*波趋势开始\s*\|\s*方向=(LONG|SHORT)", text, re.IGNORECASE)
+        if wave_start:
+            state.update(
+                {
+                    "wave_index": int(wave_start.group(1)),
+                    "wave_signal": wave_start.group(2).lower(),
+                    "entries_in_wave": 0,
+                    "entries_known": True,
+                    "pending_entry_sequence": 0,
+                    "continuity_ready": True,
+                }
+            )
+            mark_updated()
+            return
+
+        pending = re.search(
+            r"第\s*(\d+)\s*波\s*\|\s*本波第\s*(\d+)\s*次(?:委托|信号)",
+            text,
+            re.IGNORECASE,
+        )
+        if pending:
+            direction_match = re.search(r"(?:方向|信号方向)\s*=\s*(LONG|SHORT)", text, re.IGNORECASE)
+            normalized_direction = direction_match.group(1).strip().lower() if direction_match else ""
+            if normalized_direction in {"long", "short"}:
+                state["wave_signal"] = normalized_direction
+            state["wave_index"] = int(pending.group(1))
+            sequence = int(pending.group(2))
+            state["entries_in_wave"] = max(int(state.get("entries_in_wave", 0) or 0), sequence - 1)
+            state["entries_known"] = True
+            state["pending_entry_sequence"] = sequence
+            state["continuity_ready"] = bool(state.get("wave_signal"))
+            mark_updated()
+
+        capped = re.search(
+            r"第\s*(\d+)\s*波趋势(?:开仓次数|信号次数)已达上限.*?上限=(\d+)",
+            text,
+            re.IGNORECASE,
+        )
+        if capped:
+            state["wave_index"] = int(capped.group(1))
+            state["entries_in_wave"] = int(capped.group(2))
+            state["entries_known"] = True
+            state["pending_entry_sequence"] = 0
+            state["continuity_ready"] = bool(state.get("wave_signal"))
+            mark_updated()
+
+        if "挂单已成交" in text or "恢复中的挂单已成交" in text or "本地下单成交" in text:
+            pending_sequence = int(state.get("pending_entry_sequence", 0) or 0)
+            if pending_sequence > 0:
+                state["entries_in_wave"] = max(
+                    int(state.get("entries_in_wave", 0) or 0),
+                    pending_sequence,
+                )
+                state["pending_entry_sequence"] = 0
+                state["entries_known"] = True
+                state["continuity_ready"] = bool(state.get("wave_signal"))
+                mark_updated()
+
+        if "启动默认不追老信号" in text or "启动追单窗口已过期，当前不追单" in text:
+            direction_match = re.search(r"(?:方向|信号方向)\s*=\s*(LONG|SHORT)", text, re.IGNORECASE)
+            normalized_direction = direction_match.group(1).strip().lower() if direction_match else ""
+            if normalized_direction in {"long", "short"}:
+                state["wave_signal"] = normalized_direction
+            state["entries_known"] = False
+            state["continuity_ready"] = False
+            state["pending_entry_sequence"] = 0
+            mark_updated()
+
+        no_signal_markers = (
+            "当前无法生成动态开仓价",
+            "当前无动态委托信号",
+            "当前无开空信号",
+            "当前无开多信号",
+        )
+        if any(marker in text for marker in no_signal_markers):
+            state["wave_signal"] = ""
+            state["entries_in_wave"] = 0
+            state["entries_known"] = True
+            state["pending_entry_sequence"] = 0
+            state["continuity_ready"] = False
+            mark_updated()
+
+    @staticmethod
     def _pending_order_state_label(pending_state: str) -> str:
         normalized = str(pending_state or "").strip().lower()
         mapping = {
@@ -10597,7 +10703,10 @@ class UiStrategySessionsMixin:
 
     @staticmethod
     def _recovery_main_loop_config(session):
-        """Recovered sessions never chase the already-confirmed signal."""
+        """Use the persisted wave state when it is known; stay conservative otherwise."""
+        runtime_state = dict(getattr(session, "runtime_state", {}) or {})
+        if bool(runtime_state.get("continuity_ready")):
+            return session.config
         return replace(
             session.config,
             startup_chase_current_signal=False,
@@ -10655,6 +10764,14 @@ class UiStrategySessionsMixin:
         self._upsert_session_row(session)
         self._sync_strategy_history_from_session(session)
         try:
+            set_recovery_state = getattr(session.engine, "set_recovery_runtime_state", None)
+            if callable(set_recovery_state):
+                set_recovery_state(session.runtime_state)
+            if not bool((session.runtime_state or {}).get("continuity_ready")):
+                session.engine._logger(
+                    "升级连续状态不可用，已采用保守恢复：不追当前老信号；"
+                    "如需接当前波段，请确认空仓且无挂单后手动停止并重新启动并选择追当前信号。"
+                )
             session.engine.start_custom(
                 _run_signal_recovery,
                 thread_name=f"okx-{session.config.strategy_id}-recover-signal",
@@ -10856,6 +10973,9 @@ class UiStrategySessionsMixin:
                         _monitor_pending()
                         if not session.engine._stop_event.is_set():
                             continue_main_loop = True
+                            set_recovery_state = getattr(session.engine, "set_recovery_runtime_state", None)
+                            if callable(set_recovery_state):
+                                set_recovery_state(session.runtime_state)
                             self.root.after(
                                 0,
                                 lambda: _mark_recovery_back_to_running(
@@ -11349,6 +11469,7 @@ class UiStrategySessionsMixin:
         observed_at: datetime,
         allow_reconciliation: bool = True,
     ) -> None:
+        self._update_session_continuity_state(session, message, observed_at=observed_at)
         signal_bar_at = _extract_session_bar_time(message)
         if "准备挂单" in message:
             trade = self._ensure_session_trade_runtime(session, observed_at=observed_at, signal_bar_at=signal_bar_at)

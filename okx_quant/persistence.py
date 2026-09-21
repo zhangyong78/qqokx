@@ -1673,6 +1673,8 @@ def _normalize_recoverable_strategy_session_record(item: object) -> dict[str, ob
     recovery_root_dir = str(item.get("recovery_root_dir", "")).strip()
     raw_config_snapshot = item.get("config_snapshot")
     config_snapshot = raw_config_snapshot if isinstance(raw_config_snapshot, dict) else {}
+    raw_runtime_state = item.get("runtime_state")
+    runtime_state = raw_runtime_state if isinstance(raw_runtime_state, dict) else {}
     if not session_id or not strategy_id or not strategy_name or not started_at or not recovery_root_dir:
         return None
     updated_at = str(item.get("updated_at", "")).strip()
@@ -1689,6 +1691,7 @@ def _normalize_recoverable_strategy_session_record(item: object) -> dict[str, ob
         "log_file_path": str(item.get("log_file_path", "")).strip(),
         "recovery_root_dir": recovery_root_dir,
         "config_snapshot": config_snapshot,
+        "runtime_state": runtime_state,
         "updated_at": updated_at or None,
     }
 

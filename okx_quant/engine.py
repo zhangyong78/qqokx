@@ -84,6 +84,14 @@ _HOUR_MS = 3_600_000
 EXCHANGE_DYNAMIC_STOP_MAX_CACHED_TICKER_AGE_SECONDS = 3.0
 
 
+def _coerce_nonnegative_int(value: object) -> int:
+    """Read persisted counters defensively so a damaged snapshot cannot stop recovery."""
+    try:
+        return max(int(value or 0), 0)
+    except (TypeError, ValueError):
+        return 0
+
+
 def _live_dynamic_take_profit_enabled(config: StrategyConfig) -> bool:
     """与回测一致：EMA 动态委托与 EMA 突破/跌破在 take_profit_mode=dynamic 时启用动态止盈逻辑。"""
     if str(config.take_profit_mode or "") != "dynamic":
@@ -497,6 +505,7 @@ class StrategyEngine:
         self._order_ref_counter = 0
         self._manual_trade_control = ManualTradeControlState()
         self._manual_close_reentry_pending = False
+        self._recovery_runtime_state: dict[str, object] = {}
         self._ema55_slope_same_bar_reentry_block_ts: dict[tuple[str, str, str, str], int] = {}
         self._session_runner = EngineSessionRunner(self)
         self._strategy_router = EngineStrategyRouter(self)
@@ -525,6 +534,17 @@ class StrategyEngine:
 
     def start_custom(self, target: Callable[[], None], *, thread_name: str) -> None:
         self._session_runner.start_custom(target, thread_name=thread_name)
+
+    def set_recovery_runtime_state(self, runtime_state: dict[str, object] | None) -> None:
+        """Seed one controlled upgrade recovery with persisted wave state."""
+        with self._lock:
+            self._recovery_runtime_state = dict(runtime_state or {})
+
+    def _consume_recovery_runtime_state(self) -> dict[str, object]:
+        with self._lock:
+            state = dict(self._recovery_runtime_state)
+            self._recovery_runtime_state = {}
+        return state
 
     def stop(self) -> None:
         self._session_runner.stop()
@@ -970,13 +990,19 @@ class StrategyEngine:
         idle_signal_candle_ts: int | None = None
         dynamic_stop_only = config.take_profit_mode == "dynamic"
         trader_virtual_stop_loss_enabled = config.trader_virtual_stop_loss
-        current_wave_signal: Literal["long", "short"] | None = None
-        entries_in_current_wave = 0
-        current_wave_index = 0
+        recovery_state = self._consume_recovery_runtime_state()
+        recovered_signal = str(recovery_state.get("wave_signal", "") or "").strip().lower()
+        current_wave_signal: Literal["long", "short"] | None = (
+            recovered_signal if recovered_signal in {"long", "short"} else None
+        )
+        entries_in_current_wave = _coerce_nonnegative_int(recovery_state.get("entries_in_wave", 0))
+        current_wave_index = _coerce_nonnegative_int(recovery_state.get("wave_index", 0))
+        continuity_recovery = bool(recovery_state.get("continuity_ready")) and current_wave_signal is not None
         startup_gate = StartupSignalGateState(
             started_at_ms=int(time.time() * 1000),
             chase_window_seconds=config.resolved_startup_chase_window_seconds(),
             chase_current_signal=config.startup_chase_current_signal,
+            startup_gate_enabled=not continuity_recovery,
         )
 
         self._log_strategy_start(config, instrument, instrument)
@@ -1022,6 +1048,12 @@ class StrategyEngine:
                 "初始仅在 OKX 挂止损"
             )
         self._logger(f"指标回看数量：{lookback} 根 K 线")
+        if continuity_recovery:
+            self._logger(
+                f"升级连续恢复 | 当前波段={current_wave_signal.upper()} | "
+                f"本波已开仓={entries_in_current_wave}/{config.max_entries_per_trend or '不限'} | "
+                "恢复原波段计数，不重新追老信号"
+            )
 
         self._log_hourly_debug(
             config.inst_id,
@@ -2548,13 +2580,19 @@ class StrategyEngine:
         last_candle_ts: int | None = None
         active_trigger: LocalSignalTrigger | None = None
         idle_signal_candle_ts: int | None = None
-        current_wave_signal: Literal["long", "short"] | None = None
-        entries_in_current_wave = 0
-        current_wave_index = 0
+        recovery_state = self._consume_recovery_runtime_state()
+        recovered_signal = str(recovery_state.get("wave_signal", "") or "").strip().lower()
+        current_wave_signal: Literal["long", "short"] | None = (
+            recovered_signal if recovered_signal in {"long", "short"} else None
+        )
+        entries_in_current_wave = _coerce_nonnegative_int(recovery_state.get("entries_in_wave", 0))
+        current_wave_index = _coerce_nonnegative_int(recovery_state.get("wave_index", 0))
+        continuity_recovery = bool(recovery_state.get("continuity_ready")) and current_wave_signal is not None
         startup_gate = StartupSignalGateState(
             started_at_ms=int(time.time() * 1000),
             chase_window_seconds=config.resolved_startup_chase_window_seconds(),
             chase_current_signal=config.startup_chase_current_signal,
+            startup_gate_enabled=not continuity_recovery,
         )
 
         self._log_strategy_start(config, signal_instrument, trade_instrument)
@@ -2587,6 +2625,12 @@ class StrategyEngine:
             trend_ema_period=config.trend_ema_period,
             entry_reference_ema_period=entry_reference_ema_period,
         )
+        if continuity_recovery:
+            self._logger(
+                f"升级连续恢复 | 当前波段={current_wave_signal.upper()} | "
+                f"本波已开仓={entries_in_current_wave}/{config.max_entries_per_trend or '不限'} | "
+                "恢复原波段计数，不重新追老信号"
+            )
 
         while not self._stop_event.is_set():
             candles = self._get_candles_with_retry(config.inst_id, config.bar, limit=lookback)
