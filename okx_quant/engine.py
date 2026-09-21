@@ -451,6 +451,9 @@ class StartupSignalGateState:
     chase_window_seconds: int
     chase_current_signal: bool = False
     blocked_signal: Literal["long", "short"] | None = None
+    # The startup-only gate must not continue blocking normal re-entry after
+    # an in-run manual close has been confirmed.
+    startup_gate_enabled: bool = True
 
 
 @dataclass(frozen=True)
@@ -493,6 +496,7 @@ class StrategyEngine:
         self._lock = threading.Lock()
         self._order_ref_counter = 0
         self._manual_trade_control = ManualTradeControlState()
+        self._manual_close_reentry_pending = False
         self._ema55_slope_same_bar_reentry_block_ts: dict[tuple[str, str, str, str], int] = {}
         self._session_runner = EngineSessionRunner(self)
         self._strategy_router = EngineStrategyRouter(self)
@@ -570,14 +574,34 @@ class StrategyEngine:
             updated_at_ms=int(time.time() * 1000),
         )
         with self._lock:
+            self._manual_close_reentry_pending = False
             self._manual_trade_control = state
         return state
 
     def resume_automatic_trade_management(self) -> ManualTradeControlState:
+        with self._lock:
+            previous = self._manual_trade_control
+            if previous.manual_reason == "manual_flatten":
+                self._manual_close_reentry_pending = True
         state = ManualTradeControlState(updated_at_ms=int(time.time() * 1000))
         with self._lock:
             self._manual_trade_control = state
         return state
+
+    def consume_manual_close_reentry_request(self) -> bool:
+        """Consume the one-shot signal-gate release after a confirmed manual close."""
+        with self._lock:
+            pending = self._manual_close_reentry_pending
+            self._manual_close_reentry_pending = False
+        return pending
+
+    def _release_startup_signal_gate_after_manual_close(self, gate_state: StartupSignalGateState) -> bool:
+        if not self.consume_manual_close_reentry_request():
+            return False
+        gate_state.startup_gate_enabled = False
+        gate_state.blocked_signal = None
+        self._logger("人工平仓已确认 | 已解除启动信号门禁 | 后续按当前策略规则重新评估信号")
+        return True
 
     def _ema55_slope_same_bar_reentry_key(self, credentials: Credentials, config: StrategyConfig) -> tuple[str, str, str, str]:
         return (
@@ -1044,6 +1068,7 @@ class StrategyEngine:
                         newest_ts=newest_ts,
                         dynamic_stop_only=dynamic_stop_only,
                     )
+                    self._release_startup_signal_gate_after_manual_close(startup_gate)
                     # After a round-trip closes on the current confirmed candle,
                     # do not immediately re-place another entry from the same
                     # candle's reference price. Wait for the next confirmed bar.
@@ -1071,6 +1096,7 @@ class StrategyEngine:
                     if not partial_managed:
                         self._stop_event.wait(config.poll_seconds)
                         continue
+                    self._release_startup_signal_gate_after_manual_close(startup_gate)
                     entries_in_current_wave += 1
                     if self._stop_event.is_set():
                         return
@@ -1113,6 +1139,7 @@ class StrategyEngine:
                         newest_ts=newest_ts,
                         dynamic_stop_only=dynamic_stop_only,
                     )
+                    self._release_startup_signal_gate_after_manual_close(startup_gate)
                     if self._stop_event.is_set():
                         return
                     self._log_dynamic_position_closed(active_order)
@@ -1140,6 +1167,7 @@ class StrategyEngine:
                     if not partial_managed:
                         self._stop_event.wait(config.poll_seconds)
                         continue
+                    self._release_startup_signal_gate_after_manual_close(startup_gate)
                     entries_in_current_wave += 1
                     if self._stop_event.is_set():
                         return
@@ -7572,6 +7600,8 @@ def _should_skip_startup_signal(
     candle_ts: int,
     bar: str,
 ) -> tuple[bool, str | None]:
+    if not gate_state.startup_gate_enabled:
+        return False, None
     if gate_state.blocked_signal is not None and gate_state.blocked_signal != signal:
         gate_state.blocked_signal = None
 

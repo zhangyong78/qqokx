@@ -1812,6 +1812,33 @@ class StrategyEngineTest(TestCase):
         self.assertIn("启动追当前信号，本次接管当前波段", message or "")
         self.assertIsNone(gate.blocked_signal)
 
+    def test_startup_signal_gate_is_disabled_for_normal_reentry_after_manual_close(self) -> None:
+        gate = StartupSignalGateState(
+            started_at_ms=180_000,
+            chase_window_seconds=0,
+            blocked_signal="long",
+            startup_gate_enabled=False,
+        )
+
+        should_skip, message = _should_skip_startup_signal(
+            gate,
+            signal="long",
+            candle_ts=60_000,
+            bar="1m",
+        )
+
+        self.assertFalse(should_skip)
+        self.assertIsNone(message)
+
+    def test_manual_close_reentry_request_is_one_shot(self) -> None:
+        engine = StrategyEngine(object(), lambda *_: None)
+
+        engine.mark_manual_flatten()
+        engine.resume_automatic_trade_management()
+
+        self.assertTrue(engine.consume_manual_close_reentry_request())
+        self.assertFalse(engine.consume_manual_close_reentry_request())
+
     def test_startup_takeover_skips_when_current_price_has_crossed_stop(self) -> None:
         messages: list[str] = []
         gate = StartupSignalGateState(
