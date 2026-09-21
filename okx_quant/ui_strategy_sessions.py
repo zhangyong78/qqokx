@@ -505,6 +505,7 @@ class UiStrategySessionsMixin:
             "strategy",
             "mode",
             "symbol",
+            "market_price",
             "bar",
             "direction",
             "risk_amount",
@@ -531,6 +532,7 @@ class UiStrategySessionsMixin:
             "strategy",
             "mode",
             "symbol",
+            "market_price",
             "bar",
             "direction",
             "risk_amount",
@@ -560,6 +562,7 @@ class UiStrategySessionsMixin:
             "strategy": "策略",
             "mode": "模式",
             "symbol": "标的(双击K线)",
+            "market_price": "实时价格",
             "bar": "周期",
             "direction": "方向",
             "risk_amount": "风险金",
@@ -680,6 +683,37 @@ class UiStrategySessionsMixin:
         if value is None:
             value = trade.pending_stop_price
         return _format_optional_decimal(value)
+
+    def _session_runtime_market_price_text(self, session: StrategySession) -> str:
+        trade_inst_id = _session_trade_inst_id(session)
+        if not trade_inst_id:
+            return "-"
+        config = getattr(session, "config", None)
+        snapshot_provider = getattr(self, "_positions_snapshot_for_session", None)
+        snapshot = snapshot_provider(session) if callable(snapshot_provider) else None
+        expected_sides = _session_expected_position_sides(session)
+        if snapshot is not None:
+            for position in getattr(snapshot, "positions", ()):
+                if _position_matches_session_live_pnl(
+                    position,
+                    trade_inst_id=trade_inst_id,
+                    expected_sides=expected_sides,
+                ):
+                    price = getattr(position, "mark_price", None) or getattr(position, "last_price", None)
+                    if price is not None and price > 0:
+                        return _format_optional_decimal(price)
+            prices = dict(getattr(snapshot, "market_prices", {}) or {})
+            snapshot_price = prices.get(trade_inst_id)
+            if snapshot_price is not None and snapshot_price > 0:
+                return _format_optional_decimal(snapshot_price)
+        cache = getattr(self, "_running_session_market_price_cache", {})
+        cache_key = (
+            str(getattr(session, "api_name", "") or "").strip(),
+            str(getattr(config, "environment", "") or "").strip().lower(),
+            trade_inst_id,
+        )
+        cached = cache.get(cache_key) if isinstance(cache, dict) else None
+        return _format_optional_decimal(cached[0] if isinstance(cached, tuple) and cached else None)
 
     def _session_runtime_next_stop_move_price_text(self, session: StrategySession) -> str:
         """Return the next dynamic-stop trigger price for the active trade."""
@@ -842,6 +876,19 @@ class UiStrategySessionsMixin:
         ):
             return None
         return (stop_price - entry_price) * amount * Decimal(direction_sign)
+
+    @staticmethod
+    def _session_runtime_risk_price_distance(session: StrategySession) -> Decimal | None:
+        """Return the one-R price distance, independent of position size."""
+        trade = getattr(session, "active_trade", None)
+        if trade is None:
+            return None
+        entry_price = trade.entry_price or trade.pending_entry_reference
+        stop_price = trade.initial_stop_price or trade.pending_stop_price or trade.current_stop_price
+        if entry_price is None or stop_price is None or entry_price <= 0 or stop_price <= 0:
+            return None
+        distance = abs(entry_price - stop_price)
+        return distance if distance > 0 else None
 
     @staticmethod
     def _session_runtime_r_text(value: Decimal | None, risk_basis: Decimal | None) -> str:
@@ -8540,7 +8587,9 @@ class UiStrategySessionsMixin:
         runtime_risk_basis = None
         if getattr(session, "active_trade", None) is not None:
             runtime_risk_basis = UiStrategySessionsMixin._session_runtime_risk_basis_usdt(self, session)
-        current_r_text = _format_optional_decimal(runtime_risk_basis)
+        current_r_text = _format_optional_decimal(
+            UiStrategySessionsMixin._session_runtime_risk_price_distance(session)
+        )
         live_pnl_risk_basis = runtime_risk_basis if live_pnl is not None else None
         values = (
             session.session_id,
@@ -8552,6 +8601,11 @@ class UiStrategySessionsMixin:
             session.strategy_name,
             session.run_mode_label,
             session.symbol,
+            (
+                self._session_runtime_market_price_text(session)
+                if callable(getattr(self, "_session_runtime_market_price_text", None))
+                else "-"
+            ),
             bar_label,
             _normalize_strategy_direction_label(
                 getattr(session, "strategy_id", getattr(getattr(session, "config", None), "strategy_id", "")),

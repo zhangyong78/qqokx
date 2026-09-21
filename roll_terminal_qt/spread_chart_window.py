@@ -35,6 +35,12 @@ CHART_BAR_OPTIONS: tuple[tuple[str, str], ...] = (
     ("4小时", "4H"),
 )
 
+_BAR_INTERVAL_MS = {
+    "15m": 15 * 60 * 1000,
+    "1H": 60 * 60 * 1000,
+    "4H": 4 * 60 * 60 * 1000,
+}
+
 
 def _aligned_spread_candles(left_candles: list[Candle], right_candles: list[Candle]) -> list[Candle]:
     left_by_ts = {item.ts: item for item in left_candles}
@@ -71,6 +77,68 @@ def _aligned_spread_candles(left_candles: list[Candle], right_candles: list[Cand
     return spread
 
 
+def _load_pair_candles(
+    client: OkxRestClient,
+    left_inst_id: str,
+    right_inst_id: str,
+    bar: str,
+    limit: int,
+) -> tuple[list[Candle], list[Candle]]:
+    """Load both legs from a common time window, including expired futures."""
+    left = client.get_candles_history(left_inst_id, bar, limit=limit)
+    right = client.get_candles_history(right_inst_id, bar, limit=limit)
+    if not left or not right:
+        return left, right
+    if {item.ts for item in left} & {item.ts for item in right}:
+        return left, right
+
+    interval_ms = _BAR_INTERVAL_MS.get(bar)
+    if interval_ms is None:
+        return left, right
+
+    left_start, left_end = left[0].ts, left[-1].ts
+    right_start, right_end = right[0].ts, right[-1].ts
+    if left_end < right_start:
+        end_ts = left_end
+        start_ts = max(0, end_ts - interval_ms * (limit - 1))
+        right = client.get_candles_history_range(
+            right_inst_id,
+            bar,
+            start_ts=start_ts,
+            end_ts=end_ts,
+            limit=limit,
+        )
+    elif right_end < left_start:
+        end_ts = right_end
+        start_ts = max(0, end_ts - interval_ms * (limit - 1))
+        left = client.get_candles_history_range(
+            left_inst_id,
+            bar,
+            start_ts=start_ts,
+            end_ts=end_ts,
+            limit=limit,
+        )
+    else:
+        overlap_start = max(left_start, right_start)
+        overlap_end = min(left_end, right_end)
+        if overlap_start <= overlap_end:
+            left = client.get_candles_history_range(
+                left_inst_id,
+                bar,
+                start_ts=overlap_start,
+                end_ts=overlap_end,
+                limit=limit,
+            )
+            right = client.get_candles_history_range(
+                right_inst_id,
+                bar,
+                start_ts=overlap_start,
+                end_ts=overlap_end,
+                limit=limit,
+            )
+    return left, right
+
+
 class SpreadChartLoadThread(QThread):
     loaded = Signal(str, str, str, object)
     failed = Signal(str)
@@ -83,16 +151,27 @@ class SpreadChartLoadThread(QThread):
         self._limit = max(60, limit)
 
     def run(self) -> None:
+        client = OkxRestClient()
         try:
-            client = OkxRestClient()
-            left = client.get_candles_history(self._left_inst_id, self._bar, limit=self._limit)
-            right = client.get_candles_history(self._right_inst_id, self._bar, limit=self._limit)
+            left, right = _load_pair_candles(
+                client,
+                self._left_inst_id,
+                self._right_inst_id,
+                self._bar,
+                self._limit,
+            )
+            if not left:
+                raise ValueError(f"{self._left_inst_id} 没有获取到K线。")
+            if not right:
+                raise ValueError(f"{self._right_inst_id} 没有获取到K线。")
             spread = _aligned_spread_candles(left, right)
             if not spread:
-                raise ValueError("这两个合约在当前周期没有可对齐的K线数据。")
+                raise ValueError("两条腿的历史 K 线没有共同时间范围，无法计算价差。")
             self.loaded.emit(self._left_inst_id, self._right_inst_id, self._bar, spread)
         except Exception as exc:  # noqa: BLE001
             self.failed.emit(str(exc))
+        finally:
+            client.close()
 
 
 class SpreadChartWindow(QMainWindow):

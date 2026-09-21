@@ -3895,6 +3895,13 @@ class UiPositionsMixin:
             self._position_tickers = dict(position_tickers)
         profile_name = self._positions_context_profile_name
         if profile_name:
+            previous_snapshot = self._positions_snapshot_by_profile.get(profile_name)
+            preserved_market_prices = (
+                dict(previous_snapshot.market_prices)
+                if previous_snapshot is not None
+                and str(previous_snapshot.effective_environment or "") == str(effective_environment or "")
+                else {}
+            )
             self._positions_snapshot_by_profile[profile_name] = ProfilePositionSnapshot(
                 api_name=profile_name,
                 effective_environment=effective_environment,
@@ -3904,6 +3911,7 @@ class UiPositionsMixin:
                 position_instruments=dict(
                     position_instruments if position_instruments is not None else self._position_instruments
                 ),
+                market_prices=preserved_market_prices,
                 ws_cache_note=ws_cache_note,
             )
         if profile_name and effective_environment:
@@ -4197,7 +4205,9 @@ class UiPositionsMixin:
                 forced_keys.update(targets)
 
     def _refresh_session_position_snapshots_worker(self, targets: list[tuple[str, str]]) -> None:
-        results: list[tuple[str, str, list[OkxPosition], str, dict[str, Decimal], dict[str, Instrument]]] = []
+        results: list[
+            tuple[str, str, list[OkxPosition], str, dict[str, Decimal], dict[str, Instrument], dict[str, Decimal]]
+        ] = []
         warnings: list[str] = []
         for profile_name, environment in targets:
             credentials = self._credentials_for_profile_or_none(profile_name)
@@ -4250,6 +4260,11 @@ class UiPositionsMixin:
                 pass
             if position_tickers:
                 positions = _apply_position_ticker_prices(positions, position_tickers)
+            market_prices = {
+                inst_id: price
+                for inst_id, ticker in position_tickers.items()
+                if (price := _ticker_display_price(ticker)) is not None and price > 0
+            }
             results.append(
                 (
                     profile_name,
@@ -4258,18 +4273,29 @@ class UiPositionsMixin:
                     ws_cache_note,
                     dict(upl_usdt_prices),
                     dict(position_instruments),
+                    dict(market_prices),
                 )
             )
         self.root.after(0, lambda: self._apply_session_position_snapshot_sync(results, warnings))
 
     def _apply_session_position_snapshot_sync(
         self,
-        results: list[tuple[str, str, list[OkxPosition], str, dict[str, Decimal], dict[str, Instrument]]],
+        results: list[
+            tuple[str, str, list[OkxPosition], str, dict[str, Decimal], dict[str, Instrument], dict[str, Decimal]]
+        ],
         warnings: list[str],
     ) -> None:
         self._session_positions_snapshot_refreshing = False
         refreshed_any = False
-        for profile_name, environment, positions, ws_cache_note, upl_usdt_prices, position_instruments in results:
+        for (
+            profile_name,
+            environment,
+            positions,
+            ws_cache_note,
+            upl_usdt_prices,
+            position_instruments,
+            market_prices,
+        ) in results:
             self._positions_snapshot_by_profile[profile_name] = ProfilePositionSnapshot(
                 api_name=profile_name,
                 effective_environment=environment,
@@ -4277,6 +4303,7 @@ class UiPositionsMixin:
                 upl_usdt_prices=dict(upl_usdt_prices),
                 refreshed_at=datetime.now(),
                 position_instruments=dict(position_instruments),
+                market_prices=dict(market_prices),
                 ws_cache_note=ws_cache_note,
             )
             refreshed_any = True
@@ -4319,6 +4346,83 @@ class UiPositionsMixin:
         if notes:
             return "持仓缓存 " + "；".join(notes[:3])
         return "持仓缓存待同步"
+
+    def _running_session_market_price_targets(self, *, now: datetime | None = None) -> dict[tuple[str, str], set[str]]:
+        checked_at = now or datetime.now()
+        cache = getattr(self, "_running_session_market_price_cache", {})
+        targets: dict[tuple[str, str], set[str]] = {}
+        for session in self.sessions.values():
+            if not QuantApp._session_counts_toward_running_summary(session):
+                continue
+            profile_name = str(getattr(session, "api_name", "") or "").strip()
+            environment = str(getattr(getattr(session, "config", None), "environment", "") or "").strip().lower()
+            inst_id = _session_trade_inst_id(session)
+            if not profile_name or not environment or not inst_id:
+                continue
+            cache_key = (profile_name, environment, inst_id)
+            cached = cache.get(cache_key) if isinstance(cache, dict) else None
+            if (
+                isinstance(cached, tuple)
+                and len(cached) == 2
+                and isinstance(cached[1], datetime)
+                and (checked_at - cached[1]).total_seconds() < RUNNING_SESSION_MARKET_PRICE_MAX_AGE_SECONDS
+            ):
+                continue
+            targets.setdefault((profile_name, environment), set()).add(inst_id)
+        return targets
+
+    def _schedule_running_session_market_price_sync(self) -> None:
+        targets = self._running_session_market_price_targets()
+        if not targets:
+            return
+        if getattr(self, "_running_session_market_price_refreshing", False):
+            self._running_session_market_price_refresh_requested = True
+            return
+        self._running_session_market_price_refreshing = True
+        self._running_session_market_price_refresh_requested = False
+        try:
+            threading.Thread(
+                target=self._refresh_running_session_market_price_worker,
+                args=(targets,),
+                daemon=True,
+            ).start()
+        except RuntimeError:
+            self._running_session_market_price_refreshing = False
+            self._running_session_market_price_refresh_requested = True
+
+    def _refresh_running_session_market_price_worker(
+        self,
+        targets: dict[tuple[str, str], set[str]],
+    ) -> None:
+        all_inst_ids = {inst_id for inst_ids in targets.values() for inst_id in inst_ids}
+        try:
+            prices = _build_session_market_price_map(self.client, all_inst_ids)
+        except Exception:
+            prices = {}
+        self.root.after(0, lambda: self._apply_running_session_market_prices(targets, prices))
+
+    def _apply_running_session_market_prices(
+        self,
+        targets: dict[tuple[str, str], set[str]],
+        prices: dict[str, Decimal],
+    ) -> None:
+        self._running_session_market_price_refreshing = False
+        refreshed_at = datetime.now()
+        cache = getattr(self, "_running_session_market_price_cache", None)
+        if not isinstance(cache, dict):
+            cache = {}
+            self._running_session_market_price_cache = cache
+        for (profile_name, environment), inst_ids in targets.items():
+            for inst_id in inst_ids:
+                price = prices.get(inst_id)
+                if price is not None and price > 0:
+                    cache[(profile_name, environment, inst_id)] = (price, refreshed_at)
+        for session in self.sessions.values():
+            self._upsert_session_row(session, reorder=False)
+        self._apply_running_session_tree_sort_order()
+        if getattr(self, "_running_session_market_price_refresh_requested", False):
+            self._running_session_market_price_refresh_requested = False
+            self._schedule_running_session_market_price_sync()
 
     def _refresh_session_live_pnl_cache(self) -> None:
         cache: dict[str, tuple[Decimal | None, datetime | None]] = {
@@ -4625,6 +4729,13 @@ class UiPositionsMixin:
             return session.run_mode_label or ""
         if normalized == "symbol":
             return session.symbol or ""
+        if normalized == "market_price":
+            provider = getattr(self, "_session_runtime_market_price_text", None)
+            text = provider(session) if callable(provider) else "-"
+            try:
+                return Decimal(text) if text not in {"", "-"} else Decimal("0")
+            except (InvalidOperation, ValueError):
+                return Decimal("0")
         if normalized == "bar":
             return str(getattr(getattr(session, "config", None), "bar", "") or "")
         if normalized == "direction":
@@ -4650,9 +4761,9 @@ class UiPositionsMixin:
         if normalized == "current_r":
             if getattr(session, "active_trade", None) is None:
                 return Decimal("0")
-            risk_basis_provider = getattr(self, "_session_runtime_risk_basis_usdt", None)
-            risk_basis = risk_basis_provider(session) if callable(risk_basis_provider) else None
-            return risk_basis or Decimal("0")
+            distance_provider = getattr(self, "_session_runtime_risk_price_distance", None)
+            distance = distance_provider(session) if callable(distance_provider) else None
+            return distance or Decimal("0")
         if normalized == "pnl":
             return session.net_pnl_total or Decimal("0")
         if normalized == "last_pnl":
@@ -6458,4 +6569,5 @@ class UiPositionsMixin:
     def _refresh_positions_periodic(self) -> None:
         if self.position_auto_refresh_enabled:
             self.refresh_positions()
+            self._schedule_running_session_market_price_sync()
         self.root.after(self._position_refresh_interval_ms(), self._refresh_positions_periodic)

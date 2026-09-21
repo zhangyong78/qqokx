@@ -800,6 +800,7 @@ POSITION_REFRESH_INTERVAL_OPTIONS = {
 # 非前台 API 只承担运行中策略的仓位展示核对。保持低频，避免把
 # 500ms 的界面状态刷新循环放大成账户 REST 轮询。
 RUNNING_SESSION_POSITION_SNAPSHOT_MAX_AGE_SECONDS = 60
+RUNNING_SESSION_MARKET_PRICE_MAX_AGE_SECONDS = 15
 REFRESH_STALE_FAILURE_THRESHOLD = 3
 REFRESH_BADGE_PALETTES = {
     "idle": {"bg": "#f3f4f6", "fg": "#4b5563"},
@@ -1006,6 +1007,7 @@ class ProfilePositionSnapshot:
     upl_usdt_prices: dict[str, Decimal]
     refreshed_at: datetime
     position_instruments: dict[str, Instrument] = field(default_factory=dict)
+    market_prices: dict[str, Decimal] = field(default_factory=dict)
     ws_cache_note: str = ""
 
 
@@ -4014,6 +4016,9 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         self._strategy_book_tree_hover_tip_column = ""
         self._positions_snapshot_by_profile: dict[str, ProfilePositionSnapshot] = {}
         self._session_live_pnl_cache: dict[str, tuple[Decimal | None, datetime | None]] = {}
+        self._running_session_market_price_cache: dict[tuple[str, str, str], tuple[Decimal, datetime]] = {}
+        self._running_session_market_price_refreshing = False
+        self._running_session_market_price_refresh_requested = False
         self._market_condition_scheduler_job: str | None = None
         self._market_condition_scheduler_inflight: set[str] = set()
 
@@ -5474,6 +5479,7 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
                 "strategy",
                 "mode",
                 "symbol",
+                "market_price",
                 "bar",
                 "direction",
                 "risk_amount",
@@ -5502,6 +5508,7 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         self.session_tree.heading("strategy", text="策略")
         self.session_tree.heading("mode", text="模式")
         self.session_tree.heading("symbol", text="标的(双击K线)")
+        self.session_tree.heading("market_price", text="实时价格")
         self.session_tree.heading("bar", text="周期")
         self.session_tree.heading("direction", text="方向")
         self.session_tree.heading("risk_amount", text="风险金")
@@ -5527,6 +5534,7 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         self.session_tree.column("strategy", width=108, anchor="w")
         self.session_tree.column("mode", width=88, anchor="center")
         self.session_tree.column("symbol", width=132, anchor="w")
+        self.session_tree.column("market_price", width=92, anchor="e")
         self.session_tree.column("bar", width=54, anchor="center")
         self.session_tree.column("direction", width=64, anchor="center")
         self.session_tree.column("risk_amount", width=72, anchor="e")
@@ -8605,6 +8613,12 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
             except ValueError:
                 insert_at = len(normalized_running_columns)
             normalized_running_columns.insert(insert_at, "next_stop_price")
+        if normalized_running_columns and "market_price" not in normalized_running_columns:
+            try:
+                insert_at = normalized_running_columns.index("symbol") + 1
+            except ValueError:
+                insert_at = len(normalized_running_columns)
+            normalized_running_columns.insert(insert_at, "market_price")
         # Add the standalone current-R column for settings saved before it
         # was introduced, keeping it next to the live PnL column.
         if normalized_running_columns and "current_r" not in normalized_running_columns:
@@ -12788,6 +12802,53 @@ def _build_position_ticker_map(client: OkxRestClient, positions: list[OkxPositio
             continue
         result[inst_id] = _merge_ticker_order_book_quotes(ticker, inst_id, bid_price=bid_price, ask_price=ask_price)
     return result
+
+
+def _build_session_market_price_map(
+    client: OkxRestClient,
+    inst_ids: set[str],
+) -> dict[str, Decimal]:
+    """Read one cached-style ticker batch for the running-session price column."""
+    normalized_ids = {str(inst_id or "").strip().upper() for inst_id in inst_ids if str(inst_id or "").strip()}
+    if not normalized_ids:
+        return {}
+    grouped: dict[str, set[str]] = {}
+    for inst_id in normalized_ids:
+        grouped.setdefault(infer_inst_type(inst_id), set()).add(inst_id)
+
+    tickers: dict[str, OkxTicker] = {}
+    for inst_type, needed in grouped.items():
+        try:
+            for ticker in client.get_tickers(inst_type):
+                ticker_id = str(getattr(ticker, "inst_id", "") or "").strip().upper()
+                if ticker_id in needed:
+                    tickers[ticker_id] = ticker
+        except Exception:
+            continue
+    for inst_id in normalized_ids.difference(tickers):
+        try:
+            tickers[inst_id] = client.get_ticker(inst_id)
+        except Exception:
+            continue
+
+    prices: dict[str, Decimal] = {}
+    for inst_id, ticker in tickers.items():
+        price = _ticker_display_price(ticker)
+        if price is not None and price > 0:
+            prices[inst_id] = price
+    return prices
+
+
+def _ticker_display_price(ticker: OkxTicker | None) -> Decimal | None:
+    if ticker is None:
+        return None
+    return (
+        getattr(ticker, "mark", None)
+        or getattr(ticker, "last", None)
+        or getattr(ticker, "bid", None)
+        or getattr(ticker, "ask", None)
+        or getattr(ticker, "index", None)
+    )
 
 
 def _merge_ticker_order_book_quotes(
