@@ -5519,7 +5519,7 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         self.session_tree.heading("stop_amount", text="止损金额")
         self.session_tree.heading("take_profit", text="止盈价")
         self.session_tree.heading("live_pnl", text="实时浮盈亏")
-        self.session_tree.heading("current_r", text="1R风险额")
+        self.session_tree.heading("current_r", text="R损失空间")
         self.session_tree.heading("pnl", text="净盈亏")
         self.session_tree.heading("last_pnl", text="上次净盈亏")
         self.session_tree.heading("status", text="状态")
@@ -8598,6 +8598,36 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         normalized_running_columns = list(
             UiStrategySessionsMixin._normalize_running_session_display_columns(saved_running_columns)
         )
+        # Move the former built-in order to the approved monitoring-first
+        # layout, while preserving any user-customized subset/order.
+        legacy_default_running_columns = (
+            "session",
+            "api",
+            "account_equity",
+            "strategy",
+            "mode",
+            "symbol",
+            "market_price",
+            "bar",
+            "direction",
+            "risk_amount",
+            "open_qty",
+            "entry_price",
+            "stop_price",
+            "next_stop_price",
+            "stop_amount",
+            "take_profit",
+            "live_pnl",
+            "current_r",
+            "pnl",
+            "last_pnl",
+            "status",
+            "started",
+        )
+        if tuple(normalized_running_columns) == legacy_default_running_columns:
+            normalized_running_columns = list(
+                UiStrategySessionsMixin._running_session_default_display_columns()
+            )
         # Older settings snapshots predate the stop-amount column.  Add it
         # once during migration while still allowing the column menu to hide
         # it afterwards.
