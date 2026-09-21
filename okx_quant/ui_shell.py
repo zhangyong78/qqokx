@@ -45,6 +45,7 @@ from okx_quant.daily_trade_report import (
     build_daily_trade_report,
     daily_trade_from_strategy_ledger,
     format_report_decimal,
+    format_report_pnl_with_r,
     report_to_csv,
     report_to_html,
 )
