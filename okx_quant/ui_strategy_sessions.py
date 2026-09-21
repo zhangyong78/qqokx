@@ -28,6 +28,7 @@ from okx_quant.models import (
     normalize_dynamic_protection_rules,
 )
 from okx_quant.client_order_id import with_custom_order_id_prefix
+from okx_quant.duration_input import format_duration_cn_compact
 from okx_quant.pricing import format_decimal
 from okx_quant.strategy_parameters import (
     iter_strategy_parameter_keys,
@@ -8654,6 +8655,20 @@ class UiStrategySessionsMixin:
             return configured
         return None
 
+    @staticmethod
+    def _session_trade_detail_hold_duration(record: StrategyTradeLedgerRecord) -> str:
+        opened_at = record.opened_at
+        closed_at = record.closed_at
+        if opened_at is None or closed_at is None:
+            return "-"
+        try:
+            seconds = int((closed_at - opened_at).total_seconds())
+        except (AttributeError, TypeError, ValueError, OverflowError):
+            return "-"
+        if seconds < 0:
+            return "-"
+        return format_duration_cn_compact(seconds)
+
     def _session_trade_detail_records(
         self,
         session: StrategySession,
@@ -8736,6 +8751,7 @@ class UiStrategySessionsMixin:
                     _format_optional_decimal(record.entry_price),
                     self._session_trade_detail_size_text(session, record, instruments=instruments),
                     _format_history_datetime(record.closed_at),
+                    self._session_trade_detail_hold_duration(record),
                     _format_optional_decimal(record.exit_price),
                     _format_optional_usdt_precise(fee_total, places=2),
                     _format_optional_usdt_precise(record.funding_fee or Decimal("0"), places=2),
@@ -8937,6 +8953,7 @@ class UiStrategySessionsMixin:
                     "entry",
                     "size",
                     "closed",
+                    "holding",
                     "exit",
                     "fee",
                     "funding",
@@ -8955,6 +8972,7 @@ class UiStrategySessionsMixin:
                 "entry": "进场价格",
                 "size": "开仓数量",
                 "closed": "出场时间",
+                "holding": "持仓时间",
                 "exit": "出场价格",
                 "fee": "手续费",
                 "funding": "资金费",
@@ -8971,6 +8989,7 @@ class UiStrategySessionsMixin:
             tree.column("entry", width=102, anchor="e")
             tree.column("size", width=102, anchor="e")
             tree.column("closed", width=150, anchor="center")
+            tree.column("holding", width=110, anchor="center")
             tree.column("exit", width=102, anchor="e")
             tree.column("fee", width=90, anchor="e")
             tree.column("funding", width=90, anchor="e")
