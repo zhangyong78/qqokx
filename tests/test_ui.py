@@ -3447,7 +3447,8 @@ class StrategyDuplicateLaunchGuardTest(TestCase):
         self.assertEqual(app.session_tree.rows["S01"]["values"][9], "1H")
         self.assertEqual(app.session_tree.rows["S01"]["values"][11], "10")
         self.assertEqual(app.session_tree.rows["S01"]["values"][17], "-")
-        self.assertEqual(app.session_tree.rows["S01"]["values"][19], "+1.25")
+        self.assertEqual(app.session_tree.rows["S01"]["values"][18], "-")
+        self.assertEqual(app.session_tree.rows["S01"]["values"][20], "+1.25")
     def test_session_trader_label_prefers_trader_id_and_falls_back_to_dash(self) -> None:
         trader_session = SimpleNamespace(trader_id="T001")
         plain_session = SimpleNamespace(trader_id="")

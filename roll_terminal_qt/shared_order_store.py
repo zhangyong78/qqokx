@@ -104,6 +104,7 @@ class SharedOrderRefreshThread(QThread):
 class SharedOrderStore(QObject):
     snapshot_changed = Signal(str, str, object)
     refresh_failed = Signal(str, str, str)
+    refresh_finished = Signal(str, str)
 
     def __init__(self) -> None:
         super().__init__()
@@ -165,6 +166,10 @@ class SharedOrderStore(QObject):
         self._refresh_threads[key] = thread
         thread.start()
 
+    def is_refreshing(self, *, profile_name: str, environment: str) -> bool:
+        thread = self._refresh_threads.get(_snapshot_key(profile_name, environment))
+        return bool(thread is not None and thread.isRunning())
+
     def _apply_cached_history(self, profile_name: str, environment: str, orders: object) -> None:
         if not isinstance(orders, list):
             return
@@ -194,6 +199,7 @@ class SharedOrderStore(QObject):
         thread = self._refresh_threads.pop(key, None)
         if thread is not None:
             thread.deleteLater()
+        self.refresh_finished.emit(key[0], key[1])
 
 
 _SHARED_ORDER_STORE: SharedOrderStore | None = None

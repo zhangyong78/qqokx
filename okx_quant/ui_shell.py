@@ -53,6 +53,9 @@ from okx_quant.engine import (
     DEFAULT_DEBUG_ATR_PERIOD,
     FilledPosition,
     StrategyEngine,
+    _dynamic_next_trigger_price_text,
+    _infer_dynamic_next_trigger_r_from_stop,
+    _live_ema55_slope_dynamic_fee_offset_enabled,
     live_exchange_dynamic_take_profit_template_enabled,
     _dynamic_two_taker_fee_offset_live,
     _format_notify_size_with_unit,
@@ -5477,6 +5480,7 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
                 "open_qty",
                 "entry_price",
                 "stop_price",
+                "next_stop_price",
                 "take_profit",
                 "live_pnl",
                 "current_r",
@@ -5504,6 +5508,7 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         self.session_tree.heading("open_qty", text="开仓数量")
         self.session_tree.heading("entry_price", text="开仓价")
         self.session_tree.heading("stop_price", text="止损价")
+        self.session_tree.heading("next_stop_price", text="下次上移价")
         self.session_tree.heading("stop_amount", text="止损金额")
         self.session_tree.heading("take_profit", text="止盈价")
         self.session_tree.heading("live_pnl", text="实时浮盈亏")
@@ -5528,6 +5533,7 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         self.session_tree.column("open_qty", width=92, anchor="e")
         self.session_tree.column("entry_price", width=76, anchor="e")
         self.session_tree.column("stop_price", width=76, anchor="e")
+        self.session_tree.column("next_stop_price", width=92, anchor="e")
         self.session_tree.column("stop_amount", width=128, anchor="e")
         self.session_tree.column("take_profit", width=76, anchor="e")
         self.session_tree.column("live_pnl", width=96, anchor="e")
@@ -8593,6 +8599,12 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
             except ValueError:
                 insert_at = len(normalized_running_columns)
             normalized_running_columns.insert(insert_at, "stop_amount")
+        if normalized_running_columns and "next_stop_price" not in normalized_running_columns:
+            try:
+                insert_at = normalized_running_columns.index("stop_price") + 1
+            except ValueError:
+                insert_at = len(normalized_running_columns)
+            normalized_running_columns.insert(insert_at, "next_stop_price")
         # Add the standalone current-R column for settings saved before it
         # was introduced, keeping it next to the live PnL column.
         if normalized_running_columns and "current_r" not in normalized_running_columns:

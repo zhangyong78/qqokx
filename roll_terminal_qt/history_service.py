@@ -46,10 +46,15 @@ def load_local_position_history(
 
 
 def load_cached_order_history(profile_name: str, environment: str, limit: int) -> list[OkxTradeOrderItem]:
+    return load_local_order_history(profile_name, environment)[:limit]
+
+
+def load_local_order_history(profile_name: str, environment: str) -> list[OkxTradeOrderItem]:
+    """Load every locally cached order-history row for fill export enrichment."""
     records = load_history_cache_records("orders", profile_name, environment)
     items = [item for record in records if (item := _order_item_from_cache(record)) is not None]
     items.sort(key=lambda item: item.update_time or item.created_time or 0, reverse=True)
-    return items[:limit]
+    return items
 
 
 def merge_order_history_cache(

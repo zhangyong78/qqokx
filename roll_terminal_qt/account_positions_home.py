@@ -249,6 +249,7 @@ from roll_terminal_qt.history_service import (
     OrderHistoryFeedThread,
     PositionHistoryFeedThread,
     load_local_fill_history,
+    load_local_order_history,
     load_local_position_history_all,
 )
 from roll_terminal_qt.incremental_views import keyed_row_delta
@@ -2753,6 +2754,9 @@ class AccountPositionsHomeWidget(QWidget):
         self._position_kline_window_height = 760
         self._fill_history_fetch_limit = 100
         self._position_history_fetch_limit = 300
+        self._fill_export_sync_in_progress = False
+        self._fill_export_pending_sources: set[str] = set()
+        self._pending_position_export_mode: str | None = None
         self._position_history_last_sync_text = "-"
         self._position_history_filter_resetting = False
         self._current_order_canceling = False
@@ -3073,11 +3077,11 @@ class AccountPositionsHomeWidget(QWidget):
             self._order_history_summary_label.setText("正在同步历史委托...")
         self._order_history_feed.start()
 
-    def _start_fill_history_refresh(self, *, force_restart: bool = False) -> None:
+    def _start_fill_history_refresh(self, *, force_restart: bool = False) -> FillHistoryFeedThread | None:
         if self._runtime is None:
-            return
+            return None
         if self._fill_history_feed is not None and self._fill_history_feed.isRunning():
-            return
+            return self._fill_history_feed
         if self._fill_history_feed is not None:
             self._stop_fill_history_thread(wait_ms=0)
         generation = self._private_thread_generation
@@ -3096,12 +3100,13 @@ class AccountPositionsHomeWidget(QWidget):
         if hasattr(self, "_fill_history_summary_label"):
             self._fill_history_summary_label.setText("正在同步历史成交...")
         self._fill_history_feed.start()
+        return self._fill_history_feed
 
-    def _start_position_history_refresh(self, *, force_restart: bool = False) -> None:
+    def _start_position_history_refresh(self, *, force_restart: bool = False) -> PositionHistoryFeedThread | None:
         if self._runtime is None:
-            return
+            return None
         if self._position_history_feed is not None and self._position_history_feed.isRunning():
-            return
+            return self._position_history_feed
         if self._position_history_feed is not None:
             self._stop_position_history_thread(wait_ms=0)
         generation = self._private_thread_generation
@@ -3119,6 +3124,7 @@ class AccountPositionsHomeWidget(QWidget):
         self._position_history_feed.finished.connect(self._clear_position_history_thread)
         self._position_history_summary_label.setText("正在同步历史仓位...")
         self._position_history_feed.start()
+        return self._position_history_feed
 
     @Slot()
     def _refresh_position_history(self) -> None:
@@ -6496,10 +6502,14 @@ class AccountPositionsHomeWidget(QWidget):
         more_button = QPushButton("增加100条")
         more_button.clicked.connect(self._expand_fill_history_limit)
         top.addWidget(more_button)
-        export_button = QPushButton("导出全部本地成交")
-        export_button.setToolTip("导出本地缓存中的全部历史成交，不受当前显示数量和筛选条件限制")
-        export_button.clicked.connect(lambda _checked=False: self.export_all_local_fill_history())
-        top.addWidget(export_button)
+        self._fill_export_button = QPushButton("同步并导出复盘成交（推荐）")
+        self._fill_export_button.setToolTip(
+            "先同步最新成交，再导出本地全部真实成交；CSV 会标记部分成交后撤单并附当前持仓快照"
+        )
+        self._fill_export_button.clicked.connect(
+            lambda _checked=False: self.sync_and_export_all_local_fill_history()
+        )
+        top.addWidget(self._fill_export_button)
         layout.addLayout(top)
 
         filter_row = QGridLayout()
@@ -6573,14 +6583,21 @@ class AccountPositionsHomeWidget(QWidget):
         edit_button = QPushButton("编辑备注")
         edit_button.clicked.connect(self.edit_selected_position_history_note)
         top.addWidget(edit_button)
-        export_button = QPushButton("导出筛选结果")
-        export_button.setToolTip("导出当前筛选后的历史仓位，并附带原始数值供分析")
-        export_button.clicked.connect(lambda _checked=False: self.export_filtered_position_history())
+        export_button = QPushButton("同步并导出筛选")
+        export_button.setToolTip("先同步最新历史仓位，再导出当前筛选结果")
+        export_button.clicked.connect(
+            lambda _checked=False: self.sync_and_export_position_history(all_local=False)
+        )
+        self._position_export_filtered_button = export_button
         top.addWidget(export_button)
-        export_all_button = QPushButton("导出全部本地仓位")
-        export_all_button.setToolTip("导出本地缓存中的全部历史仓位，不受当前显示数量和筛选条件限制")
-        export_all_button.clicked.connect(lambda _checked=False: self.export_all_local_position_history())
-        top.addWidget(export_all_button)
+        self._position_export_all_button = QPushButton("同步并导出全部仓位")
+        self._position_export_all_button.setToolTip(
+            "先同步最新历史仓位，再导出本地缓存中的全部已结束仓位"
+        )
+        self._position_export_all_button.clicked.connect(
+            lambda _checked=False: self.sync_and_export_position_history(all_local=True)
+        )
+        top.addWidget(self._position_export_all_button)
         layout.addLayout(top)
 
         filter_row = QGridLayout()
@@ -7514,6 +7531,95 @@ class AccountPositionsHomeWidget(QWidget):
             )
         )
 
+    def sync_and_export_all_local_fill_history(self) -> None:
+        """Refresh recent fills first, then export the complete local fill cache."""
+        if self._fill_export_sync_in_progress:
+            return
+        if not self._ensure_runtime_ready(force_unlock=True):
+            self.export_all_local_fill_history()
+            return
+        self._fill_export_sync_in_progress = True
+        if hasattr(self, "_fill_export_button"):
+            self._fill_export_button.setEnabled(False)
+            self._fill_export_button.setText("正在同步最新成交...")
+        if hasattr(self, "_fill_history_summary_label"):
+            self._fill_history_summary_label.setText("正在同步最新成交，完成后自动打开导出窗口...")
+        self._fill_export_pending_sources = {"fills", "orders"}
+        self._start_order_history_refresh(force_restart=False)
+        shared_order_store = getattr(self, "_shared_order_store", None)
+        if shared_order_store is None or not shared_order_store.is_refreshing(
+            profile_name=str(self._last_profile_name or "").strip(),
+            environment=self._note_environment(),
+        ):
+            self._fill_export_pending_sources.discard("orders")
+        thread = self._start_fill_history_refresh(force_restart=True)
+        if thread is None:
+            self._mark_fill_export_source_finished("fills")
+            return
+        thread.finished.connect(lambda: self._mark_fill_export_source_finished("fills"))
+        if not thread.isRunning():
+            QTimer.singleShot(0, lambda: self._mark_fill_export_source_finished("fills"))
+
+    def _on_shared_order_refresh_finished_for_export(self, profile_name: str, environment: str) -> None:
+        if profile_name != str(self._last_profile_name or "").strip():
+            return
+        if environment != self._note_environment():
+            return
+        self._mark_fill_export_source_finished("orders")
+
+    def _mark_fill_export_source_finished(self, source: str) -> None:
+        if not self._fill_export_sync_in_progress:
+            return
+        self._fill_export_pending_sources.discard(source)
+        if self._fill_export_pending_sources:
+            return
+        self._fill_export_sync_in_progress = False
+        if hasattr(self, "_fill_export_button"):
+            self._fill_export_button.setEnabled(True)
+            self._fill_export_button.setText("同步并导出复盘成交（推荐）")
+        QTimer.singleShot(0, self.export_all_local_fill_history)
+
+    def sync_and_export_position_history(self, *, all_local: bool) -> None:
+        """Refresh recent closed positions before opening the CSV save dialog."""
+        if self._pending_position_export_mode is not None:
+            return
+        if not self._ensure_runtime_ready(force_unlock=True):
+            self.export_filtered_position_history(all_local=all_local)
+            return
+        self._pending_position_export_mode = "all" if all_local else "filtered"
+        for button_name in ("_position_export_filtered_button", "_position_export_all_button"):
+            button = getattr(self, button_name, None)
+            if button is not None:
+                button.setEnabled(False)
+        if hasattr(self, "_position_export_all_button"):
+            self._position_export_all_button.setText("正在同步最新仓位...")
+        if hasattr(self, "_position_history_summary_label"):
+            self._position_history_summary_label.setText("正在同步最新历史仓位，完成后自动打开导出窗口...")
+        thread = self._start_position_history_refresh(force_restart=True)
+        if thread is None:
+            self._finish_position_export_sync()
+            return
+        thread.finished.connect(self._finish_position_export_sync)
+        if not thread.isRunning():
+            QTimer.singleShot(0, self._finish_position_export_sync)
+
+    @Slot()
+    def _finish_position_export_sync(self) -> None:
+        mode = self._pending_position_export_mode
+        if mode is None:
+            return
+        self._pending_position_export_mode = None
+        for button_name in ("_position_export_filtered_button", "_position_export_all_button"):
+            button = getattr(self, button_name, None)
+            if button is not None:
+                button.setEnabled(True)
+        if hasattr(self, "_position_export_all_button"):
+            self._position_export_all_button.setText("同步并导出全部仓位")
+        QTimer.singleShot(
+            0,
+            lambda mode=mode: self.export_filtered_position_history(all_local=mode == "all"),
+        )
+
     def export_filtered_position_history(self, *, all_local: bool = False) -> None:
         """Export filtered positions, or every locally cached position when requested."""
         filtered = (
@@ -7673,11 +7779,37 @@ class AccountPositionsHomeWidget(QWidget):
         if not items:
             QMessageBox.information(self, "导出历史成交", "本地缓存中没有可导出的历史成交。")
             return
+        orders_by_id: dict[str, OkxTradeOrderItem] = {}
+        for order in load_local_order_history(profile_name, self._note_environment()):
+            order_id = str(order.order_id or "").strip()
+            if order_id:
+                orders_by_id.setdefault(order_id, order)
+        filled_by_order: dict[str, Decimal] = {}
+        for item in items:
+            order_id = str(item.order_id or "").strip()
+            if order_id and item.fill_size is not None:
+                filled_by_order[order_id] = filled_by_order.get(order_id, Decimal("0")) + abs(item.fill_size)
+        current_position_by_inst: dict[str, list[str]] = {}
+        for position in self._raw_positions:
+            if position.position == 0:
+                continue
+            summary = " | ".join(
+                (
+                    f"方向={position.pos_side or 'net'}",
+                    f"持仓={position.position}",
+                    f"均价={position.avg_price if position.avg_price is not None else ''}",
+                    f"标记价={position.mark_price if position.mark_price is not None else ''}",
+                    f"未实现盈亏={position.unrealized_pnl if position.unrealized_pnl is not None else ''}",
+                )
+            )
+            current_position_by_inst.setdefault(position.inst_id, []).append(summary)
+        exported_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        environment = self._note_environment()
 
-        default_name = f"历史成交_全部本地_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        default_name = f"交易复盘_成交明细_{profile_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
         target, _ = QFileDialog.getSaveFileName(
             self,
-            "导出全部本地历史成交",
+            "导出 ChatGPT 复盘成交数据",
             default_name,
             "CSV 文件 (*.csv)",
         )
@@ -7697,6 +7829,9 @@ class AccountPositionsHomeWidget(QWidget):
             return "" if value is None else str(value)
 
         headers = (
+            "导出时间",
+            "API账户",
+            "环境",
             "成交时间",
             "成交时间戳_ms",
             "类型",
@@ -7710,6 +7845,16 @@ class AccountPositionsHomeWidget(QWidget):
             "成交类型",
             "订单ID",
             "成交ID",
+            "关联委托状态",
+            "原委托量_raw",
+            "累计成交量_raw",
+            "未成交撤销量_raw",
+            "部分成交后撤单",
+            "委托类型",
+            "委托来源",
+            "客户订单ID",
+            "当前仍有持仓",
+            "当前持仓快照",
             "成交价_raw",
             "成交量_raw",
             "手续费_raw",
@@ -7720,8 +7865,35 @@ class AccountPositionsHomeWidget(QWidget):
         rows: list[list[str]] = []
         for item in items:
             raw = item.raw if isinstance(item.raw, dict) else {}
+            order_id = str(item.order_id or raw_value(raw, "ordId", "orderId")).strip()
+            order = orders_by_id.get(order_id)
+            order_size = order.size if order is not None else None
+            cumulative_fill = (
+                order.filled_size
+                if order is not None and order.filled_size is not None
+                else filled_by_order.get(order_id)
+            )
+            order_state = str(order.state or "").strip().lower() if order is not None else ""
+            current_position_summary = " || ".join(current_position_by_inst.get(item.inst_id, ()))
+            canceled_remainder: Decimal | None = None
+            partial_cancel = "否"
+            if order_state in {"canceled", "mmp_canceled"} and order_size is not None:
+                resolved_fill = cumulative_fill or Decimal("0")
+                canceled_remainder = max(abs(order_size) - abs(resolved_fill), Decimal("0"))
+                if resolved_fill > 0 and canceled_remainder > 0:
+                    partial_cancel = "是"
+            order_type = (order.ord_type or "") if order is not None else ""
+            order_source = (order.source_label or order.source_kind or "") if order is not None else ""
+            client_order_id = (
+                order.client_order_id or order.algo_client_order_id or ""
+                if order is not None
+                else ""
+            )
             rows.append(
                 [
+                    exported_at,
+                    profile_name,
+                    environment,
                     _format_okx_ms_timestamp(item.fill_time),
                     str(item.fill_time or ""),
                     item.inst_type or "-",
@@ -7733,8 +7905,18 @@ class AccountPositionsHomeWidget(QWidget):
                     _format_fill_history_fee_cell(item, self._fill_history_usdt_prices),
                     _format_fill_history_pnl(item, self._fill_history_usdt_prices),
                     _format_fill_history_exec_type(item.exec_type),
-                    item.order_id or raw_value(raw, "ordId", "orderId"),
+                    order_id,
                     item.trade_id or raw_value(raw, "tradeId"),
+                    order_state,
+                    decimal_text(order_size),
+                    decimal_text(cumulative_fill),
+                    decimal_text(canceled_remainder),
+                    partial_cancel,
+                    order_type,
+                    order_source,
+                    client_order_id,
+                    "是" if current_position_summary else "否",
+                    current_position_summary,
                     decimal_text(item.fill_price),
                     decimal_text(item.fill_size),
                     decimal_text(item.fill_fee),
@@ -7752,7 +7934,11 @@ class AccountPositionsHomeWidget(QWidget):
         except OSError as exc:
             QMessageBox.critical(self, "导出失败", f"无法写入 CSV 文件：{exc}")
             return
-        QMessageBox.information(self, "导出成功", f"已导出 {len(rows)} 条全部本地历史成交：\n{target}")
+        QMessageBox.information(
+            self,
+            "导出成功",
+            f"已导出 {len(rows)} 条复盘成交记录（含委托状态和当前持仓快照）：\n{target}",
+        )
 
     def _selected_position_history_item(self) -> OkxPositionHistoryItem | None:
         row = self._position_history_table.currentRow() if hasattr(self, "_position_history_table") else -1
@@ -8002,6 +8188,7 @@ def _account_positions_home_shared_init(self: AccountPositionsHomeWidget, parent
     self._shared_order_store = get_shared_order_store()
     _ACCOUNT_POSITIONS_HOME_ORIGINAL_INIT(self, parent)
     self._shared_order_store.snapshot_changed.connect(self._apply_shared_order_snapshot)
+    self._shared_order_store.refresh_finished.connect(self._on_shared_order_refresh_finished_for_export)
     runtime = getattr(self, "_runtime", None)
     profile_name = str(getattr(self, "_last_profile_name", "") or "").strip()
     environment = str(getattr(runtime, "environment", "") or "").strip()

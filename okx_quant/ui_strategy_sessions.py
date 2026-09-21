@@ -511,6 +511,7 @@ class UiStrategySessionsMixin:
             "open_qty",
             "entry_price",
             "stop_price",
+            "next_stop_price",
             "take_profit",
             "live_pnl",
             "current_r",
@@ -536,6 +537,7 @@ class UiStrategySessionsMixin:
             "open_qty",
             "entry_price",
             "stop_price",
+            "next_stop_price",
             "stop_amount",
             "take_profit",
             "live_pnl",
@@ -564,10 +566,11 @@ class UiStrategySessionsMixin:
             "open_qty": "开仓数量",
             "entry_price": "开仓价",
             "stop_price": "止损价",
+            "next_stop_price": "下次上移价",
             "stop_amount": "止损金额",
             "take_profit": "止盈价",
             "live_pnl": "实时浮盈亏",
-            "current_r": "1R风险额",
+            "current_r": "R损失空间",
             "pnl": "净盈亏",
             "last_pnl": "上次净盈亏",
             "status": "状态",
@@ -677,6 +680,62 @@ class UiStrategySessionsMixin:
         if value is None:
             value = trade.pending_stop_price
         return _format_optional_decimal(value)
+
+    def _session_runtime_next_stop_move_price_text(self, session: StrategySession) -> str:
+        """Return the next dynamic-stop trigger price for the active trade."""
+        trade = getattr(session, "active_trade", None)
+        config = getattr(session, "config", None)
+        if trade is None or config is None or str(getattr(config, "take_profit_mode", "") or "") != "dynamic":
+            return "-"
+        entry_price = trade.entry_price or trade.pending_entry_reference
+        initial_stop = trade.initial_stop_price or trade.pending_stop_price
+        current_stop = trade.current_stop_price or initial_stop
+        if entry_price is None or initial_stop is None or current_stop is None:
+            return "-"
+        risk_per_unit = abs(entry_price - initial_stop)
+        direction_sign = UiStrategySessionsMixin._strategy_trade_direction_sign(session)
+        if risk_per_unit <= 0 or direction_sign not in {-1, 1}:
+            return "-"
+
+        trade_inst_id = _session_trade_inst_id(session)
+        if not trade_inst_id:
+            return "-"
+        instruments: dict[str, Instrument] = {}
+        snapshot_provider = getattr(self, "_positions_snapshot_for_session", None)
+        if callable(snapshot_provider):
+            try:
+                snapshot = snapshot_provider(session)
+            except Exception:
+                snapshot = None
+            if snapshot is not None:
+                instruments = dict(getattr(snapshot, "position_instruments", {}) or {})
+        if not instruments:
+            instruments = dict(getattr(self, "_position_instruments", {}) or {})
+        instrument = instruments.get(trade_inst_id) or instruments.get(trade_inst_id.upper())
+        tick_size = getattr(instrument, "tick_size", None) if instrument is not None else None
+        if tick_size is None or tick_size <= 0:
+            return "-"
+
+        direction = "long" if direction_sign > 0 else "short"
+        try:
+            next_trigger_r = _infer_dynamic_next_trigger_r_from_stop(
+                direction=direction,
+                entry_price=entry_price,
+                current_stop_loss=current_stop,
+                risk_per_unit=risk_per_unit,
+                tick_size=tick_size,
+                config=config,
+            )
+            return _dynamic_next_trigger_price_text(
+                direction=direction,
+                entry_price=entry_price,
+                risk_per_unit=risk_per_unit,
+                next_trigger_r=next_trigger_r,
+                tick_size=tick_size,
+                dynamic_fee_offset_enabled=_live_ema55_slope_dynamic_fee_offset_enabled(config),
+            ) or "-"
+        except Exception:
+            return "-"
 
     def _session_runtime_price_delta_amount(
         self,
@@ -8483,13 +8542,6 @@ class UiStrategySessionsMixin:
             runtime_risk_basis = UiStrategySessionsMixin._session_runtime_risk_basis_usdt(self, session)
         current_r_text = _format_optional_decimal(runtime_risk_basis)
         live_pnl_risk_basis = runtime_risk_basis if live_pnl is not None else None
-        if live_pnl is not None:
-            r_text = UiStrategySessionsMixin._session_runtime_r_text(
-                live_pnl,
-                live_pnl_risk_basis,
-            )
-            if r_text:
-                current_r_text = r_text
         values = (
             session.session_id,
             trader_label,
@@ -8510,6 +8562,11 @@ class UiStrategySessionsMixin:
             open_qty_text,
             self._session_runtime_entry_price_text(session),
             self._session_runtime_stop_price_text(session),
+            (
+                self._session_runtime_next_stop_move_price_text(session)
+                if callable(getattr(self, "_session_runtime_next_stop_move_price_text", None))
+                else "-"
+            ),
             self._session_runtime_take_profit_text(session),
             UiStrategySessionsMixin._session_runtime_usdt_with_r_text(
                 self,

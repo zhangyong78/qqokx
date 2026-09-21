@@ -3,7 +3,7 @@ from __future__ import annotations
 import time
 import traceback
 from datetime import datetime
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 from okx_quant.okx_client import OkxPosition, OkxTradeOrderItem
@@ -4637,6 +4637,13 @@ class UiPositionsMixin:
             return getattr(getattr(session, "config", None), "risk_amount", None) or Decimal("0")
         if normalized == "open_qty":
             return self._session_open_position_sort_value(session)
+        if normalized == "next_stop_price":
+            provider = getattr(self, "_session_runtime_next_stop_move_price_text", None)
+            text = provider(session) if callable(provider) else "-"
+            try:
+                return Decimal(text) if text not in {"", "-"} else Decimal("0")
+            except (InvalidOperation, ValueError):
+                return Decimal("0")
         if normalized == "live_pnl":
             live_pnl, _refreshed_at = self._session_live_pnl_snapshot(session)
             return live_pnl or Decimal("0")
