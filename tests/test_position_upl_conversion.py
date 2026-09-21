@@ -24,6 +24,7 @@ from okx_quant.ui import (
     _format_group_position_size,
     _format_position_avg_price,
     _format_position_avg_price_usdt,
+    _format_position_contracts,
     _format_position_mark_price_usdt,
     _format_position_market_value,
     _format_position_option_component_usdt,
@@ -341,9 +342,17 @@ class PositionUplConversionTest(TestCase):
         self.assertEqual(metrics["market_value_native"], Decimal("0.25"))
         self.assertEqual(metrics["market_value_currency"], "BTC")
         self.assertEqual(
-            _build_group_row_values("分组", metrics)[21],
+            _build_group_row_values("分组", metrics)[22],
             "0.25 BTC（≈20000 USDT）",
         )
+
+    def test_format_position_contracts_shows_raw_derivative_count(self) -> None:
+        position = _make_position(inst_id="BTC-USD-260626-100000-C", upl="0", margin_ccy="BTC")
+        position = OkxPosition(**{**position.__dict__, "inst_type": "OPTION", "position": Decimal("20")})
+        self.assertEqual(_format_position_contracts(position), "20 张")
+
+        spot = OkxPosition(**{**position.__dict__, "inst_type": "SPOT"})
+        self.assertEqual(_format_position_contracts(spot), "-")
 
     def test_format_position_avg_price_usdt_for_option(self) -> None:
         position = _make_position(inst_id="BTC-USD-260626-100000-C", upl="0", margin_ccy="BTC")
@@ -964,10 +973,10 @@ class PositionUplConversionTest(TestCase):
                 "theta_usdt": Decimal("-27.2"),
             },
         )
-        self.assertEqual(values[17], "-0.06947484")
-        self.assertEqual(values[19], "+0.73991882")
-        self.assertEqual(values[26], "1.23456")
-        self.assertEqual(values[30], "-27.20")
+        self.assertEqual(values[18], "-0.06947484")
+        self.assertEqual(values[20], "+0.73991882")
+        self.assertEqual(values[27], "1.23456")
+        self.assertEqual(values[31], "-27.20")
 
     def test_group_row_values_use_two_decimals_for_usdt_pnl(self) -> None:
         values = _build_group_row_values(
@@ -990,10 +999,10 @@ class PositionUplConversionTest(TestCase):
             },
         )
         self.assertEqual(values[15], "1 个持仓 | 250000 DOGE")
-        self.assertEqual(values[17], "-2733.75")
-        self.assertEqual(values[19], "-31.36")
-        self.assertEqual(values[26], "250000.00000")
-        self.assertEqual(values[30], "+123.46")
+        self.assertEqual(values[18], "-2733.75")
+        self.assertEqual(values[20], "-31.36")
+        self.assertEqual(values[27], "250000.00000")
+        self.assertEqual(values[31], "+123.46")
 
     def test_group_row_values_display_btc_market_value_before_usdt_total(self) -> None:
         values = _build_group_row_values(
@@ -1018,7 +1027,7 @@ class PositionUplConversionTest(TestCase):
             },
         )
 
-        self.assertEqual(values[21], "1.42 BTC（≈94356 USDT）")
+        self.assertEqual(values[22], "1.42 BTC（≈94356 USDT）")
 
     def test_format_group_position_size_accumulates_coin_quantity(self) -> None:
         positions = [

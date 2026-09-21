@@ -20,6 +20,8 @@ from roll_terminal_qt.account_positions_home import (
     _current_order_view_program_owner_label,
     _current_order_view_to_trade_order_item,
     _format_estimated_close_fee,
+    _format_group_estimated_close_fee,
+    _group_row_values_with_break_even,
     _position_display_foreground_colors,
 )
 from okx_quant.okx_client import Instrument, OkxOrderResult
@@ -83,7 +85,111 @@ class PositionDisplayForegroundColorsTest(TestCase):
             fee_rate=Decimal("0.0003"),
         )
 
-        self.assertEqual(text, "0.0000005 BTC（≈0.03 USDT）")
+        self.assertEqual(text, "0.03 USDT")
+
+    def test_estimated_close_fee_for_linear_perpetual_uses_quote_usdt(self) -> None:
+        position = SimpleNamespace(
+            position=Decimal("250"),
+            inst_id="DOGE-USDT-SWAP",
+            inst_type="SWAP",
+            avg_price=Decimal("0.08"),
+            mark_price=Decimal("0.08"),
+            last_price=Decimal("0.08"),
+            pos_side="long",
+        )
+        instrument = Instrument(
+            inst_id="DOGE-USDT-SWAP",
+            inst_type="SWAP",
+            tick_size=Decimal("0.00001"),
+            lot_size=Decimal("1"),
+            min_size=Decimal("1"),
+            state="live",
+            ct_val=Decimal("1000"),
+            ct_mult=Decimal("1"),
+            ct_val_ccy="DOGE",
+        )
+        ticker = SimpleNamespace(bid=Decimal("0.08"), ask=Decimal("0.08"))
+
+        text = _format_estimated_close_fee(
+            position,
+            instrument,
+            ticker,
+            {"DOGE": Decimal("0.08")},
+            fee_rate=Decimal("0.0003"),
+        )
+
+        self.assertEqual(text, "6.00 USDT")
+
+        group_text = _format_group_estimated_close_fee(
+            [position],
+            {position.inst_id: instrument},
+            {position.inst_id: ticker},
+            {"DOGE": Decimal("0.08")},
+            fee_rate_for=lambda _inst_type: Decimal("0.0003"),
+        )
+        self.assertEqual(group_text, "6.00 USDT")
+
+    def test_estimated_close_fee_for_option_also_returns_usdt_only(self) -> None:
+        position = SimpleNamespace(
+            position=Decimal("100"),
+            inst_id="BTC-USD-260925-75000-C",
+            inst_type="OPTION",
+            avg_price=Decimal("0.0008"),
+            mark_price=Decimal("0.0018"),
+            last_price=Decimal("0.0018"),
+            pos_side="long",
+        )
+        instrument = Instrument(
+            inst_id="BTC-USD-260925-75000-C",
+            inst_type="OPTION",
+            tick_size=Decimal("0.0001"),
+            lot_size=Decimal("1"),
+            min_size=Decimal("1"),
+            state="live",
+            ct_val=Decimal("1"),
+            ct_mult=Decimal("0.01"),
+            ct_val_ccy="BTC",
+        )
+        ticker = SimpleNamespace(bid=Decimal("0.0018"), ask=Decimal("0.0018"))
+
+        text = _format_estimated_close_fee(
+            position,
+            instrument,
+            ticker,
+            {"BTC": Decimal("80000")},
+            fee_rate=Decimal("0.0003"),
+        )
+
+        self.assertEqual(text, "10.08 USDT")
+
+    def test_group_estimated_close_fee_stays_in_its_column_after_contract_column(self) -> None:
+        values = _group_row_values_with_break_even(
+            "风险单元",
+            {
+                "count": 1,
+                "size_display": "250000 DOGE",
+                "contract_count": Decimal("250"),
+                "option_side_display": "--",
+                "upl": Decimal("0"),
+                "upl_usdt": Decimal("0"),
+                "realized": Decimal("0"),
+                "realized_usdt": Decimal("0"),
+                "market_value_usdt": Decimal("100"),
+                "pnl_currency": "USDT",
+                "imr": None,
+                "mmr": None,
+                "delta": None,
+                "gamma": None,
+                "vega": None,
+                "theta": None,
+                "theta_usdt": None,
+                "open_value_usdt": None,
+                "estimated_close_fee": "6.00 USDT",
+            },
+        )
+
+        self.assertEqual(values[23], "6.00 USDT")
+        self.assertEqual(values[24], "≈100 USDT")
 
     def test_history_position_kline_markers_use_open_and_close_timestamps(self) -> None:
         history_item = SimpleNamespace(

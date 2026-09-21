@@ -183,6 +183,7 @@ from okx_quant.ui_shell import (
     _format_position_quote_price_usdt,
     _format_position_realized_pnl,
     _format_position_size,
+    _format_position_contracts,
     _format_position_unrealized_pnl,
     _format_ratio,
     _format_mark_price,
@@ -494,6 +495,7 @@ POSITION_COLUMNS: tuple[tuple[str, str, int, Qt.AlignmentFlag], ...] = (
     ("open_value_usdt", "开仓价值≈USDT", 116, Qt.AlignmentFlag.AlignRight),
     ("break_even", "保本价格", 96, Qt.AlignmentFlag.AlignRight),
     ("pos", "持仓量", 170, Qt.AlignmentFlag.AlignRight),
+    ("pos_contracts", "持仓张数", 100, Qt.AlignmentFlag.AlignRight),
     ("option_side", "买购:卖购 | 买沽:卖沽", 170, Qt.AlignmentFlag.AlignCenter),
     ("upl", "浮盈亏", 168, Qt.AlignmentFlag.AlignRight),
     ("upl_usdt", "浮盈≈USDT", 108, Qt.AlignmentFlag.AlignRight),
@@ -732,6 +734,19 @@ def _position_estimated_close_fee_snapshot(
     rate = max(fee_rate, Decimal("0"))
     currency = contract_currency.strip().upper()
 
+    # Linear perpetual/futures contracts settle against the quote currency.
+    # Prefer the instrument id and close price here instead of trusting a
+    # stale/mismatched cached ctValCcy (which could otherwise turn a DOGE/USDT
+    # fee into a nonsensical BTC amount).
+    inst_parts = str(position.inst_id or "").strip().upper().split("-")
+    quote_currency = inst_parts[1] if len(inst_parts) > 1 else ""
+    if position.inst_type in {"SWAP", "FUTURES"} and quote_currency in {"USDT", "USDC"}:
+        close_price = _position_close_price(position, ticker)
+        if close_price is None:
+            return None, None
+        notional_usdt = notional if currency in {"USDT", "USDC"} else notional * close_price
+        return rate * notional_usdt, "USDT"
+
     if position.inst_type == "OPTION":
         close_price = _position_close_price(position, ticker)
         if close_price is None:
@@ -748,6 +763,36 @@ def _position_estimated_close_fee_snapshot(
         asset_symbol = str(position.inst_id or "").strip().upper().split("-", 1)[0] or "币"
         return rate * notional / close_price, asset_symbol
     return rate * notional, currency
+
+
+def _estimated_close_fee_usdt(
+    position: OkxPosition,
+    instrument: Instrument | None,
+    ticker: object | None,
+    upl_usdt_prices: dict[str, Decimal],
+    *,
+    fee_rate: Decimal,
+) -> Decimal | None:
+    fee, currency = _position_estimated_close_fee_snapshot(
+        position,
+        instrument,
+        ticker,
+        fee_rate=fee_rate,
+    )
+    if fee is None or not currency:
+        return None
+    normalized_currency = currency.strip().upper()
+    if normalized_currency in {"USDT", "USDC", "USD"}:
+        return fee
+    conversion = upl_usdt_prices.get(normalized_currency)
+    if conversion is None or conversion <= 0:
+        inst_parts = str(position.inst_id or "").strip().upper().split("-")
+        quote_currency = inst_parts[1] if len(inst_parts) > 1 else ""
+        if quote_currency in {"USD", "USDT", "USDC"}:
+            conversion = _position_close_price(position, ticker)
+    if conversion is None or conversion <= 0:
+        return None
+    return fee * conversion
 
 
 def _format_estimated_close_fee_amount(value: Decimal) -> str:
@@ -770,6 +815,18 @@ def _format_estimated_close_fee(
     *,
     fee_rate: Decimal,
 ) -> str:
+    if position.inst_type in {"OPTION", "SWAP", "FUTURES"}:
+        usdt_fee = _estimated_close_fee_usdt(
+            position,
+            instrument,
+            ticker,
+            upl_usdt_prices,
+            fee_rate=fee_rate,
+        )
+        if usdt_fee is None:
+            return "-"
+        return f"{_format_estimated_close_fee_usdt_amount(usdt_fee)} USDT"
+
     fee, currency = _position_estimated_close_fee_snapshot(
         position,
         instrument,
@@ -803,6 +860,17 @@ def _format_group_estimated_close_fee(
 ) -> str:
     totals: dict[str, Decimal] = {}
     for position in positions:
+        if position.inst_type in {"OPTION", "SWAP", "FUTURES"}:
+            usdt_fee = _estimated_close_fee_usdt(
+                position,
+                position_instruments.get(position.inst_id),
+                position_tickers.get(position.inst_id),
+                upl_usdt_prices,
+                fee_rate=fee_rate_for(position.inst_type),
+            )
+            if usdt_fee is not None:
+                totals["USDT"] = totals.get("USDT", Decimal("0")) + usdt_fee
+            continue
         fee, currency = _position_estimated_close_fee_snapshot(
             position,
             position_instruments.get(position.inst_id),
@@ -875,7 +943,7 @@ def _position_break_even_price(
 def _group_row_values_with_break_even(group_type: str, metrics: dict[str, object]) -> tuple[str, ...]:
     values = list(_build_group_row_values(group_type, metrics))
     values.insert(15, "--")
-    values.insert(22, str(metrics.get("estimated_close_fee") or "--"))
+    values.insert(23, str(metrics.get("estimated_close_fee") or "--"))
     return tuple(values)
 
 DEFAULT_VISIBLE_COLUMNS: tuple[str, ...] = (
@@ -888,6 +956,7 @@ DEFAULT_VISIBLE_COLUMNS: tuple[str, ...] = (
     "open_value_usdt",
     "break_even",
     "pos",
+    "pos_contracts",
     "option_side",
     "upl",
     "upl_usdt",
@@ -926,6 +995,7 @@ DEFAULT_VISIBLE_COLUMNS: tuple[str, ...] = (
     "break_even",
     "option_side",
     "pos",
+    "pos_contracts",
     "realized",
     "estimated_close_fee",
     "theta",
@@ -5050,6 +5120,8 @@ class AccountPositionsHomeWidget(QWidget):
                 prefs_version = 1
             if prefs_version < 2:
                 loaded_visible_columns.add("estimated_close_fee")
+            if prefs_version < 3:
+                loaded_visible_columns.add("pos_contracts")
             if loaded_visible_columns:
                 self._visible_column_ids = loaded_visible_columns
         raw_tree_column_widths = snapshot.get("tree_column_widths")
@@ -5307,6 +5379,7 @@ class AccountPositionsHomeWidget(QWidget):
                 places=2,
             ),
             _format_position_size(position, self._position_instruments),
+            _format_position_contracts(position),
             _format_option_trade_side_display(position),
             _format_position_unrealized_pnl(position),
             _format_optional_usdt(_position_unrealized_pnl_usdt(position, self._upl_usdt_prices)),
@@ -5351,7 +5424,7 @@ class AccountPositionsHomeWidget(QWidget):
         if position.unrealized_pnl is not None:
             pnl_color = QColor("#13803d" if position.unrealized_pnl > 0 else "#c23b3b" if position.unrealized_pnl < 0 else "#1f2937")
         if pnl_color is not None:
-            for index in (18, 19, 20, 21):
+            for index in (19, 20, 21, 22):
                 item.setForeground(index, pnl_color)
         for column_id, color in _position_display_foreground_colors(
             time_value_text=values[2],

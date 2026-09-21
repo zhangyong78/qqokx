@@ -8029,8 +8029,8 @@ class PositionRealizedUsdtColumnTest(TestCase):
             },
         )
 
-        self.assertEqual(values[19], "+0.00100000")
-        self.assertEqual(values[20], "+100")
+        self.assertEqual(values[20], "+0.00100000")
+        self.assertEqual(values[21], "+100")
 
     def test_insert_position_row_includes_realized_usdt_value(self) -> None:
         app = SimpleNamespace(

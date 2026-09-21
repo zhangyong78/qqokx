@@ -705,7 +705,7 @@ def save_account_positions_home_view_prefs(
         if normalized_value > 0:
             normalized_tree_column_widths[normalized_key] = normalized_value
     payload = {
-        "version": 2,
+        "version": 3,
         "visible_columns": normalized_visible_columns,
         "tree_column_widths": normalized_tree_column_widths,
         "position_kline_bar": str(position_kline_bar or "1H").strip() or "1H",

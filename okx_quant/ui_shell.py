@@ -11773,6 +11773,14 @@ def _aggregate_position_metrics(
     return {
         "count": len(positions),
         "size_display": _format_group_position_size(positions, position_instruments),
+        "contract_count": (
+            sum(
+                (abs(item.position) for item in positions if item.inst_type in {"OPTION", "FUTURES", "SWAP"}),
+                Decimal("0"),
+            )
+            if any(item.inst_type in {"OPTION", "FUTURES", "SWAP"} and item.position != 0 for item in positions)
+            else None
+        ),
         "option_side_display": _format_group_option_trade_side(positions, position_instruments),
         "upl": _sum_decimal([item.unrealized_pnl for item in positions]),
         "upl_usdt": _sum_decimal([_position_unrealized_pnl_usdt(item, upl_usdt_prices) for item in positions]),
@@ -11799,6 +11807,7 @@ def _build_group_row_values(group_type: str, metrics: dict[str, Decimal | int | 
     count = metrics["count"]
     pnl_places = _group_pnl_places(metrics.get("pnl_currency"))
     size_display = metrics.get("size_display")
+    contract_count = metrics.get("contract_count")
     option_side_display = metrics.get("option_side_display")
     market_value_native = metrics.get("market_value_native")
     market_value_currency = metrics.get("market_value_currency")
@@ -11834,6 +11843,7 @@ def _build_group_row_values(group_type: str, metrics: dict[str, Decimal | int | 
             if isinstance(count, int) and isinstance(size_display, str) and size_display
             else (f"{count} 个持仓" if isinstance(count, int) else "--")
         ),
+        format_decimal(contract_count) + " 张" if isinstance(contract_count, Decimal) else "-",
         option_side_display if isinstance(option_side_display, str) and option_side_display else "--",
         _format_optional_decimal_fixed(
             metrics["upl"] if isinstance(metrics["upl"], Decimal) else None,
@@ -12073,6 +12083,13 @@ def _format_position_size(position: OkxPosition, position_instruments: dict[str,
     if currency:
         return f"{format_decimal(amount)} {currency} ({direction})"
     return f"{format_decimal(amount)} ({direction})"
+
+
+def _format_position_contracts(position: OkxPosition) -> str:
+    """Format the raw derivative contract count without converting it to coin value."""
+    if position.inst_type not in {"OPTION", "FUTURES", "SWAP"} or position.position == 0:
+        return "-"
+    return f"{format_decimal(abs(position.position))} 张"
 
 
 def _position_delta_value(

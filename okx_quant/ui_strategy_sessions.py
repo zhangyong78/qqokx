@@ -8640,6 +8640,20 @@ class UiStrategySessionsMixin:
             return f"{reason} | {note}"
         return reason or note or "-"
 
+    @staticmethod
+    def _session_trade_detail_risk_basis(
+        session: StrategySession,
+        record: StrategyTradeLedgerRecord,
+    ) -> Decimal | None:
+        """Resolve the R denominator used by the session PnL detail dialog."""
+        planned = getattr(record, "planned_initial_risk_usdt", None)
+        if planned is not None and planned > 0:
+            return planned
+        configured = getattr(getattr(session, "config", None), "risk_amount", None)
+        if configured is not None and configured > 0:
+            return configured
+        return None
+
     def _session_trade_detail_records(
         self,
         session: StrategySession,
@@ -8703,6 +8717,7 @@ class UiStrategySessionsMixin:
         for index, record in enumerate(records, start=1):
             fee_total = (record.entry_fee or Decimal("0")) + (record.exit_fee or Decimal("0"))
             net_pnl = record.net_pnl or Decimal("0")
+            risk_basis = self._session_trade_detail_risk_basis(session, record)
             if net_pnl > 0:
                 row_tag = "trade_profit"
             elif net_pnl < 0:
@@ -8725,7 +8740,7 @@ class UiStrategySessionsMixin:
                     _format_optional_usdt_precise(fee_total, places=2),
                     _format_optional_usdt_precise(record.funding_fee or Decimal("0"), places=2),
                     _format_optional_usdt_precise(record.gross_pnl or Decimal("0"), places=2),
-                    _format_optional_usdt_precise(net_pnl, places=2),
+                    format_report_pnl_with_r(net_pnl, risk_basis),
                     self._session_trade_detail_reason_text(record),
                 ),
                 tags=(row_tag,),
@@ -8827,6 +8842,15 @@ class UiStrategySessionsMixin:
         loss_count = sum(1 for item in records if (item.net_pnl or Decimal("0")) < 0)
         flat_count = sum(1 for item in records if (item.net_pnl or Decimal("0")) == 0)
         net_total = sum(((item.net_pnl or Decimal("0")) for item in records), Decimal("0"))
+        risk_total = sum(
+            (
+                risk_basis
+                for item in records
+                for risk_basis in (self._session_trade_detail_risk_basis(session, item),)
+                if risk_basis is not None
+            ),
+            Decimal("0"),
+        )
         status_parts = [f"盈利 {win_count}", f"亏损 {loss_count}"]
         if flat_count:
             status_parts.append(f"保本 {flat_count}")
@@ -8838,7 +8862,7 @@ class UiStrategySessionsMixin:
             scope_text = f"策略链路累计 {len(record_session_ids)} 个会话（当前 {session.session_id}）"
         header_text = (
             f"{scope_text} | {session.symbol} | {bar_text} | {session.direction_label or '-'} | "
-            f"{range_part} | {' | '.join(status_parts)} | 净盈亏 {_format_optional_usdt_precise(net_total, places=2)}"
+            f"{range_part} | {' | '.join(status_parts)} | 净盈亏 {format_report_pnl_with_r(net_total, risk_total)}"
         )
         return header_text
 
@@ -8951,7 +8975,7 @@ class UiStrategySessionsMixin:
             tree.column("fee", width=90, anchor="e")
             tree.column("funding", width=90, anchor="e")
             tree.column("gross", width=96, anchor="e")
-            tree.column("net", width=96, anchor="e")
+            tree.column("net", width=170, anchor="e")
             tree.column("reason", width=220, anchor="center")
             tree.tag_configure("trade_profit", foreground="#1a7f37")
             tree.tag_configure("trade_loss", foreground="#d1242f")
