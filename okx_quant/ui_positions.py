@@ -4640,6 +4640,15 @@ class UiPositionsMixin:
         if normalized == "live_pnl":
             live_pnl, _refreshed_at = self._session_live_pnl_snapshot(session)
             return live_pnl or Decimal("0")
+        if normalized == "current_r":
+            live_pnl, _refreshed_at = self._session_live_pnl_snapshot(session)
+            if live_pnl is None:
+                return Decimal("0")
+            risk_basis_provider = getattr(self, "_session_runtime_risk_basis_usdt", None)
+            risk_basis = risk_basis_provider(session) if callable(risk_basis_provider) else None
+            if risk_basis is None or risk_basis <= 0:
+                return Decimal("0")
+            return live_pnl / risk_basis
         if normalized == "pnl":
             return session.net_pnl_total or Decimal("0")
         if normalized == "last_pnl":

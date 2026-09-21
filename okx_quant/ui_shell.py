@@ -5479,6 +5479,7 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
                 "stop_price",
                 "take_profit",
                 "live_pnl",
+                "current_r",
                 "pnl",
                 "last_pnl",
                 "status",
@@ -5506,6 +5507,7 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         self.session_tree.heading("stop_amount", text="止损金额")
         self.session_tree.heading("take_profit", text="止盈价")
         self.session_tree.heading("live_pnl", text="实时浮盈亏")
+        self.session_tree.heading("current_r", text="当前R")
         self.session_tree.heading("pnl", text="净盈亏")
         self.session_tree.heading("last_pnl", text="上次净盈亏")
         self.session_tree.heading("status", text="状态")
@@ -5529,6 +5531,7 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         self.session_tree.column("stop_amount", width=128, anchor="e")
         self.session_tree.column("take_profit", width=76, anchor="e")
         self.session_tree.column("live_pnl", width=96, anchor="e")
+        self.session_tree.column("current_r", width=72, anchor="e")
         self.session_tree.column("pnl", width=88, anchor="e")
         self.session_tree.column("last_pnl", width=88, anchor="e")
         self.session_tree.column("status", width=120, anchor="center")
@@ -8590,6 +8593,14 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
             except ValueError:
                 insert_at = len(normalized_running_columns)
             normalized_running_columns.insert(insert_at, "stop_amount")
+        # Add the standalone current-R column for settings saved before it
+        # was introduced, keeping it next to the live PnL column.
+        if normalized_running_columns and "current_r" not in normalized_running_columns:
+            try:
+                insert_at = normalized_running_columns.index("live_pnl") + 1
+            except ValueError:
+                insert_at = len(normalized_running_columns)
+            normalized_running_columns.insert(insert_at, "current_r")
         self._running_session_display_columns = tuple(normalized_running_columns)
         self._sync_current_api_sender_email_override(self._current_credential_profile())
         self._refresh_global_email_toggle_text()

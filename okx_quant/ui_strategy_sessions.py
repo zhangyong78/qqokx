@@ -508,6 +508,7 @@ class UiStrategySessionsMixin:
             "stop_price",
             "take_profit",
             "live_pnl",
+            "current_r",
             "pnl",
             "last_pnl",
             "status",
@@ -533,6 +534,7 @@ class UiStrategySessionsMixin:
             "stop_amount",
             "take_profit",
             "live_pnl",
+            "current_r",
             "pnl",
             "last_pnl",
             "status",
@@ -560,6 +562,7 @@ class UiStrategySessionsMixin:
             "stop_amount": "止损金额",
             "take_profit": "止盈价",
             "live_pnl": "实时浮盈亏",
+            "current_r": "当前R",
             "pnl": "净盈亏",
             "last_pnl": "上次净盈亏",
             "status": "状态",
@@ -786,13 +789,17 @@ class UiStrategySessionsMixin:
         self,
         session: StrategySession,
         value: Decimal | None,
+        *,
+        risk_basis: Decimal | None = None,
     ) -> str:
         amount_text = _format_optional_usdt_precise(value, places=2)
         if value is None:
             return amount_text
+        if risk_basis is None:
+            risk_basis = UiStrategySessionsMixin._session_runtime_risk_basis_usdt(self, session)
         r_text = UiStrategySessionsMixin._session_runtime_r_text(
             value,
-            UiStrategySessionsMixin._session_runtime_risk_basis_usdt(self, session),
+            risk_basis,
         )
         return f"{amount_text} U（{r_text}）" if r_text else f"{amount_text} U"
 
@@ -8466,6 +8473,16 @@ class UiStrategySessionsMixin:
             _trade_count, _win_count, _gross_pnl, _fee_total, _funding_total, display_net_pnl, display_last_pnl, _last_reason = display_financials(session)
         else:
             display_net_pnl, display_last_pnl = session.net_pnl_total, session.last_net_pnl
+        live_pnl_risk_basis = None
+        current_r_text = "-"
+        if live_pnl is not None:
+            live_pnl_risk_basis = UiStrategySessionsMixin._session_runtime_risk_basis_usdt(self, session)
+            r_text = UiStrategySessionsMixin._session_runtime_r_text(
+                live_pnl,
+                live_pnl_risk_basis,
+            )
+            if r_text:
+                current_r_text = r_text
         values = (
             session.session_id,
             trader_label,
@@ -8487,7 +8504,13 @@ class UiStrategySessionsMixin:
             self._session_runtime_entry_price_text(session),
             self._session_runtime_stop_price_text(session),
             self._session_runtime_take_profit_text(session),
-            UiStrategySessionsMixin._session_runtime_usdt_with_r_text(self, session, live_pnl),
+            UiStrategySessionsMixin._session_runtime_usdt_with_r_text(
+                self,
+                session,
+                live_pnl,
+                risk_basis=live_pnl_risk_basis,
+            ),
+            current_r_text,
             _format_optional_usdt_precise(display_net_pnl, places=2),
             _format_optional_usdt_precise(display_last_pnl, places=2),
             status_text,
