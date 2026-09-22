@@ -237,11 +237,14 @@ class ManualOpportunityInstrumentDialog(QDialog):
 
 
 class RollTerminalWindow(QMainWindow):
-    def __init__(self) -> None:
+    def __init__(self, profile_name: str = "") -> None:
         super().__init__()
         self.setWindowTitle("专业套利终端")
         self.resize(1680, 980)
-        self._runtime = load_runtime("159") or load_runtime()
+        requested_profile = str(profile_name or "").strip()
+        self._runtime = load_runtime(requested_profile) if requested_profile else None
+        if self._runtime is None:
+            self._runtime = load_runtime("159") or load_runtime()
         environment = self._runtime.environment if self._runtime is not None else "live"
         self._feed = MarketFeedThread(environment=environment)
         self._account_feed = AccountFeedThread(self._runtime)

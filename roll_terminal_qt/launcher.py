@@ -577,7 +577,7 @@ class LauncherWindow(QMainWindow):
             self._home_widget = page
             return page
         if page_key == "roll":
-            page = RollTerminalWindow()
+            page = RollTerminalWindow(profile_name=self._active_profile_name)
             set_workspace_managed = getattr(page, "set_workspace_managed", None)
             if callable(set_workspace_managed):
                 set_workspace_managed(True)
@@ -1061,7 +1061,7 @@ class LauncherWindow(QMainWindow):
 def create_module_window(module_key: str, *, profile_name: str = "") -> QWidget:
     normalized = module_key.strip().lower()
     if normalized == "roll":
-        window = RollTerminalWindow()
+        window = RollTerminalWindow(profile_name=profile_name)
         apply_qt_window_icon(window)
         return window
     if normalized == "kline-analysis":
