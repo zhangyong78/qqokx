@@ -3433,6 +3433,69 @@ class StrategyEngineTest(TestCase):
         self.assertEqual(place_limit_calls[0]["stop_loss_algo_cl_ord_id"], "slg-1")
         self.assertTrue(any("附带止损被拒" in message and "本次开仓已放弃" in message for message in messages))
 
+    def test_dynamic_limit_price_band_rejection_skips_current_candle(self) -> None:
+        messages: list[str] = []
+
+        class _StubClient:
+            @staticmethod
+            def place_limit_order(*_args, **_kwargs):  # noqa: ANN002, ANN003
+                raise OkxApiError(
+                    "操作全部失败 | 委托价格不在限价范围内 (最高买入价：0.09959，最低卖出价：0.0976)",
+                    code="51006",
+                )
+
+        engine = StrategyEngine(
+            _StubClient(),  # type: ignore[arg-type]
+            messages.append,
+            strategy_name="EMA 动态委托多头",
+            session_id="S01",
+        )
+        engine._next_client_order_id = lambda *, role: f"{role}-1"  # type: ignore[assignment]
+        config = StrategyConfig(
+            inst_id="DOGE-USDT-SWAP",
+            bar="1H",
+            ema_period=5,
+            trend_ema_period=13,
+            atr_period=10,
+            atr_stop_multiplier=Decimal("1"),
+            atr_take_multiplier=Decimal("1"),
+            order_size=Decimal("1.38"),
+            trade_mode="cross",
+            signal_mode="long_only",
+            position_mode="long_short",
+            environment="live",
+            tp_sl_trigger_type="mark",
+            strategy_id=STRATEGY_DYNAMIC_LONG_ID,
+            poll_seconds=10,
+            take_profit_mode="dynamic",
+        )
+        plan = OrderPlan(
+            inst_id="DOGE-USDT-SWAP",
+            side="buy",
+            pos_side="long",
+            size=Decimal("1.38"),
+            take_profit=Decimal("0.103"),
+            stop_loss=Decimal("0.09723"),
+            entry_reference=Decimal("0.10012"),
+            atr_value=Decimal("0.00289"),
+            signal="long",
+            candle_ts=1,
+            tp_sl_inst_id="DOGE-USDT-SWAP",
+            tp_sl_mode="exchange",
+        )
+
+        result = engine._submit_dynamic_limit_entry_order(
+            None,  # type: ignore[arg-type]
+            config,
+            plan=plan,
+            dynamic_stop_only=True,
+            trader_virtual_stop_loss_enabled=False,
+        )
+
+        self.assertIsNone(result)
+        self.assertTrue(any("超出 OKX 限价范围" in message for message in messages))
+        self.assertTrue(any("等待下一根 K 线重新计算" in message for message in messages))
+
     def test_manage_filled_dynamic_entry_submits_stop_loss_algo_after_plain_limit_fill(self) -> None:
         messages: list[str] = []
         captured_algo: dict[str, object] = {}

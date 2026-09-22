@@ -5593,6 +5593,20 @@ class StrategyEngine:
         lowered = normalized.lower()
         return "止损价格应低于开仓价格" in normalized or "stop loss price should be lower than" in lowered
 
+    @staticmethod
+    def _is_dynamic_limit_price_band_failure(detail: str) -> bool:
+        """A stale EMA limit price must not terminate the whole strategy."""
+        normalized = str(detail or "").strip()
+        if "51006" not in normalized:
+            return False
+        lowered = normalized.lower()
+        return (
+            "限价范围" in normalized
+            or "价格超出交易所允许范围" in normalized
+            or "price limit" in lowered
+            or "price band" in lowered
+        )
+
     def _submit_dynamic_limit_entry_order(
         self,
         credentials: Credentials,
@@ -5635,6 +5649,21 @@ class StrategyEngine:
             return cl_ord_id, result, stop_loss_algo_cl_ord_id
         except RuntimeError as exc:
             detail = str(exc).strip()
+            if self._is_dynamic_limit_price_band_failure(detail):
+                self._logger(
+                    " | ".join(
+                        [
+                            f"{_fmt_ts(plan.candle_ts)} | 当前动态挂单价超出 OKX 限价范围，已跳过本根",
+                            f"标的={plan.inst_id}",
+                            f"方向={plan.signal.upper()}",
+                            f"计划开仓价={format_decimal(plan.entry_reference)}",
+                            f"止损={format_decimal(plan.stop_loss)}",
+                            detail,
+                            "等待下一根 K 线重新计算，不终止策略",
+                        ]
+                    )
+                )
+                return None
             if not (
                 dynamic_stop_only
                 and not trader_virtual_stop_loss_enabled
