@@ -3,8 +3,9 @@ from __future__ import annotations
 from decimal import Decimal
 
 from PySide6.QtCore import QDateTime, QThread, Qt, Signal, Slot
-from PySide6.QtGui import QPainter
+from PySide6.QtGui import QColor, QPainter, QPen
 from PySide6.QtWidgets import (
+    QCheckBox,
     QHBoxLayout,
     QLabel,
     QMainWindow,
@@ -40,6 +41,24 @@ _BAR_INTERVAL_MS = {
     "1H": 60 * 60 * 1000,
     "4H": 4 * 60 * 60 * 1000,
 }
+
+
+def _compact_spread_axis_range(candles: list[Candle]) -> tuple[Decimal, Decimal]:
+    """Keep the default spread chart readable when one candle has a bad wick.
+
+    The executable spread is represented by the candle body (open/close).
+    Cross-market high/low timestamps are not simultaneous, so their theoretical
+    difference can create extreme wicks which otherwise flatten every normal bar.
+    """
+    body_values = [value for candle in candles for value in (candle.open, candle.close)]
+    if not body_values:
+        return Decimal("-1"), Decimal("1")
+    lower = min(body_values)
+    upper = max(body_values)
+    span = upper - lower
+    midpoint = (upper + lower) / Decimal("2")
+    padding = max(span * Decimal("0.12"), abs(midpoint) * Decimal("0.002"), Decimal("1"))
+    return lower - padding, upper + padding
 
 
 def _aligned_spread_candles(left_candles: list[Candle], right_candles: list[Candle]) -> list[Candle]:
@@ -184,6 +203,7 @@ class SpreadChartWindow(QMainWindow):
         self._current_bar = "15m"
         self._load_thread: SpreadChartLoadThread | None = None
         self._bar_buttons: dict[str, QPushButton] = {}
+        self._candles: list[Candle] = []
 
         root = QWidget()
         self.setCentralWidget(root)
@@ -210,6 +230,13 @@ class SpreadChartWindow(QMainWindow):
             button.clicked.connect(lambda _checked=False, target_bar=bar: self._select_bar(target_bar))
             self._bar_buttons[bar] = button
             bar_row.addWidget(button)
+        self._show_raw_extremes_check = QCheckBox("显示原始极值")
+        self._show_raw_extremes_check.setToolTip(
+            "默认会压缩跨市场不同时间点造成的异常长影线，使正常价差变化更清楚；"
+            "勾选后按原始最高/最低价完整显示。"
+        )
+        self._show_raw_extremes_check.toggled.connect(self._render_current_chart)
+        bar_row.addWidget(self._show_raw_extremes_check)
         bar_row.addStretch(1)
         layout.addLayout(bar_row)
 
@@ -270,6 +297,13 @@ class SpreadChartWindow(QMainWindow):
     def _apply_loaded_chart(self, left_inst_id: str, right_inst_id: str, bar: str, candles: list[Candle]) -> None:
         if left_inst_id != self._left_inst_id or right_inst_id != self._right_inst_id or bar != self._current_bar:
             return
+        self._candles = list(candles)
+        self._render_current_chart()
+
+    def _render_current_chart(self, _checked: bool | None = None) -> None:
+        candles = self._candles
+        if not candles:
+            return
         self._chart.removeAllSeries()
         for axis in list(self._chart.axes()):
             self._chart.removeAxis(axis)
@@ -278,32 +312,49 @@ class SpreadChartWindow(QMainWindow):
         candle_series.setIncreasingColor(Qt.GlobalColor.red)
         candle_series.setDecreasingColor(Qt.GlobalColor.darkGreen)
         candle_series.setBodyOutlineVisible(True)
+        candle_series.setBodyWidth(0.58)
+        candle_series.setPen(QPen(QColor("#4b5563"), 1))
 
         close_series = QLineSeries()
-        close_series.setName("收盘")
+        close_series.setName("中间价差")
+        close_series.setPen(QPen(QColor("#0f766e"), 2))
 
-        min_price: Decimal | None = None
-        max_price: Decimal | None = None
         first_ts = candles[0].ts
         last_ts = candles[-1].ts
+        show_raw_extremes = self._show_raw_extremes_check.isChecked()
+        if show_raw_extremes:
+            min_price = min(candle.low for candle in candles)
+            max_price = max(candle.high for candle in candles)
+        else:
+            min_price, max_price = _compact_spread_axis_range(candles)
+        clipped_wick_count = 0
 
         for candle in candles:
             timestamp_ms = int(candle.ts)
+            display_high = candle.high
+            display_low = candle.low
+            if not show_raw_extremes:
+                display_high = min(max(display_high, min_price), max_price)
+                display_low = max(min(display_low, max_price), min_price)
+                if display_high != candle.high or display_low != candle.low:
+                    clipped_wick_count += 1
             candle_set = QCandlestickSet(
                 float(candle.open),
-                float(candle.high),
-                float(candle.low),
+                float(display_high),
+                float(display_low),
                 float(candle.close),
                 timestamp_ms,
             )
             candle_series.append(candle_set)
             close_series.append(timestamp_ms, float(candle.close))
-            min_price = candle.low if min_price is None else min(min_price, candle.low)
-            max_price = candle.high if max_price is None else max(max_price, candle.high)
 
         self._chart.addSeries(candle_series)
         self._chart.addSeries(close_series)
-        self._chart.setTitle(f"{left_inst_id} / {right_inst_id} 价差K线 | {bar}")
+        view_label = "原始极值" if show_raw_extremes else "紧凑交易视图"
+        self._chart.setTitle(
+            f"{self._left_inst_id} / {self._right_inst_id} 价差K线 | "
+            f"{self._current_bar} | {view_label}"
+        )
 
         axis_x = QDateTimeAxis()
         axis_x.setFormat("MM-dd HH:mm")
@@ -311,16 +362,17 @@ class SpreadChartWindow(QMainWindow):
         axis_x.setRange(QDateTime.fromMSecsSinceEpoch(int(first_ts)), QDateTime.fromMSecsSinceEpoch(int(last_ts)))
 
         axis_y = QValueAxis()
-        if min_price is None or max_price is None:
-            min_value = -1.0
-            max_value = 1.0
-        else:
+        if show_raw_extremes:
             diff = max_price - min_price
             padding = max(diff * Decimal("0.08"), Decimal("1"))
             min_value = float(min_price - padding)
             max_value = float(max_price + padding)
+        else:
+            min_value = float(min_price)
+            max_value = float(max_price)
         axis_y.setRange(min_value, max_value)
         axis_y.setLabelFormat("%.2f")
+        axis_y.setTickCount(6)
 
         self._chart.addAxis(axis_x, Qt.AlignmentFlag.AlignBottom)
         self._chart.addAxis(axis_y, Qt.AlignmentFlag.AlignLeft)
@@ -330,8 +382,14 @@ class SpreadChartWindow(QMainWindow):
         close_series.attachAxis(axis_y)
 
         last_close = candles[-1].close
+        compact_note = (
+            "原始最高/最低价显示中"
+            if show_raw_extremes
+            else f"紧凑视图，已压缩 {clipped_wick_count} 根异常影线"
+        )
         self._status.setText(
-            f"{bar} 已加载 {len(candles)} 根 | 最新价差收盘 {fmt_decimal(last_close, 2)}"
+            f"{self._current_bar} 已加载 {len(candles)} 根 | "
+            f"最新价差 {fmt_decimal(last_close, 2)} | {compact_note}"
         )
 
     @Slot(str)

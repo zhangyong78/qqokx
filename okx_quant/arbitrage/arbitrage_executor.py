@@ -44,6 +44,8 @@ ORDER_CANCEL_REQUEST_TIMEOUT_SECONDS = 2.5
 POST_CANCEL_SETTLE_SECONDS = 5.0
 POST_CANCEL_RECOVERY_SECONDS = 8.0
 POST_CANCEL_NONTERMINAL_RECOVERY_SECONDS = 12.0
+TRANSIENT_ORDER_SUBMIT_RETRY_COUNT = 3
+TRANSIENT_ORDER_SUBMIT_BACKOFF_SECONDS = 1.0
 
 
 def _post_cancel_settle_seconds_for_mode(execution_mode: str) -> float:
@@ -300,6 +302,44 @@ def _is_missing_order_query_error(exc: BaseException) -> bool:
     return any(marker in message or marker in lowered for marker in markers)
 
 
+def _is_transient_order_query_error(exc: BaseException) -> bool:
+    """Return whether an order request can be retried without assuming no fill.
+
+    OKX may return HTTP 5xx/50013 while an order is already being processed.
+    Treating that response as a definitive failure can stop a roll one batch
+    early, or cause a duplicate order if the caller submits blindly again.
+    """
+    if isinstance(exc, OkxApiError):
+        if exc.status is not None and exc.status >= 500:
+            return True
+        if str(exc.code or "").strip() in {"50004", "50011", "50013", "50014"}:
+            return True
+    message = str(exc or "")
+    lowered = message.lower()
+    markers = (
+        "http 500",
+        "http 502",
+        "http 503",
+        "http 504",
+        "当前系统繁忙",
+        "system busy",
+        "temporarily unavailable",
+        "service unavailable",
+        "gateway timeout",
+        "bad gateway",
+        "网络错误",
+        "超时",
+        "timed out",
+        "timeout",
+        "connection reset",
+        "connection aborted",
+        "connection refused",
+        "handshake",
+        "ssl",
+    )
+    return any(marker in message or marker in lowered for marker in markers)
+
+
 def _wait_order_fill(
     client: OkxRestClient,
     *,
@@ -325,7 +365,7 @@ def _wait_order_fill(
                 request_timeout=ORDER_STATUS_REQUEST_TIMEOUT_SECONDS,
             )
         except OkxApiError as exc:
-            if not _is_missing_order_query_error(exc):
+            if not (_is_missing_order_query_error(exc) or _is_transient_order_query_error(exc)):
                 raise
             status = None
             if cl_ord_id:
@@ -338,7 +378,10 @@ def _wait_order_fill(
                         request_timeout=ORDER_STATUS_REQUEST_TIMEOUT_SECONDS,
                     )
                 except (OkxApiError, TypeError) as retry_exc:
-                    if not isinstance(retry_exc, TypeError) and not _is_missing_order_query_error(retry_exc):
+                    if (
+                        not isinstance(retry_exc, TypeError)
+                        and not (_is_missing_order_query_error(retry_exc) or _is_transient_order_query_error(retry_exc))
+                    ):
                         raise
             if status is None:
                 cached_status = _get_cached_private_order_status(
@@ -543,8 +586,9 @@ def _wait_order_fill_with_private_ws(
                         request_timeout=ORDER_STATUS_REQUEST_TIMEOUT_SECONDS,
                     )
                 except OkxApiError as exc:
-                    if not _is_missing_order_query_error(exc):
+                    if not (_is_missing_order_query_error(exc) or _is_transient_order_query_error(exc)):
                         raise
+                    status = None
                     if cl_ord_id:
                         try:
                             status = client.get_order(
@@ -555,7 +599,10 @@ def _wait_order_fill_with_private_ws(
                                 request_timeout=ORDER_STATUS_REQUEST_TIMEOUT_SECONDS,
                             )
                         except (OkxApiError, TypeError) as retry_exc:
-                            if not isinstance(retry_exc, TypeError) and not _is_missing_order_query_error(retry_exc):
+                            if (
+                                not isinstance(retry_exc, TypeError)
+                                and not (_is_missing_order_query_error(retry_exc) or _is_transient_order_query_error(retry_exc))
+                            ):
                                 raise
                     if status is None:
                         cached_status = _get_cached_private_order_status(
@@ -1189,7 +1236,7 @@ class ArbitrageExecutor:
             message = str(exc)
             if self._is_missing_order_status_message(message):
                 return None
-            if self._is_retryable_order_query_error_message(message):
+            if self._is_retryable_order_query_error_message(message) or _is_transient_order_query_error(exc):
                 return None
             raise
 
@@ -1322,6 +1369,16 @@ class ArbitrageExecutor:
             if retried_result is not None:
                 self._track_active_roll_order_id(retried_result.ord_id)
                 return retried_result
+            if cl_ord_id and inst_id and _is_transient_order_query_error(exc):
+                return self._recover_order_after_transient_submit_error(
+                    credentials=credentials,
+                    config=config,
+                    label=label,
+                    kwargs=kwargs,
+                    cl_ord_id=cl_ord_id,
+                    inst_id=inst_id,
+                    initial_error=exc,
+                )
             if not cl_ord_id or not inst_id or not self._is_timeout_error_message(str(exc)):
                 raise
             self._logger(f"{label} 下单请求超时，正在按 clOrdId={cl_ord_id} 回查 OKX 是否已受理。")
@@ -1349,6 +1406,100 @@ class ArbitrageExecutor:
             )
             self._track_active_roll_order_id(result.ord_id)
             return result
+
+    def _recover_order_after_transient_submit_error(
+        self,
+        *,
+        credentials,
+        config: StrategyConfig,
+        label: str,
+        kwargs: dict[str, object],
+        cl_ord_id: str,
+        inst_id: str,
+        initial_error: OkxApiError,
+    ) -> OkxOrderResult:
+        """Recover an order after an ambiguous transient POST response.
+
+        The same clOrdId is used for every retry. We always query first, and
+        after every failed retry, so a slow/accepted OKX request cannot create
+        a duplicate leg.
+        """
+        last_error: OkxApiError = initial_error
+        for attempt in range(TRANSIENT_ORDER_SUBMIT_RETRY_COUNT + 1):
+            if attempt > 0:
+                delay = TRANSIENT_ORDER_SUBMIT_BACKOFF_SECONDS * (2 ** (attempt - 1))
+                time.sleep(delay)
+                self._logger(
+                    f"{label} 临时接口错误，使用同一 clOrdId 第 {attempt}/"
+                    f"{TRANSIENT_ORDER_SUBMIT_RETRY_COUNT} 次重试。"
+                )
+            else:
+                self._logger(
+                    f"{label} 下单接口临时异常，先按 clOrdId={cl_ord_id} 回查，避免重复下单。"
+                )
+
+            status = self._wait_order_status_by_ref(
+                credentials=credentials,
+                config=config,
+                inst_id=inst_id,
+                cl_ord_id=cl_ord_id,
+                timeout_seconds=3.0,
+            )
+            if status is not None and status.ord_id:
+                self._logger(
+                    f"{label} 临时异常后回查成功：已确认订单 {status.ord_id}，"
+                    f"状态 {status.state or '-'}。"
+                )
+                result = OkxOrderResult(
+                    ord_id=status.ord_id,
+                    cl_ord_id=cl_ord_id,
+                    s_code="0",
+                    s_msg="recovered_after_transient_error",
+                    raw=status.raw,
+                )
+                self._track_active_roll_order_id(result.ord_id)
+                return result
+
+            if attempt >= TRANSIENT_ORDER_SUBMIT_RETRY_COUNT:
+                break
+            try:
+                result = self._client.place_simple_order(
+                    credentials,
+                    config,
+                    **kwargs,
+                )
+            except OkxApiError as exc:
+                last_error = exc
+                if not _is_transient_order_query_error(exc):
+                    # One final clOrdId lookup handles a response that arrived
+                    # after the retry request was sent, then surfaces the real
+                    # validation/order error if no order exists.
+                    status = self._wait_order_status_by_ref(
+                        credentials=credentials,
+                        config=config,
+                        inst_id=inst_id,
+                        cl_ord_id=cl_ord_id,
+                        timeout_seconds=2.0,
+                    )
+                    if status is not None and status.ord_id:
+                        result = OkxOrderResult(
+                            ord_id=status.ord_id,
+                            cl_ord_id=cl_ord_id,
+                            s_code="0",
+                            s_msg="recovered_after_transient_error",
+                            raw=status.raw,
+                        )
+                        self._track_active_roll_order_id(result.ord_id)
+                        return result
+                    raise
+                continue
+            self._track_active_roll_order_id(result.ord_id)
+            return result
+
+        raise OkxApiError(
+            f"{last_error} | 已按同一 clOrdId 回查并重试 {TRANSIENT_ORDER_SUBMIT_RETRY_COUNT} 次，"
+            "仍未确认订单结果。为避免重复下单，已停止本批次。"
+        ) from last_error
 
     def _retry_spot_post_only_as_limit(
         self,

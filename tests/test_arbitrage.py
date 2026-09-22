@@ -399,6 +399,63 @@ class ArbitrageWaitOrderFillTest(unittest.TestCase):
         self.assertEqual(avg_price, Decimal("100.2"))
         self.assertEqual(client.calls, ["ord_id", "cl_ord_id"])
 
+    def test_wait_order_fill_ignores_okx_system_busy_until_status_is_available(self) -> None:
+        class _SystemBusyOrderClient:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def get_order(  # noqa: ANN001
+                self,
+                credentials,
+                config,
+                *,
+                inst_id: str,
+                ord_id: str | None = None,
+                cl_ord_id: str | None = None,
+                request_timeout: float | None = None,
+            ):
+                self.calls += 1
+                if self.calls == 1:
+                    raise OkxApiError(
+                        'HTTP 500: {"code":"50013","msg":"当前系统繁忙"}',
+                        status=500,
+                    )
+                return OkxOrderStatus(
+                    ord_id="ord-busy-recovered",
+                    state="filled",
+                    side="buy",
+                    ord_type="market",
+                    price=Decimal("100"),
+                    avg_price=Decimal("100.3"),
+                    size=Decimal("1"),
+                    filled_size=Decimal("1"),
+                    raw={},
+                )
+
+        client = _SystemBusyOrderClient()
+        runtime = ArbitrageTradeRuntime(
+            credentials=Credentials("k", "s", "p"),
+            environment="demo",
+            trade_mode="cross",
+            position_mode="net",
+        )
+        config = arbitrage_executor_module._build_strategy_config("BTC-USDT-SWAP", runtime)  # noqa: SLF001
+        with patch("okx_quant.arbitrage.arbitrage_executor.PollSeconds", 0.01):
+            filled, avg_price = arbitrage_executor_module._wait_order_fill(
+                client,
+                credentials=runtime.credentials,
+                config=config,
+                inst_id="BTC-USDT-SWAP",
+                ord_id="ord-busy",
+                expected_size=Decimal("1"),
+                logger=lambda _message: None,
+                label="测试订单",
+            )
+
+        self.assertEqual(filled, Decimal("1"))
+        self.assertEqual(avg_price, Decimal("100.3"))
+        self.assertEqual(client.calls, 2)
+
 
 class ArbitrageAutoOpenMoreTest(unittest.TestCase):
     def test_limit_trigger(self) -> None:
@@ -2143,6 +2200,43 @@ class ArbitrageExecutorCloseTest(unittest.TestCase):
 
         self.assertEqual(result.ord_id, "ord-recovered")
         self.assertEqual(result.cl_ord_id, "arb-test-timeout")
+
+    def test_place_simple_order_with_recovery_retries_system_busy_with_same_cl_ord_id(self) -> None:
+        client = _FakeArbitrageTradeClient()
+        executor = ArbitrageExecutor(client)
+        runtime = ArbitrageTradeRuntime(
+            credentials=Credentials("k", "s", "p"),
+            environment="demo",
+            trade_mode="cross",
+            position_mode="net",
+        )
+        config = arbitrage_executor_module._build_strategy_config("BTC-USDT-SWAP", runtime)  # noqa: SLF001
+        recovered = SimpleNamespace(ord_id="ord-after-busy", cl_ord_id="arb-test-busy")
+        busy_error = OkxApiError(
+            'HTTP 500: {"code":"50013","msg":"当前系统繁忙"}',
+            status=500,
+        )
+        with (
+            patch.object(client, "place_simple_order", side_effect=[busy_error, recovered]),
+            patch.object(executor, "_wait_order_status_by_ref", return_value=None),
+            patch("okx_quant.arbitrage.arbitrage_executor.time.sleep"),
+        ):
+            result = executor._place_simple_order_with_recovery(
+                credentials=runtime.credentials,
+                config=config,
+                label="测试挂单腿",
+                inst_id="BTC-USDT-SWAP",
+                side="buy",
+                size=Decimal("1"),
+                ord_type="market",
+                pos_side="short",
+                reduce_only=True,
+                cl_ord_id="arb-test-busy",
+            )
+
+        self.assertEqual(result.ord_id, "ord-after-busy")
+        self.assertEqual(result.cl_ord_id, "arb-test-busy")
+        self.assertEqual(client.orders, [])
 
     def test_place_simple_order_with_recovery_tracks_active_roll_order_id(self) -> None:
         client = _FakeArbitrageTradeClient()

@@ -566,6 +566,23 @@ class LauncherWindow(QMainWindow):
         if callable(apply_profile):
             apply_profile(profile_name)
 
+    def _create_roll_page(self) -> QWidget:
+        """Create the roll page while keeping lightweight test/embed stubs compatible."""
+        try:
+            return RollTerminalWindow(profile_name=self._active_profile_name)
+        except (TypeError, AttributeError) as exc:
+            # Some embedded/test replacements intentionally expose the old
+            # zero-argument QWidget constructor. They can still receive the
+            # profile through the normal workspace-profile hook below.
+            try:
+                page = RollTerminalWindow()
+            except (TypeError, AttributeError):
+                raise exc
+            apply_profile = getattr(page, "apply_workspace_profile", None)
+            if callable(apply_profile):
+                apply_profile(self._active_profile_name)
+            return page
+
     def _create_page(self, page_key: str) -> QWidget:
         if page_key == "kline":
             return KlineAnalysisWindow(embedded=True)
@@ -577,7 +594,7 @@ class LauncherWindow(QMainWindow):
             self._home_widget = page
             return page
         if page_key == "roll":
-            page = RollTerminalWindow(profile_name=self._active_profile_name)
+            page = self._create_roll_page()
             set_workspace_managed = getattr(page, "set_workspace_managed", None)
             if callable(set_workspace_managed):
                 set_workspace_managed(True)
@@ -1061,7 +1078,16 @@ class LauncherWindow(QMainWindow):
 def create_module_window(module_key: str, *, profile_name: str = "") -> QWidget:
     normalized = module_key.strip().lower()
     if normalized == "roll":
-        window = RollTerminalWindow(profile_name=profile_name)
+        try:
+            window = RollTerminalWindow(profile_name=profile_name)
+        except (TypeError, AttributeError) as exc:
+            try:
+                window = RollTerminalWindow()
+            except (TypeError, AttributeError):
+                raise exc
+            apply_profile = getattr(window, "apply_workspace_profile", None)
+            if callable(apply_profile):
+                apply_profile(profile_name)
         apply_qt_window_icon(window)
         return window
     if normalized == "kline-analysis":

@@ -321,13 +321,13 @@ class RollTerminalWindow(QMainWindow):
         self._apply_api_profile(target)
 
     def _auto_execution_runtime(self):
-        if self._auto_enabled and self._auto_task_runtime is not None:
+        if getattr(self, "_auto_enabled", False) and getattr(self, "_auto_task_runtime", None) is not None:
             return self._auto_task_runtime
         return self._runtime
 
     def local_task_counts(self) -> tuple[LocalTaskCount, ...]:
         runtimes: list[object] = []
-        if self._auto_enabled and self._auto_task_runtime is not None:
+        if getattr(self, "_auto_enabled", False) and getattr(self, "_auto_task_runtime", None) is not None:
             runtimes.append(self._auto_task_runtime)
         elif self._execution_thread is not None and self._execution_thread.isRunning():
             runtime = getattr(self._execution_thread, "_runtime", None)
