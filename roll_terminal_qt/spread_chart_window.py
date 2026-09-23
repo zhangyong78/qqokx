@@ -34,12 +34,14 @@ CHART_BAR_OPTIONS: tuple[tuple[str, str], ...] = (
     ("15分钟", "15m"),
     ("1小时", "1H"),
     ("4小时", "4H"),
+    ("日线", "1D"),
 )
 
 _BAR_INTERVAL_MS = {
     "15m": 15 * 60 * 1000,
     "1H": 60 * 60 * 1000,
     "4H": 4 * 60 * 60 * 1000,
+    "1D": 24 * 60 * 60 * 1000,
 }
 
 
@@ -59,6 +61,36 @@ def _compact_spread_axis_range(candles: list[Candle]) -> tuple[Decimal, Decimal]
     midpoint = (upper + lower) / Decimal("2")
     padding = max(span * Decimal("0.12"), abs(midpoint) * Decimal("0.002"), Decimal("1"))
     return lower - padding, upper + padding
+
+
+def _compact_spread_wick_cap(candles: list[Candle]) -> Decimal:
+    """Return a robust display cap for cross-market spread candle wicks."""
+    if not candles:
+        return Decimal("1")
+    body_ranges = sorted(abs(candle.close - candle.open) for candle in candles)
+    wick_extensions = sorted(
+        max(
+            candle.high - max(candle.open, candle.close),
+            min(candle.open, candle.close) - candle.low,
+            Decimal("0"),
+        )
+        for candle in candles
+    )
+    median_body = body_ranges[len(body_ranges) // 2]
+    typical_wick = wick_extensions[min(len(wick_extensions) - 1, int((len(wick_extensions) - 1) * 0.8))]
+    body_values = [value for candle in candles for value in (candle.open, candle.close)]
+    body_span = max(body_values) - min(body_values)
+    return max(typical_wick * Decimal("1.5"), median_body * Decimal("4"), body_span * Decimal("0.03"), Decimal("1"))
+
+
+def _compact_spread_wick_bounds(candle: Candle, wick_cap: Decimal) -> tuple[Decimal, Decimal]:
+    """Clip only pathological spread wicks while keeping every body intact."""
+    body_high = max(candle.open, candle.close)
+    body_low = min(candle.open, candle.close)
+    return (
+        min(max(candle.high, body_high), body_high + wick_cap),
+        max(min(candle.low, body_low), body_low - wick_cap),
+    )
 
 
 def _aligned_spread_candles(left_candles: list[Candle], right_candles: list[Candle]) -> list[Candle]:
@@ -237,6 +269,13 @@ class SpreadChartWindow(QMainWindow):
         )
         self._show_raw_extremes_check.toggled.connect(self._render_current_chart)
         bar_row.addWidget(self._show_raw_extremes_check)
+        self._show_close_line_check = QCheckBox("显示收盘线")
+        self._show_close_line_check.setToolTip("普通 K 线默认不叠加收盘价连线；需要观察连续价差时可以打开。")
+        self._show_close_line_check.toggled.connect(self._render_current_chart)
+        bar_row.addWidget(self._show_close_line_check)
+        self._reset_view_button = QPushButton("恢复视图")
+        self._reset_view_button.clicked.connect(self._reset_chart_view)
+        bar_row.addWidget(self._reset_view_button)
         bar_row.addStretch(1)
         layout.addLayout(bar_row)
 
@@ -245,6 +284,7 @@ class SpreadChartWindow(QMainWindow):
         self._chart.setBackgroundVisible(False)
         self._chart_view = QChartView(self._chart)
         self._chart_view.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        self._chart_view.setRubberBand(QChartView.RubberBand.RectangleRubberBand)
         layout.addWidget(self._chart_view, 1)
 
         self._sync_bar_buttons()
@@ -293,6 +333,11 @@ class SpreadChartWindow(QMainWindow):
             button.style().unpolish(button)
             button.style().polish(button)
 
+    @Slot()
+    def _reset_chart_view(self) -> None:
+        self._chart.zoomReset()
+        self._chart_view.repaint()
+
     @Slot(str, str, str, object)
     def _apply_loaded_chart(self, left_inst_id: str, right_inst_id: str, bar: str, candles: list[Candle]) -> None:
         if left_inst_id != self._left_inst_id or right_inst_id != self._right_inst_id or bar != self._current_bar:
@@ -322,11 +367,16 @@ class SpreadChartWindow(QMainWindow):
         first_ts = candles[0].ts
         last_ts = candles[-1].ts
         show_raw_extremes = self._show_raw_extremes_check.isChecked()
+        show_close_line = self._show_close_line_check.isChecked()
+        wick_cap = _compact_spread_wick_cap(candles)
         if show_raw_extremes:
             min_price = min(candle.low for candle in candles)
             max_price = max(candle.high for candle in candles)
         else:
             min_price, max_price = _compact_spread_axis_range(candles)
+            compact_bounds = [_compact_spread_wick_bounds(candle, wick_cap) for candle in candles]
+            min_price = min(min_price, *(low for _high, low in compact_bounds))
+            max_price = max(max_price, *(high for high, _low in compact_bounds))
         clipped_wick_count = 0
 
         for candle in candles:
@@ -334,8 +384,7 @@ class SpreadChartWindow(QMainWindow):
             display_high = candle.high
             display_low = candle.low
             if not show_raw_extremes:
-                display_high = min(max(display_high, min_price), max_price)
-                display_low = max(min(display_low, max_price), min_price)
+                display_high, display_low = _compact_spread_wick_bounds(candle, wick_cap)
                 if display_high != candle.high or display_low != candle.low:
                     clipped_wick_count += 1
             candle_set = QCandlestickSet(
@@ -346,18 +395,22 @@ class SpreadChartWindow(QMainWindow):
                 timestamp_ms,
             )
             candle_series.append(candle_set)
-            close_series.append(timestamp_ms, float(candle.close))
+            if show_close_line:
+                close_series.append(timestamp_ms, float(candle.close))
 
         self._chart.addSeries(candle_series)
-        self._chart.addSeries(close_series)
+        if show_close_line:
+            self._chart.addSeries(close_series)
         view_label = "原始极值" if show_raw_extremes else "紧凑交易视图"
+        if show_close_line:
+            view_label += " + 收盘线"
         self._chart.setTitle(
             f"{self._left_inst_id} / {self._right_inst_id} 价差K线 | "
             f"{self._current_bar} | {view_label}"
         )
 
         axis_x = QDateTimeAxis()
-        axis_x.setFormat("MM-dd HH:mm")
+        axis_x.setFormat("MM-dd" if self._current_bar == "1D" else "MM-dd HH:mm")
         axis_x.setTickCount(min(8, max(3, len(candles) // 30 + 2)))
         axis_x.setRange(QDateTime.fromMSecsSinceEpoch(int(first_ts)), QDateTime.fromMSecsSinceEpoch(int(last_ts)))
 

@@ -5,8 +5,12 @@ from unittest import TestCase
 
 from okx_quant.models import Candle
 from roll_terminal_qt.spread_chart_window import (
+    CHART_BAR_OPTIONS,
+    _BAR_INTERVAL_MS,
     _aligned_spread_candles,
     _compact_spread_axis_range,
+    _compact_spread_wick_bounds,
+    _compact_spread_wick_cap,
     _load_pair_candles,
 )
 
@@ -27,6 +31,10 @@ def _candles(start: int, count: int) -> list[Candle]:
 
 
 class SpreadChartHistoryAlignmentTest(TestCase):
+    def test_includes_daily_period_with_one_day_alignment_interval(self) -> None:
+        self.assertIn(("日线", "1D"), CHART_BAR_OPTIONS)
+        self.assertEqual(_BAR_INTERVAL_MS["1D"], 24 * 60 * 60 * 1000)
+
     def test_loads_newer_leg_from_older_leg_window(self) -> None:
         left = _candles(1_000_000, 4)
         right_latest = _candles(10_000_000, 4)
@@ -58,6 +66,28 @@ class SpreadChartHistoryAlignmentTest(TestCase):
 
 
 class SpreadChartCompactRangeTest(TestCase):
+    def test_compact_wicks_do_not_fill_the_whole_chart_with_vertical_lines(self) -> None:
+        candles = [
+            Candle(
+                ts=1_000_000 + index,
+                open=Decimal("100") + index,
+                high=Decimal("1000") if index == 0 else Decimal("104") + index,
+                low=Decimal("-800") if index == 0 else Decimal("98") + index,
+                close=Decimal("101") + index,
+                volume=Decimal("0"),
+                confirmed=True,
+            )
+            for index in range(5)
+        ]
+
+        wick_cap = _compact_spread_wick_cap(candles)
+        display_high, display_low = _compact_spread_wick_bounds(candles[0], wick_cap)
+
+        self.assertLess(display_high, candles[0].high)
+        self.assertGreater(display_low, candles[0].low)
+        self.assertGreaterEqual(display_high, candles[0].close)
+        self.assertLessEqual(display_low, candles[0].open)
+
     def test_uses_candle_bodies_not_an_extreme_wick_for_default_axis(self) -> None:
         candles = [
             Candle(

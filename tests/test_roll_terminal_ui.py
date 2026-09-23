@@ -502,6 +502,35 @@ class RollTerminalUiTests(unittest.TestCase):
 
         self.assertEqual(parsed, ("批次 2/5", "目标 0.3 张"))
 
+    def test_zero_failed_history_cleanup_only_matches_zero_filled_records(self) -> None:
+        zero_failed = {"status": "失败", "success": False, "qty": "0", "current_filled_qty": "0", "target_filled_qty": "0"}
+        partial_failed = {"status": "失败", "success": False, "qty": "2", "current_filled_qty": "2", "target_filled_qty": "0"}
+        completed_zero = {"status": "完成", "success": True, "qty": "0", "current_filled_qty": "0", "target_filled_qty": "0"}
+
+        self.assertTrue(RollTerminalWindow._is_zero_failed_history_record(zero_failed))
+        self.assertFalse(RollTerminalWindow._is_zero_failed_history_record(partial_failed))
+        self.assertFalse(RollTerminalWindow._is_zero_failed_history_record(completed_zero))
+
+    def test_build_execution_history_record_keeps_both_leg_filled_quantities(self) -> None:
+        window = self._build_window()
+        window._last_profile_name = "api1"
+        window._active_execution_label = "移仓"
+        window._latest_execution_pair = lambda: ("BTC-USD-260925", "BTC-USD-261225")
+        result = SimpleNamespace(
+            success=False,
+            message="移仓部分完成后中断",
+            rolled_derivative_qty=Decimal("2"),
+            target_derivative_filled_qty=Decimal("1"),
+            order_ids=("old-1", "new-1"),
+        )
+
+        record = window._build_execution_history_record(result)
+
+        self.assertEqual(record["current_filled_qty"], "2")
+        self.assertEqual(record["target_filled_qty"], "1")
+        self.assertEqual(record["order_ids"], ["old-1", "new-1"])
+        self.assertFalse(RollTerminalWindow._is_zero_failed_history_record(record))
+
     def test_refresh_template_controls_close_mode_uses_lte_threshold_label(self) -> None:
         window = self._build_window()
         window._auto_enabled = False

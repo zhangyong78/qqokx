@@ -6,7 +6,7 @@ import time
 from datetime import datetime
 from decimal import Decimal, ROUND_DOWN
 
-from PySide6.QtCore import QThread, QTimer, Qt, Slot
+from PySide6.QtCore import QThread, QTimer, Qt, Signal, Slot
 from PySide6.QtGui import QColor, QFont
 from PySide6.QtWidgets import (
     QApplication,
@@ -114,6 +114,181 @@ TERMINAL_MODE_OPTIONS = (
     ("套利平仓", "close"),
     ("交割移仓", "roll"),
 )
+
+
+class ExecutionHistoryDialog(QDialog):
+    """Large, sortable view for the local arbitrage execution ledger."""
+
+    records_delete_requested = Signal(object)
+    zero_failed_cleanup_requested = Signal()
+
+    HEADERS = [
+        "时间",
+        "账户",
+        "类型",
+        "旧合约",
+        "新合约",
+        "计划数量",
+        "旧合约成交",
+        "新合约成交",
+        "状态",
+        "平均价差",
+        "双腿手续费",
+        "扣费后净价差",
+    ]
+
+    def __init__(self, records: list[dict[str, object]], *, formatter, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("套利历史账本")
+        self.resize(1560, 820)
+        self.setMinimumSize(1100, 560)
+        self._formatter = formatter
+        self._records: list[dict[str, object]] = []
+        self._record_by_token: dict[int, dict[str, object]] = {}
+
+        root = QVBoxLayout(self)
+        toolbar = QHBoxLayout()
+        toolbar.addWidget(QLabel("搜索"))
+        self._search = QLineEdit()
+        self._search.setPlaceholderText("时间、合约、状态、错误原因...")
+        self._search.textChanged.connect(self._apply_filter)
+        toolbar.addWidget(self._search, 1)
+        toolbar.addWidget(QLabel("状态"))
+        self._status = QComboBox()
+        self._status.addItem("全部", "all")
+        self._status.addItem("完成", "完成")
+        self._status.addItem("失败", "失败")
+        self._status.currentIndexChanged.connect(self._apply_filter)
+        toolbar.addWidget(self._status)
+        self._cleanup_button = QPushButton("清理0张失败记录")
+        self._cleanup_button.clicked.connect(self.zero_failed_cleanup_requested.emit)
+        toolbar.addWidget(self._cleanup_button)
+        self._delete_button = QPushButton("删除选中记录")
+        self._delete_button.clicked.connect(self._request_delete_selected)
+        toolbar.addWidget(self._delete_button)
+        root.addLayout(toolbar)
+
+        self._summary = QLabel()
+        self._summary.setObjectName("Hint")
+        root.addWidget(self._summary)
+
+        self._table = QTableWidget(0, len(self.HEADERS))
+        self._table.setHorizontalHeaderLabels(self.HEADERS)
+        self._table.setSortingEnabled(True)
+        self._table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self._table.setSelectionMode(QTableWidget.SelectionMode.ExtendedSelection)
+        self._table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self._table.verticalHeader().setVisible(False)
+        self._table.setWordWrap(False)
+        header = self._table.horizontalHeader()
+        for column in range(len(self.HEADERS)):
+            header.setSectionResizeMode(column, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(11, QHeaderView.ResizeMode.Stretch)
+        self._table.cellClicked.connect(self._show_detail)
+        root.addWidget(self._table, 4)
+
+        detail_title = QLabel("执行详情")
+        detail_title.setObjectName("Subtle")
+        root.addWidget(detail_title)
+        self._detail = QTextEdit()
+        self._detail.setReadOnly(True)
+        self._detail.setMinimumHeight(150)
+        self._detail.setPlaceholderText("点击上方记录查看完整执行日志。")
+        root.addWidget(self._detail, 1)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        buttons.rejected.connect(self.reject)
+        root.addWidget(buttons)
+        self.set_records(records)
+
+    def set_records(self, records: list[dict[str, object]]) -> None:
+        self._records = list(records)
+        self._apply_filter()
+
+    @staticmethod
+    def _decimal_text(value: object) -> str:
+        try:
+            return fmt_decimal(Decimal(str(value or "0")))
+        except (ArithmeticError, ValueError):
+            return "0"
+
+    def _record_values(self, record: dict[str, object]) -> list[str]:
+        planned = record.get("planned_qty", record.get("qty", "0"))
+        current = record.get("current_filled_qty", record.get("qty", "0"))
+        target = record.get("target_filled_qty", record.get("qty", "0"))
+        return [
+            str(record.get("timestamp", "")),
+            str(record.get("profile", "")),
+            str(record.get("task", "")),
+            str(record.get("current_inst_id", "")),
+            str(record.get("target_inst_id", "")),
+            self._decimal_text(planned),
+            self._decimal_text(current),
+            self._decimal_text(target),
+            str(record.get("status", "")),
+            self._formatter._history_metric_value(str(record.get("avg_spread_line", ""))),
+            self._formatter._history_fee_display(str(record.get("fee_line", ""))),
+            self._formatter._history_metric_value(str(record.get("net_spread_line", ""))),
+        ]
+
+    def _apply_filter(self) -> None:
+        query = self._search.text().strip().lower()
+        selected_status = str(self._status.currentData() or "all")
+        visible: list[tuple[dict[str, object], list[str]]] = []
+        for record in self._records:
+            values = self._record_values(record)
+            haystack = " ".join(values + [str(record.get("message", ""))]).lower()
+            if selected_status != "all" and str(record.get("status", "")) != selected_status:
+                continue
+            if query and query not in haystack:
+                continue
+            visible.append((record, values))
+
+        self._table.setUpdatesEnabled(False)
+        self._table.setSortingEnabled(False)
+        self._record_by_token = {}
+        self._table.setRowCount(len(visible))
+        for row, (record, values) in enumerate(visible):
+            token = id(record)
+            self._record_by_token[token] = record
+            color = QColor("#1a7f46") if bool(record.get("success", False)) else QColor("#c83b55")
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(value)
+                item.setForeground(color)
+                item.setToolTip(str(record.get("message", "") or ""))
+                if column == 0:
+                    item.setData(Qt.ItemDataRole.UserRole + 1, token)
+                if column == 0:
+                    item.setData(Qt.ItemDataRole.UserRole, str(record.get("message", "") or ""))
+                self._table.setItem(row, column, item)
+        self._table.setSortingEnabled(True)
+        self._table.setUpdatesEnabled(True)
+        self._summary.setText(f"共 {len(self._records)} 条，当前显示 {len(visible)} 条")
+        self._detail.clear()
+
+    def _request_delete_selected(self) -> None:
+        records: list[dict[str, object]] = []
+        for index in self._table.selectionModel().selectedRows():
+            item = self._table.item(index.row(), 0)
+            if item is None:
+                continue
+            token = item.data(Qt.ItemDataRole.UserRole + 1)
+            record = self._record_by_token.get(int(token)) if token is not None else None
+            if record is not None:
+                records.append(record)
+        if records:
+            self.records_delete_requested.emit(records)
+        else:
+            QMessageBox.information(self, "删除历史账本", "请先选择要删除的记录。")
+
+    def _show_detail(self, row: int, _column: int) -> None:
+        if row < 0 or row >= self._table.rowCount():
+            return
+        item = self._table.item(row, 0)
+        if item is None:
+            return
+        message = item.data(Qt.ItemDataRole.UserRole)
+        self._detail.setPlainText(str(message or "无详细执行日志"))
 
 
 class OrderBookPanel(QFrame):
@@ -272,6 +447,7 @@ class RollTerminalWindow(QMainWindow):
         self._spot_arbitrage_scan_widget: SpotArbitrageScanWidget | None = None
         self._spot_arbitrage_chart_widget: SpotArbitrageChartWidget | None = None
         self._execution_history_records: list[dict[str, object]] = []
+        self._execution_history_dialog: ExecutionHistoryDialog | None = None
         self._all_opportunities = load_all_opportunities()
         self._filtered_opportunities = list(self._all_opportunities)
         self._selected_opportunity: ArbitrageOpportunityView | None = None
@@ -1052,7 +1228,7 @@ class RollTerminalWindow(QMainWindow):
         history_header.setSectionResizeMode(7, QHeaderView.ResizeMode.ResizeToContents)
         history_header.setSectionResizeMode(8, QHeaderView.ResizeMode.ResizeToContents)
         history_header.setSectionResizeMode(9, QHeaderView.ResizeMode.Stretch)
-        self._history_table.setMaximumHeight(220)
+        self._history_table.setMaximumHeight(340)
         self._order_table = QTableWidget(0, 8)
         self._order_table.setHorizontalHeaderLabels(["合约", "订单号", "方向", "类型", "状态", "价格", "成交均价", "成交/数量"])
         self._order_table.verticalHeader().setVisible(False)
@@ -1078,7 +1254,13 @@ class RollTerminalWindow(QMainWindow):
         activity_layout.addWidget(self._execution_table, 2)
         history_title = QLabel("历史账本")
         history_title.setObjectName("Subtle")
-        activity_layout.addWidget(history_title)
+        history_toolbar = QHBoxLayout()
+        history_toolbar.addWidget(history_title)
+        history_toolbar.addStretch(1)
+        self._open_history_button = QPushButton("弹出历史账本")
+        self._open_history_button.clicked.connect(self._open_execution_history_dialog)
+        history_toolbar.addWidget(self._open_history_button)
+        activity_layout.addLayout(history_toolbar)
         activity_layout.addWidget(self._history_summary)
         activity_layout.addWidget(self._history_table, 2)
         activity_layout.addWidget(orders_title)
@@ -3468,15 +3650,133 @@ class RollTerminalWindow(QMainWindow):
             self._append_log(f"历史账本写入失败：{exc}")
         self._refresh_execution_history_view()
 
+    @staticmethod
+    def _history_decimal_value(record: dict[str, object], key: str, fallback_key: str = "qty") -> Decimal:
+        raw = record.get(key, record.get(fallback_key, "0"))
+        try:
+            return Decimal(str(raw or "0"))
+        except (ArithmeticError, ValueError):
+            return Decimal("0")
+
+    @classmethod
+    def _is_zero_failed_history_record(cls, record: dict[str, object]) -> bool:
+        if bool(record.get("success", False)) or str(record.get("status", "")) != "失败":
+            return False
+        return (
+            cls._history_decimal_value(record, "qty") == 0
+            and cls._history_decimal_value(record, "current_filled_qty") == 0
+            and cls._history_decimal_value(record, "target_filled_qty") == 0
+        )
+
+    def _open_execution_history_dialog(self) -> None:
+        if self._execution_history_dialog is None:
+            self._execution_history_dialog = ExecutionHistoryDialog(
+                self._execution_history_records,
+                formatter=self,
+                parent=self,
+            )
+            self._execution_history_dialog.records_delete_requested.connect(
+                self._delete_execution_history_records
+            )
+            self._execution_history_dialog.zero_failed_cleanup_requested.connect(
+                lambda: self._cleanup_zero_failed_history(parent=self._execution_history_dialog)
+            )
+        else:
+            self._execution_history_dialog.set_records(self._execution_history_records)
+        self._execution_history_dialog.show()
+        self._execution_history_dialog.raise_()
+        self._execution_history_dialog.activateWindow()
+
+    def _cleanup_zero_failed_history(self, *, parent: QWidget | None = None) -> None:
+        removable = [record for record in self._execution_history_records if self._is_zero_failed_history_record(record)]
+        if not removable:
+            QMessageBox.information(parent or self, "清理历史账本", "没有找到可安全清理的零成交失败记录。")
+            return
+        answer = QMessageBox.question(
+            parent or self,
+            "确认清理历史账本",
+            f"发现 {len(removable)} 条零成交失败记录。\n"
+            "只会删除旧合约和新合约实际成交都为 0 的失败记录，是否继续？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+
+        remaining = [record for record in self._execution_history_records if not self._is_zero_failed_history_record(record)]
+        try:
+            self._write_execution_history_records(remaining)
+            self._execution_history_records = remaining
+            self._refresh_execution_history_view()
+            if self._execution_history_dialog is not None:
+                self._execution_history_dialog.set_records(remaining)
+            self._append_log(f"历史账本已清理 {len(removable)} 条零成交失败记录，备份已保存。")
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.critical(parent or self, "清理历史账本失败", f"原账本未替换，请检查文件权限：{exc}")
+
+    def _delete_execution_history_records(self, records: object) -> None:
+        selected = records if isinstance(records, list) else []
+        selected_ids = {id(record) for record in selected if isinstance(record, dict)}
+        removable = [record for record in self._execution_history_records if id(record) in selected_ids]
+        if not removable:
+            return
+        parent = self._execution_history_dialog or self
+        answer = QMessageBox.question(
+            parent,
+            "确认删除历史账本",
+            f"确定删除选中的 {len(removable)} 条历史记录吗？\n"
+            "只删除本地历史账本记录，不会撤销或修改 OKX 上的订单。",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        remaining = [record for record in self._execution_history_records if id(record) not in selected_ids]
+        try:
+            self._write_execution_history_records(remaining)
+            self._execution_history_records = remaining
+            self._refresh_execution_history_view()
+            if self._execution_history_dialog is not None:
+                self._execution_history_dialog.set_records(remaining)
+            self._append_log(f"历史账本已删除 {len(removable)} 条选中记录，备份已保存。")
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.critical(parent, "删除历史账本失败", f"原账本未替换，请检查文件权限：{exc}")
+
+    def _write_execution_history_records(self, records: list[dict[str, object]]) -> None:
+        path = self._roll_terminal_history_path()
+        temporary_path = path.with_name(path.name + ".tmp")
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            if path.exists():
+                path.with_name(path.name + ".bak").write_bytes(path.read_bytes())
+            temporary_path.write_text(
+                "".join(json.dumps(record, ensure_ascii=False) + "\n" for record in records),
+                encoding="utf-8",
+            )
+            temporary_path.replace(path)
+        except Exception:
+            if temporary_path.exists():
+                temporary_path.unlink()
+            raise
+
     def _build_execution_history_record(self, result) -> dict[str, object]:  # noqa: ANN001
         message = str(getattr(result, "message", "") or "")
         lines = [line.strip() for line in message.splitlines() if line.strip()]
         current_inst_id, target_inst_id = self._latest_execution_pair()
-        qty = (
+        current_filled_qty = (
             getattr(result, "rolled_derivative_qty", None)
             or getattr(result, "executed_derivative_qty", None)
             or Decimal("0")
         )
+        target_filled_qty = (
+            getattr(result, "target_derivative_filled_qty", None)
+            or getattr(result, "executed_derivative_qty", None)
+            or Decimal("0")
+        )
+        qty = current_filled_qty or target_filled_qty or Decimal("0")
+        planned_qty = getattr(result, "planned_derivative_qty", None) or qty
+        raw_order_ids = getattr(result, "order_ids", ()) or ()
+        order_ids = [str(item) for item in raw_order_ids if str(item).strip()]
         success = bool(getattr(result, "success", False))
         avg_spread_line = next(
             (
@@ -3505,6 +3805,10 @@ class RollTerminalWindow(QMainWindow):
             "current_inst_id": current_inst_id,
             "target_inst_id": target_inst_id,
             "qty": str(qty),
+            "planned_qty": str(planned_qty),
+            "current_filled_qty": str(current_filled_qty),
+            "target_filled_qty": str(target_filled_qty),
+            "order_ids": order_ids,
             "status": "完成" if success else "失败",
             "success": success,
             "avg_spread_line": avg_spread_line,

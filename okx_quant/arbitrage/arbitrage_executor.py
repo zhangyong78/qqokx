@@ -42,8 +42,12 @@ PRIVATE_WS_STALE_REST_FALLBACK_SECONDS = 5.0
 ORDER_STATUS_REQUEST_TIMEOUT_SECONDS = 2.5
 ORDER_CANCEL_REQUEST_TIMEOUT_SECONDS = 2.5
 POST_CANCEL_SETTLE_SECONDS = 5.0
-POST_CANCEL_RECOVERY_SECONDS = 8.0
-POST_CANCEL_NONTERMINAL_RECOVERY_SECONDS = 12.0
+ROLL_NETWORK_RECOVERY_SECONDS = 90.0
+ROLL_NETWORK_RECOVERY_POLL_SECONDS = 2.0
+ROLL_NETWORK_RECOVERY_CANCEL_INTERVAL_SECONDS = 4.0
+ROLL_POSITION_CONFIRMATION_COUNT = 2
+POST_CANCEL_RECOVERY_SECONDS = ROLL_NETWORK_RECOVERY_SECONDS
+POST_CANCEL_NONTERMINAL_RECOVERY_SECONDS = ROLL_NETWORK_RECOVERY_SECONDS
 TRANSIENT_ORDER_SUBMIT_RETRY_COUNT = 3
 TRANSIENT_ORDER_SUBMIT_BACKOFF_SECONDS = 1.0
 
@@ -65,28 +69,28 @@ def _post_cancel_settle_seconds_for_mode(execution_mode: str) -> float:
 def _post_cancel_recovery_seconds_for_mode(execution_mode: str) -> float:
     normalized = str(execution_mode or "").strip().lower()
     if normalized == "both_maker_first_taker":
-        return 8.0
+        return ROLL_NETWORK_RECOVERY_SECONDS
     if normalized in {
         "old_maker_new_taker",
         "new_maker_old_taker",
         "spot_maker_derivative_taker",
         "derivative_maker_spot_taker",
     }:
-        return 3.0
+        return ROLL_NETWORK_RECOVERY_SECONDS
     return 0.0
 
 
 def _post_cancel_nonterminal_recovery_seconds_for_mode(execution_mode: str) -> float:
     normalized = str(execution_mode or "").strip().lower()
     if normalized == "both_maker_first_taker":
-        return 12.0
+        return ROLL_NETWORK_RECOVERY_SECONDS
     if normalized in {
         "old_maker_new_taker",
         "new_maker_old_taker",
         "spot_maker_derivative_taker",
         "derivative_maker_spot_taker",
     }:
-        return 4.0
+        return ROLL_NETWORK_RECOVERY_SECONDS
     return 0.0
 
 
@@ -1656,111 +1660,159 @@ class ArbitrageExecutor:
                 label=label,
                 settle_seconds=settle_seconds,
             )
-        except PostCancelNonTerminalError as exc:
-            if nonterminal_recovery_seconds <= 0:
+        except (PostCancelNonTerminalError, PostCancelStatusUnknownError) as exc:
+            is_unknown = isinstance(exc, PostCancelStatusUnknownError)
+            recovery_window = recovery_seconds if is_unknown else nonterminal_recovery_seconds
+            if recovery_window <= 0:
+                if is_unknown:
+                    self._logger(f"{label} 撤单后订单状态暂不可确认，已暂停后续批次：{exc}")
+                else:
+                    self._logger(f"{label} 撤单后订单仍为未终态，已暂停后续批次：{exc}")
+                raise
+
+            self._post_cancel_recovery_used = True
+            reason = "网络或服务短暂异常" if is_unknown else "撤单尚未生效或订单仍在处理中"
+            self._logger(
+                f"{label} {reason}，暂停后续批次，最长 {format_decimal(Decimal(str(recovery_window)))} 秒"
+                f"持续撤单并核对订单终态：{exc}"
+            )
+            latest_filled = known_filled
+            latest_avg = known_avg
+            last_state = "unknown"
+            deadline = time.time() + max(0.0, recovery_window)
+            last_cancel_at = 0.0
+            while time.time() < deadline:
+                now = time.time()
+                if now - last_cancel_at >= ROLL_NETWORK_RECOVERY_CANCEL_INTERVAL_SECONDS:
+                    self._cancel_order_safely(
+                        credentials=credentials,
+                        config=config,
+                        inst_id=inst_id,
+                        ord_id=ord_id,
+                        label=label,
+                    )
+                    last_cancel_at = time.time()
+                status = self._wait_order_status_by_ref(
+                    credentials=credentials,
+                    config=config,
+                    inst_id=inst_id,
+                    ord_id=ord_id,
+                    timeout_seconds=min(max(deadline - time.time(), 0.0), 1.2),
+                )
+                if status is None:
+                    time.sleep(min(ROLL_NETWORK_RECOVERY_POLL_SECONDS, max(deadline - time.time(), 0.0)))
+                    continue
+                next_filled = status.filled_size or Decimal("0")
+                if next_filled > latest_filled:
+                    self._logger(
+                        f"{label} 恢复核对期间新增成交 {format_decimal(next_filled - latest_filled)} 张，"
+                        f"累计 {format_decimal(next_filled)} 张。"
+                    )
+                    latest_filled = next_filled
+                    latest_avg = status.avg_price
+                elif latest_avg is None and status.avg_price is not None:
+                    latest_avg = status.avg_price
+                last_state = (status.state or "unknown").lower()
+                if last_state in {"filled", "canceled", "cancelled"}:
+                    self._logger(
+                        f"{label} 已确认订单终态 {status.state or '-'}，"
+                        f"累计成交 {format_decimal(latest_filled)} 张。"
+                    )
+                    return latest_filled, latest_avg, last_state
+                time.sleep(min(ROLL_NETWORK_RECOVERY_POLL_SECONDS, max(deadline - time.time(), 0.0)))
+            raise OkxApiError(
+                f"{label} 网络恢复等待 {format_decimal(Decimal(str(recovery_window)))} 秒后，"
+                f"订单仍未确认终态（最近状态：{last_state}）。已保持安全暂停，未继续后续批次。"
+            ) from exc
+
+    def _fresh_roll_leg_position_size(
+        self,
+        *,
+        credentials,
+        environment: str,
+        inst_id: str,
+        position_side: str | None,
+    ) -> Decimal:
+        positions = self._client.get_positions(
+            credentials,
+            environment=environment,
+            inst_type="FUTURES",
+            prefer_cache=False,
+        )
+        normalized_inst_id = str(inst_id or "").strip().upper()
+        normalized_side = str(position_side or "").strip().lower()
+        total = Decimal("0")
+        for position in positions:
+            if str(getattr(position, "inst_id", "") or "").strip().upper() != normalized_inst_id:
+                continue
+            actual_side = str(getattr(position, "pos_side", "") or "").strip().lower()
+            if normalized_side in {"long", "short"} and actual_side not in {normalized_side, "net"}:
+                continue
+            raw_position = getattr(position, "position", Decimal("0"))
+            value = raw_position if isinstance(raw_position, Decimal) else Decimal(str(raw_position or "0"))
+            total += abs(value)
+        return total
+
+    def _confirm_roll_recovery_positions_stable(
+        self,
+        *,
+        credentials,
+        environment: str,
+        current_inst_id: str,
+        target_inst_id: str,
+        position_side: str | None,
+        recovery_seconds: float,
+    ) -> None:
+        """Confirm both futures legs stopped changing before another roll order is allowed."""
+        deadline = time.time() + max(0.0, recovery_seconds)
+        stable_count = 0
+        previous: tuple[Decimal, Decimal] | None = None
+        last_error: BaseException | None = None
+        while time.time() < deadline:
+            try:
+                snapshot = (
+                    self._fresh_roll_leg_position_size(
+                        credentials=credentials,
+                        environment=environment,
+                        inst_id=current_inst_id,
+                        position_side=position_side,
+                    ),
+                    self._fresh_roll_leg_position_size(
+                        credentials=credentials,
+                        environment=environment,
+                        inst_id=target_inst_id,
+                        position_side=position_side,
+                    ),
+                )
+            except Exception as exc:  # noqa: BLE001
+                if not _is_transient_order_query_error(exc):
+                    raise OkxApiError(f"网络恢复后读取两腿实时持仓失败，已保持安全暂停：{exc}") from exc
+                last_error = exc
+                self._logger(f"网络恢复后两腿持仓暂不可读取，继续等待确认：{exc}")
+                time.sleep(min(ROLL_NETWORK_RECOVERY_POLL_SECONDS, max(deadline - time.time(), 0.0)))
+                continue
+            if snapshot == previous:
+                stable_count += 1
+            else:
+                previous = snapshot
+                stable_count = 1
                 self._logger(
-                    f"{label} ???????????????????? live/partially_filled??"
-                    "??????????????????????"
+                    "网络恢复后读取两腿实时持仓："
+                    f"旧合约 {format_decimal(snapshot[0])} 张，目标合约 {format_decimal(snapshot[1])} 张；"
+                    "正在复核稳定性。"
                 )
-                raise
-            self._logger(
-                f"{label} ?????????????????????????? {nonterminal_recovery_seconds} ??"
-                f" ???{exc}"
-            )
-            latest_filled = known_filled
-            latest_avg = known_avg
-            last_state = ""
-            deadline = time.time() + max(0.0, nonterminal_recovery_seconds)
-            while time.time() < deadline:
-                self._cancel_order_safely(
-                    credentials=credentials,
-                    config=config,
-                    inst_id=inst_id,
-                    ord_id=ord_id,
-                    label=label,
+            if stable_count >= ROLL_POSITION_CONFIRMATION_COUNT:
+                self._logger(
+                    "网络恢复后两腿实时持仓已连续确认稳定，"
+                    "两笔挂单均已进入终态，允许继续本批补齐或下一批移仓。"
                 )
-                status = self._wait_order_status_by_ref(
-                    credentials=credentials,
-                    config=config,
-                    inst_id=inst_id,
-                    ord_id=ord_id,
-                    timeout_seconds=min(max(deadline - time.time(), 0.0), 1.2),
-                )
-                if status is None:
-                    time.sleep(min(PollSeconds, max(deadline - time.time(), 0.0), 0.25))
-                    continue
-                next_filled = status.filled_size or Decimal("0")
-                if next_filled > latest_filled:
-                    self._logger(
-                        f"{label} ?????????????? {format_decimal(next_filled - latest_filled)}?"
-                        f"?? {format_decimal(next_filled)}?"
-                    )
-                    latest_filled = next_filled
-                    latest_avg = status.avg_price
-                elif latest_avg is None and status.avg_price is not None:
-                    latest_avg = status.avg_price
-                last_state = (status.state or "").lower()
-                if last_state in {"filled", "canceled", "cancelled"}:
-                    self._logger(
-                        f"{label} ????????????? {status.state or '-'}?"
-                        f"???? {format_decimal(latest_filled)}?"
-                    )
-                    return latest_filled, latest_avg, last_state
-                time.sleep(min(PollSeconds, max(deadline - time.time(), 0.0), 0.25))
-            raise OkxApiError(
-                f"{label} ????????? {nonterminal_recovery_seconds} ?????????????{last_state or 'unknown'}??"
-                "??????????????????????????"
-            ) from exc
-        except PostCancelStatusUnknownError as exc:
-            if recovery_seconds <= 0:
-                raise
-            self._logger(
-                f"{label} ?????????????????? {recovery_seconds} ?????{exc}"
-            )
-            latest_filled = known_filled
-            latest_avg = known_avg
-            last_state = ""
-            deadline = time.time() + max(0.0, recovery_seconds)
-            while time.time() < deadline:
-                self._cancel_order_safely(
-                    credentials=credentials,
-                    config=config,
-                    inst_id=inst_id,
-                    ord_id=ord_id,
-                    label=label,
-                )
-                status = self._wait_order_status_by_ref(
-                    credentials=credentials,
-                    config=config,
-                    inst_id=inst_id,
-                    ord_id=ord_id,
-                    timeout_seconds=min(max(deadline - time.time(), 0.0), 1.2),
-                )
-                if status is None:
-                    time.sleep(min(PollSeconds, max(deadline - time.time(), 0.0), 0.25))
-                    continue
-                next_filled = status.filled_size or Decimal("0")
-                if next_filled > latest_filled:
-                    self._logger(
-                        f"{label} ???????????? {format_decimal(next_filled - latest_filled)}?"
-                        f"?? {format_decimal(next_filled)}?"
-                    )
-                    latest_filled = next_filled
-                    latest_avg = status.avg_price
-                elif latest_avg is None and status.avg_price is not None:
-                    latest_avg = status.avg_price
-                last_state = (status.state or "").lower()
-                if last_state in {"filled", "canceled", "cancelled"}:
-                    self._logger(
-                        f"{label} ??????????? {status.state or '-'}?"
-                        f"???? {format_decimal(latest_filled)}?"
-                    )
-                    return latest_filled, latest_avg, last_state
-                time.sleep(min(PollSeconds, max(deadline - time.time(), 0.0), 0.25))
-            raise OkxApiError(
-                f"{label} ??????? {recovery_seconds} ?????????????{last_state or 'unknown'}??"
-                "??????????????????????????"
-            ) from exc
+                return
+            time.sleep(min(ROLL_NETWORK_RECOVERY_POLL_SECONDS, max(deadline - time.time(), 0.0)))
+        detail = f"最近错误：{last_error}" if last_error is not None else "持仓仍在变化或未获得连续确认"
+        raise OkxApiError(
+            f"网络恢复后 {format_decimal(Decimal(str(recovery_seconds)))} 秒内未能确认两腿实时持仓稳定（{detail}）。"
+            "已保持安全暂停，未继续后续批次。"
+        )
 
     def _cancel_dual_maker_orders_and_capture_fills(
         self,
@@ -1779,7 +1831,11 @@ class ArbitrageExecutor:
         settle_seconds: float = POST_CANCEL_SETTLE_SECONDS,
         recovery_seconds: float = POST_CANCEL_RECOVERY_SECONDS,
         nonterminal_recovery_seconds: float = POST_CANCEL_NONTERMINAL_RECOVERY_SECONDS,
+        confirm_recovery_positions: bool = False,
+        position_side: str | None = None,
     ) -> tuple[Decimal, Decimal | None, Decimal, Decimal | None]:
+        if confirm_recovery_positions:
+            self._post_cancel_recovery_used = False
         self._cancel_order_safely(
             credentials=credentials,
             config=current_config,
@@ -1818,6 +1874,15 @@ class ArbitrageExecutor:
             settle_seconds=settle_seconds,
             recovery_seconds=recovery_seconds,
         )
+        if confirm_recovery_positions and bool(getattr(self, "_post_cancel_recovery_used", False)):
+            self._confirm_roll_recovery_positions_stable(
+                credentials=credentials,
+                environment=current_config.environment,
+                current_inst_id=current_inst_id,
+                target_inst_id=target_inst_id,
+                position_side=position_side,
+                recovery_seconds=max(recovery_seconds, nonterminal_recovery_seconds),
+            )
         return latest_current_filled, latest_current_avg, latest_target_filled, latest_target_avg
 
     def _execute_taker_leg(
@@ -3955,6 +4020,8 @@ class ArbitrageExecutor:
                         settle_seconds=post_cancel_settle_seconds,
                         recovery_seconds=post_cancel_recovery_seconds,
                         nonterminal_recovery_seconds=post_cancel_nonterminal_recovery_seconds,
+                        confirm_recovery_positions=True,
+                        position_side=derivative_pos_side,
                     )
                     if current_batch_filled <= 0 and target_batch_filled <= 0:
                         if attempt >= request.chase_limit:
@@ -4010,6 +4077,8 @@ class ArbitrageExecutor:
                         settle_seconds=post_cancel_settle_seconds,
                         recovery_seconds=post_cancel_recovery_seconds,
                         nonterminal_recovery_seconds=post_cancel_nonterminal_recovery_seconds,
+                        confirm_recovery_positions=True,
+                        position_side=derivative_pos_side,
                     )
                 if current_batch_filled != current_maker_filled or target_batch_filled != target_maker_filled:
                     self._logger("双边挂单出现单腿先成，已撤单并按最新成交差额立即补齐。")

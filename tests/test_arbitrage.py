@@ -3503,6 +3503,89 @@ class ArbitrageExecutorCloseTest(unittest.TestCase):
         self.assertEqual(state, "canceled")
         self.assertGreaterEqual(client.calls, 3)
 
+    def test_dual_maker_cancel_recovery_confirms_both_live_positions_before_returning(self) -> None:
+        class _TransientDualRecoveryClient(_FakeArbitrageTradeClient):
+            def __init__(self) -> None:
+                super().__init__()
+                self.status_calls = 0
+                self.position_calls = 0
+
+            def get_order(  # noqa: ANN001
+                self,
+                credentials,
+                config,
+                *,
+                inst_id: str,
+                ord_id: str | None = None,
+                cl_ord_id: str | None = None,
+                request_timeout: float | None = None,
+            ):
+                self.status_calls += 1
+                if self.status_calls == 1:
+                    raise OkxApiError("network error: _ssl.c:993: The handshake operation timed out")
+                return OkxOrderStatus(
+                    ord_id=str(ord_id or cl_ord_id or ""),
+                    state="canceled",
+                    side="buy",
+                    ord_type="limit",
+                    price=Decimal("100"),
+                    avg_price=None,
+                    size=Decimal("1"),
+                    filled_size=Decimal("0"),
+                    raw={},
+                )
+
+            def get_positions(  # noqa: ANN001
+                self,
+                credentials,
+                *,
+                environment: str,
+                inst_type: str | None = None,
+                prefer_cache: bool = True,
+            ):
+                self.position_calls += 1
+                return [
+                    SimpleNamespace(inst_id="BTC-USDT-260926", pos_side="short", position=Decimal("8")),
+                    SimpleNamespace(inst_id="BTC-USDT-261226", pos_side="short", position=Decimal("2")),
+                ]
+
+        client = _TransientDualRecoveryClient()
+        logs: list[str] = []
+        executor = ArbitrageExecutor(client, logger=logs.append)
+        runtime = ArbitrageTradeRuntime(
+            credentials=Credentials("k", "s", "p"),
+            environment="demo",
+            trade_mode="cross",
+            position_mode="net",
+        )
+        current_config = arbitrage_executor_module._build_strategy_config("BTC-USDT-260926", runtime)  # noqa: SLF001
+        target_config = arbitrage_executor_module._build_strategy_config("BTC-USDT-261226", runtime)  # noqa: SLF001
+
+        with patch.object(arbitrage_executor_module, "ROLL_NETWORK_RECOVERY_POLL_SECONDS", 0.01):
+            result = executor._cancel_dual_maker_orders_and_capture_fills(  # noqa: SLF001
+                credentials=runtime.credentials,
+                current_config=current_config,
+                target_config=target_config,
+                current_inst_id="BTC-USDT-260926",
+                target_inst_id="BTC-USDT-261226",
+                current_ord_id="old-order",
+                target_ord_id="target-order",
+                current_filled=Decimal("0"),
+                current_avg=None,
+                target_filled=Decimal("0"),
+                target_avg=None,
+                settle_seconds=0,
+                recovery_seconds=0.5,
+                nonterminal_recovery_seconds=0.5,
+                confirm_recovery_positions=True,
+                position_side="short",
+            )
+
+        self.assertEqual(result, (Decimal("0"), None, Decimal("0"), None))
+        self.assertGreaterEqual(client.position_calls, 4)
+        self.assertTrue(any("两腿实时持仓已连续确认稳定" in line for line in logs))
+        self.assertFalse(any("?" * 3 in line for line in logs))
+
     def test_wait_order_terminal_after_cancel_with_recovery_does_not_extend_confirmed_live_order(self) -> None:
         client = _FakeArbitrageTradeClient()
         executor = ArbitrageExecutor(client)
