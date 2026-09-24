@@ -1415,6 +1415,11 @@ class OkxRestClient:
         return first if isinstance(first, dict) else None
 
     def get_mark_price(self, inst_id: str) -> Decimal:
+        mark_price, _ = self.get_mark_price_snapshot(inst_id)
+        return mark_price
+
+    def get_mark_price_snapshot(self, inst_id: str) -> tuple[Decimal, int]:
+        """Return the current mark price and exchange timestamp in milliseconds."""
         payload = self._request(
             "GET",
             "/api/v5/public/mark-price",
@@ -1422,10 +1427,12 @@ class OkxRestClient:
         )
         if not payload.get("data"):
             raise OkxApiError(f"{inst_id} 缺少标记价格，无法触发")
-        mark_price = _to_decimal(payload["data"][0].get("markPx"))
-        if mark_price is None:
+        first = payload["data"][0]
+        mark_price = _to_decimal(first.get("markPx"))
+        timestamp = _to_int(first.get("ts"))
+        if mark_price is None or mark_price <= 0 or timestamp is None:
             raise OkxApiError(f"{inst_id} 缺少标记价格，无法触发")
-        return mark_price
+        return mark_price, timestamp
 
     @staticmethod
     def _trigger_price_from_ticker(ticker: OkxTicker, inst_id: str, price_type: TriggerPriceType) -> Decimal | None:

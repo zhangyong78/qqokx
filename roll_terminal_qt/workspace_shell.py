@@ -81,6 +81,7 @@ class WorkspaceHeader(QFrame):
         ("tool:smart-order", "无限下单"),
         ("option:option-strategy", "期权策略计算器"),
         ("option:deribit-volatility", "Deribit 波动率"),
+        ("option:option-roll", "期权移仓"),
         ("tool:ai-snapshot", "生成 AI 快照"),
         ("settings:paths", "数据目录与路径"),
         ("settings:history-sync", "历史数据同步"),
@@ -125,7 +126,7 @@ class WorkspaceHeader(QFrame):
         trading_tools_button.setObjectName("WorkspacePageButton")
         self._page_buttons["smart-order"] = trading_tools_button
         layout.addWidget(trading_tools_button)
-        layout.addWidget(self._menu_button("期权工具", self._ROUTES[5:7]))
+        layout.addWidget(self._menu_button("期权工具", self._ROUTES[5:8]))
         snapshot_button = QToolButton(self)
         snapshot_button.setDefaultAction(self._register_action(*self._ROUTES[7]))
         snapshot_button.setObjectName("WorkspacePageButton")

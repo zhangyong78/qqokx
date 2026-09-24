@@ -65,6 +65,7 @@ class WorkspaceShellQtTests(QtWidgetTestCase):
                 "tool:smart-order",
                 "option:option-strategy",
                 "option:deribit-volatility",
+                "option:option-roll",
                 "tool:ai-snapshot",
                 "settings:font-standard",
                 "settings:font-large",
@@ -72,6 +73,7 @@ class WorkspaceShellQtTests(QtWidgetTestCase):
                 "settings:paths",
                 "settings:logs",
                 "settings:version",
+                "settings:history-sync",
             },
         )
 

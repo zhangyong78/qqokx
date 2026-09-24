@@ -83,6 +83,12 @@ def launcher_module_specs() -> tuple[LauncherModuleSpec, ...]:
             subtitle="纯 Qt 版复刻期权策略计算器，支持期权链、策略腿、盈亏图、组合 K 线与持仓导入。",
             status="Qt 原生",
         ),
+        LauncherModuleSpec(
+            key="option-roll",
+            title="期权移仓",
+            subtitle="独立的双腿期权限价移仓，按标记价保护、每轮 1 张并支持等待和持仓复核。",
+            status="Qt 原生第一版",
+        ),
     )
 
 

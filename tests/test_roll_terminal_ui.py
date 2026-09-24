@@ -9,7 +9,7 @@ from unittest.mock import MagicMock, patch
 from okx_quant.models import Instrument
 from roll_terminal_qt.account_service import FuturesPositionView
 from roll_terminal_qt.execution_service import ProfessionalCloseExecutionPlan, ProfessionalOpenExecutionPlan
-from roll_terminal_qt.ui import RollTerminalWindow
+from roll_terminal_qt.ui import ExecutionHistoryDialog, RollTerminalWindow
 from roll_terminal_qt.opportunity_service import (
     is_manual_instrument_active,
     is_manual_instrument_allowed,
@@ -170,6 +170,62 @@ class RollTerminalUiTests(unittest.TestCase):
             manual_instrument_label("BTC-USD-260925", "FUTURES", "BTC-USD"),
             "BTC-USD 币本位季度交割 · BTC-USD-260925",
         )
+
+    def test_roll_history_average_groups_pairs_by_filled_contract_quantity(self) -> None:
+        dialog = ExecutionHistoryDialog.__new__(ExecutionHistoryDialog)
+        dialog._formatter = SimpleNamespace(
+            _extract_history_fee_usdt=RollTerminalWindow._extract_history_fee_usdt,
+        )
+        records = [
+            {
+                "task": "移仓",
+                "current_inst_id": "BTC-USD-260925",
+                "target_inst_id": "BTC-USD-261225",
+                "current_filled_qty": "10",
+                "target_filled_qty": "10",
+                "fee_line": "折合USDT合计 ≈-1",
+                "message": (
+                    "旧合约买入平空均价：100\n目标合约卖出开空均价：110\n"
+                    "扣双腿手续费后净价差：9 USDT/BTC"
+                ),
+            },
+            {
+                "task": "移仓",
+                "current_inst_id": "BTC-USD-260925",
+                "target_inst_id": "BTC-USD-261225",
+                "current_filled_qty": "30",
+                "target_filled_qty": "30",
+                "fee_line": "折合USDT合计 ≈-6",
+                "message": (
+                    "旧合约买入平空均价：200\n目标合约卖出开空均价：230\n"
+                    "扣双腿手续费后净价差：27 USDT/BTC"
+                ),
+            },
+            {
+                "task": "移仓",
+                "current_inst_id": "BTC-USD-260925",
+                "target_inst_id": "BTC-USD-261225",
+                "current_filled_qty": "10",
+                "target_filled_qty": "0",
+                "message": "旧合约买入平空均价：300\n目标合约卖出开空均价：320",
+            },
+        ]
+
+        rows, skipped = dialog._build_average_rows(records)
+
+        self.assertEqual(skipped, 1)
+        self.assertEqual(len(rows), 1)
+        row = rows[0]
+        self.assertEqual(row["record_count"], 2)
+        self.assertEqual(row["current_qty"], Decimal("40"))
+        self.assertEqual(row["target_qty"], Decimal("40"))
+        self.assertEqual(row["current_avg"], Decimal("175"))
+        self.assertEqual(row["target_avg"], Decimal("200"))
+        self.assertEqual(row["current_btc"], Decimal("25"))
+        self.assertEqual(row["target_btc"], Decimal("1000") / Decimal("110") + Decimal("3000") / Decimal("230"))
+        self.assertEqual(row["avg_spread"], Decimal("25"))
+        self.assertEqual(row["fee_usdt"], Decimal("-7"))
+        self.assertEqual(row["net_spread"], Decimal("22.5"))
 
     def test_professional_execution_pair_requires_one_spot_and_one_derivative(self) -> None:
         spot_derivative = type(

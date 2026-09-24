@@ -115,6 +115,12 @@ TERMINAL_MODE_OPTIONS = (
     ("交割移仓", "roll"),
 )
 
+_HISTORY_OLD_AVG_PRICE_PATTERN = re.compile(r"(?:旧合约|当前合约).*?均价[：:]\s*(-?\d+(?:\.\d+)?)")
+_HISTORY_TARGET_AVG_PRICE_PATTERN = re.compile(r"(?:目标合约|新合约).*?均价[：:]\s*(-?\d+(?:\.\d+)?)")
+_HISTORY_FEE_PER_BTC_PATTERN = re.compile(r"按\s*1\s*BTC\s*折算手续费[：:]\s*(-?\d+(?:\.\d+)?)\s*USDT")
+_HISTORY_NET_SPREAD_PATTERN = re.compile(r"(?:扣双腿手续费后)?净价差[：:]\s*(-?\d+(?:\.\d+)?)\s*USDT/BTC")
+_BTC_USD_CONTRACT_FACE_VALUE = Decimal("100")
+
 
 class ExecutionHistoryDialog(QDialog):
     """Large, sortable view for the local arbitrage execution ledger."""
@@ -136,6 +142,18 @@ class ExecutionHistoryDialog(QDialog):
         "双腿手续费",
         "扣费后净价差",
     ]
+    AVERAGE_HEADERS = [
+        "移仓合约对",
+        "归集笔数",
+        "旧合约成交",
+        "新合约成交",
+        "成交折合BTC（旧 / 新）",
+        "旧合约加权均价",
+        "新合约加权均价",
+        "平均价差",
+        "累计手续费",
+        "扣费后平均价差",
+    ]
 
     def __init__(self, records: list[dict[str, object]], *, formatter, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -145,6 +163,7 @@ class ExecutionHistoryDialog(QDialog):
         self._formatter = formatter
         self._records: list[dict[str, object]] = []
         self._record_by_token: dict[int, dict[str, object]] = {}
+        self._average_visible = False
 
         root = QVBoxLayout(self)
         toolbar = QHBoxLayout()
@@ -163,6 +182,10 @@ class ExecutionHistoryDialog(QDialog):
         self._cleanup_button = QPushButton("清理0张失败记录")
         self._cleanup_button.clicked.connect(self.zero_failed_cleanup_requested.emit)
         toolbar.addWidget(self._cleanup_button)
+        self._average_button = QPushButton("平均计算")
+        self._average_button.setToolTip("按当前筛选结果和移仓合约对，按实际成交张数归集均价、折合 BTC、手续费和扣费后价差。")
+        self._average_button.clicked.connect(self._toggle_average_calculation)
+        toolbar.addWidget(self._average_button)
         self._delete_button = QPushButton("删除选中记录")
         self._delete_button.clicked.connect(self._request_delete_selected)
         toolbar.addWidget(self._delete_button)
@@ -186,6 +209,26 @@ class ExecutionHistoryDialog(QDialog):
         header.setSectionResizeMode(11, QHeaderView.ResizeMode.Stretch)
         self._table.cellClicked.connect(self._show_detail)
         root.addWidget(self._table, 4)
+
+        self._average_title = QLabel("平均计算：按移仓合约对和实际成交张数加权归集")
+        self._average_title.setObjectName("Subtle")
+        self._average_title.setVisible(False)
+        root.addWidget(self._average_title)
+        self._average_table = QTableWidget(0, len(self.AVERAGE_HEADERS))
+        self._average_table.setHorizontalHeaderLabels(self.AVERAGE_HEADERS)
+        self._average_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self._average_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self._average_table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
+        self._average_table.verticalHeader().setVisible(False)
+        self._average_table.setWordWrap(False)
+        average_header = self._average_table.horizontalHeader()
+        for column in range(len(self.AVERAGE_HEADERS)):
+            average_header.setSectionResizeMode(column, QHeaderView.ResizeMode.ResizeToContents)
+        average_header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        self._average_table.setMinimumHeight(130)
+        self._average_table.setMaximumHeight(240)
+        self._average_table.setVisible(False)
+        root.addWidget(self._average_table, 1)
 
         detail_title = QLabel("执行详情")
         detail_title.setObjectName("Subtle")
@@ -231,6 +274,165 @@ class ExecutionHistoryDialog(QDialog):
             self._formatter._history_metric_value(str(record.get("net_spread_line", ""))),
         ]
 
+    @staticmethod
+    def _decimal_value(value: object) -> Decimal | None:
+        try:
+            return Decimal(str(value).replace(",", ""))
+        except (ArithmeticError, ValueError):
+            return None
+
+    @classmethod
+    def _message_decimal_value(cls, message: str, pattern: re.Pattern[str]) -> Decimal | None:
+        match = pattern.search(message)
+        return cls._decimal_value(match.group(1)) if match is not None else None
+
+    @classmethod
+    def _record_filled_qty(cls, record: dict[str, object], key: str) -> Decimal:
+        value = cls._decimal_value(record.get(key, record.get("qty", "0")))
+        return value if value is not None and value > 0 else Decimal("0")
+
+    def _build_average_rows(self, records: list[dict[str, object]]) -> tuple[list[dict[str, object]], int]:
+        grouped: dict[tuple[str, str], dict[str, object]] = {}
+        skipped = 0
+        for record in records:
+            if "移仓" not in str(record.get("task", "") or ""):
+                continue
+            current_inst_id = str(record.get("current_inst_id", "") or "").strip().upper()
+            target_inst_id = str(record.get("target_inst_id", "") or "").strip().upper()
+            current_qty = self._record_filled_qty(record, "current_filled_qty")
+            target_qty = self._record_filled_qty(record, "target_filled_qty")
+            matched_qty = min(current_qty, target_qty)
+            message = str(record.get("message", "") or "")
+            current_price = self._message_decimal_value(message, _HISTORY_OLD_AVG_PRICE_PATTERN)
+            target_price = self._message_decimal_value(message, _HISTORY_TARGET_AVG_PRICE_PATTERN)
+            if (
+                not current_inst_id
+                or not target_inst_id
+                or matched_qty <= 0
+                or current_price is None
+                or target_price is None
+                or current_price <= 0
+                or target_price <= 0
+            ):
+                skipped += 1
+                continue
+            key = (current_inst_id, target_inst_id)
+            group = grouped.setdefault(
+                key,
+                {
+                    "current_inst_id": current_inst_id,
+                    "target_inst_id": target_inst_id,
+                    "record_count": 0,
+                    "current_qty": Decimal("0"),
+                    "target_qty": Decimal("0"),
+                    "current_notional": Decimal("0"),
+                    "target_notional": Decimal("0"),
+                    "current_btc": Decimal("0"),
+                    "target_btc": Decimal("0"),
+                    "matched_qty": Decimal("0"),
+                    "net_spread_notional": Decimal("0"),
+                    "net_spread_qty": Decimal("0"),
+                    "fee_usdt": Decimal("0"),
+                },
+            )
+            group["record_count"] = int(group["record_count"]) + 1
+            group["current_qty"] = Decimal(group["current_qty"]) + current_qty
+            group["target_qty"] = Decimal(group["target_qty"]) + target_qty
+            group["current_notional"] = Decimal(group["current_notional"]) + current_price * current_qty
+            group["target_notional"] = Decimal(group["target_notional"]) + target_price * target_qty
+            group["current_btc"] = Decimal(group["current_btc"]) + (
+                current_qty * _BTC_USD_CONTRACT_FACE_VALUE / current_price
+            )
+            group["target_btc"] = Decimal(group["target_btc"]) + (
+                target_qty * _BTC_USD_CONTRACT_FACE_VALUE / target_price
+            )
+            group["matched_qty"] = Decimal(group["matched_qty"]) + matched_qty
+            group["fee_usdt"] = Decimal(group["fee_usdt"]) + self._formatter._extract_history_fee_usdt(
+                str(record.get("fee_line", "") or "")
+            )
+            net_spread = self._message_decimal_value(message, _HISTORY_NET_SPREAD_PATTERN)
+            if net_spread is None:
+                fee_per_btc = self._message_decimal_value(message, _HISTORY_FEE_PER_BTC_PATTERN)
+                if fee_per_btc is not None:
+                    net_spread = target_price - current_price - fee_per_btc
+            if net_spread is not None:
+                group["net_spread_notional"] = Decimal(group["net_spread_notional"]) + net_spread * matched_qty
+                group["net_spread_qty"] = Decimal(group["net_spread_qty"]) + matched_qty
+
+        rows: list[dict[str, object]] = []
+        for group in grouped.values():
+            current_qty = Decimal(group["current_qty"])
+            target_qty = Decimal(group["target_qty"])
+            net_spread_qty = Decimal(group["net_spread_qty"])
+            current_avg = Decimal(group["current_notional"]) / current_qty if current_qty > 0 else None
+            target_avg = Decimal(group["target_notional"]) / target_qty if target_qty > 0 else None
+            rows.append(
+                {
+                    **group,
+                    "current_avg": current_avg,
+                    "target_avg": target_avg,
+                    "avg_spread": target_avg - current_avg if current_avg is not None and target_avg is not None else None,
+                    "net_spread": (
+                        Decimal(group["net_spread_notional"]) / net_spread_qty if net_spread_qty > 0 else None
+                    ),
+                }
+            )
+        rows.sort(key=lambda item: (str(item["current_inst_id"]), str(item["target_inst_id"])))
+        return rows, skipped
+
+    @staticmethod
+    def _formatted_decimal(value: Decimal | None, *, places: int = 2, suffix: str = "") -> str:
+        if value is None:
+            return "-"
+        return f"{fmt_decimal(value, places)}{suffix}"
+
+    def _refresh_average_table(self, records: list[dict[str, object]]) -> None:
+        rows, skipped = self._build_average_rows(records)
+        self._average_table.setUpdatesEnabled(False)
+        self._average_table.setRowCount(len(rows))
+        for row_index, row in enumerate(rows):
+            current_avg = row["current_avg"]
+            target_avg = row["target_avg"]
+            avg_spread = row["avg_spread"]
+            net_spread = row["net_spread"]
+            values = [
+                f"{row['current_inst_id']} → {row['target_inst_id']}",
+                str(row["record_count"]),
+                self._formatted_decimal(Decimal(row["current_qty"])),
+                self._formatted_decimal(Decimal(row["target_qty"])),
+                " / ".join(
+                    (
+                        self._formatted_decimal(Decimal(row["current_btc"]), places=6),
+                        self._formatted_decimal(Decimal(row["target_btc"]), places=6),
+                    )
+                ) + " BTC",
+                self._formatted_decimal(current_avg, places=2),
+                self._formatted_decimal(target_avg, places=2),
+                self._formatted_decimal(avg_spread, places=4, suffix=" USDT/BTC"),
+                self._formatted_decimal(Decimal(row["fee_usdt"]), places=6, suffix=" USDT"),
+                self._formatted_decimal(net_spread, places=4, suffix=" USDT/BTC"),
+            ]
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(value)
+                if column in {7, 9} and isinstance(avg_spread, Decimal) and avg_spread < 0:
+                    item.setForeground(QColor("#c83b55"))
+                self._average_table.setItem(row_index, column, item)
+        self._average_table.setUpdatesEnabled(True)
+        self._average_table.viewport().update()
+        suffix = f"；略过 {skipped} 笔缺少完整双腿成交价或成交量的记录" if skipped else ""
+        self._average_title.setText(
+            f"平均计算：按移仓合约对归集 {len(rows)} 组，按实际成交张数加权{suffix}。"
+        )
+
+    @Slot()
+    def _toggle_average_calculation(self) -> None:
+        self._average_visible = not self._average_visible
+        self._average_title.setVisible(self._average_visible)
+        self._average_table.setVisible(self._average_visible)
+        self._average_button.setText("收起平均计算" if self._average_visible else "平均计算")
+        if self._average_visible:
+            self._apply_filter()
+
     def _apply_filter(self) -> None:
         query = self._search.text().strip().lower()
         selected_status = str(self._status.currentData() or "all")
@@ -264,6 +466,8 @@ class ExecutionHistoryDialog(QDialog):
         self._table.setSortingEnabled(True)
         self._table.setUpdatesEnabled(True)
         self._summary.setText(f"共 {len(self._records)} 条，当前显示 {len(visible)} 条")
+        if self._average_visible:
+            self._refresh_average_table([record for record, _values in visible])
         self._detail.clear()
 
     def _request_delete_selected(self) -> None:
@@ -3901,7 +4105,7 @@ class RollTerminalWindow(QMainWindow):
     def _extract_history_fee_usdt(text: str) -> Decimal:
         if not text:
             return Decimal("0")
-        match = re.search(r"折合USDT合计\s*[~=]?\s*(-?\d+(?:\.\d+)?)", text)
+        match = re.search(r"折合USDT合计\s*[~≈=]?\s*(-?\d+(?:\.\d+)?)", text)
         if match:
             return Decimal(match.group(1))
         match = re.search(r"\(~?(-?\d+(?:\.\d+)?)\s*USDT\)", text)

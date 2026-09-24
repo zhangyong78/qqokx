@@ -41,6 +41,7 @@ from roll_terminal_qt.deribit_volatility_window import DeribitVolatilityQtWindow
 from roll_terminal_qt.line_trading_window import LineTradingQtWindow
 from roll_terminal_qt.module_overview import ModuleOverview, build_module_overview, launcher_module_specs
 from roll_terminal_qt.option_strategy_window import OptionStrategyQtWindow
+from roll_terminal_qt.option_roll_execution_window import OptionRollExecutionQtWindow
 from roll_terminal_qt.kline_analysis_window import KlineAnalysisWindow
 from roll_terminal_qt.ai_snapshot_service import AISnapshotWorker
 from roll_terminal_qt.perf_metrics import measure_ui_step
@@ -862,7 +863,7 @@ class LauncherWindow(QMainWindow):
         if normalized == "smart-order":
             self.show_page(normalized)
             return
-        if normalized in {"option-strategy", "deribit-volatility"}:
+        if normalized in {"option-strategy", "deribit-volatility", "option-roll"}:
             self.open_module_window(normalized)
             return
         if normalized == "ai-snapshot":
@@ -1112,6 +1113,10 @@ def create_module_window(module_key: str, *, profile_name: str = "") -> QWidget:
         return window
     if normalized == "option-strategy":
         window = OptionStrategyQtWindow(profile_name=profile_name)
+        apply_qt_window_icon(window)
+        return window
+    if normalized == "option-roll":
+        window = OptionRollExecutionQtWindow(profile_name=profile_name)
         apply_qt_window_icon(window)
         return window
     for spec in launcher_module_specs():

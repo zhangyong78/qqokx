@@ -10,9 +10,18 @@ def load_runtime(profile_name: str | None = None) -> ArbitrageTradeRuntime | Non
     profiles = snapshot.get("profiles", {}) if isinstance(snapshot, dict) else {}
     if not isinstance(profiles, dict) or not profiles:
         return None
-    selected = str(profile_name or snapshot.get("selected_profile") or "").strip()
-    if selected not in profiles:
-        selected = next(iter(profiles))
+    requested = str(profile_name or "").strip()
+    # A caller that explicitly names a profile must never silently fall back to
+    # another account.  In particular, a typo must not turn a demo operation
+    # into a request against the first (possibly live) profile.
+    if requested:
+        if requested not in profiles:
+            return None
+        selected = requested
+    else:
+        selected = str(snapshot.get("selected_profile") or "").strip()
+        if selected not in profiles:
+            selected = next(iter(profiles))
     profile = profiles.get(selected)
     if not isinstance(profile, dict):
         return None

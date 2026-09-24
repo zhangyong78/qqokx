@@ -229,7 +229,8 @@ function Update-Version-Files([string]$oldVersionText, [string]$newVersionText, 
 
     Update-TextFile (Join-Path $repoRoot 'README.md') {
         param($text)
-        $updated = $text.Replace(('当前版本：`v' + $oldVersionText + '`'), ('当前版本：`v' + $newVersionText + '`'))
+        $updated = [regex]::Replace($text, '当前版本：`v\d+\.\d+\.\d+`', ('当前版本：`v' + $newVersionText + '`'), 1)
+        $updated = [regex]::Replace($updated, '(?m)^`v\d+\.\d+\.\d+` 这一轮版本内容', ('`v' + $newVersionText + '` 这一轮版本内容'), 1)
         $header = "## 11. 更新日志"
         $section = @"
 ### v$newVersionText

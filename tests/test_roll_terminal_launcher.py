@@ -27,6 +27,7 @@ class RollTerminalLauncherTests(unittest.TestCase):
                 "auto-channel",
                 "deribit-volatility",
                 "option-strategy",
+                "option-roll",
             ),
         )
 
