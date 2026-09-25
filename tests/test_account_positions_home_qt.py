@@ -6,6 +6,7 @@ from types import SimpleNamespace
 from unittest import TestCase
 from unittest.mock import MagicMock, patch
 
+from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QHeaderView
 
 from tests.qt_test_case import QtWidgetTestCase
@@ -24,7 +25,7 @@ from roll_terminal_qt.account_positions_home import (
     _group_row_values_with_break_even,
     _position_display_foreground_colors,
 )
-from okx_quant.okx_client import Instrument, OkxFillHistoryItem, OkxOrderResult
+from okx_quant.okx_client import Instrument, OkxFillHistoryItem, OkxOrderResult, OkxPositionHistoryItem
 from okx_quant.models import OptionTickBand
 from okx_quant.position_protection import ProtectionSessionSnapshot
 from roll_terminal_qt.order_service import OrderStatusView
@@ -321,11 +322,11 @@ class PositionDisplayForegroundColorsTest(TestCase):
     def test_history_position_contract_click_opens_matching_kline(self) -> None:
         history_item = SimpleNamespace(inst_id="BTC-USD-260720-65000-C", inst_type="OPTION")
         app = SimpleNamespace(
-            _visible_position_history_items=[history_item],
+            _position_history_item_for_table_row=lambda _row: history_item,
             _open_position_history_kline=MagicMock(),
         )
 
-        AccountPositionsHomeWidget._on_position_history_table_clicked(app, 0, 3)
+        AccountPositionsHomeWidget._on_position_history_table_clicked(app, 0, 4)
         AccountPositionsHomeWidget._on_position_history_table_clicked(app, 0, 1)
 
         app._open_position_history_kline.assert_called_once_with(history_item)
@@ -410,8 +411,56 @@ class AccountPositionsHistoryTabWiringTest(QtWidgetTestCase):
         ):
             widget = AccountPositionsHomeWidget()
             try:
-                widget._position_history_table.cellDoubleClicked.emit(0, 3)
-                handler.assert_called_once_with(0, 3)
+                widget._position_history_table.cellDoubleClicked.emit(0, 4)
+                handler.assert_called_once_with(0, 4)
+            finally:
+                self.dispose_widget(widget)
+
+    def test_position_history_checkboxes_update_selected_statistics(self) -> None:
+        items = [
+            OkxPositionHistoryItem(
+                update_time=index,
+                inst_id="BTC-USDT-SWAP",
+                inst_type="SWAP",
+                mgn_mode="cross",
+                pos_side="net",
+                direction="long",
+                open_avg_price=Decimal("100"),
+                close_avg_price=Decimal("101"),
+                close_size=Decimal("1"),
+                pnl=value,
+                realized_pnl=value,
+                settle_pnl=Decimal("0"),
+                raw={"ccy": "USDT", "openMaxPos": "1", "closeTotalPos": "1"},
+            )
+            for index, value in enumerate((Decimal("10"), Decimal("-4"), Decimal("3")), start=1)
+        ]
+        with patch.object(AccountPositionsHomeWidget, "_start_private_threads"):
+            widget = AccountPositionsHomeWidget()
+            try:
+                widget._position_history_items = items
+                widget._position_history_instruments = {}
+                widget._position_history_usdt_prices = {"USDT": Decimal("1")}
+                widget._position_history_last_sync_text = "test"
+                widget._position_history_range_start_edit.clear()
+                widget._position_history_range_end_edit.clear()
+                widget._render_position_history_table()
+
+                self.assertEqual(widget._position_history_table.columnCount(), 16)
+                for row in range(3):
+                    widget._position_history_table.item(row, 0).setCheckState(Qt.CheckState.Checked)
+
+                self.assertEqual(len(widget._selected_position_history_keys), 3)
+                self.assertIn("选中统计：已选 3 笔", widget._position_history_summary_label.text())
+                self.assertIn("折合USDT合计 +9", widget._position_history_summary_label.text())
+
+                widget._clear_selected_position_history_items()
+                self.assertFalse(widget._selected_position_history_keys)
+                self.assertIn("选中统计：未勾选历史仓位", widget._position_history_summary_label.text())
+
+                widget._select_visible_position_history_items()
+                self.assertEqual(len(widget._selected_position_history_keys), 3)
+                self.assertIn("选中统计：已选 3 笔", widget._position_history_summary_label.text())
             finally:
                 self.dispose_widget(widget)
 

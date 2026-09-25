@@ -2738,6 +2738,8 @@ class AccountPositionsHomeWidget(QWidget):
         self._order_history_usdt_prices: dict[str, Decimal] = {}
         self._position_history_items: list[OkxPositionHistoryItem] = []
         self._visible_position_history_items: list[OkxPositionHistoryItem] = []
+        self._selected_position_history_keys: set[str] = set()
+        self._position_history_check_state_updating = False
         self._position_history_instruments: dict[str, object] = {}
         self._position_history_usdt_prices: dict[str, Decimal] = {}
         self._position_instruments: dict[str, object] = {}
@@ -3362,7 +3364,7 @@ class AccountPositionsHomeWidget(QWidget):
     def _render_position_history_table(self) -> None:
         if not hasattr(self, "_position_history_table"):
             return
-        self._position_history_table.setHorizontalHeaderItem(13, QTableWidgetItem("\u5df2\u5b9e\u73b0\u6536\u76ca"))
+        self._position_history_table.setHorizontalHeaderItem(14, QTableWidgetItem("\u5df2\u5b9e\u73b0\u6536\u76ca"))
         filtered = self._filtered_position_history_items()
         selected_key = ""
         row = self._position_history_table.currentRow()
@@ -6211,11 +6213,12 @@ class AccountPositionsHomeWidget(QWidget):
 
     @Slot(int, int)
     def _on_position_history_table_clicked(self, row: int, column: int) -> None:
-        # The contract column is index 3: the opening-time column was added
-        # before the historical position type/contract columns.
-        if column != 3 or row < 0 or row >= len(self._visible_position_history_items):
+        # The leading checkbox moves the contract column to index 4.
+        if column != 4:
             return
-        item = self._visible_position_history_items[row]
+        item = self._position_history_item_for_table_row(row)
+        if item is None:
+            return
         if not item.inst_id or not item.inst_type:
             return
         self._open_position_history_kline(item)
@@ -6606,6 +6609,14 @@ class AccountPositionsHomeWidget(QWidget):
         more_button = QPushButton("本地显示更多100条")
         more_button.clicked.connect(self._expand_position_history_limit)
         top.addWidget(more_button)
+        select_visible_button = QPushButton("全选当前筛选")
+        select_visible_button.setToolTip("勾选当前筛选结果中的全部历史仓位，并即时计算选中统计")
+        select_visible_button.clicked.connect(self._select_visible_position_history_items)
+        top.addWidget(select_visible_button)
+        clear_selected_button = QPushButton("清空勾选")
+        clear_selected_button.setToolTip("清除全部历史仓位勾选，不影响筛选条件或备注")
+        clear_selected_button.clicked.connect(self._clear_selected_position_history_items)
+        top.addWidget(clear_selected_button)
         edit_button = QPushButton("编辑备注")
         edit_button.clicked.connect(self.edit_selected_position_history_note)
         top.addWidget(edit_button)
@@ -6681,14 +6692,16 @@ class AccountPositionsHomeWidget(QWidget):
         layout.addLayout(filter_row)
 
         self._position_history_table = self._build_history_table(
-            ("平仓时间", "开仓时间", "持仓时间", "合约", "保证金模式", "持仓模式", "交易方向", "开仓均价", "平仓均价", "最大持仓量", "已平仓量", "手续费", "盈亏", "仓位状态", "备注"),
-            stretch_columns={3, 14},
+            ("选择", "平仓时间", "开仓时间", "持仓时间", "合约", "保证金模式", "持仓模式", "交易方向", "开仓均价", "平仓均价", "最大持仓量", "已平仓量", "手续费", "盈亏", "仓位状态", "备注"),
+            stretch_columns={4, 15},
         )
         self._position_history_table.cellDoubleClicked.connect(self._on_position_history_table_clicked)
-        self._position_history_table.setColumnWidth(0, 170)
+        self._position_history_table.itemChanged.connect(self._on_position_history_checkbox_changed)
+        self._position_history_table.setColumnWidth(0, 50)
         self._position_history_table.setColumnWidth(1, 170)
-        self._position_history_table.setColumnWidth(11, 220)
-        self._position_history_table.setColumnWidth(12, 240)
+        self._position_history_table.setColumnWidth(2, 170)
+        self._position_history_table.setColumnWidth(12, 220)
+        self._position_history_table.setColumnWidth(13, 240)
         layout.addWidget(self._position_history_table, 1)
         self._position_history_summary_label.setMinimumHeight(34)
         return tab
@@ -7460,23 +7473,16 @@ class AccountPositionsHomeWidget(QWidget):
         if not selected_key and 0 <= row < len(self._visible_position_history_items):
             selected_key = self._position_history_row_key(self._visible_position_history_items[row])
         self._visible_position_history_items = filtered
-        stats_text = _format_position_history_filter_stats(
-            list(enumerate(filtered)),
-            self._position_history_usdt_prices,
-        )
-        self._position_history_summary_label.setText(
-            "\n".join(
-                (
-                    f"历史仓位：{len(self._position_history_items)} 条 | 最近同步：{self._position_history_last_sync_text} | 当前显示：{len(filtered)}/{len(self._position_history_items)}",
-                    f"筛选统计：{stats_text}",
-                )
-            )
-        )
+        all_keys = {self._position_history_row_key(item) for item in self._position_history_items}
+        self._selected_position_history_keys.intersection_update(all_keys)
+        self._update_position_history_summary(filtered)
         sorting_enabled = self._position_history_table.isSortingEnabled()
         self._position_history_table.setSortingEnabled(False)
+        self._position_history_check_state_updating = True
         self._position_history_table.setRowCount(len(filtered))
         for row, item in enumerate(filtered):
             values = (
+                "",
                 _format_okx_ms_timestamp(item.update_time),
                 _position_history_open_time_text(item),
                 _position_history_holding_time_text(item),
@@ -7510,16 +7516,29 @@ class AccountPositionsHomeWidget(QWidget):
                 _position_history_status_text(item),
                 _format_position_note_summary(self._position_history_note_text(item)),
             )
-            self._set_table_row(self._position_history_table, row, values, left_align={3, 14})
-            holding_item = self._position_history_table.item(row, 2)
+            self._set_table_row(self._position_history_table, row, values, left_align={4, 15})
+            row_key = self._position_history_row_key(item)
+            checkbox_item = QTableWidgetItem()
+            checkbox_item.setFlags(
+                Qt.ItemFlag.ItemIsEnabled
+                | Qt.ItemFlag.ItemIsSelectable
+                | Qt.ItemFlag.ItemIsUserCheckable
+            )
+            checkbox_item.setCheckState(
+                Qt.CheckState.Checked if row_key in self._selected_position_history_keys else Qt.CheckState.Unchecked
+            )
+            checkbox_item.setData(Qt.ItemDataRole.UserRole, row_key)
+            checkbox_item.setTextAlignment(int(Qt.AlignmentFlag.AlignCenter | Qt.AlignmentFlag.AlignVCenter))
+            self._position_history_table.setItem(row, 0, checkbox_item)
+            holding_item = self._position_history_table.item(row, 3)
             if holding_item is not None:
                 holding_item = _HoldingTimeTableWidgetItem(
                     holding_item.text(),
                     _position_history_holding_hours(item),
                 )
                 holding_item.setTextAlignment(int(Qt.AlignmentFlag.AlignCenter | Qt.AlignmentFlag.AlignVCenter))
-                self._position_history_table.setItem(row, 2, holding_item)
-            pnl_item = self._position_history_table.item(row, 12)
+                self._position_history_table.setItem(row, 3, holding_item)
+            pnl_item = self._position_history_table.item(row, 13)
             if pnl_item is not None:
                 pnl_sort_value = _position_history_pnl_sort_value(item, self._position_history_usdt_prices)
                 pnl_item = _PositionHistoryPnlTableWidgetItem(pnl_item.text(), pnl_sort_value)
@@ -7534,11 +7553,8 @@ class AccountPositionsHomeWidget(QWidget):
                             else "#1f2937"
                         )
                     )
-                self._position_history_table.setItem(row, 12, pnl_item)
-            self._position_history_table.item(row, 0).setData(
-                Qt.ItemDataRole.UserRole,
-                self._position_history_row_key(item),
-            )
+                self._position_history_table.setItem(row, 13, pnl_item)
+        self._position_history_check_state_updating = False
         self._position_history_table.setSortingEnabled(sorting_enabled)
         self._restore_table_selection(
             self._position_history_table,
@@ -7547,15 +7563,62 @@ class AccountPositionsHomeWidget(QWidget):
             self._position_history_row_key,
         )
 
+    @Slot(QTableWidgetItem)
+    def _on_position_history_checkbox_changed(self, table_item: QTableWidgetItem) -> None:
+        if self._position_history_check_state_updating or table_item.column() != 0:
+            return
+        row_key = str(table_item.data(Qt.ItemDataRole.UserRole) or "").strip()
+        if not row_key:
+            return
+        if table_item.checkState() == Qt.CheckState.Checked:
+            self._selected_position_history_keys.add(row_key)
+        else:
+            self._selected_position_history_keys.discard(row_key)
+        self._update_position_history_summary(self._visible_position_history_items)
+
+    def _select_visible_position_history_items(self) -> None:
+        self._selected_position_history_keys.update(
+            self._position_history_row_key(item) for item in self._visible_position_history_items
+        )
+        self._render_position_history_table()
+
+    def _clear_selected_position_history_items(self) -> None:
+        if not self._selected_position_history_keys:
+            return
+        self._selected_position_history_keys.clear()
+        self._render_position_history_table()
+
+    def _update_position_history_summary(self, filtered: list[OkxPositionHistoryItem]) -> None:
+        filtered_stats = _format_position_history_filter_stats(
+            list(enumerate(filtered)),
+            self._position_history_usdt_prices,
+        )
+        selected_items = [
+            item for item in self._position_history_items
+            if self._position_history_row_key(item) in self._selected_position_history_keys
+        ]
+        selected_stats = _format_position_history_filter_stats(
+            list(enumerate(selected_items)),
+            self._position_history_usdt_prices,
+        )
+        self._position_history_summary_label.setText(
+            "\n".join(
+                (
+                    f"历史仓位：{len(self._position_history_items)} 条 | 最近同步：{self._position_history_last_sync_text} | 当前显示：{len(filtered)}/{len(self._position_history_items)}",
+                    f"筛选统计：{filtered_stats}",
+                    f"选中统计：已选 {len(selected_items)} 笔 | {selected_stats}" if selected_items else "选中统计：未勾选历史仓位。",
+                )
+            )
+        )
+
     def _refresh_position_history_detail(self) -> None:
         if not hasattr(self, "_position_history_detail"):
             return
-        row = self._position_history_table.currentRow() if hasattr(self, "_position_history_table") else -1
-        if row < 0 or row >= len(self._visible_position_history_items):
+        item = self._selected_position_history_item()
+        if item is None:
             if hasattr(self, "_position_history_detail"):
                 self._position_history_detail.setPlainText("这里会显示选中历史仓位的详情。")
             return
-        item = self._visible_position_history_items[row]
         self._position_history_detail.setPlainText(
             _build_position_history_detail_text(
                 item,
@@ -8024,9 +8087,21 @@ class AccountPositionsHomeWidget(QWidget):
 
     def _selected_position_history_item(self) -> OkxPositionHistoryItem | None:
         row = self._position_history_table.currentRow() if hasattr(self, "_position_history_table") else -1
-        if row < 0 or row >= len(self._visible_position_history_items):
+        return self._position_history_item_for_table_row(row)
+
+    def _position_history_item_for_table_row(self, row: int) -> OkxPositionHistoryItem | None:
+        if row < 0 or not hasattr(self, "_position_history_table"):
             return None
-        return self._visible_position_history_items[row]
+        checkbox_item = self._position_history_table.item(row, 0)
+        row_key = str(checkbox_item.data(Qt.ItemDataRole.UserRole) or "").strip() if checkbox_item else ""
+        if row_key:
+            return next(
+                (item for item in self._visible_position_history_items if self._position_history_row_key(item) == row_key),
+                None,
+            )
+        if row < len(self._visible_position_history_items):
+            return self._visible_position_history_items[row]
+        return None
 
     def edit_selected_position_history_note(self) -> None:
         item = self._selected_position_history_item()
