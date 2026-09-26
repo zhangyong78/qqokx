@@ -637,6 +637,51 @@ class _ColumnConfigTableStub:
 
 
 class AccountPositionsHomeQtHelpersTest(TestCase):
+    @staticmethod
+    def _current_order(inst_type: str) -> SimpleNamespace:
+        return SimpleNamespace(
+            inst_id=f"TEST-{inst_type or 'UNKNOWN'}",
+            inst_type=inst_type,
+            state="live",
+            side="buy",
+            pos_side="net",
+            ord_type="limit",
+            ord_id=f"order-{inst_type or 'unknown'}",
+            client_order_id="",
+            raw={},
+        )
+
+    @staticmethod
+    def _current_order_filter_app(inst_type: str, orders: list[SimpleNamespace]) -> SimpleNamespace:
+        type_combo = SimpleNamespace(currentData=lambda: inst_type)
+        empty_combo = SimpleNamespace(currentData=lambda: "")
+        empty_edit = SimpleNamespace(text=lambda: "")
+        return SimpleNamespace(
+            _visible_orders=orders,
+            _pending_type_combo=type_combo,
+            _pending_source_combo=empty_combo,
+            _pending_state_combo=empty_combo,
+            _pending_asset_edit=empty_edit,
+            _pending_expiry_edit=empty_edit,
+            _pending_keyword_edit=empty_edit,
+        )
+
+    def test_current_order_type_options_include_spot_and_other(self) -> None:
+        self.assertIn(("现货 SPOT", "SPOT"), account_positions_module.CURRENT_ORDER_TYPE_OPTIONS)
+        self.assertIn(("其他", "OTHER"), account_positions_module.CURRENT_ORDER_TYPE_OPTIONS)
+
+    def test_current_order_type_filter_supports_spot_and_other(self) -> None:
+        spot = self._current_order("SPOT")
+        margin = self._current_order("MARGIN")
+        swap = self._current_order("SWAP")
+        orders = [spot, margin, swap]
+
+        spot_app = self._current_order_filter_app("SPOT", orders)
+        other_app = self._current_order_filter_app("OTHER", orders)
+
+        self.assertEqual(AccountPositionsHomeWidget._filtered_current_orders(spot_app), [spot])
+        self.assertEqual(AccountPositionsHomeWidget._filtered_current_orders(other_app), [margin])
+
     def test_option_break_even_uses_strike_premium_and_two_way_fee(self) -> None:
         call = SimpleNamespace(
             inst_id="BTC-USD-260731-63000-C",

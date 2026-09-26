@@ -314,6 +314,17 @@ POSITION_TYPE_OPTIONS: tuple[tuple[str, str], ...] = (
     ("期权 OPTION", "OPTION"),
 )
 
+CURRENT_ORDER_TYPE_OPTIONS: tuple[tuple[str, str], ...] = (
+    ("全部类型", ""),
+    ("现货 SPOT", "SPOT"),
+    ("交割合约 FUTURES", "FUTURES"),
+    ("永续 SWAP", "SWAP"),
+    ("期权 OPTION", "OPTION"),
+    ("其他", "OTHER"),
+)
+
+_PRIMARY_ORDER_INST_TYPES = frozenset({"SPOT", "FUTURES", "SWAP", "OPTION"})
+
 POSITION_OPTION_SIDE_OPTIONS: tuple[tuple[str, str], ...] = (
     ("全部方向", ""),
     ("购", "购"),
@@ -6404,7 +6415,7 @@ class AccountPositionsHomeWidget(QWidget):
         self._pending_type_combo = QComboBox()
         self._pending_source_combo = QComboBox()
         self._pending_state_combo = QComboBox()
-        for label, value in POSITION_TYPE_OPTIONS:
+        for label, value in CURRENT_ORDER_TYPE_OPTIONS:
             self._pending_type_combo.addItem(label, value)
         for label, value in ORDER_SOURCE_FILTER_OPTIONS:
             self._pending_source_combo.addItem(label, value)
@@ -6902,7 +6913,10 @@ class AccountPositionsHomeWidget(QWidget):
         keyword = self._pending_keyword_edit.text().strip().upper()
         result: list[OrderStatusView] = []
         for item in items:
-            if inst_type and (item.inst_type or "").strip().upper() != inst_type:
+            item_inst_type = (item.inst_type or "").strip().upper()
+            if inst_type == "OTHER" and item_inst_type in _PRIMARY_ORDER_INST_TYPES:
+                continue
+            if inst_type and inst_type != "OTHER" and item_inst_type != inst_type:
                 continue
             feed_source = str(item.raw.get("_feed_source") or "").strip().lower()
             source_kind = str(item.raw.get("_source_kind") or "").strip().lower()
