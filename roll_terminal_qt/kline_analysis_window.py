@@ -442,6 +442,12 @@ def _format_bar_time(ts: int) -> str:
     return datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M")
 
 
+def _format_chart_time(ts: int) -> str:
+    moment = datetime.fromtimestamp(int(ts))
+    weekday = ("周一", "周二", "周三", "周四", "周五", "周六", "周日")[moment.weekday()]
+    return f"{moment:%Y-%m-%d} {weekday} {moment:%H:%M}"
+
+
 def _to_ema(values: list[float], period: int) -> list[float]:
     if period <= 0:
         return []
@@ -3584,16 +3590,15 @@ if QChartView is not None:
                         painter.setBrush(QColor("#ffffff"))
                         painter.drawEllipse(QPointF(snapped_x, marker_y), 4.0, 4.0)
                         painter.end()
-                        candle_dt = QDateTime.fromMSecsSinceEpoch(int(candle["time"]) * 1000)
                         self._update_hover_overlays(
                             bounds=plot_area,
                             anchor=QPointF(snapped_x, marker_y),
                             candle_color=candle_color,
                             price_text=self._format_hover_value(float(candle["close"])),
-                            time_text=candle_dt.toString("MM-dd HH:mm"),
+                            time_text=_format_chart_time(int(candle["time"])),
                             tooltip_lines=(
-                                f"联动定位 {QDateTime.fromSecsSinceEpoch(int(candle_time)).toString('yyyy-MM-dd HH:mm')}",
-                                candle_dt.toString("yyyy-MM-dd HH:mm"),
+                                f"联动定位 {_format_chart_time(int(candle_time))}",
+                                _format_chart_time(int(candle["time"])),
                                 f"O {self._format_hover_value(float(candle['open']))}  H {self._format_hover_value(float(candle['high']))}",
                                 f"L {self._format_hover_value(float(candle['low']))}  C {self._format_hover_value(float(candle['close']))}",
                                 f"成交量 {self._format_hover_value(float(candle['volume']))}",
@@ -3620,15 +3625,14 @@ if QChartView is not None:
                 painter.setBrush(QColor("#ffffff"))
                 painter.drawEllipse(QPointF(snapped_x, marker_y), 4.0, 4.0)
                 painter.end()
-                candle_dt = QDateTime.fromMSecsSinceEpoch(int(candle["time"]) * 1000)
                 self._update_hover_overlays(
                     bounds=plot_area,
                     anchor=QPointF(snapped_x, hover_y),
                     candle_color=candle_color,
                     price_text=self._format_hover_value(hover_value),
-                    time_text=candle_dt.toString("MM-dd HH:mm"),
+                    time_text=_format_chart_time(int(candle["time"])),
                     tooltip_lines=(
-                        candle_dt.toString("yyyy-MM-dd HH:mm"),
+                        _format_chart_time(int(candle["time"])),
                         f"O {self._format_hover_value(float(candle['open']))}  H {self._format_hover_value(float(candle['high']))}",
                         f"L {self._format_hover_value(float(candle['low']))}  C {self._format_hover_value(float(candle['close']))}",
                         f"成交量 {self._format_hover_value(float(candle['volume']))}",
@@ -4226,8 +4230,14 @@ if QChartView is not None:
                 candle_top = self._y_for_value(float(candle["high"]), plot_area)
                 candle_bottom = self._y_for_value(float(candle["low"]), plot_area)
                 x_center = self._x_for_index(index, plot_area)
-                time_text = QDateTime.fromSecsSinceEpoch(marker_timestamp(marker)).toString("MM-dd HH:mm")
-                label_lines = ["开仓" if event == "open" else "平仓", self._format_hover_value(price)]
+                time_text = _format_chart_time(marker_timestamp(marker))
+                trade_label = (
+                    "开多" if event == "open" and direction == "long" else
+                    "开空" if event == "open" and direction == "short" else
+                    "平多" if event == "close" and direction == "long" else
+                    "平空"
+                )
+                label_lines = [trade_label, self._format_hover_value(price)]
                 result = exit_results.get(id(marker))
                 if event == "close" and result is not None:
                     label_lines.append(f"{result[1]:+.2f}%")
@@ -5919,7 +5929,7 @@ class KlineAnalysisWindow(QMainWindow):
         history_trade_layout.setSpacing(6)
         self._show_history_trades_check = QCheckBox("历史交易")
         self._show_history_trades_check.setChecked(True)
-        self._show_history_trades_check.setToolTip("显示当前 API、环境和品种对应的 OKX 历史仓位开仓、平仓标记。")
+        self._show_history_trades_check.setToolTip("显示当前 API、环境和品种对应的 OKX 历史交易标记：开多、平多、开空、平空。")
         self._show_history_trades_check.toggled.connect(self._on_history_trade_visibility_changed)
         history_trade_layout.addWidget(self._show_history_trades_check)
         self._history_trade_direction_combo = QComboBox()
@@ -5930,7 +5940,7 @@ class KlineAnalysisWindow(QMainWindow):
         self._history_trade_direction_combo.currentIndexChanged.connect(self._sync_chart_options)
         history_trade_layout.addWidget(self._history_trade_direction_combo)
         self._sync_history_trades_button = QPushButton("同步")
-        self._sync_history_trades_button.setToolTip("重新从 OKX 同步当前品种的历史仓位开仓、平仓记录。")
+        self._sync_history_trades_button.setToolTip("重新从 OKX 同步当前品种的历史开多、平多、开空、平空记录。")
         self._sync_history_trades_button.clicked.connect(lambda: self._load_history_trades(force=True))
         history_trade_layout.addWidget(self._sync_history_trades_button)
         top_row.addWidget(self._history_trade_group, 0)
@@ -9429,7 +9439,9 @@ class KlineAnalysisWindow(QMainWindow):
                     continue
 
         axis_x = QDateTimeAxis()
-        axis_x.setFormat("MM-dd" if _bar_to_ms(period) >= 86_400_000 else "MM-dd HH:mm")
+        axis_x.setFormat(
+            "yyyy-MM-dd ddd" if _bar_to_ms(period) >= 86_400_000 else "yyyy-MM-dd ddd HH:mm"
+        )
         axis_x.setTickCount(min(8, max(3, len(candles) // 180 + 3)))
         axis_x.setLabelsColor(QColor(_CHART_AXIS_TEXT_COLOR))
         axis_x.setGridLineColor(QColor(_CHART_GRID_COLOR))
@@ -11822,6 +11834,14 @@ class KlineAnalysisWindow(QMainWindow):
                 let currentCandles = [];
                 const chartRecentVisibleBars = __RECENT_VIEW_BARS__;
 
+                function formatChartTime(time) {
+                  const date = new Date(Number(time) * 1000);
+                  if (!Number.isFinite(date.getTime())) return '-';
+                  const weekdays = ['周日', '周一', '周二', '周三', '周四', '周五', '周六'];
+                  const pad = (value) => String(value).padStart(2, '0');
+                  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${weekdays[date.getDay()]} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
+                }
+
                 function toTooltipText(time, payload, trendPayload) {
                   if (!time || !payload) {
                     return '';
@@ -11834,8 +11854,7 @@ class KlineAnalysisWindow(QMainWindow):
                   const trendText = trendPayload
                     ? `${trendPayload.label || '中性'} (${trendPayload.state || 'neutral'})`
                     : '中性';
-                  const date = new Date(time * 1000);
-                  const dateText = `${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')} ${String(date.getHours()).padStart(2, '0')}:${String(date.getMinutes()).padStart(2, '0')}`;
+                  const dateText = formatChartTime(time);
                   const trendTitle = trendPayload?.title || trendTitleForPeriod(payload?.period);
                   return `时间 ${dateText}\n开 ${formatNumber(o)}  高 ${formatNumber(h)}\n低 ${formatNumber(l)}  收 ${formatNumber(c)}\n量 ${formatNumber(v)}\n${trendTitle} ${trendText}`;
                 }
@@ -11881,6 +11900,9 @@ class KlineAnalysisWindow(QMainWindow):
                       rightOffset: 6,
                       barSpacing: 8,
                       borderColor: '#18202b',
+                    },
+                    localization: {
+                      timeFormatter: formatChartTime,
                     },
                     crosshair: {
                       mode: 1,

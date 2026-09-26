@@ -98,6 +98,7 @@ from roll_terminal_qt.kline_analysis_window import (
     _prefer_native_chart_backend,
     _default_native_visible_range,
     _native_right_padding_ms,
+    _format_chart_time,
     _ordered_trend_endpoints,
     _reverse_kline_chart_payload,
     _rr_box_end_display_x,
@@ -6909,6 +6910,9 @@ class RollTerminalQtWindowHelperTests(QtWidgetTestCase):
 
     def test_default_single_chart_period_is_4h(self) -> None:
         self.assertEqual(_DEFAULT_SINGLE_CHART_PERIOD, "4H")
+
+    def test_chart_time_includes_year_date_and_short_weekday(self) -> None:
+        self.assertEqual(_format_chart_time(1783180800), "2026-07-05 周日 00:00")
 
     def test_default_dual_chart_periods_are_day_and_4h(self) -> None:
         self.assertEqual(_DEFAULT_DUAL_PRIMARY_PERIOD, "1D")
