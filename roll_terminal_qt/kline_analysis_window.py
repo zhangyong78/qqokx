@@ -48,6 +48,7 @@ from PySide6.QtWidgets import (
     QScrollArea,
     QSizePolicy,
     QSplitter,
+    QTabBar,
     QSpinBox,
     QTabWidget,
     QTableWidget,
@@ -5488,6 +5489,9 @@ class KlineAnalysisWindow(QMainWindow):
         self._chart_stack_splitter = None
         self._primary_period_buttons: dict[str, QPushButton] = {}
         self._active_chart_target = "primary"
+        self._symbol_tab_bar: QTabBar | None = None
+        self._symbol_link_all_check: QCheckBox | None = None
+        self._updating_symbol_tabs = False
         self._chart_mode_cycle_btn: QPushButton | None = None
         self._chart_range_mode_btn: QPushButton | None = None
         self._chart_view_range_mode = "recent"
@@ -6539,6 +6543,26 @@ class KlineAnalysisWindow(QMainWindow):
         self._chart_account_splitter.setStretchFactor(1, 2)
         chart_layout.addWidget(self._chart_account_splitter, 1)
 
+        symbol_tab_row = QHBoxLayout()
+        symbol_tab_row.setContentsMargins(0, 4, 0, 0)
+        symbol_tab_row.setSpacing(8)
+        symbol_tab_row.addWidget(QLabel("交易对"))
+        self._symbol_tab_bar = QTabBar()
+        self._symbol_tab_bar.setShape(QTabBar.Shape.RoundedSouth)
+        self._symbol_tab_bar.setExpanding(False)
+        self._symbol_tab_bar.setUsesScrollButtons(True)
+        self._symbol_tab_bar.setDrawBase(False)
+        self._symbol_tab_bar.setToolTip("点击切换当前选中的 K 线窗口交易对")
+        for symbol in KLINE_SYMBOL_OPTIONS:
+            tab_index = self._symbol_tab_bar.addTab(symbol)
+            self._symbol_tab_bar.setTabData(tab_index, symbol)
+        self._symbol_tab_bar.currentChanged.connect(self._on_symbol_tab_changed)
+        symbol_tab_row.addWidget(self._symbol_tab_bar, 1)
+        self._symbol_link_all_check = QCheckBox("全部K线窗口联动")
+        self._symbol_link_all_check.setToolTip("开启后，点击底部交易对标签会同时切换主图、副图和第三图")
+        symbol_tab_row.addWidget(self._symbol_link_all_check)
+        chart_layout.addLayout(symbol_tab_row)
+
         splitter.addWidget(control_scroll)
         splitter.addWidget(chart_host)
         splitter.setStretchFactor(0, 1)
@@ -7278,10 +7302,87 @@ class KlineAnalysisWindow(QMainWindow):
         if self._active_chart_target == resolved:
             self._refresh_chart_selection_visuals()
             self._sync_primary_period_buttons()
+            self._refresh_symbol_tab_selection()
             return
         self._active_chart_target = resolved
         self._refresh_chart_selection_visuals()
         self._sync_primary_period_buttons()
+        self._refresh_symbol_tab_selection()
+
+    def _symbol_for_chart_target(self, target: str | None = None) -> str:
+        resolved = target or self._active_chart_target
+        if resolved == "tertiary" and self._triple_chart_enabled():
+            return self._selected_tertiary_symbol()
+        if resolved == "secondary" and self._secondary_chart_check.isChecked():
+            return self._selected_secondary_symbol()
+        return self._selected_symbol()
+
+    def _refresh_symbol_tab_selection(self) -> None:
+        tab_bar = self._symbol_tab_bar
+        if tab_bar is None:
+            return
+        symbol = self._symbol_for_chart_target()
+        target_index = next(
+            (
+                index
+                for index in range(tab_bar.count())
+                if str(tab_bar.tabData(index) or "").strip().upper() == symbol
+            ),
+            -1,
+        )
+        if target_index < 0 or tab_bar.currentIndex() == target_index:
+            return
+        self._updating_symbol_tabs = True
+        try:
+            tab_bar.blockSignals(True)
+            tab_bar.setCurrentIndex(target_index)
+        finally:
+            tab_bar.blockSignals(False)
+            self._updating_symbol_tabs = False
+
+    @Slot(int)
+    def _on_symbol_tab_changed(self, index: int) -> None:
+        if self._updating_symbol_tabs or self._symbol_tab_bar is None:
+            return
+        symbol = str(self._symbol_tab_bar.tabData(index) or "").strip().upper()
+        if not symbol:
+            return
+        if self._symbol_link_all_check is not None and self._symbol_link_all_check.isChecked():
+            self._switch_all_chart_symbols(symbol)
+            return
+        target = self._active_chart_target
+        if target == "secondary" and self._secondary_chart_check.isChecked():
+            if self._selected_secondary_symbol() != symbol:
+                self._secondary_symbol_combo.setCurrentText(symbol)
+            else:
+                self._on_secondary_symbol_changed(symbol)
+            return
+        if target == "tertiary" and self._triple_chart_enabled():
+            if self._selected_tertiary_symbol() != symbol:
+                self._tertiary_symbol_combo.setCurrentText(symbol)
+            else:
+                self._on_tertiary_symbol_changed(symbol)
+            return
+        if self._selected_symbol() != symbol:
+            self._symbol_combo.setCurrentText(symbol)
+        else:
+            self._on_symbol_confirmed()
+
+    def _switch_all_chart_symbols(self, symbol: str) -> None:
+        combos = (self._symbol_combo, self._secondary_symbol_combo, self._tertiary_symbol_combo)
+        for combo in combos:
+            combo.blockSignals(True)
+        try:
+            for combo in combos:
+                combo.setCurrentText(symbol)
+        finally:
+            for combo in combos:
+                combo.blockSignals(False)
+        self._on_symbol_confirmed()
+        if self._secondary_chart_check.isChecked() and self._secondary_chart_kind() == "kline":
+            self._on_secondary_symbol_changed(symbol)
+        if self._triple_chart_enabled():
+            self._on_tertiary_symbol_changed(symbol)
 
     def _apply_chart_mode_period_defaults(self, *, dual_enabled: bool) -> None:
         primary_period = _DEFAULT_DUAL_PRIMARY_PERIOD if dual_enabled else _DEFAULT_SINGLE_CHART_PERIOD
@@ -8097,6 +8198,7 @@ class KlineAnalysisWindow(QMainWindow):
 
     @Slot()
     def _on_symbol_confirmed(self) -> None:
+        self._refresh_symbol_tab_selection()
         if not self._volatility_available_for_current_symbol() and self._secondary_chart_kind() == "volatility":
             self._secondary_chart_kind_mode = "kline"
             self._secondary_pending_payload = None
@@ -8109,6 +8211,7 @@ class KlineAnalysisWindow(QMainWindow):
 
     @Slot(str)
     def _on_secondary_symbol_changed(self, _value: str) -> None:
+        self._refresh_symbol_tab_selection()
         if (
             not self._secondary_chart_check.isChecked()
             or not self._use_native_chart
@@ -8123,6 +8226,7 @@ class KlineAnalysisWindow(QMainWindow):
 
     @Slot(str)
     def _on_tertiary_symbol_changed(self, _value: str) -> None:
+        self._refresh_symbol_tab_selection()
         if not self._triple_chart_enabled() or not self._use_native_chart:
             return
         if self._has_active_loaders():

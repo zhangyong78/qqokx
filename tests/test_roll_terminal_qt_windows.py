@@ -6179,6 +6179,53 @@ class RollTerminalQtWindowHelperTests(QtWidgetTestCase):
             finally:
                 self.__class__.dispose_widget(window)
 
+    def test_symbol_tabs_switch_active_chart_and_can_link_all_charts(self) -> None:
+        with patch("roll_terminal_qt.kline_analysis_window.QTimer.singleShot", return_value=None):
+            window = KlineAnalysisWindow()
+            try:
+                window._use_native_chart = True
+                window._secondary_chart_check.blockSignals(True)
+                window._secondary_chart_check.setChecked(True)
+                window._secondary_chart_check.blockSignals(False)
+                window._secondary_chart_kind_mode = "kline"
+                window._secondary_symbol_combo.blockSignals(True)
+                window._secondary_symbol_combo.setCurrentText("ETH-USDT-SWAP")
+                window._secondary_symbol_combo.blockSignals(False)
+                window._set_active_chart_target("secondary")
+
+                sol_index = next(
+                    index
+                    for index in range(window._symbol_tab_bar.count())
+                    if window._symbol_tab_bar.tabText(index) == "SOL-USDT-SWAP"
+                )
+                with patch.object(window, "_load_secondary_data") as load_secondary:
+                    window._symbol_tab_bar.setCurrentIndex(sol_index)
+
+                self.assertEqual(window._selected_symbol(), "BTC-USDT-SWAP")
+                self.assertEqual(window._selected_secondary_symbol(), "SOL-USDT-SWAP")
+                load_secondary.assert_called_once_with(symbol="SOL-USDT-SWAP")
+
+                window._symbol_link_all_check.setChecked(True)
+                doge_index = next(
+                    index
+                    for index in range(window._symbol_tab_bar.count())
+                    if window._symbol_tab_bar.tabText(index) == "DOGE-USDT-SWAP"
+                )
+                with (
+                    patch.object(window, "_load_data"),
+                    patch.object(window, "_on_secondary_symbol_changed"),
+                ):
+                    window._symbol_tab_bar.setCurrentIndex(doge_index)
+
+                self.assertEqual(window._selected_symbol(), "DOGE-USDT-SWAP")
+                self.assertEqual(window._selected_secondary_symbol(), "DOGE-USDT-SWAP")
+                self.assertEqual(
+                    window._symbol_tab_bar.tabData(window._symbol_tab_bar.currentIndex()),
+                    "DOGE-USDT-SWAP",
+                )
+            finally:
+                self.__class__.dispose_widget(window)
+
     def test_triple_chart_mode_forces_horizontal_layout(self) -> None:
         with patch("roll_terminal_qt.kline_analysis_window.QTimer.singleShot", return_value=None):
             window = KlineAnalysisWindow()
