@@ -314,7 +314,7 @@ POSITION_TYPE_OPTIONS: tuple[tuple[str, str], ...] = (
     ("期权 OPTION", "OPTION"),
 )
 
-CURRENT_ORDER_TYPE_OPTIONS: tuple[tuple[str, str], ...] = (
+ACCOUNT_RECORD_TYPE_OPTIONS: tuple[tuple[str, str], ...] = (
     ("全部类型", ""),
     ("现货 SPOT", "SPOT"),
     ("交割合约 FUTURES", "FUTURES"),
@@ -324,6 +324,16 @@ CURRENT_ORDER_TYPE_OPTIONS: tuple[tuple[str, str], ...] = (
 )
 
 _PRIMARY_ORDER_INST_TYPES = frozenset({"SPOT", "FUTURES", "SWAP", "OPTION"})
+
+
+def _inst_type_filter_matches(item_inst_type: str | None, selected_inst_type: str | None) -> bool:
+    item_type = str(item_inst_type or "").strip().upper()
+    selected_type = str(selected_inst_type or "").strip().upper()
+    if not selected_type:
+        return True
+    if selected_type == "OTHER":
+        return item_type not in _PRIMARY_ORDER_INST_TYPES
+    return item_type == selected_type
 
 POSITION_OPTION_SIDE_OPTIONS: tuple[tuple[str, str], ...] = (
     ("全部方向", ""),
@@ -6415,7 +6425,7 @@ class AccountPositionsHomeWidget(QWidget):
         self._pending_type_combo = QComboBox()
         self._pending_source_combo = QComboBox()
         self._pending_state_combo = QComboBox()
-        for label, value in CURRENT_ORDER_TYPE_OPTIONS:
+        for label, value in ACCOUNT_RECORD_TYPE_OPTIONS:
             self._pending_type_combo.addItem(label, value)
         for label, value in ORDER_SOURCE_FILTER_OPTIONS:
             self._pending_source_combo.addItem(label, value)
@@ -6489,7 +6499,7 @@ class AccountPositionsHomeWidget(QWidget):
         self._order_history_type_combo = QComboBox()
         self._order_history_source_combo = QComboBox()
         self._order_history_state_combo = QComboBox()
-        for label, value in POSITION_TYPE_OPTIONS:
+        for label, value in ACCOUNT_RECORD_TYPE_OPTIONS:
             self._order_history_type_combo.addItem(label, value)
         for label, value in ORDER_SOURCE_FILTER_OPTIONS:
             self._order_history_source_combo.addItem(label, value)
@@ -6557,7 +6567,7 @@ class AccountPositionsHomeWidget(QWidget):
         filter_row.setVerticalSpacing(8)
         self._fill_history_type_combo = QComboBox()
         self._fill_history_side_combo = QComboBox()
-        for label, value in POSITION_TYPE_OPTIONS:
+        for label, value in ACCOUNT_RECORD_TYPE_OPTIONS:
             self._fill_history_type_combo.addItem(label, value)
         for label, value in HISTORY_FILL_SIDE_FILTER_OPTIONS:
             self._fill_history_side_combo.addItem(label, value)
@@ -6645,7 +6655,7 @@ class AccountPositionsHomeWidget(QWidget):
         filter_row.setVerticalSpacing(8)
         self._position_history_type_combo = QComboBox()
         self._position_history_margin_combo = QComboBox()
-        for label, value in POSITION_TYPE_OPTIONS:
+        for label, value in ACCOUNT_RECORD_TYPE_OPTIONS:
             self._position_history_type_combo.addItem(label, value)
         for label, value in HISTORY_MARGIN_MODE_FILTER_OPTIONS:
             self._position_history_margin_combo.addItem(label, value)
@@ -6913,10 +6923,7 @@ class AccountPositionsHomeWidget(QWidget):
         keyword = self._pending_keyword_edit.text().strip().upper()
         result: list[OrderStatusView] = []
         for item in items:
-            item_inst_type = (item.inst_type or "").strip().upper()
-            if inst_type == "OTHER" and item_inst_type in _PRIMARY_ORDER_INST_TYPES:
-                continue
-            if inst_type and inst_type != "OTHER" and item_inst_type != inst_type:
+            if not _inst_type_filter_matches(item.inst_type, inst_type):
                 continue
             feed_source = str(item.raw.get("_feed_source") or "").strip().lower()
             source_kind = str(item.raw.get("_source_kind") or "").strip().lower()
@@ -7269,7 +7276,7 @@ class AccountPositionsHomeWidget(QWidget):
         keyword = self._order_history_keyword_edit.text().strip().upper()
         result: list[OkxTradeOrderItem] = []
         for item in self._order_history_items:
-            if inst_type and (item.inst_type or "").strip().upper() != inst_type:
+            if not _inst_type_filter_matches(item.inst_type, inst_type):
                 continue
             if source_filter and (item.source_kind or "").strip().lower() != source_filter:
                 continue
@@ -7357,7 +7364,7 @@ class AccountPositionsHomeWidget(QWidget):
         keyword = self._fill_history_keyword_edit.text().strip().upper()
         result: list[OkxFillHistoryItem] = []
         for item in self._fill_history_items:
-            if inst_type and (item.inst_type or "").strip().upper() != inst_type:
+            if not _inst_type_filter_matches(item.inst_type, inst_type):
                 continue
             if side_filter and side_filter not in {(item.side or "").strip().lower(), (item.pos_side or "").strip().lower()}:
                 continue
@@ -7445,7 +7452,7 @@ class AccountPositionsHomeWidget(QWidget):
         end_date = self._parse_history_date(self._position_history_range_end_edit.text(), end_of_day=True)
         result: list[OkxPositionHistoryItem] = []
         for item in self._position_history_items:
-            if inst_type and (item.inst_type or "").strip().upper() != inst_type:
+            if not _inst_type_filter_matches(item.inst_type, inst_type):
                 continue
             if margin_mode and (item.mgn_mode or "").strip().lower() != margin_mode:
                 continue

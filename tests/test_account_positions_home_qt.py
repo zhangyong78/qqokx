@@ -666,9 +666,17 @@ class AccountPositionsHomeQtHelpersTest(TestCase):
             _pending_keyword_edit=empty_edit,
         )
 
-    def test_current_order_type_options_include_spot_and_other(self) -> None:
-        self.assertIn(("现货 SPOT", "SPOT"), account_positions_module.CURRENT_ORDER_TYPE_OPTIONS)
-        self.assertIn(("其他", "OTHER"), account_positions_module.CURRENT_ORDER_TYPE_OPTIONS)
+    def test_account_record_type_options_include_spot_and_other(self) -> None:
+        self.assertIn(("现货 SPOT", "SPOT"), account_positions_module.ACCOUNT_RECORD_TYPE_OPTIONS)
+        self.assertIn(("其他", "OTHER"), account_positions_module.ACCOUNT_RECORD_TYPE_OPTIONS)
+
+    def test_account_record_type_filter_matches_other_types(self) -> None:
+        matches = account_positions_module._inst_type_filter_matches
+
+        self.assertTrue(matches("SPOT", "SPOT"))
+        self.assertTrue(matches("MARGIN", "OTHER"))
+        self.assertTrue(matches("", "OTHER"))
+        self.assertFalse(matches("SWAP", "OTHER"))
 
     def test_current_order_type_filter_supports_spot_and_other(self) -> None:
         spot = self._current_order("SPOT")
