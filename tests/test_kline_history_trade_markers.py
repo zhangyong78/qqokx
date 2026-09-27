@@ -152,11 +152,18 @@ class KlineHistoryTradeMarkersTest(TestCase):
         )
         self.assertEqual([item["color"] for item in rendered], ["#38bdf8", "#f97316", "#38bdf8", "#f97316"])
 
-    def test_best_parameter_indicators_use_symbol_defaults_on_one_hour_only(self) -> None:
-        specs = _best_parameter_indicator_specs("ETH-USDT-SWAP", "1H")
+    def test_best_parameter_indicators_use_symbol_defaults_on_each_primary_period(self) -> None:
+        period_specs = {
+            period: _best_parameter_indicator_specs("ETH-USDT-SWAP", period)
+            for period in ("15m", "1H", "4H", "1D")
+        }
+        specs = period_specs["1H"]
 
         self.assertIn(("最佳 EMA 21", "ema", 21, "#f59e0b"), specs)
         self.assertIn(("最佳 EMA 55", "ema", 55, "#8b5cf6"), specs)
+        for period, period_specs_value in period_specs.items():
+            with self.subTest(period=period):
+                self.assertEqual(period_specs_value, specs)
         long_specs = _best_parameter_indicator_specs("ETH-USDT-SWAP", "1H", direction_filter="long")
         short_specs = _best_parameter_indicator_specs("ETH-USDT-SWAP", "1H", direction_filter="short")
         self.assertEqual({item[2] for item in long_specs}, {21, 55})
@@ -166,4 +173,3 @@ class KlineHistoryTradeMarkersTest(TestCase):
         self.assertIn(("最佳 EMA 5", "ema", 5, "#f59e0b"), doge_specs)
         self.assertIn(("最佳 EMA 13", "ema", 13, "#8b5cf6"), doge_specs)
         self.assertNotEqual({item[2] for item in specs}, {item[2] for item in doge_specs})
-        self.assertEqual(_best_parameter_indicator_specs("ETH-USDT-SWAP", "4H"), [])

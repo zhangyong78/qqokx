@@ -2914,9 +2914,10 @@ def _best_parameter_indicator_specs(
     *,
     direction_filter: str = "all",
 ) -> list[tuple[str, str, int, str]]:
-    """Return the selected long/short 1H best-parameter indicator lines for one symbol."""
+    """Return the selected best-parameter indicator lines for one symbol and period."""
 
-    if period.strip().upper() != "1H":
+    normalized_period = str(period or "").strip().upper()
+    if normalized_period not in {"15M", "1H", "4H", "1D"}:
         return []
     normalized_direction = str(direction_filter or "all").strip().lower()
     include_long = normalized_direction != "short"
@@ -5908,7 +5909,7 @@ class KlineAnalysisWindow(QMainWindow):
 
         self._best_parameter_indicators_check = QCheckBox("最佳参数指标")
         self._best_parameter_indicators_check.setToolTip(
-            "显示当前品种已固化的 1H 最佳参数均线；开启时隐藏原 EMA 15 / SMA 50。"
+            "显示当前品种已固化的最佳参数均线；会按当前 K 线周期重新计算，开启时隐藏原 EMA 15 / SMA 50。"
         )
         self._best_parameter_indicators_check.toggled.connect(self._on_best_parameter_indicators_changed)
         top_row.addWidget(self._best_parameter_indicators_check, 0)

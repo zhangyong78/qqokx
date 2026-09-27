@@ -127,10 +127,6 @@ class WorkspaceHeader(QFrame):
         self._page_buttons["smart-order"] = trading_tools_button
         layout.addWidget(trading_tools_button)
         layout.addWidget(self._menu_button("期权工具", self._ROUTES[5:8]))
-        snapshot_button = QToolButton(self)
-        snapshot_button.setDefaultAction(self._register_action(*self._ROUTES[7]))
-        snapshot_button.setObjectName("WorkspacePageButton")
-        layout.addWidget(snapshot_button)
         layout.addStretch(1)
 
         self.connection_label = QLabel("行情连接中", self)

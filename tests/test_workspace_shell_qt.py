@@ -77,6 +77,13 @@ class WorkspaceShellQtTests(QtWidgetTestCase):
             },
         )
 
+    def test_option_roll_is_only_inside_option_tools_menu(self) -> None:
+        header = WorkspaceHeader()
+        direct_buttons = [button for button in header.findChildren(QToolButton) if button.text() == "期权移仓"]
+        self.assertEqual(direct_buttons, [])
+        option_menu = next(button for button in header.findChildren(QToolButton) if button.text() == "期权工具")
+        self.assertTrue(any(action.text() == "期权移仓" for action in option_menu.menu().actions()))
+
     def test_workspace_header_marks_trading_tools_active_for_smart_order(self) -> None:
         header = WorkspaceHeader()
         trading_tools_button = next(
