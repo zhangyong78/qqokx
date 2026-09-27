@@ -401,11 +401,11 @@ _DAILY_TREND_NEUTRAL_BIAS = 0.008
 _DAILY_TREND_STRONG_BIAS = 0.015
 _DAILY_TREND_STRONG_SLOPE = 0.006
 _DAILY_TREND_BAND_COLOR = {
-    "strong_bull": "#1d4ed8",
-    "weak_bull": "#60a5fa",
+    "strong_bull": "#22c55e",
+    "weak_bull": "#4ade80",
     "neutral": "#94a3b8",
-    "weak_bear": "#fb923c",
-    "strong_bear": "#f97316",
+    "weak_bear": "#f87171",
+    "strong_bear": "#ef4444",
 }
 _DAILY_TREND_BAND_ALPHA = 245
 _DAILY_TREND_BAND_MAX_HEIGHT = 28.0

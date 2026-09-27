@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import threading
 from dataclasses import dataclass, field, replace
+from datetime import datetime, timezone
 from typing import Callable
 
 from PySide6.QtCore import QObject, QTimer, Signal, Slot
 
 from okx_quant.arbitrage.models import ArbitrageTradeRuntime
+from okx_quant.account_equity import record_account_equity
 from okx_quant.okx_client import OkxAccountOverview, OkxOrderStatus, OkxPosition, OkxRestClient, OkxTradeOrderItem
 from okx_quant.ui_shell import _build_position_instrument_map, _build_position_ticker_map, _build_upl_usdt_price_map
 from roll_terminal_qt.order_service import OrderFeedThread, OrderStatusView
@@ -24,6 +26,7 @@ class AccountRealtimeSnapshot:
     position_instruments: dict[str, object] = field(default_factory=dict)
     position_tickers: dict[str, object] = field(default_factory=dict)
     upl_usdt_prices: dict[str, object] = field(default_factory=dict)
+    account_updated_at: datetime | None = None
 
 
 class RealtimeAccountStore(QObject):
@@ -53,6 +56,7 @@ class RealtimeAccountStore(QObject):
         self._positions: list[OkxPosition] = []
         self._orders: list[OrderStatusView] = []
         self._account: OkxAccountOverview | object | None = None
+        self._account_updated_at: datetime | None = None
         self._position_instruments: dict[str, object] = {}
         self._position_tickers: dict[str, object] = {}
         self._upl_usdt_prices: dict[str, object] = {}
@@ -80,6 +84,7 @@ class RealtimeAccountStore(QObject):
         self._positions = []
         self._orders = []
         self._account = None
+        self._account_updated_at = None
         self._position_instruments = {}
         self._position_tickers = {}
         self._upl_usdt_prices = {}
@@ -171,6 +176,7 @@ class RealtimeAccountStore(QObject):
             position_instruments=dict(self._position_instruments),
             position_tickers=dict(self._position_tickers),
             upl_usdt_prices=dict(self._upl_usdt_prices),
+            account_updated_at=self._account_updated_at,
         )
 
     def request_reconcile(self, reason: str) -> None:
@@ -227,6 +233,15 @@ class RealtimeAccountStore(QObject):
                     )
                 )
             account = self._client.get_account_overview(credentials, environment=environment, prefer_cache=False)
+            account_updated_at = datetime.now(timezone.utc)
+            equity_error = ""
+            try:
+                record_account_equity(
+                    str(getattr(credentials, "profile_name", "") or ""), environment, account,
+                    sampled_at=account_updated_at,
+                )
+            except Exception as exc:
+                equity_error = f"权益快照保存失败：{exc}"
             pending_orders = self._client.get_pending_orders(
                 credentials,
                 environment=environment,
@@ -251,6 +266,8 @@ class RealtimeAccountStore(QObject):
                 {
                     "positions": positions,
                     "account": account,
+                    "account_updated_at": account_updated_at,
+                    "equity_error": equity_error,
                     "pending_orders": pending_orders,
                     "upl_usdt_prices": upl_usdt_prices,
                     "position_instruments": position_instruments,
@@ -272,12 +289,15 @@ class RealtimeAccountStore(QObject):
             return
         self._positions = list(result.get("positions") or [])
         self._account = result.get("account")
+        self._account_updated_at = result.get("account_updated_at")
         self._upl_usdt_prices = dict(result.get("upl_usdt_prices") or {})
         self._position_instruments = dict(result.get("position_instruments") or {})
         self._position_tickers = dict(result.get("position_tickers") or {})
         self._orders = self._views_from_pending_orders(list(result.get("pending_orders") or []))
         self._source = "rest"
         self.status_changed.emit(f"账户已通过 REST {reason} 校验")
+        if result.get("equity_error"):
+            self.status_changed.emit(str(result["equity_error"]))
         self._schedule_emit()
 
     @Slot(int, str, int)
@@ -334,7 +354,10 @@ class RealtimeAccountStore(QObject):
             self._positions = list(positions_payload[1])
         account_payload = result.get("account")
         if account_payload is not None:
-            self._account = account_payload[1]
+            next_account = account_payload[1]
+            if next_account != self._account:
+                self._account_updated_at = datetime.now(timezone.utc)
+            self._account = next_account
         updates: list[OrderStatusView] = []
         orders_payload = result.get("orders")
         if orders_payload is not None:
@@ -400,6 +423,7 @@ class RealtimeAccountStore(QObject):
                 position_instruments=dict(self._position_instruments),
                 position_tickers=dict(self._position_tickers),
                 upl_usdt_prices=dict(self._upl_usdt_prices),
+                account_updated_at=self._account_updated_at,
             )
         )
 

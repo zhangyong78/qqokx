@@ -14,6 +14,12 @@ from okx_quant.okx_client import (
     OkxRestClient,
     OkxTradeOrderItem,
 )
+from roll_terminal_qt.bill_history_service import (
+    load_local_account_bills,
+    load_local_asset_bills,
+    merge_account_bills,
+    merge_asset_bills,
+)
 from okx_quant.persistence import (
     load_history_sync_state,
     save_history_sync_state,
@@ -32,8 +38,11 @@ from roll_terminal_qt.history_service import (
 )
 
 
-HISTORY_SYNC_SOURCES = ("fills", "orders", "positions")
-HISTORY_SYNC_SOURCE_LABELS = {"fills": "历史成交", "orders": "历史委托", "positions": "历史仓位"}
+HISTORY_SYNC_SOURCES = ("fills", "orders", "positions", "bills", "asset_bills")
+HISTORY_SYNC_SOURCE_LABELS = {
+    "fills": "历史成交", "orders": "历史委托", "positions": "历史仓位",
+    "bills": "账户账单", "asset_bills": "充值提现",
+}
 
 
 class HistorySyncThread(QThread):
@@ -111,8 +120,12 @@ class HistorySyncThread(QThread):
             )
         elif source == "orders":
             items = load_local_order_history(self._profile_name, self._environment)[: self._display_limits[source]]
-        else:
+        elif source == "positions":
             items = load_local_position_history_all(self._profile_name, self._environment)[: self._display_limits[source]]
+        elif source == "bills":
+            items = load_local_account_bills(self._profile_name, self._environment)[: self._display_limits[source]]
+        elif source == "asset_bills":
+            items = load_local_asset_bills(self._profile_name, self._environment)[: self._display_limits[source]]
         if items:
             self.payload_ready.emit(source, {"items": items, "cached": True})
             self.progress.emit(source, f"{HISTORY_SYNC_SOURCE_LABELS[source]}已显示本地缓存 {len(items)} 条，正在检查最新数据...")
@@ -123,11 +136,11 @@ class HistorySyncThread(QThread):
         has_cursor = isinstance(source_state, dict) and isinstance(source_state.get(source), dict)
         display_limit = self._display_limits[source]
         if self._deep:
-            remote_limit = max(display_limit, {"fills": 100, "orders": 200, "positions": 300}[source])
+            remote_limit = max(display_limit, {"fills": 100, "orders": 200, "positions": 300, "bills": 500, "asset_bills": 100}[source])
         elif has_cursor:
-            remote_limit = {"fills": 20, "orders": 20, "positions": 30}[source]
+            remote_limit = {"fills": 20, "orders": 20, "positions": 30, "bills": 100, "asset_bills": 50}[source]
         else:
-            remote_limit = min(display_limit, {"fills": 100, "orders": 100, "positions": 100}[source])
+            remote_limit = min(display_limit, {"fills": 100, "orders": 100, "positions": 100, "bills": 200, "asset_bills": 100}[source])
         mode_text = "深度检查" if self._deep else ("增量检查" if has_cursor else "首次检查")
         self.progress.emit(source, f"{mode_text}{HISTORY_SYNC_SOURCE_LABELS[source]}，最多读取 {remote_limit} 条...")
 
@@ -166,7 +179,7 @@ class HistorySyncThread(QThread):
                 "items": items,
                 "usdt_prices": self._build_order_usdt_prices(client, items),
             }
-        else:
+        elif source == "positions":
             remote_items = client.get_positions_history(
                 self._runtime.credentials,
                 environment=self._environment,
@@ -183,6 +196,20 @@ class HistorySyncThread(QThread):
                 "instruments": self._build_position_instrument_map(client, items),
                 "usdt_prices": self._build_position_usdt_prices(client, items),
             }
+        if source == "bills":
+            remote_items = client.get_account_bills_history(
+                self._runtime.credentials, environment=self._environment, limit=remote_limit,
+            )
+            items = merge_account_bills(profile_name=self._profile_name, environment=self._environment,
+                                        remote_items=remote_items, limit=display_limit)
+            payload = {"items": items}
+        elif source == "asset_bills":
+            remote_items = client.get_asset_bills_history(
+                self._runtime.credentials, environment=self._environment, limit=remote_limit,
+            )
+            items = merge_asset_bills(profile_name=self._profile_name, environment=self._environment,
+                                      remote_items=remote_items, limit=display_limit)
+            payload = {"items": items}
         self._save_cursor(source, items)
         self.payload_ready.emit(source, payload)
         self.progress.emit(source, f"{HISTORY_SYNC_SOURCE_LABELS[source]}同步完成，本地显示 {len(items)} 条")
@@ -197,10 +224,13 @@ class HistorySyncThread(QThread):
         elif source == "orders":
             latest_time = getattr(latest, "update_time", None) or getattr(latest, "created_time", None)
             latest_id = getattr(latest, "order_id", None) or getattr(latest, "client_order_id", None)
-        else:
+        elif source == "positions":
             latest_time = getattr(latest, "update_time", None)
             raw = getattr(latest, "raw", {})
             latest_id = raw.get("posId") if isinstance(raw, dict) else None
+        elif source in {"bills", "asset_bills"}:
+            latest_time = getattr(latest, "bill_time", None)
+            latest_id = getattr(latest, "bill_id", None)
         state = load_history_sync_state(self._profile_name, self._environment)
         sources = state.get("sources") if isinstance(state.get("sources"), dict) else {}
         sources[source] = {

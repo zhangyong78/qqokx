@@ -86,11 +86,13 @@ def load_local_fill_history(profile_name: str, environment: str) -> list[OkxFill
 def load_local_position_history_all(
     profile_name: str,
     environment: str,
+    *,
+    persist_collapsed: bool = True,
 ) -> list[OkxPositionHistoryItem]:
     """Load every locally cached, collapsed position-history row."""
     local_records = load_history_cache_records("positions", profile_name, environment)
     collapsed_records = _collapse_position_history_records(local_records)
-    if collapsed_records != local_records:
+    if persist_collapsed and collapsed_records != local_records:
         save_history_cache_records("positions", profile_name, environment, collapsed_records)
     items = [
         item

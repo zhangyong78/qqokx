@@ -51,6 +51,8 @@ HISTORY_CACHE_DIR_NAME = "history"
 HISTORY_ORDER_FILE_NAME = "order_history.json"
 HISTORY_FILLS_FILE_NAME = "fills_history.json"
 HISTORY_POSITIONS_FILE_NAME = "position_history.json"
+HISTORY_BILLS_FILE_NAME = "account_bills_history.json"
+HISTORY_ASSET_BILLS_FILE_NAME = "asset_bills_history.json"
 HISTORY_SYNC_STATE_FILE_NAME = "history_sync_state.json"
 ACCOUNT_EQUITY_CURVE_FILE_NAME = "account_equity_curve.json"
 POSITION_HISTORY_VIEW_PREFS_FILE_NAME = "position_history_view_prefs.json"
@@ -772,6 +774,8 @@ def history_cache_file_path(
         "orders": HISTORY_ORDER_FILE_NAME,
         "fills": HISTORY_FILLS_FILE_NAME,
         "positions": HISTORY_POSITIONS_FILE_NAME,
+        "bills": HISTORY_BILLS_FILE_NAME,
+        "asset_bills": HISTORY_ASSET_BILLS_FILE_NAME,
     }
     file_name = file_name_by_kind.get(str(history_kind).strip().lower())
     if not file_name:

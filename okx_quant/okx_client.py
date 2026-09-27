@@ -428,6 +428,20 @@ class OkxAccountBillItem:
 
 
 @dataclass(frozen=True)
+class OkxAssetBillItem:
+    bill_id: str
+    bill_time: int | None
+    currency: str | None
+    bill_type: str | None
+    amount: Decimal | None
+    fee: Decimal | None
+    state: str | None
+    tx_id: str | None
+    client_id: str | None
+    raw: dict[str, Any]
+
+
+@dataclass(frozen=True)
 class OkxAccountAssetItem:
     ccy: str
     equity: Decimal | None
@@ -2308,6 +2322,46 @@ class OkxRestClient:
                 items.append(parsed)
         items.sort(key=lambda item: item.bill_time or 0, reverse=True)
         return items[:limit]
+
+    def get_asset_bills_history(
+        self,
+        credentials: Credentials,
+        *,
+        environment: str,
+        limit: int = 100,
+    ) -> list[OkxAssetBillItem]:
+        """Read recent funding-account deposits, withdrawals and transfers."""
+        payload = self._request(
+            "GET",
+            "/api/v5/asset/bills-history",
+            params={"limit": str(min(100, max(1, int(limit))))},
+            auth=True,
+            credentials=credentials,
+            simulated=environment == "demo",
+        )
+        result: list[OkxAssetBillItem] = []
+        for item in payload.get("data", []):
+            bill_id = str(item.get("billId") or item.get("id") or "").strip()
+            if not bill_id:
+                continue
+            try:
+                bill_time = _to_int(item.get("ts"), item.get("cTime"), item.get("uTime"))
+            except (TypeError, ValueError):
+                bill_time = None
+            result.append(OkxAssetBillItem(
+                bill_id=bill_id,
+                bill_time=bill_time,
+                currency=str(item.get("ccy") or "").strip().upper() or None,
+                bill_type=str(item.get("type") or "").strip() or None,
+                amount=_first_decimal(item.get("amt"), item.get("amount")),
+                fee=_to_decimal(item.get("fee")),
+                state=str(item.get("state") or "").strip() or None,
+                tx_id=str(item.get("txId") or "").strip() or None,
+                client_id=str(item.get("clientId") or "").strip() or None,
+                raw=item,
+            ))
+        result.sort(key=lambda item: item.bill_time or 0, reverse=True)
+        return result
 
     def get_positions_history(
         self,

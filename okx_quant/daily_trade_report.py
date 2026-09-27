@@ -18,7 +18,8 @@ def _decimal(value: object | None) -> Decimal | None:
     if value is None or value == "":
         return None
     try:
-        return Decimal(str(value))
+        number = Decimal(str(value))
+        return number if number.is_finite() else None
     except (InvalidOperation, TypeError, ValueError):
         return None
 
@@ -32,7 +33,10 @@ def _datetime(value: object | None) -> datetime | None:
         number = float(value)
         if number > 10_000_000_000:
             number /= 1000
-        parsed = datetime.fromtimestamp(number, tz=timezone.utc)
+        try:
+            parsed = datetime.fromtimestamp(number, tz=timezone.utc)
+        except (ValueError, OverflowError, OSError):
+            return None
     else:
         text = str(value).strip()
         try:
@@ -63,8 +67,6 @@ def _normalize_trade_datetimes(trade: "DailyTrade") -> "DailyTrade":
     """
     opened_at = _datetime(trade.opened_at)
     closed_at = _datetime(trade.closed_at)
-    if opened_at == trade.opened_at and closed_at == trade.closed_at:
-        return trade
     return replace(trade, opened_at=opened_at, closed_at=closed_at)
 
 
@@ -98,6 +100,12 @@ class DailyTrade:
     # Legacy exchange-history rows may not be associated with a strategy and
     # therefore legitimately have no risk basis.
     risk_amount: Decimal | None = None
+    inst_type: str = ""
+    pnl_currency: str = "USDT"
+    native_net_pnl: Decimal | None = None
+    valuation_note: str = ""
+    pnl_ratio: Decimal | None = None
+    is_closed: bool = True
 
 
 @dataclass(frozen=True)
@@ -280,9 +288,9 @@ def build_daily_trade_report(
             key = (trade.opened_at.date(), api)
             daily_values.setdefault(key, _empty_daily(*key))
             daily_values[key]["opened_count"] = int(daily_values[key]["opened_count"]) + 1
-            if trade.closed_at is None:
+            if trade.closed_at is None or not trade.is_closed:
                 daily_values[key]["open_count"] = int(daily_values[key]["open_count"]) + 1
-        if not _in_range(trade.closed_at, start_date, end_date):
+        if not trade.is_closed or not _in_range(trade.closed_at, start_date, end_date):
             continue
         report_date = trade.closed_at.date()
         key = (report_date, api)
@@ -368,7 +376,7 @@ def format_report_price(value: Decimal | None, symbol: str = "") -> str:
 def report_to_csv(report: DailyTradeReport) -> str:
     output = io.StringIO(newline="")
     writer = csv.writer(output)
-    writer.writerow(("平仓日期", "API", "品种", "策略", "会话", "方向", "开仓时间", "平仓时间", "开仓价", "平仓价", "数量", "净盈亏", "净盈亏R", "风险金", "手续费", "资金费", "状态", "来源", "平仓原因"))
+    writer.writerow(("平仓日期", "API", "品种", "策略", "会话", "方向", "开仓时间", "平仓时间", "开仓价", "平仓价", "数量", "净盈亏", "净盈亏R", "风险金", "手续费", "资金费", "状态", "来源", "平仓原因", "环境", "产品类型", "原币净盈亏", "结算币种", "估值说明"))
     for trade in report.trades:
         writer.writerow(
             (
@@ -383,7 +391,7 @@ def report_to_csv(report: DailyTradeReport) -> str:
                 str(trade.entry_price or ""),
                 str(trade.exit_price or ""),
                 str(trade.size or ""),
-                str(trade.net_pnl or ""),
+                str(trade.net_pnl) if trade.net_pnl is not None else "",
                 format_report_pnl_with_r(trade.net_pnl, trade.risk_amount),
                 str(trade.risk_amount or ""),
                 str(trade.fee or ""),
@@ -391,6 +399,11 @@ def report_to_csv(report: DailyTradeReport) -> str:
                 trade.status,
                 trade.source,
                 trade.close_reason,
+                trade.environment,
+                trade.inst_type,
+                str(trade.native_net_pnl) if trade.native_net_pnl is not None else "",
+                trade.pnl_currency,
+                trade.valuation_note,
             )
         )
     return output.getvalue()
@@ -407,6 +420,7 @@ def report_to_html(report: DailyTradeReport) -> str:
             trade.session_id,
             format_report_pnl_with_r(trade.net_pnl, trade.risk_amount),
             trade.status,
+            trade.valuation_note or "USDT",
         )
         rows.append("<tr>" + "".join(f"<td>{html.escape(str(cell))}</td>" for cell in cells) + "</tr>")
     summary = "；".join(
@@ -419,6 +433,7 @@ def report_to_html(report: DailyTradeReport) -> str:
         "table{border-collapse:collapse;width:100%}th,td{border:1px solid #d9dee5;padding:6px 8px;text-align:left}"
         "th{background:#f3f5f7}</style>"
         f"<h1>API每日交易报表</h1><p>{html.escape(summary)}</p>"
-        "<table><thead><tr><th>平仓时间</th><th>API</th><th>品种</th><th>策略</th><th>会话</th><th>净盈亏</th><th>状态</th></tr></thead>"
+        "<p>Asia/Shanghai · U=USDT · 按完整仓位结束日归集；部分平仓不计入汇总。参考汇率估值不代表历史成交汇率。</p>"
+        "<table><thead><tr><th>平仓时间</th><th>API</th><th>品种</th><th>策略</th><th>会话</th><th>净盈亏</th><th>状态</th><th>估值说明</th></tr></thead>"
         f"<tbody>{''.join(rows)}</tbody></table>"
     )

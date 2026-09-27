@@ -144,7 +144,7 @@ class HistorySyncDialog(QDialog):
         title.setObjectName("SectionTitle")
         layout.addWidget(title)
         hint = QLabel(
-            "快速增量同步只检查最近数据；深度检查才会分页补齐历史成交、历史委托和历史仓位。"
+            "快速增量同步只检查最近数据；深度检查才会分页补齐历史成交、历史委托、历史仓位和账单。"
             "关闭窗口不会停止后台同步。"
         )
         hint.setWordWrap(True)
@@ -155,7 +155,8 @@ class HistorySyncDialog(QDialog):
         source_panel.setObjectName("Guide")
         source_layout = QHBoxLayout(source_panel)
         source_layout.addWidget(QLabel("同步内容："))
-        for source, label in (("fills", "历史成交"), ("orders", "历史委托"), ("positions", "历史仓位")):
+        for source, label in (("fills", "历史成交"), ("orders", "历史委托"), ("positions", "历史仓位"),
+                              ("bills", "账户账单"), ("asset_bills", "充值提现")):
             check = QCheckBox(label)
             check.setChecked(True)
             self._source_checks[source] = check
