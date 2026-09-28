@@ -12,6 +12,7 @@ from okx_quant.models import Candle, Instrument
 
 OptionType = Literal["C", "P"]
 LegSide = Literal["buy", "sell"]
+StrategyLegKind = Literal["option", "underlying"]
 TRADING_DAYS_PER_YEAR = Decimal("365")
 SECONDS_PER_DAY = Decimal("86400")
 MIN_SIMULATION_VOLATILITY = Decimal("0.0001")
@@ -69,6 +70,7 @@ class StrategyLegDefinition:
     theta: Decimal | None = None
     vega: Decimal | None = None
     enabled: bool = True
+    leg_kind: StrategyLegKind = "option"
 
 
 @dataclass(frozen=True)
@@ -83,6 +85,8 @@ class ResolvedStrategyLeg:
     strike: Decimal
     option_type: OptionType
     contract_value: Decimal
+    leg_kind: StrategyLegKind = "option"
+    underlying_mode: Literal["linear", "inverse"] = "linear"
 
 
 @dataclass
@@ -179,6 +183,56 @@ def build_option_pnl_value(
     return (option_price - entry_price) * contract_value
 
 
+def build_underlying_pnl_value(
+    market_price: Decimal,
+    *,
+    entry_price: Decimal,
+    contract_value: Decimal,
+    mode: Literal["linear", "inverse"],
+) -> Decimal:
+    """Return one contract/unit's PnL for a spot, swap, or futures leg.
+
+    Linear products use ``(mark - entry) * multiplier``.  Coin-margined
+    inverse futures settle in the base coin and use the reciprocal-price PnL
+    convention used by OKX's USD contracts.
+    """
+
+    if market_price <= 0 or entry_price <= 0 or contract_value <= 0:
+        return Decimal("0")
+    if mode == "inverse":
+        return contract_value * ((Decimal("1") / entry_price) - (Decimal("1") / market_price))
+    return (market_price - entry_price) * contract_value
+
+
+def build_underlying_pnl_candles(
+    candles: list[Candle],
+    *,
+    entry_price: Decimal,
+    contract_value: Decimal,
+    mode: Literal["linear", "inverse"],
+) -> list[Candle]:
+    result: list[Candle] = []
+    for candle in candles:
+        values = (
+            build_underlying_pnl_value(candle.open, entry_price=entry_price, contract_value=contract_value, mode=mode),
+            build_underlying_pnl_value(candle.high, entry_price=entry_price, contract_value=contract_value, mode=mode),
+            build_underlying_pnl_value(candle.low, entry_price=entry_price, contract_value=contract_value, mode=mode),
+            build_underlying_pnl_value(candle.close, entry_price=entry_price, contract_value=contract_value, mode=mode),
+        )
+        result.append(
+            Candle(
+                ts=candle.ts,
+                open=values[0],
+                high=max(values),
+                low=min(values),
+                close=values[3],
+                volume=Decimal("0"),
+                confirmed=candle.confirmed,
+            )
+        )
+    return result
+
+
 def convert_candles_by_reference(candles: list[Candle], reference_candles: list[Candle]) -> list[Candle]:
     reference_map = {item.ts: item for item in reference_candles if item.confirmed}
     converted: list[Candle] = []
@@ -267,12 +321,36 @@ def build_option_chain_rows(quotes: list[OptionQuote]) -> list[OptionChainRow]:
 
 
 def resolve_strategy_leg(leg: StrategyLegDefinition, instrument: Instrument) -> ResolvedStrategyLeg:
-    parsed = parse_option_contract(instrument.inst_id)
     premium = leg.premium
     if premium is None:
-        raise ValueError(f"{instrument.inst_id} 缺少期权权利金，无法计算到期盈亏。")
+        label = "期权权利金" if leg.leg_kind == "option" else "持仓均价"
+        raise ValueError(f"{instrument.inst_id} 缺少{label}，无法计算盈亏。")
     if leg.quantity <= 0:
         raise ValueError(f"{instrument.inst_id} 数量必须大于 0。")
+    if leg.leg_kind == "underlying":
+        base_ccy = instrument.inst_id.split("-", 1)[0].strip().upper()
+        value_ccy = str(instrument.ct_val_ccy or "").strip().upper()
+        settle_ccy = str(instrument.settle_ccy or "").strip().upper()
+        inverse = (
+            str(instrument.inst_type or "").strip().upper() in {"FUTURES", "SWAP"}
+            and value_ccy in {"USD", "USDT"}
+            and settle_ccy == base_ccy
+        )
+        return ResolvedStrategyLeg(
+            alias=leg.alias.strip(),
+            inst_id=instrument.inst_id,
+            side=leg.side,
+            quantity=leg.quantity,
+            premium=premium,
+            inst_family=f"{base_ccy}-{settle_ccy or value_ccy or 'QUOTE'}",
+            expiry_code="",
+            strike=Decimal("0"),
+            option_type="C",
+            contract_value=option_contract_value(instrument),
+            leg_kind="underlying",
+            underlying_mode="inverse" if inverse else "linear",
+        )
+    parsed = parse_option_contract(instrument.inst_id)
     return ResolvedStrategyLeg(
         alias=leg.alias.strip(),
         inst_id=instrument.inst_id,
@@ -410,16 +488,19 @@ def build_payoff_snapshot(
     if sample_count < 2:
         raise ValueError("sample_count must be at least 2")
 
-    strikes = [item.strike for item in active_legs]
-    anchor = current_underlying_price if current_underlying_price is not None and current_underlying_price > 0 else strikes[len(strikes) // 2]
-    low_anchor = min(strikes + [anchor])
-    high_anchor = max(strikes + [anchor])
+    strikes = [item.strike for item in active_legs if item.leg_kind == "option" and item.strike > 0]
+    entry_prices = [item.premium for item in active_legs if item.premium > 0]
+    anchor = current_underlying_price if current_underlying_price is not None and current_underlying_price > 0 else (strikes or entry_prices)[0]
+    low_anchor = min(strikes + [anchor]) if strikes else anchor
+    high_anchor = max(strikes + [anchor]) if strikes else anchor
     price_lower = max((low_anchor * Decimal("0.7")), Decimal("0.0001"))
     price_upper = max(high_anchor * Decimal("1.3"), price_lower + Decimal("0.0001"))
     step = (price_upper - price_lower) / Decimal(sample_count - 1)
 
     net_premium = Decimal("0")
     for leg in active_legs:
+        if leg.leg_kind != "option":
+            continue
         direction = Decimal("1") if leg.side == "buy" else Decimal("-1")
         premium_cost = leg.premium * leg.contract_value * leg.quantity
         net_premium += -direction * premium_cost
@@ -430,6 +511,14 @@ def build_payoff_snapshot(
         pnl = net_premium
         for leg in active_legs:
             direction = Decimal("1") if leg.side == "buy" else Decimal("-1")
+            if leg.leg_kind == "underlying":
+                pnl += direction * build_underlying_pnl_value(
+                    underlying_price,
+                    entry_price=leg.premium,
+                    contract_value=leg.contract_value,
+                    mode=leg.underlying_mode,
+                ) * leg.quantity
+                continue
             intrinsic = option_intrinsic_value_at_expiry(
                 settlement_price=underlying_price,
                 strike=leg.strike,
@@ -465,16 +554,19 @@ def build_simulated_payoff_snapshot(
     if sample_count < 2:
         raise ValueError("sample_count must be at least 2")
 
-    strikes = [item.strike for item in active_legs]
-    anchor = current_underlying_price if current_underlying_price is not None and current_underlying_price > 0 else strikes[len(strikes) // 2]
-    low_anchor = min(strikes + [anchor])
-    high_anchor = max(strikes + [anchor])
+    strikes = [item.strike for item in active_legs if item.leg_kind == "option" and item.strike > 0]
+    entry_prices = [item.premium for item in active_legs if item.premium > 0]
+    anchor = current_underlying_price if current_underlying_price is not None and current_underlying_price > 0 else (strikes or entry_prices)[0]
+    low_anchor = min(strikes + [anchor]) if strikes else anchor
+    high_anchor = max(strikes + [anchor]) if strikes else anchor
     price_lower = max((low_anchor * Decimal("0.7")), Decimal("0.0001"))
     price_upper = max(high_anchor * Decimal("1.3"), price_lower + Decimal("0.0001"))
     step = (price_upper - price_lower) / Decimal(sample_count - 1)
 
     net_premium = Decimal("0")
     for leg in active_legs:
+        if leg.leg_kind != "option":
+            continue
         direction = Decimal("1") if leg.side == "buy" else Decimal("-1")
         premium_cost = leg.premium * leg.contract_value * leg.quantity
         net_premium += -direction * premium_cost
@@ -485,6 +577,14 @@ def build_simulated_payoff_snapshot(
         pnl = Decimal("0")
         for leg in active_legs:
             direction = Decimal("1") if leg.side == "buy" else Decimal("-1")
+            if leg.leg_kind == "underlying":
+                pnl += direction * build_underlying_pnl_value(
+                    underlying_price,
+                    entry_price=leg.premium,
+                    contract_value=leg.contract_value,
+                    mode=leg.underlying_mode,
+                ) * leg.quantity
+                continue
             entry_cost = leg.premium * leg.contract_value
             theoretical_value = simulated_option_value(
                 settlement_price=underlying_price,
@@ -593,12 +693,28 @@ def estimate_strategy_greeks(
         return totals
 
     for leg in active_legs:
-        greeks = estimate_leg_greeks(
-            leg,
-            settlement_price=settlement_price,
-            valuation_time=valuation_time,
-            base_implied_volatility=implied_volatility_by_alias.get(leg.alias),
-        )
+        if leg.leg_kind == "underlying":
+            if leg.underlying_mode == "inverse":
+                greeks = {
+                    "delta": leg.contract_value / (settlement_price * settlement_price),
+                    "gamma": -(Decimal("2") * leg.contract_value) / (settlement_price * settlement_price * settlement_price),
+                    "theta": Decimal("0"),
+                    "vega": Decimal("0"),
+                }
+            else:
+                greeks = {
+                    "delta": leg.contract_value,
+                    "gamma": Decimal("0"),
+                    "theta": Decimal("0"),
+                    "vega": Decimal("0"),
+                }
+        else:
+            greeks = estimate_leg_greeks(
+                leg,
+                settlement_price=settlement_price,
+                valuation_time=valuation_time,
+                base_implied_volatility=implied_volatility_by_alias.get(leg.alias),
+            )
         direction = Decimal("1") if leg.side == "buy" else Decimal("-1")
         for key, value in greeks.items():
             totals[key] += direction * value * leg.quantity
@@ -615,6 +731,21 @@ def estimate_leg_greeks(
     if settlement_price <= 0:
         return {
             "delta": Decimal("0"),
+            "gamma": Decimal("0"),
+            "theta": Decimal("0"),
+            "vega": Decimal("0"),
+        }
+
+    if leg.leg_kind == "underlying":
+        if leg.underlying_mode == "inverse":
+            return {
+                "delta": leg.contract_value / (settlement_price * settlement_price),
+                "gamma": -(Decimal("2") * leg.contract_value) / (settlement_price * settlement_price * settlement_price),
+                "theta": Decimal("0"),
+                "vega": Decimal("0"),
+            }
+        return {
+            "delta": leg.contract_value,
             "gamma": Decimal("0"),
             "theta": Decimal("0"),
             "vega": Decimal("0"),

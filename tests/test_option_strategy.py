@@ -29,6 +29,7 @@ from okx_quant.option_strategy import (
     StrategyPayoffSnapshot,
     build_option_pnl_candles,
     build_option_pnl_value,
+    build_underlying_pnl_value,
     build_composite_candles,
     build_default_formula,
     build_option_chain_rows,
@@ -72,6 +73,42 @@ def _make_instrument(inst_id: str) -> Instrument:
 
 
 class OptionStrategyTest(TestCase):
+    def test_inverse_future_leg_uses_inverse_pnl_and_payoff(self) -> None:
+        instrument = Instrument(
+            inst_id="BTC-USD-261225",
+            inst_type="FUTURES",
+            tick_size=Decimal("0.1"),
+            lot_size=Decimal("1"),
+            min_size=Decimal("1"),
+            state="live",
+            settle_ccy="BTC",
+            ct_val=Decimal("100"),
+            ct_val_ccy="USD",
+        )
+        leg = StrategyLegDefinition(
+            alias="L1",
+            inst_id=instrument.inst_id,
+            side="buy",
+            quantity=Decimal("2"),
+            premium=Decimal("100000"),
+            leg_kind="underlying",
+        )
+        resolved = resolve_strategy_leg(leg, instrument)
+
+        self.assertEqual(resolved.leg_kind, "underlying")
+        self.assertEqual(resolved.underlying_mode, "inverse")
+        self.assertEqual(
+            build_underlying_pnl_value(
+                Decimal("110000"),
+                entry_price=Decimal("100000"),
+                contract_value=Decimal("100"),
+                mode="inverse",
+            ),
+            Decimal("0.00009090909090909090909090909090"),
+        )
+        payoff = build_payoff_snapshot([resolved], current_underlying_price=Decimal("100000"), sample_count=3)
+        self.assertEqual(payoff.points[1].pnl, Decimal("0"))
+
     def test_format_compact_number_uses_at_most_four_decimal_places(self) -> None:
         self.assertEqual(_format_compact_number(Decimal("0.000800")), "0.0008")
         self.assertEqual(_format_compact_number(Decimal("0.01850")), "0.0185")

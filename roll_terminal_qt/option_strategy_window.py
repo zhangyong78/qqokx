@@ -57,6 +57,8 @@ from okx_quant.option_strategy import (
     StrategyPayoffSnapshot,
     build_composite_candles,
     build_default_formula,
+    build_underlying_pnl_candles,
+    build_underlying_pnl_value,
     build_option_chain_rows,
     build_option_pnl_candles,
     build_option_pnl_value,
@@ -111,6 +113,108 @@ def _shared_client() -> OkxRestClient:
     if _SHARED_CLIENT is None:
         _SHARED_CLIENT = OkxRestClient()
     return _SHARED_CLIENT
+
+
+def build_option_position_import_payload(
+    positions: list[OkxPosition] | tuple[OkxPosition, ...],
+    *,
+    instruments_by_inst_id: dict[str, Instrument],
+    tickers_by_inst_id: dict[str, OkxTicker] | None = None,
+    strategy_name: str = "持仓导入期权分析",
+) -> OptionRollTransferPayload:
+    """Validate checked option positions and convert them to strategy legs."""
+
+    selected = list(positions)
+    if not selected:
+        raise ValueError("当前筛选结果中没有勾选的仓位。")
+    option_positions = [item for item in selected if str(item.inst_type or "").strip().upper() == "OPTION"]
+    non_option_positions = [item for item in selected if str(item.inst_type or "").strip().upper() != "OPTION"]
+    if not option_positions:
+        raise ValueError("当前勾选仓位中没有可导入的期权仓位。")
+
+    parsed_options: list[tuple[OkxPosition, Any]] = []
+    families: set[str] = set()
+    for position in option_positions:
+        inst_id = str(position.inst_id or "").strip().upper()
+        try:
+            parsed = parse_option_contract(inst_id)
+        except Exception as exc:  # noqa: BLE001
+            raise ValueError(f"{position.inst_id} 不是有效的期权合约，无法导入。") from exc
+        parsed_options.append((position, parsed))
+        families.add(parsed.inst_family)
+
+    related_families = {parsed.inst_family for _position, parsed in parsed_options}
+    unrelated_non_options = [
+        item
+        for item in non_option_positions
+        if str(item.inst_id or "").strip().upper() not in related_families
+        and not any(
+            str(item.inst_id or "").strip().upper().startswith(f"{family}-")
+            for family in related_families
+        )
+    ]
+    if unrelated_non_options:
+        preview = "、".join(str(item.inst_id or "").strip() for item in unrelated_non_options[:3])
+        suffix = "等" if len(unrelated_non_options) > 3 else ""
+        raise ValueError(f"勾选的非期权仓位必须与期权属于相同品种，请取消勾选：{preview}{suffix}。")
+
+    normalized_instruments = {
+        str(inst_id or "").strip().upper(): instrument
+        for inst_id, instrument in instruments_by_inst_id.items()
+        if isinstance(instrument, Instrument)
+    }
+    normalized_tickers = {
+        str(inst_id or "").strip().upper(): ticker
+        for inst_id, ticker in (tickers_by_inst_id or {}).items()
+        if isinstance(ticker, OkxTicker)
+    }
+    legs: list[StrategyLegDefinition] = []
+    instruments: list[Instrument] = []
+    quotes: list[OptionQuote] = []
+    seen_instruments: set[str] = set()
+    parsed_by_inst_id = {
+        str(position.inst_id or "").strip().upper(): parsed
+        for position, parsed in parsed_options
+    }
+    for index, position in enumerate(selected, start=1):
+        inst_id = str(position.inst_id or "").strip().upper()
+        instrument = normalized_instruments.get(inst_id)
+        if instrument is None:
+            raise ValueError(f"{position.inst_id} 缺少合约信息，请先刷新持仓后再导入。")
+        side, quantity = _position_side_and_quantity(position)
+        if quantity <= 0:
+            raise ValueError(f"{position.inst_id} 的持仓数量无效，无法导入。")
+        ticker = normalized_tickers.get(inst_id)
+        quote = _build_option_quote(instrument, ticker)
+        premium = position.avg_price if position.avg_price is not None else quote.reference_price
+        legs.append(
+            StrategyLegDefinition(
+                alias=f"L{index}",
+                inst_id=inst_id,
+                side="buy" if side == "buy" else "sell",
+                quantity=quantity,
+                premium=premium,
+                enabled=True,
+                leg_kind="option" if inst_id in parsed_by_inst_id else "underlying",
+            )
+        )
+        if inst_id not in seen_instruments:
+            seen_instruments.add(inst_id)
+            instruments.append(instrument)
+            quotes.append(quote)
+
+    if len(families) != 1:
+        family_text = "、".join(sorted(families)) or "未知"
+        raise ValueError(f"导入期权分析要求所有勾选仓位属于相同品种（例如 BTC-USD），当前包含：{family_text}。")
+    family = next(iter(families))
+    return OptionRollTransferPayload(
+        strategy_name=strategy_name.strip() or f"{family} 持仓分析",
+        option_family=family,
+        expiry_code="",
+        legs=tuple(legs),
+        instruments=tuple(instruments),
+        quotes=tuple(quotes),
+    )
 
 
 def _format_greek_number(value: Decimal | None) -> str:
@@ -941,28 +1045,47 @@ class _ChartThread(QThread):
                     raise ValueError(f"{leg.inst_id} 缺少持仓价，无法生成组合浮盈亏 K 线。")
                 if current_underlying_price is None and quote.index_price is not None:
                     current_underlying_price = quote.index_price
-                resolved_legs.append(resolve_strategy_leg(leg, instrument))
-                confirmed_candles = [
-                    item
-                    for item in self._client.get_mark_price_candles(leg.inst_id, self._bar, limit=self._candle_limit)
-                    if item.confirmed
-                ]
+                resolved_leg = resolve_strategy_leg(leg, instrument)
+                resolved_legs.append(resolved_leg)
+                if leg.leg_kind == "underlying" and str(instrument.inst_type or "").strip().upper() == "SPOT":
+                    raw_candles = self._client.get_candles_history(leg.inst_id, self._bar, limit=self._candle_limit)
+                else:
+                    raw_candles = self._client.get_mark_price_candles(leg.inst_id, self._bar, limit=self._candle_limit)
+                confirmed_candles = [item for item in raw_candles if item.confirmed]
                 source_counts[leg.alias] = len(confirmed_candles)
-                candles_by_alias[leg.alias] = build_option_pnl_candles(
-                    confirmed_candles,
-                    entry_price=leg.premium,
-                    contract_value=option_contract_value(instrument),
-                )
+                if leg.leg_kind == "underlying":
+                    candles_by_alias[leg.alias] = build_underlying_pnl_candles(
+                        confirmed_candles,
+                        entry_price=leg.premium,
+                        contract_value=resolved_leg.contract_value,
+                        mode=resolved_leg.underlying_mode,
+                    )
+                else:
+                    candles_by_alias[leg.alias] = build_option_pnl_candles(
+                        confirmed_candles,
+                        entry_price=leg.premium,
+                        contract_value=option_contract_value(instrument),
+                    )
 
             spot_usdt_price, spot_usdt_candles = self._load_usdt_reference_context(active_legs)
             if current_underlying_price is None and spot_usdt_price is not None:
                 current_underlying_price = spot_usdt_price
 
+            resolved_by_alias = {item.alias: item for item in resolved_legs}
             latest_values = {
-                leg.alias: build_option_pnl_value(
-                    latest_quotes[leg.inst_id].reference_price or Decimal("0"),
-                    entry_price=leg.premium or Decimal("0"),
-                    contract_value=option_contract_value(self._instrument_map.get(leg.inst_id) or latest_quotes[leg.inst_id].instrument),
+                leg.alias: (
+                    build_underlying_pnl_value(
+                        latest_quotes[leg.inst_id].reference_price or Decimal("0"),
+                        entry_price=leg.premium or Decimal("0"),
+                        contract_value=resolved_by_alias[leg.alias].contract_value,
+                        mode=resolved_by_alias[leg.alias].underlying_mode,
+                    )
+                    if leg.leg_kind == "underlying"
+                    else build_option_pnl_value(
+                        latest_quotes[leg.inst_id].reference_price or Decimal("0"),
+                        entry_price=leg.premium or Decimal("0"),
+                        contract_value=option_contract_value(self._instrument_map.get(leg.inst_id) or latest_quotes[leg.inst_id].instrument),
+                    )
                 )
                 for leg in active_legs
             }
@@ -980,7 +1103,11 @@ class _ChartThread(QThread):
             payoff_snapshot: StrategyPayoffSnapshot | None = None
             implied_volatility_by_alias: dict[str, Decimal] = {}
             if self._mode == "all":
-                families = {parse_option_contract(item.inst_id).inst_family for item in active_legs}
+                families = {
+                    parse_option_contract(item.inst_id).inst_family
+                    for item in active_legs
+                    if item.leg_kind == "option"
+                }
                 if len(families) != 1:
                     raise ValueError("当前到期盈亏图只支持同一标的系列的期权组合。")
                 payoff_snapshot = build_payoff_snapshot(
@@ -999,6 +1126,7 @@ class _ChartThread(QThread):
                             or Decimal("0.6")
                         )
                         for leg in resolved_legs
+                        if leg.leg_kind == "option"
                     }
             snapshot = ChartSnapshot(
                 combo_candles=tuple(combo_candles),
@@ -1020,7 +1148,11 @@ class _ChartThread(QThread):
             self.error_raised.emit(self._request_id, str(exc))
 
     def _load_usdt_reference_context(self, active_legs: list[StrategyLegDefinition]) -> tuple[Decimal | None, list[Candle]]:
-        families = {parse_option_contract(item.inst_id).inst_family for item in active_legs}
+        families = {
+            parse_option_contract(item.inst_id).inst_family
+            for item in active_legs
+            if item.leg_kind == "option"
+        }
         if len(families) != 1:
             return None, []
         spot_inst_id = _spot_usdt_inst_id(next(iter(families)))
@@ -1070,7 +1202,11 @@ class _OverlayThread(QThread):
             active_legs = [item for item in self._legs if item.enabled]
             if not active_legs:
                 raise ValueError("请先启用至少一条策略腿。")
-            families = {parse_option_contract(item.inst_id).inst_family for item in active_legs}
+            families = {
+                parse_option_contract(item.inst_id).inst_family
+                for item in active_legs
+                if item.leg_kind == "option"
+            }
             if len(families) != 1:
                 raise ValueError("叠加对比仅支持同一期权系列的组合。")
             family = next(iter(families))
@@ -1087,12 +1223,25 @@ class _OverlayThread(QThread):
                     raise ValueError(f"{leg.inst_id} 当前缺少标记价 / 最新价。")
                 if leg.premium is None:
                     raise ValueError(f"{leg.inst_id} 缺少持仓价。")
-                candles = [item for item in self._client.get_mark_price_candles(leg.inst_id, self._bar, limit=self._candle_limit) if item.confirmed]
-                candles_by_alias[leg.alias] = build_option_pnl_candles(
-                    candles,
-                    entry_price=leg.premium,
-                    contract_value=option_contract_value(instrument),
-                )
+                if leg.leg_kind == "underlying" and str(instrument.inst_type or "").strip().upper() == "SPOT":
+                    raw_candles = self._client.get_candles_history(leg.inst_id, self._bar, limit=self._candle_limit)
+                else:
+                    raw_candles = self._client.get_mark_price_candles(leg.inst_id, self._bar, limit=self._candle_limit)
+                candles = [item for item in raw_candles if item.confirmed]
+                resolved_leg = resolve_strategy_leg(leg, instrument)
+                if leg.leg_kind == "underlying":
+                    candles_by_alias[leg.alias] = build_underlying_pnl_candles(
+                        candles,
+                        entry_price=leg.premium,
+                        contract_value=resolved_leg.contract_value,
+                        mode=resolved_leg.underlying_mode,
+                    )
+                else:
+                    candles_by_alias[leg.alias] = build_option_pnl_candles(
+                        candles,
+                        entry_price=leg.premium,
+                        contract_value=option_contract_value(instrument),
+                    )
             combo_candles = build_composite_candles(
                 self._formula,
                 candles_by_alias,
@@ -4927,9 +5076,17 @@ class OptionStrategyQtWindow(QMainWindow):
         quote = self._quotes_by_inst_id.get(inst_id)
         return quote.reference_price if quote is not None else None
 
-    def _option_value_approx_usdt(self, inst_id: str, value: Decimal | None) -> Decimal | None:
+    def _option_value_approx_usdt(
+        self,
+        inst_id: str,
+        value: Decimal | None,
+        *,
+        leg_kind: str = "option",
+    ) -> Decimal | None:
         if value is None:
             return None
+        if leg_kind == "underlying":
+            return value
         quote_currency = _strategy_leg_quote_currency(inst_id, self._instrument_map)
         if quote_currency in {"USDT", "USD", "USDC"}:
             return value
@@ -4952,6 +5109,28 @@ class OptionStrategyQtWindow(QMainWindow):
                 continue
             try:
                 resolved_leg = resolve_strategy_leg(leg, instrument)
+                if leg.leg_kind == "underlying":
+                    greeks = estimate_leg_greeks(
+                        resolved_leg,
+                        settlement_price=settlement_price,
+                        valuation_time=valuation_time,
+                        base_implied_volatility=None,
+                    )
+                    direction = Decimal("1") if leg.side == "buy" else Decimal("-1")
+                    if resolved_leg.underlying_mode == "inverse":
+                        delta_pa, gamma_pa = inverse_greeks_to_pa(
+                            delta_coin_per_usd=greeks["delta"],
+                            gamma_coin_per_usd2=greeks["gamma"],
+                            underlying_price=settlement_price,
+                        )
+                        leg.delta = delta_pa * direction * leg.quantity
+                        leg.gamma = gamma_pa * direction * leg.quantity
+                    else:
+                        leg.delta = greeks["delta"] * direction * leg.quantity
+                        leg.gamma = Decimal("0")
+                    leg.theta = Decimal("0")
+                    leg.vega = Decimal("0")
+                    continue
                 implied_volatility = infer_implied_volatility_for_leg(
                     resolved_leg,
                     settlement_price=settlement_price,
@@ -4986,17 +5165,23 @@ class OptionStrategyQtWindow(QMainWindow):
         coin_quantity_totals: dict[str, Decimal] = {}
         for row_index, leg in enumerate(self._legs):
             instrument = self._instrument_map.get(leg.inst_id)
-            parsed = parse_option_contract(leg.inst_id)
+            is_underlying = leg.leg_kind == "underlying"
+            parsed = None if is_underlying else parse_option_contract(leg.inst_id)
             currency = str(
-                getattr(instrument, "ct_val_ccy", None) or leg.inst_id.split("-", 1)[0]
+                (
+                    getattr(instrument, "settle_ccy", None)
+                    if is_underlying
+                    else getattr(instrument, "ct_val_ccy", None)
+                )
+                or leg.inst_id.split("-", 1)[0]
             ).strip().upper()
             if currency:
                 greek_currencies.add(currency)
             premium = leg.premium
             mark_price = self._leg_mark_price(leg.inst_id)
-            premium_usdt = self._option_value_approx_usdt(leg.inst_id, premium)
-            mark_price_usdt = self._option_value_approx_usdt(leg.inst_id, mark_price)
-            theta_usdt = self._option_value_approx_usdt(leg.inst_id, leg.theta)
+            premium_usdt = self._option_value_approx_usdt(leg.inst_id, premium, leg_kind=leg.leg_kind)
+            mark_price_usdt = self._option_value_approx_usdt(leg.inst_id, mark_price, leg_kind=leg.leg_kind)
+            theta_usdt = self._option_value_approx_usdt(leg.inst_id, leg.theta, leg_kind=leg.leg_kind)
             for key, value in (
                 ("delta", leg.delta),
                 ("gamma", leg.gamma),
@@ -5010,23 +5195,35 @@ class OptionStrategyQtWindow(QMainWindow):
                     greek_totals[key] += value
                     greek_counts[key] += 1
             contract_value = option_contract_value(instrument) if instrument is not None else Decimal("1")
-            premium_total = premium * contract_value * leg.quantity if premium is not None else None
+            premium_total = premium * contract_value * leg.quantity if premium is not None and not is_underlying else None
             coin_quantity = (
                 option_contract_coin_quantity(instrument, leg.quantity)
                 if instrument is not None
                 else None
             )
             coin_currency = str(
-                getattr(instrument, "ct_val_ccy", None) or leg.inst_id.split("-", 1)[0]
+                (
+                    getattr(instrument, "settle_ccy", None)
+                    if is_underlying
+                    else getattr(instrument, "ct_val_ccy", None)
+                )
+                or leg.inst_id.split("-", 1)[0]
             ).strip().upper()
             if coin_quantity is not None:
                 coin_quantity_totals[coin_currency] = coin_quantity_totals.get(coin_currency, Decimal("0")) + coin_quantity
             values = (
                 leg.alias,
                 leg.inst_id,
-                "认购" if parsed.option_type == "C" else "认沽",
-                parsed.expiry_label,
-                format_decimal(parsed.strike),
+                (
+                    {"SPOT": "现货", "SWAP": "永续", "FUTURES": "交割"}.get(
+                        str(getattr(instrument, "inst_type", "") or "").strip().upper(),
+                        "标的",
+                    )
+                    if is_underlying
+                    else "认购" if parsed is not None and parsed.option_type == "C" else "认沽"
+                ),
+                "-" if is_underlying else parsed.expiry_label if parsed is not None else "-",
+                "-" if is_underlying else format_decimal(parsed.strike) if parsed is not None else "-",
                 "买入" if leg.side == "buy" else "卖出",
                 format_decimal(leg.quantity),
                 f"{format_decimal(coin_quantity)} {coin_currency}" if coin_quantity is not None else "-",
@@ -5104,11 +5301,20 @@ class OptionStrategyQtWindow(QMainWindow):
                 if reference_value is None or leg.premium is None:
                     latest_values[leg.alias] = None
                     continue
-                latest_values[leg.alias] = build_option_pnl_value(
-                    reference_value,
-                    entry_price=leg.premium,
-                    contract_value=option_contract_value(instrument) if instrument is not None else Decimal("1"),
-                )
+                if leg.leg_kind == "underlying" and instrument is not None:
+                    resolved_leg = resolve_strategy_leg(leg, instrument)
+                    latest_values[leg.alias] = build_underlying_pnl_value(
+                        reference_value,
+                        entry_price=leg.premium,
+                        contract_value=resolved_leg.contract_value,
+                        mode=resolved_leg.underlying_mode,
+                    )
+                else:
+                    latest_values[leg.alias] = build_option_pnl_value(
+                        reference_value,
+                        entry_price=leg.premium,
+                        contract_value=option_contract_value(instrument) if instrument is not None else Decimal("1"),
+                    )
             if all(value is not None for value in latest_values.values()):
                 combo_value = _format_compact_number(
                     evaluate_linear_formula(
@@ -5122,6 +5328,8 @@ class OptionStrategyQtWindow(QMainWindow):
         net_premium: Decimal | None = Decimal("0")
         premium_ccy: str | None = None
         for leg in self._legs:
+            if leg.leg_kind != "option":
+                continue
             instrument = self._instrument_map.get(leg.inst_id)
             if instrument is None or leg.premium is None:
                 net_premium = None
@@ -5356,11 +5564,12 @@ class OptionStrategyQtWindow(QMainWindow):
             self._latest_resolved_legs = list(snapshot.resolved_legs)
             self._latest_implied_volatility_by_alias = dict(snapshot.implied_volatility_by_alias)
             self._latest_payoff_loaded_at = snapshot.payoff_loaded_at
-            self._latest_payoff_expiry_at = (
-                max(parse_option_expiry_datetime(item.expiry_code) for item in snapshot.resolved_legs)
-                if snapshot.resolved_legs
-                else None
-            )
+            option_expiries = [
+                parse_option_expiry_datetime(item.expiry_code)
+                for item in snapshot.resolved_legs
+                if item.leg_kind == "option" and item.expiry_code
+            ]
+            self._latest_payoff_expiry_at = max(option_expiries) if option_expiries else None
         self._refresh_deribit_volatility_series(snapshot.requested_limit)
         self._refresh_leg_greeks()
         self._render_legs()
@@ -5396,10 +5605,12 @@ class OptionStrategyQtWindow(QMainWindow):
         self._latest_deribit_resolution_note = resolution_note
 
     def _current_deribit_currency(self) -> str | None:
-        if self._latest_resolved_legs:
-            return parse_option_contract(self._latest_resolved_legs[0].inst_id).inst_family.split("-", 1)[0]
-        if self._legs:
-            return parse_option_contract(self._legs[0].inst_id).inst_family.split("-", 1)[0]
+        option_resolved_leg = next((item for item in self._latest_resolved_legs if item.leg_kind == "option"), None)
+        if option_resolved_leg is not None:
+            return parse_option_contract(option_resolved_leg.inst_id).inst_family.split("-", 1)[0]
+        option_leg = next((item for item in self._legs if item.leg_kind == "option"), None)
+        if option_leg is not None:
+            return parse_option_contract(option_leg.inst_id).inst_family.split("-", 1)[0]
         family_text = self._family_combo.currentText().strip().upper()
         return family_text.split("-", 1)[0] if family_text else None
 
@@ -5542,7 +5753,11 @@ class OptionStrategyQtWindow(QMainWindow):
             self._refresh_big_chart_window()
 
     def _load_spot_reference_price_for_legs(self, active_legs: list[StrategyLegDefinition]) -> Decimal | None:
-        families = {parse_option_contract(item.inst_id).inst_family for item in active_legs}
+        families = {
+            parse_option_contract(item.inst_id).inst_family
+            for item in active_legs
+            if item.leg_kind == "option"
+        }
         if len(families) != 1:
             return None
         spot_inst_id = _spot_usdt_inst_id(next(iter(families)))
@@ -5578,7 +5793,7 @@ class OptionStrategyQtWindow(QMainWindow):
         self._render_legs()
         self._refresh_strategy_summary()
         self.refresh_charts()
-        self._status_label.setText(f"\u5df2\u8f7d\u5165\u5c55\u671f\u5efa\u8bae\uff1a{payload.strategy_name}")
+        self._status_label.setText(f"\u5df2\u8f7d\u5165\u7b56\u7565\uff1a{payload.strategy_name}")
 
     @Slot()
     def save_current_strategy(self) -> None:
@@ -5615,6 +5830,7 @@ class OptionStrategyQtWindow(QMainWindow):
                     "theta": format_decimal(item.theta) if item.theta is not None else "",
                     "vega": format_decimal(item.vega) if item.vega is not None else "",
                     "enabled": item.enabled,
+                    "leg_kind": item.leg_kind,
                 }
                 for item in self._legs
             ],
@@ -5686,6 +5902,7 @@ class OptionStrategyQtWindow(QMainWindow):
             alias = str(raw.get("alias", "")).strip()
             inst_id = str(raw.get("inst_id", "")).strip().upper()
             side = str(raw.get("side", "buy")).strip().lower()
+            leg_kind = str(raw.get("leg_kind", "option")).strip().lower()
             enabled = bool(raw.get("enabled", True))
             quantity = self._parse_positive_decimal(str(raw.get("quantity", "1")), "策略腿数量")
             premium_text = str(raw.get("premium", "")).strip()
@@ -5694,7 +5911,7 @@ class OptionStrategyQtWindow(QMainWindow):
             gamma_text = str(raw.get("gamma", "")).strip()
             theta_text = str(raw.get("theta", "")).strip()
             vega_text = str(raw.get("vega", "")).strip()
-            if not alias or not inst_id or side not in {"buy", "sell"}:
+            if not alias or not inst_id or side not in {"buy", "sell"} or leg_kind not in {"option", "underlying"}:
                 continue
             restored.append(
                 StrategyLegDefinition(
@@ -5708,6 +5925,7 @@ class OptionStrategyQtWindow(QMainWindow):
                     theta=Decimal(theta_text) if theta_text else None,
                     vega=Decimal(vega_text) if vega_text else None,
                     enabled=enabled,
+                    leg_kind="underlying" if leg_kind == "underlying" else "option",
                 )
             )
             if alias.startswith("L") and alias[1:].isdigit():

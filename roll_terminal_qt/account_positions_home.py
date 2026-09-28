@@ -254,7 +254,13 @@ from roll_terminal_qt.history_service import (
 )
 from roll_terminal_qt.history_sync_manager import get_history_sync_manager
 from roll_terminal_qt.incremental_views import keyed_row_delta
-from roll_terminal_qt.option_strategy_window import CandlestickChartView, PositionPriceMarker, position_marker_action_label
+from roll_terminal_qt.option_strategy_window import (
+    CandlestickChartView,
+    OptionStrategyQtWindow,
+    PositionPriceMarker,
+    build_option_position_import_payload,
+    position_marker_action_label,
+)
 from roll_terminal_qt.order_service import OrderFeedThread, OrderStatusView
 from roll_terminal_qt.perf_metrics import measure_ui_step
 from roll_terminal_qt.profile_access import ensure_profile_unlocked, load_profile_snapshots, profile_requires_password
@@ -3686,6 +3692,11 @@ class AccountPositionsHomeWidget(QWidget):
         self._apply_checked_button = QPushButton("带入选中")
         self._apply_checked_button.setToolTip("勾选仅暂存；点击后才显示并统计当前筛选结果中仍勾选的仓位。")
         self._apply_checked_button.clicked.connect(self.apply_checked_positions_to_filter)
+        self._import_option_analysis_button = QPushButton("导入期权分析")
+        self._import_option_analysis_button.setToolTip(
+            "将当前筛选结果中勾选的期权、现货、永续和交割仓位导入期权分析；所有仓位必须属于相同品种，且数量和合约信息有效。"
+        )
+        self._import_option_analysis_button.clicked.connect(self._open_option_analysis_from_checked_positions)
 
         apply_button = QPushButton("应用筛选")
         apply_button.clicked.connect(self._apply_filters)
@@ -3701,9 +3712,10 @@ class AccountPositionsHomeWidget(QWidget):
         layout.addWidget(self._apply_contract_button, 0, 8)
         layout.addWidget(self._apply_expiry_button, 0, 9)
         layout.addWidget(self._apply_checked_button, 0, 10)
-        layout.addWidget(apply_button, 0, 11)
-        layout.addWidget(clear_button, 0, 12)
-        layout.addWidget(self._filter_hint, 1, 0, 1, 13)
+        layout.addWidget(self._import_option_analysis_button, 0, 11)
+        layout.addWidget(apply_button, 0, 12)
+        layout.addWidget(clear_button, 0, 13)
+        layout.addWidget(self._filter_hint, 1, 0, 1, 14)
         layout.setColumnStretch(5, 1)
         return panel
 
@@ -5686,6 +5698,41 @@ class AccountPositionsHomeWidget(QWidget):
             return
         self._show_checked_positions_only = True
         self._render_positions_tree()
+
+    def _open_option_analysis_from_checked_positions(self) -> None:
+        positions = self._checked_positions(self._visible_positions)
+        try:
+            payload = build_option_position_import_payload(
+                positions,
+                instruments_by_inst_id=self._position_instruments,
+                tickers_by_inst_id=self._position_tickers,
+            )
+        except ValueError as exc:
+            QMessageBox.information(self, "导入期权分析", str(exc))
+            return
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.critical(self, "导入期权分析失败", str(exc))
+            return
+
+        window = getattr(self, "_option_strategy_window", None)
+        if window is not None and getattr(window, "_legs", None):
+            answer = QMessageBox.question(
+                self,
+                "导入期权分析",
+                "期权分析窗口中已有策略腿，导入会替换当前内容，是否继续？",
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+        if window is None:
+            window = OptionStrategyQtWindow(profile_name=self._last_profile_name or "")
+            window.destroyed.connect(lambda *_args: setattr(self, "_option_strategy_window", None))
+            self._option_strategy_window = window
+        else:
+            window.apply_workspace_profile(self._last_profile_name or "")
+        window.load_roll_transfer_payload(payload)
+        window.show()
+        window.raise_()
+        window.activateWindow()
 
     def _clear_filters(self) -> None:
         # 连续点击时只保留最后一次刷新，避免 QTreeWidget 被重复清空和重建。

@@ -136,7 +136,11 @@ def _native_display_currency(
 ) -> str:
     for leg in legs:
         instrument = instrument_map.get(leg.inst_id)
-        if instrument is not None and instrument.ct_val_ccy:
+        if instrument is None:
+            continue
+        if getattr(leg, "leg_kind", "option") == "underlying" and instrument.settle_ccy:
+            return instrument.settle_ccy.upper()
+        if instrument.ct_val_ccy:
             return instrument.ct_val_ccy.upper()
     for instrument in instrument_map.values():
         if instrument.ct_val_ccy:

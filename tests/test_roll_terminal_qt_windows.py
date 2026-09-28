@@ -50,6 +50,7 @@ from roll_terminal_qt.option_strategy_window import (
     OptionStrategyQtWindow,
     PositionPriceMarker,
     _option_position_coin_texts,
+    build_option_position_import_payload,
 )
 from okx_quant.option_strategy import OptionChainRow, OptionQuote
 from roll_terminal_qt.perf_metrics import measure_ui_step
@@ -378,6 +379,136 @@ class RollTerminalQtWindowHelperTests(QtWidgetTestCase):
             _option_position_coin_texts(positions, {inst_id: instrument}),
             {inst_id: "多 0.5 / 空 0.1 BTC"},
         )
+
+    def test_checked_option_positions_build_analysis_payload(self) -> None:
+        call_id = "BTC-USD-260728-62500-C"
+        put_id = "BTC-USD-260829-62500-P"
+        instrument_kwargs = {
+            "inst_type": "OPTION",
+            "tick_size": Decimal("0.0001"),
+            "lot_size": Decimal("1"),
+            "min_size": Decimal("1"),
+            "state": "live",
+        }
+        instruments = {
+            call_id: Instrument(inst_id=call_id, **instrument_kwargs),
+            put_id: Instrument(inst_id=put_id, **instrument_kwargs),
+        }
+        positions = [
+            SimpleNamespace(
+                inst_id=call_id,
+                inst_type="OPTION",
+                pos_side="long",
+                position=Decimal("2"),
+                avg_price=Decimal("0.01"),
+            ),
+            SimpleNamespace(
+                inst_id=put_id,
+                inst_type="OPTION",
+                pos_side="short",
+                position=Decimal("3"),
+                avg_price=Decimal("0.02"),
+            ),
+        ]
+
+        payload = build_option_position_import_payload(positions, instruments_by_inst_id=instruments)
+
+        self.assertEqual(payload.option_family, "BTC-USD")
+        self.assertEqual([leg.alias for leg in payload.legs], ["L1", "L2"])
+        self.assertEqual([leg.side for leg in payload.legs], ["buy", "sell"])
+        self.assertEqual([leg.quantity for leg in payload.legs], [Decimal("2"), Decimal("3")])
+        self.assertEqual([quote.instrument.inst_id for quote in payload.quotes], [call_id, put_id])
+
+    def test_checked_option_positions_allow_related_non_option_and_reject_mixed_family(self) -> None:
+        btc_id = "BTC-USD-260728-62500-C"
+        btc_future_id = "BTC-USD-261225"
+        btc_spot_id = "BTC-USD"
+        eth_id = "ETH-USD-260728-3000-C"
+        instrument_kwargs = {
+            "inst_type": "OPTION",
+            "tick_size": Decimal("0.0001"),
+            "lot_size": Decimal("1"),
+            "min_size": Decimal("1"),
+            "state": "live",
+        }
+        instruments = {
+            btc_id: Instrument(inst_id=btc_id, **instrument_kwargs),
+            eth_id: Instrument(inst_id=eth_id, **instrument_kwargs),
+            btc_future_id: Instrument(
+                inst_id=btc_future_id,
+                inst_type="FUTURES",
+                tick_size=Decimal("0.1"),
+                lot_size=Decimal("1"),
+                min_size=Decimal("1"),
+                state="live",
+                settle_ccy="BTC",
+                ct_val=Decimal("100"),
+                ct_val_ccy="USD",
+            ),
+            btc_spot_id: Instrument(
+                inst_id=btc_spot_id,
+                inst_type="SPOT",
+                tick_size=Decimal("0.1"),
+                lot_size=Decimal("0.0001"),
+                min_size=Decimal("0.0001"),
+                state="live",
+                settle_ccy="USD",
+            ),
+        }
+        option_position = SimpleNamespace(
+            inst_id=btc_id,
+            inst_type="OPTION",
+            pos_side="long",
+            position=Decimal("1"),
+            avg_price=Decimal("1"),
+        )
+        related_futures_position = SimpleNamespace(
+            inst_id=btc_future_id,
+            inst_type="FUTURES",
+            pos_side="net",
+            position=Decimal("1"),
+            avg_price=Decimal("90000"),
+        )
+        related_spot_position = SimpleNamespace(
+            inst_id=btc_spot_id,
+            inst_type="SPOT",
+            pos_side="net",
+            position=Decimal("0.1"),
+            avg_price=Decimal("90000"),
+        )
+        payload = build_option_position_import_payload(
+            [related_futures_position, related_spot_position, option_position],
+            instruments_by_inst_id=instruments,
+        )
+        self.assertEqual(len(payload.legs), 3)
+        self.assertEqual([leg.inst_id for leg in payload.legs], [btc_future_id, btc_spot_id, btc_id])
+        self.assertEqual([leg.leg_kind for leg in payload.legs], ["underlying", "underlying", "option"])
+
+        unrelated_position = SimpleNamespace(
+            inst_id="ETH-USDT-SWAP",
+            inst_type="SWAP",
+            pos_side="net",
+            position=Decimal("1"),
+            avg_price=Decimal("3000"),
+        )
+        with self.assertRaisesRegex(ValueError, "相同品种"):
+            build_option_position_import_payload(
+                [unrelated_position, option_position],
+                instruments_by_inst_id=instruments,
+            )
+
+        mixed = [
+            option_position,
+            SimpleNamespace(
+                inst_id=eth_id,
+                inst_type="OPTION",
+                pos_side="long",
+                position=Decimal("1"),
+                avg_price=Decimal("1"),
+            ),
+        ]
+        with self.assertRaisesRegex(ValueError, "相同品种"):
+            build_option_position_import_payload(mixed, instruments_by_inst_id=instruments)
 
     def test_option_chain_mark_click_opens_the_linked_call_put_chart(self) -> None:
         call = OptionQuote(
