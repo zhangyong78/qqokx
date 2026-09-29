@@ -379,6 +379,48 @@ AI需要能够判断：
 
 ---
 
+## 12A. 未收盘K线可信度分级规则（V0.2强制）
+
+Snapshot不得只用 `is_closed=false` 表示未收盘K线。每个周期的K线记录必须补充：
+
+```json
+{
+  "interval": "1H",
+  "bar_start": "2026-09-29T08:00:00Z",
+  "bar_end": "2026-09-29T09:00:00Z",
+  "elapsed_minutes": 50.2,
+  "minutes_to_close": 9.8,
+  "bar_progress_pct": 83.7,
+  "bar_status": "NEAR_CLOSE",
+  "reference_level": "HIGH",
+  "is_closed": false,
+  "indicator_is_provisional": true,
+  "market_fetch_age_seconds": 4
+}
+```
+
+可信度分级：
+
+```text
+已收盘：CLOSED / CONFIRMED
+距离收盘 <= 15分钟：NEAR_CLOSE / HIGH
+距离收盘 >15分钟且 <=30分钟：FORMING / MEDIUM
+距离收盘 >30分钟：EARLY / LOW
+```
+
+规则含义：
+
+1. 未收盘不等于不可用；距离收盘越近，预判参考权重越高；
+2. `NEAR_CLOSE / HIGH` 可以用于重要预判，但必须明确声明尚未确认；
+3. `FORMING / MEDIUM` 只用于预判和准备计划；
+4. `EARLY / LOW` 只描述盘中状态，不得当作收盘确认信号；
+5. `indicator_is_provisional=true` 表示EMA15、MA50包含当前未收盘K线，属于临时值；
+6. 每个周期必须同时提供 `last_closed_bar` 和 `current_bar`，让AI明确区分已确认状态和当前预判状态；
+7. `market_fetch_age_seconds` / `volatility_fetch_age_seconds` 只表示数据抓取后的时间，不能用来表示当前K线已经运行多久；
+8. 当前K线运行时间必须使用 `elapsed_minutes`，距离收盘必须使用 `minutes_to_close`，不得再使用含义不清的 `okx_age_minutes`。
+
+---
+
 ## 13. 数据质量信息
 
 Snapshot 顶部增加：
@@ -1177,6 +1219,22 @@ Snapshot历史
 > **数据准确、一致、最新、完整、方便导出**
 
 做好。
+
+---
+
+## 43. AI Quick Snapshot（V0.2）
+
+完整 Snapshot 保留不变；日常人工交易分析使用独立的精简快照：
+
+1. 通过 `symbols=["BTC"]` 按分析标的生成，只输出所选标的、对应DVOL和相关人工衍生品持仓；
+2. 内部仍使用完整历史预热EMA15/MA50，最终输出按 `1W/1D/4H/1H = 40/80/100/120` 根裁剪；
+3. K线和DVOL使用 `columns + bars` 数组压缩格式，减少重复JSON键和Token；
+4. 保留当前K线时间语义、`last_closed_bar`、`current_bar`、完成度、距离收盘时间和可信度等级；
+5. 输出纯数学状态：价格与均线关系、均线斜率、方向和距离百分比，不硬编码交易结论；
+6. BTC/ETH DVOL输出 `1D/4H/1H = 60/80/100` 根；DVOL失败时标记 `MISSING` 并写入 warnings，不阻断快照；
+7. 当前人工永续、交割、期权持仓完整保留，期权 Greeks、IV、报价、结算币种和备注不得裁剪；
+8. 不输出完整账户多年成交历史，只保留所选标的最近关联成交；不默认输出完整期权链；
+9. Quick Snapshot文件名使用 `qqokx_AI_Quick_<SYMBOL>_YYYYMMDD_HHMMSS.json`，与完整Snapshot分开保存。
 
 ---
 

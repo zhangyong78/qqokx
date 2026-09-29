@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import argparse
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable, Iterable
 
@@ -43,11 +43,13 @@ from roll_terminal_qt.module_overview import ModuleOverview, build_module_overvi
 from roll_terminal_qt.option_strategy_window import OptionStrategyQtWindow
 from roll_terminal_qt.option_roll_execution_window import OptionRollExecutionQtWindow
 from roll_terminal_qt.kline_analysis_window import KlineAnalysisWindow
-from roll_terminal_qt.ai_snapshot_service import AISnapshotWorker
+from roll_terminal_qt.ai_snapshot_service import AIQuickSnapshotWorker, AISnapshotWorker
 from roll_terminal_qt.perf_metrics import measure_ui_step
 from roll_terminal_qt.profile_access import ensure_profile_unlocked, load_profile_snapshots
 from roll_terminal_qt.runtime import load_runtime
 from roll_terminal_qt.smart_order_window import SmartOrderQtWindow
+from okx_quant.shape_signal_monitor import ShapeSignalMonitor
+from okx_quant.shape_signal_store import load_events, mark_events_read
 from roll_terminal_qt.style import APP_STYLE, apply_global_font_mode, normalize_global_font_mode
 from roll_terminal_qt.ui import RollTerminalWindow
 from roll_terminal_qt.workspace_shell import (
@@ -60,6 +62,13 @@ from roll_terminal_qt.workspace_shell import (
 
 def module_choices() -> tuple[str, ...]:
     return ("home",) + tuple(spec.key for spec in launcher_module_specs())
+
+
+def parse_ai_quick_snapshot_symbols(text: str) -> list[str]:
+    """Return selected symbols, using BTC when the input is intentionally blank."""
+    if not str(text or "").strip():
+        return ["BTC"]
+    return normalize_watchlist(part.strip() for part in str(text).replace("，", ",").split(","))
 
 
 def _standalone_command(module_key: str) -> str:
@@ -112,6 +121,67 @@ class SharedDataDialog(QDialog):
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
         buttons.rejected.connect(self.reject)
         buttons.accepted.connect(self.accept)
+        buttons.button(QDialogButtonBox.StandardButton.Close).setText("关闭")
+        layout.addWidget(buttons)
+
+
+class AISnapshotContentsDialog(QDialog):
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        apply_qt_window_icon(self)
+        self.setWindowTitle("AI 快照内容说明")
+        self.resize(820, 680)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(18, 18, 18, 18)
+        layout.setSpacing(12)
+
+        title = QLabel("AI 快照会导出的数据")
+        title.setObjectName("SectionTitle")
+        subtitle = QLabel("快照完全只读，现货不纳入，不会执行下单、撤单或修改备注。")
+        subtitle.setObjectName("Subtle")
+        subtitle.setWordWrap(True)
+        layout.addWidget(title)
+        layout.addWidget(subtitle)
+
+        details = QTextEdit()
+        details.setReadOnly(True)
+        details.setPlainText(
+            "1. 快照基本信息\n"
+            "   生成时间、有效分析时间、账户别名、API Profile、运行环境。\n\n"
+            "2. 账户权益\n"
+            "   总权益、可用权益、保证金、名义价值和账户币种明细。\n\n"
+            "3. 人工衍生品持仓\n"
+            "   永续、交割合约、期权；方向、数量、开仓价、标记价、指数价、\n"
+            "   杠杆、保证金、强平价、盈亏、资金费率、期权 Greeks、备注和原始字段。\n\n"
+            "4. 持仓与关注品种行情\n"
+            "   1W、1D、4H、1H，各周期最多 250 根；每根包含 OHLCV、EMA15、\n"
+            "   MA50、is_closed、bar_start、bar_end、elapsed_minutes、minutes_to_close、\n"
+            "   bar_progress_pct、bar_status、reference_level 和 indicator_is_provisional。\n"
+            "   每个周期同时提供 last_closed_bar 和 current_bar。\n"
+            "   持仓品种与手动关注品种会自动合并去重。\n\n"
+            "5. DVOL 波动率\n"
+            "   BTC/ETH 的 1H、4H、1D DVOL，包含 OHLC、EMA15、MA50 和 is_closed。\n\n"
+            "6. 最近人工成交\n"
+            "   最近 7 天、最多 100 条；包含成交时间、合约、方向、价格、数量、\n"
+            "   手续费、盈亏、订单/成交编号和原始成交字段。\n\n"
+            "7. 组合汇总\n"
+            "   持仓数量、品种数量、总 Delta/Gamma/Vega/Theta、总已实现和未实现盈亏。\n\n"
+            "8. 数据质量\n"
+            "   生成前会直接向 OKX 和波动率网站补充最新 1H 数据，检查更新时间、\n"
+            "   两边是否一致、周期是否足够 250 根，并记录 PASS/DEGRADED 和 warnings。\n"
+            "   market_fetch_age_seconds / volatility_fetch_age_seconds 表示抓取后等待时间，\n"
+            "   不代表当前K线已经运行多久；K线运行时间使用 elapsed_minutes。"
+            "\n\n"
+            "9. AI 精简快照\n"
+            "   可按 BTC、ETH 等标的单独生成；行情采用压缩数组格式，\n"
+            "   1W/1D/4H/1H 默认保留 40/80/100/120 根，DVOL 默认保留 60/80/100 根，\n"
+            "   只包含所选标的及其人工衍生品持仓。"
+        )
+        layout.addWidget(details, 1)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        buttons.rejected.connect(self.reject)
         buttons.button(QDialogButtonBox.StandardButton.Close).setText("关闭")
         layout.addWidget(buttons)
 
@@ -422,6 +492,7 @@ class LauncherWindow(QMainWindow):
             self._global_font_mode = apply_global_font_mode(app, self._global_font_mode)
         self._child_windows: list[QWidget] = []
         self._shared_data_dialog: SharedDataDialog | None = None
+        self._ai_snapshot_contents_dialog: AISnapshotContentsDialog | None = None
         self._history_sync_dialog: HistorySyncDialog | None = None
         self._history_sync_manager = get_history_sync_manager()
         self._shutdown_in_progress = False
@@ -438,7 +509,18 @@ class LauncherWindow(QMainWindow):
         self._unlocked_profiles: set[str] = set()
         self._workspace_profile_serial = 0
         self._ai_snapshot_worker: AISnapshotWorker | None = None
+        self._ai_quick_snapshot_worker: AIQuickSnapshotWorker | None = None
         self._ai_snapshot_progress_dialog: QProgressDialog | None = None
+        self._shape_signal_monitor = ShapeSignalMonitor(self)
+        self._shape_signal_monitor.status_changed.connect(self._on_shape_monitor_status)
+        self._shape_signal_monitor.signal_detected.connect(self._on_shape_signal_detected)
+        self._shape_popup_boxes: list[QMessageBox] = []
+        self._shape_message_dialog = None
+        self._shape_monitor_status = "等待后台形态监控启动"
+        self._shape_startup_events: list[dict[str, object]] = []
+        self._shape_startup_popup_timer = QTimer(self)
+        self._shape_startup_popup_timer.setSingleShot(True)
+        self._shape_startup_popup_timer.timeout.connect(self._show_shape_startup_summary)
         workspace_root = QWidget(self)
         workspace_layout = QVBoxLayout(workspace_root)
         workspace_layout.setContentsMargins(0, 0, 0, 0)
@@ -464,6 +546,8 @@ class LauncherWindow(QMainWindow):
         self.resize(1680, 980)
         self.setCentralWidget(workspace_root)
         self._build_menu()
+        self._refresh_shape_message_badge()
+        self._shape_signal_monitor.start()
         self._initialize_workspace_profiles()
         QTimer.singleShot(1500, self._start_background_history_sync)
         with measure_ui_step("launcher_first_show"):
@@ -587,7 +671,11 @@ class LauncherWindow(QMainWindow):
 
     def _create_page(self, page_key: str) -> QWidget:
         if page_key == "kline":
-            return KlineAnalysisWindow(embedded=True)
+            page = KlineAnalysisWindow(embedded=True)
+            set_monitor = getattr(page, "set_shape_signal_monitor", None)
+            if callable(set_monitor):
+                set_monitor(self._shape_signal_monitor)
+            return page
         if page_key == "account":
             page = AccountPositionsHomeWidget(self)
             set_workspace_managed = getattr(page, "set_workspace_managed", None)
@@ -838,6 +926,7 @@ class LauncherWindow(QMainWindow):
             )
         except Exception:
             pass
+        self._shape_signal_monitor.stop()
         self._history_sync_manager.shutdown()
         self.deleteLater()
         app = QApplication.instance()
@@ -847,9 +936,109 @@ class LauncherWindow(QMainWindow):
     def _build_menu(self) -> None:
         self.menuBar().hide()
 
+    @Slot(object)
+    def _on_shape_signal_detected(self, event: object) -> None:
+        if not isinstance(event, dict):
+            return
+        self._refresh_shape_message_badge()
+        dialog = self._shape_message_dialog
+        if dialog is not None and dialog.isVisible() and dialog.isActiveWindow():
+            dialog.refresh()
+        if not bool(event.get("popup_enabled", True)):
+            return
+        # 将短时间内到达的实时信号和启动补算信号合并，避免连续弹出多个窗口。
+        self._shape_startup_events.append(dict(event))
+        if not self._shape_startup_popup_timer.isActive():
+            self._shape_startup_popup_timer.start(3000)
+
+    @Slot(str)
+    def _on_shape_monitor_status(self, message: str) -> None:
+        self._shape_monitor_status = str(message)
+        self._refresh_shape_message_badge()
+        self.statusBar().showMessage(str(message), 5000)
+
+    def _refresh_shape_message_badge(self) -> None:
+        unread = sum(not item.get("read_at") for item in load_events(limit=5000))
+        self._workspace_header.set_shape_message_status(unread, self._shape_monitor_status)
+
+    @Slot(object)
+    def _mark_shape_messages_viewed(self, events: object) -> None:
+        if not isinstance(events, list):
+            return
+        try:
+            mark_events_read(events)
+        except (OSError, ValueError) as exc:
+            self.statusBar().showMessage(f"信号已读状态保存失败：{exc}", 5000)
+        self._refresh_shape_message_badge()
+
+    def _open_shape_message_center(self) -> None:
+        from roll_terminal_qt.shape_signal_dialog import ShapeSignalHistoryDialog
+
+        dialog = self._shape_message_dialog
+        if dialog is None:
+            page = self._pages.get("kline")
+            if page is None:
+                self.show_page("kline")
+                page = self._pages.get("kline")
+            dialog = ShapeSignalHistoryDialog(parent=page or self)
+            dialog.events_viewed.connect(self._mark_shape_messages_viewed)
+            self._shape_message_dialog = dialog
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+        dialog.refresh()
+
+    @staticmethod
+    def _is_yesterday_shape_event(event: dict[str, object]) -> bool:
+        try:
+            candle_ts = int(event.get("candle_ts", 0) or 0)
+        except (TypeError, ValueError):
+            return False
+        if candle_ts <= 0:
+            return False
+        shanghai = timezone(timedelta(hours=8))
+        event_day = datetime.fromtimestamp(candle_ts / 1000, shanghai).date()
+        yesterday = (datetime.now(shanghai) - timedelta(days=1)).date()
+        return event_day == yesterday
+
+    def _show_shape_startup_summary(self) -> None:
+        events = self._shape_startup_events
+        self._shape_startup_events = []
+        if not events:
+            return
+        startup_count = sum(str(event.get("source") or "") == "startup" for event in events)
+        live_count = len(events) - startup_count
+        if live_count and startup_count:
+            title = f"收到 {len(events)} 条形态信号（实时 {live_count}，启动补算 {startup_count}）："
+        elif live_count:
+            title = f"收到 {live_count} 条实时形态信号："
+        else:
+            title = f"启动补算发现 {startup_count} 条形态信号："
+        lines = [title, ""]
+        for event in events[:20]:
+            lines.append(
+                f"{event.get('symbol', '-')} {event.get('period', '-')} | "
+                f"{event.get('pattern_name', '-')} {event.get('direction', '-')} | "
+                f"{event.get('close', '-')}"
+            )
+        if len(events) > 20:
+            lines.append(f"……另有 {len(events) - 20} 条，请打开历史形态信号查看。")
+        box = QMessageBox(self)
+        box.setWindowTitle("形态信号汇总")
+        box.setIcon(QMessageBox.Icon.Information)
+        box.setText("\n".join(lines))
+        box.setStandardButtons(QMessageBox.StandardButton.Ok)
+        box.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
+        self._shape_popup_boxes.append(box)
+        box.destroyed.connect(lambda *_args, target=box: self._shape_popup_boxes.remove(target) if target in self._shape_popup_boxes else None)
+        box.open()
+
     @Slot(str)
     def _handle_workspace_tool(self, tool_key: str) -> None:
         normalized = tool_key.strip().lower()
+        if normalized == "shape-messages":
+            self._open_shape_message_center()
+            return
         if normalized.startswith("font-"):
             self._set_global_font_mode(normalized.removeprefix("font-"))
             return
@@ -870,6 +1059,12 @@ class LauncherWindow(QMainWindow):
         if normalized == "ai-snapshot":
             self._start_ai_snapshot()
             return
+        if normalized == "ai-quick-snapshot":
+            self._start_ai_quick_snapshot()
+            return
+        if normalized == "ai-snapshot-info":
+            self._show_ai_snapshot_contents()
+            return
         if normalized == "paths":
             self._show_shared_data_dialog()
             return
@@ -883,6 +1078,82 @@ class LauncherWindow(QMainWindow):
             self._show_version_info()
             return
         raise KeyError(f"unknown workspace tool: {tool_key}")
+
+    @Slot()
+    def _show_ai_snapshot_contents(self) -> None:
+        if self._ai_snapshot_contents_dialog is None:
+            self._ai_snapshot_contents_dialog = AISnapshotContentsDialog(self)
+        self._ai_snapshot_contents_dialog.show()
+        self._ai_snapshot_contents_dialog.raise_()
+        self._ai_snapshot_contents_dialog.activateWindow()
+
+    def _start_ai_quick_snapshot(self) -> None:
+        if (
+            (self._ai_snapshot_worker is not None and self._ai_snapshot_worker.isRunning())
+            or (self._ai_quick_snapshot_worker is not None and self._ai_quick_snapshot_worker.isRunning())
+        ):
+            QMessageBox.information(self, "AI 精简快照", "当前已有 AI 快照任务在后台生成，请稍候。")
+            return
+        profile_name = self._active_profile_name.strip()
+        runtime = load_runtime(profile_name) if profile_name else None
+        if runtime is None:
+            QMessageBox.warning(self, "AI 精简快照", "当前没有可用的 API Profile。")
+            return
+        text, accepted = QInputDialog.getText(
+            self,
+            "AI 精简快照",
+            "输入要分析的标的（逗号分隔，例如 BTC 或 BTC, ETH）。\n"
+            "留空将默认使用 BTC。\n\n只输出选择的标的，不会附带其他币种。",
+            text="BTC",
+        )
+        if not accepted:
+            return
+        symbols = parse_ai_quick_snapshot_symbols(text)
+        if not symbols:
+            QMessageBox.warning(self, "AI 精简快照", "未识别到有效标的，请输入 BTC、ETH 等标的；留空可使用 BTC。")
+            return
+        worker = AIQuickSnapshotWorker(runtime, profile_name=profile_name, symbols=symbols)
+        self._ai_quick_snapshot_worker = worker
+        progress_dialog = QProgressDialog("正在生成 AI 精简快照…", "", 0, 0, self)
+        progress_dialog.setWindowTitle("AI 精简快照")
+        progress_dialog.setCancelButton(None)
+        progress_dialog.setMinimumDuration(0)
+        progress_dialog.setWindowModality(Qt.WindowModality.WindowModal)
+        progress_dialog.setAutoClose(False)
+        progress_dialog.setAutoReset(False)
+        progress_dialog.show()
+        self._ai_snapshot_progress_dialog = progress_dialog
+        worker.progress.connect(progress_dialog.setLabelText)
+        worker.progress.connect(lambda message: self.statusBar().showMessage(message))
+        worker.succeeded.connect(self._on_ai_quick_snapshot_succeeded)
+        worker.failed.connect(self._on_ai_quick_snapshot_failed)
+        worker.finished.connect(lambda: self.statusBar().clearMessage())
+        worker.finished.connect(self._close_ai_snapshot_progress)
+        worker.finished.connect(worker.deleteLater)
+        worker.start()
+
+    @Slot(object)
+    def _on_ai_quick_snapshot_succeeded(self, payload: object) -> None:
+        if not isinstance(payload, dict):
+            return
+        self._ai_quick_snapshot_worker = None
+        target = str(payload.get("file_path", ""))
+        symbols = ", ".join(str(item) for item in payload.get("symbols", []) or [])
+        quality = payload.get("data_quality", {})
+        status = str(quality.get("market", "")) if isinstance(quality, dict) else ""
+        box = QMessageBox(self)
+        box.setWindowTitle("AI 精简快照已生成")
+        box.setText(f"已生成：{symbols}\n行情状态：{status or '未知'}\n\n{target}")
+        open_button = box.addButton("打开所在目录", QMessageBox.ButtonRole.ActionRole)
+        box.addButton("关闭", QMessageBox.ButtonRole.RejectRole)
+        box.exec()
+        if box.clickedButton() is open_button and target:
+            self._open_local_path(Path(target).parent, title="打开精简快照目录")
+
+    @Slot(str)
+    def _on_ai_quick_snapshot_failed(self, message: str) -> None:
+        self._ai_quick_snapshot_worker = None
+        QMessageBox.critical(self, "AI 精简快照失败", message or "未知错误")
 
     def _start_ai_snapshot(self) -> None:
         if self._ai_snapshot_worker is not None and self._ai_snapshot_worker.isRunning():

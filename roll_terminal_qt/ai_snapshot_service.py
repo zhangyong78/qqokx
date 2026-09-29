@@ -4,7 +4,7 @@ from typing import Any, Iterable
 
 from PySide6.QtCore import QThread, Signal
 
-from okx_quant.ai_snapshot import AISnapshotBuilder
+from okx_quant.ai_snapshot import AIQuickSnapshotBuilder, AISnapshotBuilder
 from okx_quant.arbitrage.models import ArbitrageTradeRuntime
 
 
@@ -33,3 +33,28 @@ class AISnapshotWorker(QThread):
             return
         self.succeeded.emit(payload)
 
+
+class AIQuickSnapshotWorker(QThread):
+    progress = Signal(str)
+    succeeded = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, runtime: ArbitrageTradeRuntime, *, profile_name: str, symbols: Iterable[str]) -> None:
+        super().__init__()
+        self._runtime = runtime
+        self._profile_name = profile_name
+        self._symbols = tuple(symbols)
+
+    def run(self) -> None:
+        try:
+            builder = AIQuickSnapshotBuilder(progress_callback=self.progress.emit)
+            payload = builder.build(
+                credentials=self._runtime.credentials,
+                profile_name=self._profile_name,
+                environment=str(self._runtime.environment),
+                symbols=self._symbols,
+            )
+        except Exception as exc:
+            self.failed.emit(str(exc) or exc.__class__.__name__)
+            return
+        self.succeeded.emit(payload)

@@ -175,6 +175,21 @@ def _ensure_qt_dependency() -> bool:
         return False
 
 
+def _install_qt_message_logging() -> None:
+    from PySide6.QtCore import QtMsgType, qInstallMessageHandler
+
+    def log_message(kind, context, message) -> None:
+        print(f"[{datetime.now().isoformat(timespec='seconds')}] [Qt {kind.name}] {message}", file=sys.stderr, flush=True)
+        if kind == QtMsgType.QtFatalMsg:
+            # Qt fatal errors abort outside Python's exception hook.
+            try:
+                faulthandler.dump_traceback(file=sys.stderr._file_handle, all_threads=True)
+            except Exception:
+                pass
+
+    qInstallMessageHandler(log_message)
+
+
 def main() -> int:
     _set_console_title()
     _bootstrap_local_venv()
@@ -182,6 +197,7 @@ def main() -> int:
     _configure_qt_webengine_runtime()
     if not _ensure_qt_dependency():
         return 1
+    _install_qt_message_logging()
     from roll_terminal_qt.launcher import run
 
     return run()

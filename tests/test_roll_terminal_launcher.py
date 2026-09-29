@@ -4,7 +4,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from roll_terminal_qt.launcher import module_choices
+from roll_terminal_qt.launcher import module_choices, parse_ai_quick_snapshot_symbols
 from roll_terminal_qt.module_overview import (
     build_auto_channel_module_overview,
     build_line_trading_module_overview,
@@ -15,6 +15,12 @@ from roll_terminal_qt.module_overview import (
 
 
 class RollTerminalLauncherTests(unittest.TestCase):
+    def test_blank_quick_snapshot_symbol_input_defaults_to_btc(self) -> None:
+        self.assertEqual(parse_ai_quick_snapshot_symbols(""), ["BTC"])
+        self.assertEqual(parse_ai_quick_snapshot_symbols("   "), ["BTC"])
+        self.assertEqual(parse_ai_quick_snapshot_symbols("BTC, ETH"), ["BTC", "ETH"])
+        self.assertEqual(parse_ai_quick_snapshot_symbols("???"), [])
+
     def test_module_choices_include_home_and_all_modules(self) -> None:
         self.assertEqual(
             module_choices(),

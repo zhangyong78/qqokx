@@ -67,6 +67,8 @@ class WorkspaceShellQtTests(QtWidgetTestCase):
                 "option:deribit-volatility",
                 "option:option-roll",
                 "tool:ai-snapshot",
+                "tool:ai-snapshot-info",
+                "tool:ai-quick-snapshot",
                 "settings:font-standard",
                 "settings:font-large",
                 "settings:font-extra_large",
@@ -83,6 +85,14 @@ class WorkspaceShellQtTests(QtWidgetTestCase):
         self.assertEqual(direct_buttons, [])
         option_menu = next(button for button in header.findChildren(QToolButton) if button.text() == "期权工具")
         self.assertTrue(any(action.text() == "期权移仓" for action in option_menu.menu().actions()))
+
+    def test_ai_snapshot_menu_contains_generate_and_contents_actions(self) -> None:
+        header = WorkspaceHeader()
+        snapshot_menu = next(button for button in header.findChildren(QToolButton) if button.text() == "AI 快照")
+        self.assertEqual(
+            [action.text() for action in snapshot_menu.menu().actions()],
+            ["生成 AI 快照", "快照内容说明", "生成 AI 精简快照"],
+        )
 
     def test_workspace_header_marks_trading_tools_active_for_smart_order(self) -> None:
         header = WorkspaceHeader()

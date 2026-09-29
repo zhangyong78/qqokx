@@ -5225,6 +5225,7 @@ class SecondaryVolatilityDataLoader(QThread):
         period: str,
         limit: int,
         average_kline: bool,
+        local_only: bool = False,
     ) -> None:
         super().__init__()
         self._request_id = request_id
@@ -5232,13 +5233,16 @@ class SecondaryVolatilityDataLoader(QThread):
         self._period = period.strip()
         self._limit = limit
         self._average_kline = average_kline
+        self._local_only = local_only
 
     def run(self) -> None:
         try:
             payload = self._build_payload()
-            self.loaded.emit(self._request_id, payload)
+            if not self.isInterruptionRequested():
+                self.loaded.emit(self._request_id, payload)
         except Exception as exc:  # noqa: BLE001
-            self.failed.emit(self._request_id, str(exc))
+            if not self.isInterruptionRequested():
+                self.failed.emit(self._request_id, str(exc))
 
     def _target_resolution(self) -> str:
         requested_period = self._period.strip().upper()
@@ -5349,6 +5353,13 @@ class SecondaryVolatilityDataLoader(QThread):
         if self.isInterruptionRequested():
             raise InterruptedError("波动率副图加载已取消")
 
+        if self._local_only:
+            return self._make_payload(
+                candles=self._build_resolution_candles(cached_volatility, resolution=resolution),
+                source=f"Deribit {self._currency} DVOL（本地缓存）",
+                local_count=local_count, remote_added_count=0, cache_synced=False,
+            )
+
         now_ms = int(time.time() * 1000)
         fetch_start_ts = (
             _hourly_fetch_start_ts(cached_volatility=cached_volatility, cached_spot=cached_spot)
@@ -5364,6 +5375,8 @@ class SecondaryVolatilityDataLoader(QThread):
                 end_ts=now_ms,
                 max_records=None,
             )
+            if self.isInterruptionRequested():
+                raise InterruptedError("波动率副图加载已取消")
             fetched_spot = OkxRestClient().get_candles_history_range(
                 spot_inst_id,
                 "1H",
@@ -5394,6 +5407,8 @@ class SecondaryVolatilityDataLoader(QThread):
             spot_hourly = list(fetched_spot)
             remote_added_count = len(hourly_candles)
 
+        if self.isInterruptionRequested():
+            raise InterruptedError("波动率副图加载已取消")
         _save_cached_deribit_hourly_series(
             self._currency,
             spot_inst_id=spot_inst_id,
@@ -5434,14 +5449,15 @@ class RRTradeExecutionThread(QThread):
 class KlineAnalysisWindow(QMainWindow):
     _realtime_candle_received = Signal(object)
 
-    def __init__(self, *, embedded: bool = False) -> None:
+    def __init__(self, *, embedded: bool = False, preview_mode: bool = False) -> None:
         super().__init__()
         _debug_log("[kline] __init__ begin")
         self._embedded = bool(embedded)
+        self._preview_mode = bool(preview_mode)
         if self._embedded:
             self.setWindowFlags(Qt.WindowType.Widget)
         else:
-            self.setWindowTitle("K线分析")
+            self.setWindowTitle("K线分析预览" if self._preview_mode else "K线分析")
             self.resize(1680, 980)
 
         self._request_id = 0
@@ -5559,6 +5575,7 @@ class KlineAnalysisWindow(QMainWindow):
         self._market_client = OkxRestClient()
         self._realtime_candle_key: CandleStreamKey | None = None
         self._realtime_candle_unsubscribe: Callable[[], None] | None = None
+        self._shape_signal_monitor: object | None = None
         self._realtime_candle_received.connect(self._apply_realtime_candle)
         self._instrument_cache: dict[str, object | None] = {}
         self._rr_trade_ledger_snapshot = load_kline_rr_trade_ledger_snapshot()
@@ -5597,7 +5614,8 @@ class KlineAnalysisWindow(QMainWindow):
         self._rr_monitor_timer = QTimer(self)
         self._rr_monitor_timer.setInterval(1300)
         self._rr_monitor_timer.timeout.connect(self._monitor_active_rr_trades)
-        self._rr_monitor_timer.start()
+        if not self._preview_mode:
+            self._rr_monitor_timer.start()
         self._deferred_chart_render_timer = QTimer(self)
         self._deferred_chart_render_timer.setSingleShot(True)
         self._deferred_chart_render_timer.timeout.connect(self._render_deferred_full_chart)
@@ -5674,6 +5692,83 @@ class KlineAnalysisWindow(QMainWindow):
             )
         )
 
+    def set_shape_signal_monitor(self, monitor: object | None) -> None:
+        self._shape_signal_monitor = monitor
+
+    def configure_shape_signal_preview(
+        self,
+        *,
+        symbol: str,
+        period: str,
+        candle_ts: int,
+        pattern_name: str = "",
+        direction: str = "",
+        score: object = "",
+        marker_text: str = "",
+    ) -> None:
+        """Configure a cache-only K-line view for one historical signal."""
+        self._preview_signal_ts = int(candle_ts or 0)
+        self._preview_signal_text = str(marker_text or pattern_name or "")
+        self._preview_signal_context = {
+            "pattern_name": str(pattern_name or ""),
+            "direction": str(direction or ""),
+            "score": str(score or ""),
+        }
+        normalized_period = str(period or "1H").strip().upper()
+        if normalized_period not in {"1H", "4H", "1D"}:
+            normalized_period = "1H"
+        self._symbol_combo.setCurrentText(str(symbol or "").strip().upper())
+        self._period_combo.setCurrentText(normalized_period)
+        self._prefer_local_checkbox.setChecked(True)
+        self._auto_refresh_btn.setChecked(False)
+        self._show_history_trades_check.setChecked(False)
+        self._history_trade_group.hide()
+        self._limit_spin.setValue(max(240, self._limit_spin.value()))
+        period_checks = {
+            "1H": self._show_1h_shape_signal_check,
+            "4H": self._show_4h_shape_signal_check,
+            "1D": self._show_1d_shape_signal_check,
+        }
+        for value, checkbox in period_checks.items():
+            checkbox.blockSignals(True)
+            checkbox.setChecked(value == normalized_period)
+            checkbox.blockSignals(False)
+        self._refresh_compact_shape_button()
+
+    def show_shape_signal_context(self, *, symbol: str, period: str, candle_ts: int) -> None:
+        """Switch the existing K-line page to a signal's context."""
+        self._symbol_combo.setCurrentText(str(symbol or "").strip().upper())
+        normalized_period = str(period or "1H").strip().upper()
+        if normalized_period not in {"1H", "4H", "1D"}:
+            normalized_period = "1H"
+        self._on_period_button_clicked(normalized_period)
+        if not self._page_active:
+            QTimer.singleShot(0, self._load_data)
+        self.show()
+        self.raise_()
+        self.activateWindow()
+
+    def _open_shape_subscription_dialog(self) -> None:
+        monitor = self._shape_signal_monitor
+        if monitor is None:
+            QMessageBox.information(self, "后台形态订阅", "当前窗口没有连接主程序后台监控服务。请从本地版本主窗口打开。")
+            return
+        from roll_terminal_qt.shape_signal_dialog import ShapeSignalSubscriptionDialog
+
+        ShapeSignalSubscriptionDialog(monitor=monitor, parent=self).exec()
+
+    def _open_shape_signal_history(self) -> None:
+        owner = self.parentWidget()
+        while owner is not None:
+            opener = getattr(owner, "_open_shape_message_center", None)
+            if callable(opener):
+                opener()
+                return
+            owner = owner.parentWidget()
+        from roll_terminal_qt.shape_signal_dialog import ShapeSignalHistoryDialog
+
+        ShapeSignalHistoryDialog(parent=self).exec()
+
     def _refresh_compact_shape_button(self, *_args: object) -> None:
         if hasattr(self, "_shape_settings_button"):
             self._shape_settings_button.setText("形态：开" if self.pattern_signals_enabled() else "形态：关")
@@ -5690,10 +5785,23 @@ class KlineAnalysisWindow(QMainWindow):
         if callback is not None:
             callbacks.append(callback)
         if bool(getattr(self, "_shutdown_requested", False)):
+            if bool(getattr(self, "_shutdown_complete", False)) and callback is not None:
+                callbacks.remove(callback)
+                callback()
             return
         self._shutdown_requested = True
+        # Signal preview charts belong to this page, rather than launcher's
+        # separately registered windows. Keep their workers alive until joined.
+        finder = getattr(self, "findChildren", None)
+        self._shutdown_child_charts = list(finder(KlineAnalysisWindow)) if callable(finder) else []
+        for child in self._shutdown_child_charts:
+            child.begin_shutdown()
         self._refresh_timer.stop()
         self._rr_monitor_timer.stop()
+        for name in ("_load_request_timer", "_deferred_chart_render_timer", "_layout_refresh_timer", "_account_prefetch_timer"):
+            timer = getattr(self, name, None)
+            if timer is not None:
+                timer.stop()
         if self._realtime_candle_unsubscribe is not None:
             try:
                 self._realtime_candle_unsubscribe()
@@ -5705,6 +5813,7 @@ class KlineAnalysisWindow(QMainWindow):
             getattr(self, "_secondary_loader", None),
             getattr(self, "_tertiary_loader", None),
             getattr(self, "_secondary_volatility_loader", None),
+            getattr(self, "_history_trade_loader", None),
         ):
             if loader is not None and loader.isRunning():
                 loader.requestInterruption()
@@ -5755,11 +5864,22 @@ class KlineAnalysisWindow(QMainWindow):
                 getattr(self, "_secondary_loader", None),
                 getattr(self, "_tertiary_loader", None),
                 getattr(self, "_secondary_volatility_loader", None),
+                getattr(self, "_history_trade_loader", None),
+                getattr(self, "_rr_execution_thread", None),
             )
+        )
+        active = active or any(
+            not bool(getattr(child, "_shutdown_complete", False))
+            for child in getattr(self, "_shutdown_child_charts", [])
         )
         if active:
             QTimer.singleShot(50, lambda: KlineAnalysisWindow._poll_shutdown_loaders(self))
             return
+        drawer = getattr(self, "_account_drawer", None)
+        if drawer is not None and not drawer.shutdown(wait_ms=0):
+            QTimer.singleShot(50, lambda: KlineAnalysisWindow._poll_shutdown_loaders(self))
+            return
+        self._shutdown_complete = True
         callbacks = list(getattr(self, "_shutdown_callbacks", []))
         self._shutdown_callbacks = []
         for callback in callbacks:
@@ -6020,6 +6140,11 @@ class KlineAnalysisWindow(QMainWindow):
             checkbox.toggled.connect(action.setChecked)
             checkbox.toggled.connect(self._refresh_compact_shape_button)
             self._shape_setting_actions[label] = action
+        shape_menu.addSeparator()
+        subscribe_action = shape_menu.addAction("后台形态订阅")
+        subscribe_action.triggered.connect(self._open_shape_subscription_dialog)
+        history_action = shape_menu.addAction("历史形态信号")
+        history_action.triggered.connect(self._open_shape_signal_history)
         self._shape_settings_button.setMenu(shape_menu)
         top_row.addWidget(self._shape_settings_button, 0)
         if self._embedded:
@@ -7433,43 +7558,12 @@ class KlineAnalysisWindow(QMainWindow):
             self._load_data()
 
     def closeEvent(self, event) -> None:  # noqa: ANN001
-        monitor = getattr(self, "_rr_monitor_timer", None)
-        if monitor is not None:
-            monitor.stop()
-        if self._account_drawer is not None and not self._account_drawer.shutdown():
-            self._set_status("账户抽屉请求仍在完成中，窗口将在请求结束后关闭。")
+        if not bool(getattr(self, "_shutdown_complete", False)):
             event.ignore()
-            QTimer.singleShot(250, self.close)
+            if not bool(getattr(self, "_close_pending", False)):
+                self._close_pending = True
+                self.begin_shutdown(lambda: QTimer.singleShot(0, self.close))
             return
-        thread = self._rr_execution_thread
-        if thread is not None and thread.isRunning() and not thread.wait(1500):
-            self._set_status("RR 请求仍在完成中，窗口将在请求结束后关闭。")
-            event.ignore()
-            QTimer.singleShot(250, self.close)
-            return
-        if self._loader is not None and self._loader.isRunning():
-            self._loader.requestInterruption()
-            self._loader.wait(1000)
-        if self._history_trade_loader is not None and self._history_trade_loader.isRunning():
-            self._history_trade_loader.requestInterruption()
-            self._history_trade_loader.wait(1000)
-        if self._secondary_loader is not None and self._secondary_loader.isRunning():
-            self._secondary_loader.requestInterruption()
-            self._secondary_loader.wait(1000)
-        if self._tertiary_loader is not None and self._tertiary_loader.isRunning():
-            self._tertiary_loader.requestInterruption()
-            self._tertiary_loader.wait(1000)
-        if self._secondary_volatility_loader is not None and self._secondary_volatility_loader.isRunning():
-            self._secondary_volatility_loader.requestInterruption()
-            self._secondary_volatility_loader.wait(1000)
-        if self._deferred_chart_render_timer.isActive():
-            self._deferred_chart_render_timer.stop()
-        if self._layout_refresh_timer.isActive():
-            self._layout_refresh_timer.stop()
-        if self._load_request_timer.isActive():
-            self._load_request_timer.stop()
-        if self._refresh_timer.isActive():
-            self._refresh_timer.stop()
         super().closeEvent(event)
 
     def keyPressEvent(self, event) -> None:  # noqa: ANN001
@@ -7492,14 +7586,13 @@ class KlineAnalysisWindow(QMainWindow):
         super().keyPressEvent(event)
 
     def _has_active_loaders(self) -> bool:
+        # Retain ownership until the queued finished signal has been handled.
+        # isRunning() becomes false BEFORE that signal reaches the GUI thread.
         return bool(
-            (self._loader is not None and self._loader.isRunning())
-            or (self._secondary_loader is not None and self._secondary_loader.isRunning())
-            or (self._tertiary_loader is not None and self._tertiary_loader.isRunning())
-            or (
-                self._secondary_volatility_loader is not None
-                and self._secondary_volatility_loader.isRunning()
-            )
+            self._loader is not None
+            or self._secondary_loader is not None
+            or self._tertiary_loader is not None
+            or self._secondary_volatility_loader is not None
         )
 
     def _refresh_api_profiles(self) -> None:
@@ -7619,6 +7712,8 @@ class KlineAnalysisWindow(QMainWindow):
         return str(self._history_trade_direction_combo.currentData() or "all").strip().lower()
 
     def _load_history_trades(self, *, force: bool = False) -> None:
+        if self._preview_mode or bool(getattr(self, "_shutdown_requested", False)):
+            return
         if not self._history_trades_supported():
             return
         if not hasattr(self, "_show_history_trades_check") or not self._show_history_trades_check.isChecked():
@@ -7628,7 +7723,7 @@ class KlineAnalysisWindow(QMainWindow):
             return
         if not force and context_key in self._history_trade_markers_by_context:
             return
-        if self._history_trade_loader is not None and self._history_trade_loader.isRunning():
+        if self._history_trade_loader is not None:
             self._pending_history_trade_reload = True
             if force:
                 self._set_status("历史交易仍在同步，请稍候...")
@@ -7668,11 +7763,8 @@ class KlineAnalysisWindow(QMainWindow):
 
     @Slot()
     def _on_history_trade_loader_finished(self) -> None:
-        loader = self._history_trade_loader
-        if loader is not None:
-            loader.deleteLater()
-            self._history_trade_loader = None
-        if self._pending_history_trade_reload:
+        self._release_finished_loader("_history_trade_loader")
+        if self._pending_history_trade_reload and not bool(getattr(self, "_shutdown_requested", False)):
             self._pending_history_trade_reload = False
             QTimer.singleShot(0, self._load_history_trades)
 
@@ -7734,6 +7826,8 @@ class KlineAnalysisWindow(QMainWindow):
 
     @Slot()
     def _prefetch_account_drawer_after_chart_ready(self) -> None:
+        if self._preview_mode or bool(getattr(self, "_shutdown_requested", False)):
+            return
         if self._account_drawer is None or self._runtime is None:
             return
         context = (self._active_profile_name(), self._active_environment())
@@ -8041,6 +8135,8 @@ class KlineAnalysisWindow(QMainWindow):
         return True
 
     def _schedule_pending_reload_if_ready(self) -> None:
+        if bool(getattr(self, "_shutdown_requested", False)):
+            return
         if not self._pending_reload_after_load or self._has_active_loaders() or not self._page_active:
             return
         self._pending_reload_after_load = False
@@ -8084,16 +8180,18 @@ class KlineAnalysisWindow(QMainWindow):
             symbol=symbol,
             period=period,
             limit=requested_limit,
-            local_only=self._prefer_local_checkbox.isChecked(),
+            local_only=self._preview_mode or self._prefer_local_checkbox.isChecked(),
             average_kline=self._primary_average_kline_enabled(),
             workspace_entry=workspace_entry,
+            enable_alerts=not self._preview_mode,
             enable_shape_signals=self.pattern_signals_enabled(),
         )
         self._loader.loaded.connect(self._on_data_loaded)
         self._loader.failed.connect(self._on_data_failed)
         self._loader.finished.connect(self._on_loader_finished)
         self._loader.start()
-        self._load_history_trades()
+        if not self._preview_mode:
+            self._load_history_trades()
         if self._secondary_chart_check.isChecked() and self._use_native_chart:
             self._load_secondary_data(symbol=self._selected_secondary_symbol())
             if self._triple_chart_enabled():
@@ -8110,12 +8208,25 @@ class KlineAnalysisWindow(QMainWindow):
 
     @Slot()
     def _on_loader_finished(self) -> None:
-        if self._loader is not None:
-            self._loader.deleteLater()
-            self._loader = None
+        self._release_finished_loader("_loader")
         self._schedule_pending_reload_if_ready()
 
+    def _release_finished_loader(self, attribute: str) -> None:
+        loader = self.sender()
+        if loader is None:
+            loader = getattr(self, attribute, None)
+        if loader is None or loader.isRunning():
+            return
+        if getattr(self, attribute, None) is loader:
+            setattr(self, attribute, None)
+        loader.deleteLater()
+
     def _load_secondary_data(self, *, symbol: str) -> None:
+        if bool(getattr(self, "_shutdown_requested", False)):
+            return
+        if self._secondary_loader is not None or self._secondary_volatility_loader is not None:
+            self._pending_reload_after_load = True
+            return
         secondary_period = self._secondary_period_combo.currentText().strip()
         requested_limit = max(50, self._limit_spin.value())
         secondary_symbol = symbol.strip().upper() or self._selected_secondary_symbol()
@@ -8136,6 +8247,7 @@ class KlineAnalysisWindow(QMainWindow):
                 period=secondary_period,
                 limit=requested_limit,
                 average_kline=self._secondary_average_kline_enabled(),
+                local_only=self._preview_mode,
             )
             self._secondary_volatility_loader.loaded.connect(self._on_secondary_data_loaded)
             self._secondary_volatility_loader.failed.connect(self._on_secondary_data_failed)
@@ -8147,7 +8259,7 @@ class KlineAnalysisWindow(QMainWindow):
             symbol=secondary_symbol,
             period=secondary_period,
             limit=requested_limit,
-            local_only=self._prefer_local_checkbox.isChecked(),
+            local_only=self._preview_mode or self._prefer_local_checkbox.isChecked(),
             average_kline=self._secondary_average_kline_enabled(),
             workspace_entry={},
             enable_alerts=False,
@@ -8159,6 +8271,11 @@ class KlineAnalysisWindow(QMainWindow):
         self._secondary_loader.start()
 
     def _load_tertiary_data(self) -> None:
+        if bool(getattr(self, "_shutdown_requested", False)):
+            return
+        if self._tertiary_loader is not None:
+            self._pending_reload_after_load = True
+            return
         request_key = self._current_tertiary_request_key()
         if request_key is None:
             return
@@ -8175,7 +8292,7 @@ class KlineAnalysisWindow(QMainWindow):
             symbol=self._selected_tertiary_symbol(),
             period=self._tertiary_period_combo.currentText().strip(),
             limit=max(50, self._limit_spin.value()),
-            local_only=self._prefer_local_checkbox.isChecked(),
+            local_only=self._preview_mode or self._prefer_local_checkbox.isChecked(),
             average_kline=self._secondary_average_kline_enabled(),
             workspace_entry={},
             enable_alerts=False,
@@ -8188,23 +8305,17 @@ class KlineAnalysisWindow(QMainWindow):
 
     @Slot()
     def _on_secondary_loader_finished(self) -> None:
-        if self._secondary_loader is not None:
-            self._secondary_loader.deleteLater()
-            self._secondary_loader = None
+        self._release_finished_loader("_secondary_loader")
         self._schedule_pending_reload_if_ready()
 
     @Slot()
     def _on_tertiary_loader_finished(self) -> None:
-        if self._tertiary_loader is not None:
-            self._tertiary_loader.deleteLater()
-            self._tertiary_loader = None
+        self._release_finished_loader("_tertiary_loader")
         self._schedule_pending_reload_if_ready()
 
     @Slot()
     def _on_secondary_volatility_loader_finished(self) -> None:
-        if self._secondary_volatility_loader is not None:
-            self._secondary_volatility_loader.deleteLater()
-            self._secondary_volatility_loader = None
+        self._release_finished_loader("_secondary_volatility_loader")
         self._schedule_pending_reload_if_ready()
 
     @Slot()
@@ -8370,6 +8481,7 @@ class KlineAnalysisWindow(QMainWindow):
             if self._active_primary_request_key != self._current_primary_request_key():
                 self._set_status("主图结果已过期，正在刷新最新选择...")
                 return
+            payload = self._mark_preview_signal(payload)
             self._pending_payload = payload
             self._loaded_primary_request_key = self._active_primary_request_key
             self._remember_payload_cache(self._primary_payload_cache, self._loaded_primary_request_key, payload)
@@ -8403,10 +8515,27 @@ class KlineAnalysisWindow(QMainWindow):
                     self._sync_secondary_chart_range_from_primary()
             if self._page_active:
                 self._apply_alert_snapshot(payload.alert_snapshot)
-                self._subscribe_realtime_candle()
+                if not self._preview_mode:
+                    self._subscribe_realtime_candle()
                 self._update_refresh_hint()
         except Exception as exc:
             self._set_status(f"数据处理异常：{exc}")
+
+    def _mark_preview_signal(self, payload: KlineChartPayload) -> KlineChartPayload:
+        target_ts = int(getattr(self, "_preview_signal_ts", 0) or 0)
+        if not self._preview_mode or target_ts <= 0:
+            return payload
+        target_seconds = target_ts // 1000
+        markers: list[dict[str, Any]] = []
+        for marker in payload.signal_markers:
+            item = dict(marker)
+            marker_seconds = int(item.get("time", 0) or 0)
+            if marker_seconds == target_seconds:
+                item["color"] = "#f59e0b"
+                item["label"] = f"★ {item.get('label', '')}".strip()
+                item["text"] = f"★ {self._preview_signal_text or item.get('text', '')}".strip()
+            markers.append(item)
+        return replace(payload, signal_markers=markers)
 
     @Slot(object)
     def _apply_realtime_candle(self, candle: object) -> None:
@@ -8825,6 +8954,11 @@ class KlineAnalysisWindow(QMainWindow):
                 metric_filtered.append(dict(marker))
                 continue
             rank_value = marker.get(rank_key)
+            # 订阅监控在当前指标没有排名时，会使用另一种有效的核心K排名
+            # （例如实体排名为空、区间排名为“核心K前3”）。图表不能因此
+            # 把历史中已经确认的信号过滤掉，否则会出现“历史有、K线无”。
+            if rank_value is None:
+                rank_value = marker.get(display_rank_key)
             try:
                 rank = int(rank_value)
             except (TypeError, ValueError):

@@ -117,12 +117,18 @@ class OkxCandleWsConnection:
             asyncio.run_coroutine_threadsafe(self._ensure_subscription(key), loop)
 
         def _unsubscribe() -> None:
+            should_unsubscribe = False
             with self._lock:
                 active = self._listeners.get(key)
                 if active is not None:
                     active.discard(listener)
                     if not active:
                         self._listeners.pop(key, None)
+                        should_unsubscribe = True
+                loop = self._loop
+                connected = self._connected
+            if should_unsubscribe and connected and loop is not None:
+                asyncio.run_coroutine_threadsafe(self._remove_subscription(key), loop)
 
         return _unsubscribe
 
@@ -162,6 +168,15 @@ class OkxCandleWsConnection:
             self._subscribed.add(key)
             socket = self._socket
         await socket.send(json.dumps({"op": "subscribe", "args": [{"channel": key.channel, "instId": key.inst_id}]}, separators=(",", ":")))
+
+    async def _remove_subscription(self, key: CandleStreamKey) -> None:
+        with self._lock:
+            if key not in self._subscribed or self._listeners.get(key):
+                return
+            self._subscribed.discard(key)
+            socket = self._socket
+        if socket is not None:
+            await socket.send(json.dumps({"op": "unsubscribe", "args": [{"channel": key.channel, "instId": key.inst_id}]}, separators=(",", ":")))
 
     async def _handle_message(self, message: object) -> None:
         if isinstance(message, bytes):

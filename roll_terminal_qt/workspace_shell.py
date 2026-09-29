@@ -83,6 +83,8 @@ class WorkspaceHeader(QFrame):
         ("option:deribit-volatility", "Deribit 波动率"),
         ("option:option-roll", "期权移仓"),
         ("tool:ai-snapshot", "生成 AI 快照"),
+        ("tool:ai-snapshot-info", "快照内容说明"),
+        ("tool:ai-quick-snapshot", "生成 AI 精简快照"),
         ("settings:paths", "数据目录与路径"),
         ("settings:history-sync", "历史数据同步"),
         ("settings:logs", "日志"),
@@ -127,6 +129,7 @@ class WorkspaceHeader(QFrame):
         self._page_buttons["smart-order"] = trading_tools_button
         layout.addWidget(trading_tools_button)
         layout.addWidget(self._menu_button("期权工具", self._ROUTES[5:8]))
+        layout.addWidget(self._menu_button("AI 快照", self._ROUTES[8:11]))
         layout.addStretch(1)
 
         self.connection_label = QLabel("行情连接中", self)
@@ -149,6 +152,12 @@ class WorkspaceHeader(QFrame):
         self.task_button.clicked.connect(lambda: self.tool_requested.emit("rr-monitor"))
         layout.addWidget(self.task_button)
 
+        self.shape_message_button = QToolButton(self)
+        self.shape_message_button.setObjectName("ShapeMessageButton")
+        self.shape_message_button.setText("📣 信号")
+        self.shape_message_button.clicked.connect(lambda: self.tool_requested.emit("shape-messages"))
+        layout.addWidget(self.shape_message_button)
+
         layout.addWidget(self._settings_menu_button())
         self.setStyleSheet(
             """
@@ -158,10 +167,20 @@ class WorkspaceHeader(QFrame):
             QLabel#WorkspaceEnvironment { color: #d7e4ec; }
             QToolButton { color: #d7e4ec; background: transparent; border: 0; padding: 7px 11px; }
             QToolButton:hover { background: #1a3a51; }
+            QToolButton#ShapeMessageButton[unread="true"] { color: #ffffff; background: #ad3547; border-radius: 6px; }
             QToolButton#WorkspacePageButton:checked { background: #1c4059; border-bottom: 2px solid #2cc5b2; }
             QComboBox { min-height: 27px; }
             """
         )
+
+    def set_shape_message_status(self, unread: int, status: str) -> None:
+        button = self.shape_message_button
+        button.setText(f"📣 信号 {unread}" if unread else "📣 信号")
+        button.setToolTip(f"形态信号：{unread} 条未读\n{status}\n点击查看；关闭弹窗提醒也会保留未读信号。")
+        if button.property("unread") != bool(unread):
+            button.setProperty("unread", bool(unread))
+            button.style().unpolish(button)
+            button.style().polish(button)
 
     def _register_action(self, route_key: str, text: str) -> QAction:
         action = QAction(text, self)
@@ -192,7 +211,7 @@ class WorkspaceHeader(QFrame):
             font_menu.addAction(action)
             self._font_actions[mode] = action
         menu.addSeparator()
-        for route_key, label in self._ROUTES[8:]:
+        for route_key, label in self._ROUTES[11:]:
             menu.addAction(self._register_action(route_key, label))
         button = QToolButton(self)
         button.setText("⚙")
