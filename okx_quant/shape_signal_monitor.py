@@ -20,6 +20,7 @@ from okx_quant.okx_client import OkxRestClient
 from okx_quant.persistence import load_notification_snapshot
 from okx_quant.shape_signal_store import (
     SUPPORTED_PATTERNS,
+    SUPPORTED_PERIODS,
     append_events,
     load_subscriptions,
     normalize_subscription,
@@ -140,7 +141,7 @@ class ShapeSignalMonitor(QObject):
             environment = str(subscription.get("environment") or "demo").strip().lower() or "demo"
             for period in subscription.get("periods", []):
                 normalized_period = str(period).strip().upper()
-                if symbol and normalized_period in {"1H", "4H", "1D"}:
+                if symbol and normalized_period in SUPPORTED_PERIODS:
                     keys.add((symbol, normalized_period, environment))
         active_environments = {environment for _symbol, _period, environment in keys}
         for environment, client in list(self._clients.items()):
@@ -166,7 +167,7 @@ class ShapeSignalMonitor(QObject):
             (str(item.get("symbol") or "").strip().upper(), str(period).strip().upper(), str(item.get("environment") or "demo").strip().lower() or "demo")
             for item in subscriptions
             for period in item.get("periods", [])
-            if str(item.get("symbol") or "").strip() and str(period).strip().upper() in {"1H", "4H", "1D"}
+            if str(item.get("symbol") or "").strip() and str(period).strip().upper() in SUPPORTED_PERIODS
         })
         for symbol, period, environment in keys:
             if self._stop_event.is_set():

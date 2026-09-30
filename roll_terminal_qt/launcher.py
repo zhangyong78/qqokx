@@ -44,6 +44,7 @@ from roll_terminal_qt.option_strategy_window import OptionStrategyQtWindow
 from roll_terminal_qt.option_roll_execution_window import OptionRollExecutionQtWindow
 from roll_terminal_qt.kline_analysis_window import KlineAnalysisWindow
 from roll_terminal_qt.ai_snapshot_service import AIQuickSnapshotWorker, AISnapshotWorker
+from roll_terminal_qt.sample_prediction_window import SamplePredictionWindow
 from roll_terminal_qt.perf_metrics import measure_ui_step
 from roll_terminal_qt.profile_access import ensure_profile_unlocked, load_profile_snapshots
 from roll_terminal_qt.runtime import load_runtime
@@ -515,6 +516,8 @@ class LauncherWindow(QMainWindow):
         self._shape_signal_monitor.status_changed.connect(self._on_shape_monitor_status)
         self._shape_signal_monitor.signal_detected.connect(self._on_shape_signal_detected)
         self._shape_popup_boxes: list[QMessageBox] = []
+        self._shape_popup_box: QMessageBox | None = None
+        self._shape_popup_display_events: list[dict[str, object]] = []
         self._shape_message_dialog = None
         self._shape_monitor_status = "等待后台形态监控启动"
         self._shape_startup_events: list[dict[str, object]] = []
@@ -946,10 +949,70 @@ class LauncherWindow(QMainWindow):
             dialog.refresh()
         if not bool(event.get("popup_enabled", True)):
             return
+        event_copy = dict(event)
+        event_key = LauncherWindow._shape_popup_event_key(event_copy)
+        pending_keys = {LauncherWindow._shape_popup_event_key(item) for item in self._shape_startup_events}
+        displayed_events = getattr(self, "_shape_popup_display_events", [])
+        displayed_keys = {LauncherWindow._shape_popup_event_key(item) for item in displayed_events}
+        if event_key in pending_keys or event_key in displayed_keys:
+            return
+        current_box = getattr(self, "_shape_popup_box", None)
+        if current_box is not None and current_box.isVisible() and displayed_events:
+            event_ts = LauncherWindow._shape_popup_event_time(event_copy)
+            displayed_times = {LauncherWindow._shape_popup_event_time(item) for item in displayed_events}
+            if event_ts in displayed_times:
+                displayed_events.append(event_copy)
+                self._update_shape_popup_box()
+                return
         # 将短时间内到达的实时信号和启动补算信号合并，避免连续弹出多个窗口。
-        self._shape_startup_events.append(dict(event))
+        self._shape_startup_events.append(event_copy)
         if not self._shape_startup_popup_timer.isActive():
             self._shape_startup_popup_timer.start(3000)
+
+    @staticmethod
+    def _shape_popup_event_time(event: dict[str, object]) -> int:
+        try:
+            return int(event.get("candle_ts", 0) or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    @staticmethod
+    def _shape_popup_event_key(event: dict[str, object]) -> tuple[str, str, str, int, str, str]:
+        return (
+            str(event.get("symbol") or "").strip().upper(),
+            str(event.get("period") or "").strip().upper(),
+            str(event.get("pattern_id") or "").strip().lower(),
+            LauncherWindow._shape_popup_event_time(event),
+            str(event.get("direction") or "").strip().lower(),
+            str(event.get("environment") or "demo").strip().lower(),
+        )
+
+    @staticmethod
+    def _shape_popup_title(events: list[dict[str, object]]) -> str:
+        startup_count = sum(str(event.get("source") or "") == "startup" for event in events)
+        live_count = len(events) - startup_count
+        if live_count and startup_count:
+            return f"收到 {len(events)} 条形态信号（实时 {live_count}，启动补算 {startup_count}）："
+        if live_count:
+            return f"收到 {live_count} 条实时形态信号："
+        return f"启动补算发现 {startup_count} 条形态信号："
+
+    def _shape_popup_text(self, events: list[dict[str, object]]) -> str:
+        lines = [self._shape_popup_title(events), ""]
+        for event in events[:20]:
+            lines.append(
+                f"{event.get('symbol', '-')} {event.get('period', '-')} | "
+                f"{event.get('pattern_name', '-')} {event.get('direction', '-')} | "
+                f"{event.get('close', '-')}"
+            )
+        if len(events) > 20:
+            lines.append(f"……另有 {len(events) - 20} 条，请打开历史形态信号查看。")
+        return "\n".join(lines)
+
+    def _update_shape_popup_box(self) -> None:
+        box = self._shape_popup_box
+        if box is not None and box.isVisible():
+            box.setText(self._shape_popup_text(self._shape_popup_display_events))
 
     @Slot(str)
     def _on_shape_monitor_status(self, message: str) -> None:
@@ -1006,31 +1069,24 @@ class LauncherWindow(QMainWindow):
         self._shape_startup_events = []
         if not events:
             return
-        startup_count = sum(str(event.get("source") or "") == "startup" for event in events)
-        live_count = len(events) - startup_count
-        if live_count and startup_count:
-            title = f"收到 {len(events)} 条形态信号（实时 {live_count}，启动补算 {startup_count}）："
-        elif live_count:
-            title = f"收到 {live_count} 条实时形态信号："
-        else:
-            title = f"启动补算发现 {startup_count} 条形态信号："
-        lines = [title, ""]
-        for event in events[:20]:
-            lines.append(
-                f"{event.get('symbol', '-')} {event.get('period', '-')} | "
-                f"{event.get('pattern_name', '-')} {event.get('direction', '-')} | "
-                f"{event.get('close', '-')}"
-            )
-        if len(events) > 20:
-            lines.append(f"……另有 {len(events) - 20} 条，请打开历史形态信号查看。")
+        self._shape_popup_display_events = list(events)
         box = QMessageBox(self)
         box.setWindowTitle("形态信号汇总")
         box.setIcon(QMessageBox.Icon.Information)
-        box.setText("\n".join(lines))
+        box.setText(self._shape_popup_text(events))
         box.setStandardButtons(QMessageBox.StandardButton.Ok)
         box.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
         self._shape_popup_boxes.append(box)
-        box.destroyed.connect(lambda *_args, target=box: self._shape_popup_boxes.remove(target) if target in self._shape_popup_boxes else None)
+        self._shape_popup_box = box
+
+        def _on_shape_popup_destroyed(*_args: object, target: QMessageBox = box) -> None:
+            if target in self._shape_popup_boxes:
+                self._shape_popup_boxes.remove(target)
+            if self._shape_popup_box is target:
+                self._shape_popup_box = None
+                self._shape_popup_display_events = []
+
+        box.destroyed.connect(_on_shape_popup_destroyed)
         box.open()
 
     @Slot(str)
@@ -1064,6 +1120,9 @@ class LauncherWindow(QMainWindow):
             return
         if normalized == "ai-snapshot-info":
             self._show_ai_snapshot_contents()
+            return
+        if normalized == "sample-prediction":
+            self.open_module_window(normalized)
             return
         if normalized == "paths":
             self._show_shared_data_dialog()
@@ -1389,6 +1448,10 @@ def create_module_window(module_key: str, *, profile_name: str = "") -> QWidget:
         return window
     if normalized == "option-roll":
         window = OptionRollExecutionQtWindow(profile_name=profile_name)
+        apply_qt_window_icon(window)
+        return window
+    if normalized == "sample-prediction":
+        window = SamplePredictionWindow()
         apply_qt_window_icon(window)
         return window
     for spec in launcher_module_specs():

@@ -8,6 +8,7 @@ from unittest.mock import Mock, patch
 from PySide6.QtWidgets import QApplication
 
 from okx_quant import shape_signal_store as store
+from okx_quant.shape_signal_store import normalize_subscription
 from roll_terminal_qt.launcher import LauncherWindow
 from roll_terminal_qt.shape_signal_dialog import ShapeSignalHistoryDialog
 from roll_terminal_qt.kline_analysis_window import KlineAnalysisWindow
@@ -32,6 +33,25 @@ class ShapeSignalMessageTests(unittest.TestCase):
         header.set_shape_message_status(0, '正在监控')
         self.assertFalse(header.shape_message_button.property('unread'))
         header.close()
+
+    def test_weekly_period_is_supported_by_shape_subscription(self):
+        subscription = normalize_subscription({'periods': ['1W'], 'patterns': ['big_bullish']})
+        self.assertEqual(subscription['periods'], ['1W'])
+
+    def test_volatility_tabs_switch_to_existing_dvol_secondary_loader(self):
+        window = KlineAnalysisWindow()
+        try:
+            window._load_data = Mock()
+            dvol_index = window._symbol_tab_bar.count() - 2
+            self.assertEqual(window._symbol_tab_bar.tabText(dvol_index), 'BTC-DVOL')
+            window._symbol_tab_bar.setCurrentIndex(dvol_index)
+            self.assertEqual(window._symbol_combo.currentText(), 'BTC-USDT-SWAP')
+            self.assertEqual(window._secondary_chart_kind(), 'volatility')
+            self.assertTrue(window._secondary_chart_check.isChecked())
+            self.assertEqual(window._active_chart_target, 'secondary')
+            self.assertGreaterEqual(window._load_data.call_count, 1)
+        finally:
+            window.close()
 
     def test_filtered_history_acknowledges_only_displayed_events(self):
         with tempfile.TemporaryDirectory() as folder, patch.object(store, '_path', side_effect=lambda name: Path(folder) / name):
@@ -68,6 +88,7 @@ class ShapeSignalMessageTests(unittest.TestCase):
         host = SimpleNamespace(
             _refresh_shape_message_badge=Mock(), _shape_message_dialog=None,
             _shape_startup_events=[], _shape_startup_popup_timer=timer,
+            _shape_popup_display_events=[], _shape_popup_box=None,
         )
         event = dict(source='startup', candle_ts=int(datetime.now(timezone.utc).timestamp() * 1000), popup_enabled=True)
         LauncherWindow._on_shape_signal_detected(host, event)
@@ -81,11 +102,49 @@ class ShapeSignalMessageTests(unittest.TestCase):
         host = SimpleNamespace(
             _refresh_shape_message_badge=Mock(), _shape_message_dialog=None,
             _shape_startup_events=[], _shape_startup_popup_timer=timer,
+            _shape_popup_display_events=[], _shape_popup_box=None,
         )
         LauncherWindow._on_shape_signal_detected(host, dict(source='live', popup_enabled=True, symbol='BTC-USDT-SWAP'))
         LauncherWindow._on_shape_signal_detected(host, dict(source='live', popup_enabled=True, symbol='ETH-USDT-SWAP'))
         self.assertEqual(len(host._shape_startup_events), 2)
         self.assertEqual(timer.start.call_count, 2)
+
+    def test_late_signal_with_same_candle_time_updates_existing_popup(self):
+        class PopupStub:
+            def isVisible(self):
+                return True
+
+            def setText(self, value):
+                self.text = value
+
+        class BatchHost:
+            _shape_popup_event_key = staticmethod(LauncherWindow._shape_popup_event_key)
+            _shape_popup_event_time = staticmethod(LauncherWindow._shape_popup_event_time)
+            _shape_popup_title = staticmethod(LauncherWindow._shape_popup_title)
+            _shape_popup_text = LauncherWindow._shape_popup_text
+            _update_shape_popup_box = LauncherWindow._update_shape_popup_box
+            _shape_message_dialog = None
+
+            def __init__(self):
+                self._shape_startup_events = []
+                self._shape_startup_popup_timer = Mock()
+                self._shape_startup_popup_timer.isActive.return_value = False
+                self._shape_popup_box = PopupStub()
+                self._shape_popup_display_events = [
+                    dict(symbol='SOL-BTC', period='1H', pattern_id='double_reversal_up',
+                         direction='long', candle_ts=123000, pattern_name='双线向上反转', close='0.0012')
+                ]
+                self._refresh_shape_message_badge = Mock()
+
+        host = BatchHost()
+        LauncherWindow._on_shape_signal_detected(host, dict(
+            symbol='SOL-USDT-SWAP', period='1H', pattern_id='double_reversal_up',
+            direction='short', candle_ts=123000, pattern_name='双线向下反转', close='119.37',
+            source='startup', popup_enabled=True,
+        ))
+        self.assertEqual(len(host._shape_popup_display_events), 2)
+        self.assertIn('SOL-USDT-SWAP', host._shape_popup_box.text)
+        host._shape_startup_popup_timer.start.assert_not_called()
 
     def test_chart_keeps_signal_when_selected_metric_rank_is_missing(self):
         class ChartFilterStub:

@@ -85,6 +85,7 @@ class WorkspaceHeader(QFrame):
         ("tool:ai-snapshot", "生成 AI 快照"),
         ("tool:ai-snapshot-info", "快照内容说明"),
         ("tool:ai-quick-snapshot", "生成 AI 精简快照"),
+        ("tool:sample-prediction", "样本预测"),
         ("settings:paths", "数据目录与路径"),
         ("settings:history-sync", "历史数据同步"),
         ("settings:logs", "日志"),
@@ -129,7 +130,7 @@ class WorkspaceHeader(QFrame):
         self._page_buttons["smart-order"] = trading_tools_button
         layout.addWidget(trading_tools_button)
         layout.addWidget(self._menu_button("期权工具", self._ROUTES[5:8]))
-        layout.addWidget(self._menu_button("AI 快照", self._ROUTES[8:11]))
+        layout.addWidget(self._menu_button("AI", self._ROUTES[8:12]))
         layout.addStretch(1)
 
         self.connection_label = QLabel("行情连接中", self)
@@ -211,7 +212,7 @@ class WorkspaceHeader(QFrame):
             font_menu.addAction(action)
             self._font_actions[mode] = action
         menu.addSeparator()
-        for route_key, label in self._ROUTES[11:]:
+        for route_key, label in self._ROUTES[12:]:
             menu.addAction(self._register_action(route_key, label))
         button = QToolButton(self)
         button.setText("⚙")

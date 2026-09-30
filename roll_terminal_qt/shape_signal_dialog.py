@@ -124,7 +124,7 @@ class ShapeSignalHistoryDialog(QDialog):
             self._symbol_filter.blockSignals(False)
         self._sync_filter_options(
             self._period_filter,
-            [(period, period) for period in ("1H", "4H", "1D") if any(str(event.get("period") or "").upper() == period for event in all_events)],
+            [(period, period) for period in SUPPORTED_PERIODS if any(str(event.get("period") or "").upper() == period for event in all_events)],
             selected=self._period_filter.currentData(),
             all_label="全部周期",
         )

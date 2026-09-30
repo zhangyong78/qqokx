@@ -13,7 +13,7 @@ from okx_quant.app_paths import state_dir_path
 
 SUBSCRIPTIONS_FILE_NAME = "shape_signal_subscriptions.json"
 EVENTS_FILE_NAME = "shape_signal_events.json"
-SUPPORTED_PERIODS = ("1H", "4H", "1D")
+SUPPORTED_PERIODS = ("1H", "4H", "1D", "1W")
 SUPPORTED_PATTERNS = (
     "big_bullish",
     "big_bearish",
@@ -52,7 +52,7 @@ def normalize_subscription(value: object) -> dict[str, object]:
         "id": str(raw.get("id") or uuid4().hex[:12]).strip(),
         "symbol": str(raw.get("symbol") or "BTC-USDT-SWAP").strip().upper(),
         "environment": str(raw.get("environment") or "demo").strip().lower() or "demo",
-        "periods": [item for item in SUPPORTED_PERIODS if item in periods] or ["1H", "4H", "1D"],
+        "periods": [item for item in SUPPORTED_PERIODS if item in periods] or list(SUPPORTED_PERIODS),
         "patterns": [item for item in SUPPORTED_PATTERNS if item in patterns] or list(SUPPORTED_PATTERNS),
         "metric": "range" if str(raw.get("metric") or "body").strip().lower() == "range" else "body",
         "top_n": max(1, min(10, top_n)),
