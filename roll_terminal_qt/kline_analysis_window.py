@@ -126,6 +126,12 @@ _NATIVE_BOOTSTRAP_RENDER_DELAY_MS = 90
 _AUTO_REFRESH_DEFAULT_ENABLED = True
 _NATIVE_RIGHT_PADDING_BARS = 24
 _RECENT_VIEW_BARS = 240
+_LINKED_MIN_VISIBLE_BARS = {
+    "1W": 80,
+    "1D": 240,
+    "4H": 240,
+    "1H": 240,
+}
 _KLINE_PAYLOAD_CACHE_LIMIT = 8
 _KLINE_SPLITTER_LEFT_RATIO = 0.11
 _VOLUME_OVERLAY_HEIGHT_RATIO = 0.18
@@ -7122,7 +7128,54 @@ class KlineAnalysisWindow(QMainWindow):
         source_text = source_text.replace("（本地聚合）", "")
         return [f"{currency}波动率 | 平均K线 {average_text} | {aggregation_text} | 来源 {source_text}"]
 
-    def _sync_chart_range_to_other(self, *, target: str, start_x: float, end_x: float) -> None:
+    def _chart_period_for_target(self, target: str) -> str:
+        controls = {
+            "primary": self._period_combo,
+            "secondary": self._secondary_period_combo,
+            "tertiary": self._tertiary_period_combo,
+            "quaternary": self._quaternary_period_combo,
+        }
+        control = controls.get(target)
+        return control.currentText().strip().upper() if control is not None else "1H"
+
+    def _linked_range_for_target(
+        self,
+        *,
+        target: str,
+        start_x: float,
+        end_x: float,
+        source: str | None,
+    ) -> tuple[float, float]:
+        if not source or source == target:
+            return float(start_x), float(end_x)
+        source_view = {
+            "primary": self._native_chart_view,
+            "secondary": self._secondary_native_chart_view,
+            "tertiary": self._tertiary_native_chart_view,
+            "quaternary": self._quaternary_native_chart_view,
+        }.get(source)
+        target_view = {
+            "primary": self._native_chart_view,
+            "secondary": self._secondary_native_chart_view,
+            "tertiary": self._tertiary_native_chart_view,
+            "quaternary": self._quaternary_native_chart_view,
+        }.get(target)
+        source_step = max(1.0, float(getattr(source_view, "_display_step_ms", 0.0) or 0.0))
+        target_step = max(1.0, float(getattr(target_view, "_display_step_ms", 0.0) or 0.0))
+        source_visible_bars = max(1, int(round(max(1.0, float(end_x) - float(start_x)) / source_step)))
+        target_period = self._chart_period_for_target(target)
+        target_visible_bars = max(source_visible_bars, _LINKED_MIN_VISIBLE_BARS.get(target_period, _RECENT_VIEW_BARS))
+        target_span = float(target_visible_bars) * target_step
+        return float(end_x) - target_span, float(end_x)
+
+    def _sync_chart_range_to_other(
+        self,
+        *,
+        target: str,
+        start_x: float,
+        end_x: float,
+        source: str | None = None,
+    ) -> None:
         if self._syncing_chart_range or not self._secondary_chart_check.isChecked() or not self._use_native_chart:
             return
         target_views = {
@@ -7136,7 +7189,13 @@ class KlineAnalysisWindow(QMainWindow):
             return
         self._syncing_chart_range = True
         try:
-            target_view.set_external_x_range(float(start_x), float(end_x))
+            linked_start, linked_end = self._linked_range_for_target(
+                target=target,
+                start_x=start_x,
+                end_x=end_x,
+                source=source if (self._triple_chart_enabled() or self._quad_chart_enabled()) else None,
+            )
+            target_view.set_external_x_range(linked_start, linked_end)
         finally:
             self._syncing_chart_range = False
 
@@ -7148,7 +7207,12 @@ class KlineAnalysisWindow(QMainWindow):
             targets.append("quaternary")
         for target in targets:
             if target != source:
-                self._sync_chart_range_to_other(target=target, start_x=start_x, end_x=end_x)
+                self._sync_chart_range_to_other(
+                    target=target,
+                    start_x=start_x,
+                    end_x=end_x,
+                    source=source,
+                )
 
     def _sync_hover_time_from(self, *, source: str, candle_time: object) -> None:
         targets: dict[str, object] = {
@@ -7169,6 +7233,20 @@ class KlineAnalysisWindow(QMainWindow):
             return
         if not isinstance(self._native_chart_view, InteractiveKlineChartView):
             return
+        if self._triple_chart_enabled() or self._quad_chart_enabled():
+            self._syncing_chart_range = True
+            try:
+                for view in (
+                    self._native_chart_view,
+                    self._secondary_native_chart_view,
+                    self._tertiary_native_chart_view if self._triple_chart_enabled() else None,
+                    self._quaternary_native_chart_view if self._quad_chart_enabled() else None,
+                ):
+                    if isinstance(view, InteractiveKlineChartView):
+                        view.set_recent_view_range()
+            finally:
+                self._syncing_chart_range = False
+            return
         start_x, end_x = self._native_chart_view.current_x_range()
         self._sync_chart_range_from(source="primary", start_x=start_x, end_x=end_x)
 
@@ -7180,9 +7258,18 @@ class KlineAnalysisWindow(QMainWindow):
         ):
             return False
         if self._triple_chart_enabled():
-            self._native_chart_view.set_recent_view_range()
-            start_x, end_x = self._native_chart_view.current_x_range()
-            self._sync_chart_range_from(source="primary", start_x=start_x, end_x=end_x)
+            self._syncing_chart_range = True
+            try:
+                for view in (
+                    self._native_chart_view,
+                    self._secondary_native_chart_view,
+                    self._tertiary_native_chart_view,
+                    self._quaternary_native_chart_view if self._quad_chart_enabled() else None,
+                ):
+                    if isinstance(view, InteractiveKlineChartView):
+                        view.set_recent_view_range()
+            finally:
+                self._syncing_chart_range = False
             return True
         primary_period_ms = _bar_to_ms(self._period_combo.currentText().strip())
         secondary_period_ms = _bar_to_ms(self._secondary_period_combo.currentText().strip())
@@ -7798,6 +7885,25 @@ class KlineAnalysisWindow(QMainWindow):
             self._apply_secondary_chart_visibility()
             self._update_secondary_controls_state()
             self._load_data()
+            return
+        # While a DVOL tab is active, BTC/ETH-related tabs are volatility
+        # selectors rather than a request to leave the volatility view.  Keep
+        # the current chart kind and only change its underlying currency; a
+        # different coin is still allowed to leave volatility mode below.
+        if self._secondary_chart_kind() == "volatility":
+            underlying_currency = _volatility_currency_for_symbol(symbol)
+            if underlying_currency is not None:
+                base_symbol = f"{underlying_currency}-USDT-SWAP"
+                if self._selected_symbol() == base_symbol:
+                    self._on_symbol_confirmed()
+                else:
+                    self._symbol_combo.setCurrentText(base_symbol)
+                return
+            # A volatility four-chart view represents one underlying currency
+            # across all periods.  Selecting any other perpetual/spot pair
+            # must therefore leave volatility mode and switch every chart,
+            # even when the normal "link all K-line windows" option is off.
+            self._switch_all_chart_symbols(symbol)
             return
         if self._symbol_link_all_check is not None and self._symbol_link_all_check.isChecked():
             self._switch_all_chart_symbols(symbol)
@@ -8809,11 +8915,35 @@ class KlineAnalysisWindow(QMainWindow):
 
     @Slot()
     def _on_symbol_confirmed(self) -> None:
+        was_volatility = self._secondary_chart_kind() == "volatility"
         self._refresh_symbol_tab_selection()
         if not self._volatility_available_for_current_symbol() and self._secondary_chart_kind() == "volatility":
             self._secondary_chart_kind_mode = "kline"
             self._secondary_pending_payload = None
             self._loaded_secondary_request_key = None
+            if was_volatility and (self._triple_chart_enabled() or self._quad_chart_enabled()):
+                selected_symbol = self._selected_symbol()
+                for combo in (
+                    self._secondary_symbol_combo,
+                    self._tertiary_symbol_combo,
+                    self._quaternary_symbol_combo,
+                ):
+                    combo.blockSignals(True)
+                try:
+                    for combo in (
+                        self._secondary_symbol_combo,
+                        self._tertiary_symbol_combo,
+                        self._quaternary_symbol_combo,
+                    ):
+                        combo.setCurrentText(selected_symbol)
+                finally:
+                    for combo in (
+                        self._secondary_symbol_combo,
+                        self._tertiary_symbol_combo,
+                        self._quaternary_symbol_combo,
+                    ):
+                        combo.blockSignals(False)
+                self._refresh_symbol_tab_selection()
         self._update_secondary_controls_state()
         self._reload_workspace_view()
         self._refresh_rr_trade_hint()
