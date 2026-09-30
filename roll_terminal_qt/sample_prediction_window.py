@@ -265,17 +265,19 @@ class SamplePredictionWindow(QMainWindow):
         arrow = QLineSeries()
         arrow.setName("未来预测 ↑")
         arrow_pen = QPen(QColor("#ea580c"))
-        arrow_pen.setWidth(3)
+        arrow_pen.setWidth(4)
         arrow.setPen(arrow_pen)
         price_span = max(max_price - min_price, 1.0)
         arrow_tip_y = min(forecast_open, forecast_close) - price_span * 0.025
         arrow_start_y = max(min_price + price_span * 0.04, arrow_tip_y - price_span * 0.16)
         arrow_tip_x = float(forecast_index)
-        arrow.append(arrow_tip_x - 0.65, arrow_start_y)
+        # Keep the forecast marker centered on the final candle.  The old
+        # diagonal shaft made the target easy to miss when the chart was wide.
+        arrow.append(arrow_tip_x, arrow_start_y)
         arrow.append(arrow_tip_x, arrow_tip_y)
-        arrow.append(arrow_tip_x - 0.14, arrow_tip_y - price_span * 0.025)
+        arrow.append(arrow_tip_x - 0.20, arrow_tip_y - price_span * 0.035)
         arrow.append(arrow_tip_x, arrow_tip_y)
-        arrow.append(arrow_tip_x + 0.14, arrow_tip_y - price_span * 0.025)
+        arrow.append(arrow_tip_x + 0.20, arrow_tip_y - price_span * 0.035)
         self._chart.addSeries(arrow)
 
         x_axis = QValueAxis()
