@@ -1455,7 +1455,7 @@ class RRCardDialog(QDialog):
         self._summary_label.setObjectName("Subtle")
         parameter_layout.addRow("方向", self._side_combo)
         parameter_layout.addRow("管理方式", self._management_mode_combo)
-        parameter_layout.addRow("风险金额", self._risk_edit)
+        parameter_layout.addRow("风险金(U)", self._risk_edit)
         parameter_layout.addRow("入场价", self._entry_edit)
         parameter_layout.addRow("止损价", self._stop_edit)
         parameter_layout.addRow("R 倍数", self._r_edit)
@@ -1544,7 +1544,7 @@ class RRCardDialog(QDialog):
                     [
                         f"自动止盈：{_format_rr_table_price(take_profit, self._price_increment)}",
                         f"币数量：{snapshot['card_position_text']}",
-                        f"实际风险：{snapshot['card_actual_risk_text']}",
+                        f"实际风险(U)：{snapshot['card_actual_risk_text']}",
                         f"盈亏比：{snapshot['card_rr_text']}",
                         f"管理方式：{_rr_management_mode_text(management_mode)}",
                         f"手续费偏移：{'开启' if self._fee_offset_check.isChecked() else '关闭'}",
@@ -5639,6 +5639,9 @@ class KlineAnalysisWindow(QMainWindow):
         # 双图联动默认左右并排，便于同时比较两个周期/交易对。
         self._secondary_layout_mode_value = "horizontal"
         self._secondary_chart_kind_mode = "kline"
+        # 波动率视图不是普通交易对图的附属状态。记住当前 DVOL
+        # 标的，避免用户在该视图中误点其他自选品种后替换四张图。
+        self._active_volatility_currency: str | None = None
         self._shape_signal_size_metric = "body"
         self._initial_load_requested = False
         self._page_active = False
@@ -6738,8 +6741,19 @@ class KlineAnalysisWindow(QMainWindow):
         rr_manage_row.addWidget(monitor_rr_btn)
         control_layout.addLayout(rr_manage_row)
 
-        self._rr_table = QTableWidget(0, 8)
-        self._rr_table.setHorizontalHeaderLabels(["方向", "入场", "止损", "止盈", "管理", "R", "K线", "锁定"])
+        rr_risk_row = QHBoxLayout()
+        rr_risk_row.addWidget(QLabel("风险金(U)"))
+        self._rr_risk_edit = QLineEdit("100")
+        self._rr_risk_edit.setPlaceholderText("默认 100")
+        self._rr_risk_edit.setToolTip(
+            "每笔交易最多按此金额承担止损风险。实际下单风险会受合约最小张数取整影响。"
+        )
+        rr_risk_row.addWidget(self._rr_risk_edit, 1)
+        rr_risk_row.addWidget(QLabel("默认 100 U；保存 RR 后生效"))
+        control_layout.addLayout(rr_risk_row)
+
+        self._rr_table = QTableWidget(0, 9)
+        self._rr_table.setHorizontalHeaderLabels(["方向", "入场", "止损", "止盈", "管理", "R", "K线", "锁定", "风险金"])
         self._rr_table.verticalHeader().setVisible(False)
         self._rr_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self._rr_table.itemSelectionChanged.connect(self._on_rr_selected)
@@ -6756,6 +6770,7 @@ class KlineAnalysisWindow(QMainWindow):
         rr_header.setSectionResizeMode(5, QHeaderView.ResizeMode.ResizeToContents)
         rr_header.setSectionResizeMode(6, QHeaderView.ResizeMode.ResizeToContents)
         rr_header.setSectionResizeMode(7, QHeaderView.ResizeMode.ResizeToContents)
+        rr_header.setSectionResizeMode(8, QHeaderView.ResizeMode.ResizeToContents)
         rr_header.setStretchLastSection(False)
         self._rr_table.setMinimumHeight(96)
         self._rr_table.setMaximumHeight(116)
@@ -7580,7 +7595,14 @@ class KlineAnalysisWindow(QMainWindow):
         if self._triple_chart_enabled():
             return
         previous_kind = self._secondary_chart_kind()
+        if previous_kind == "kline" and not self._volatility_available_for_current_symbol():
+            self._set_status("波动率视图仅支持 BTC / ETH；请先选择 BTC-USDT-SWAP 或 ETH-USDT-SWAP。")
+            return
         self._secondary_chart_kind_mode = ("volatility" if previous_kind == "kline" else "kline")
+        if self._secondary_chart_kind() == "volatility":
+            self._active_volatility_currency = self._current_volatility_currency()
+        else:
+            self._active_volatility_currency = None
         self._refresh_secondary_chart_kind_button()
         self._refresh_secondary_sync_period_button()
         self._update_secondary_controls_state()
@@ -7829,8 +7851,8 @@ class KlineAnalysisWindow(QMainWindow):
         if tab_bar is None:
             return
         symbol = self._symbol_for_chart_target()
-        if self._active_chart_target == "secondary" and self._secondary_chart_kind() == "volatility":
-            currency = self._current_volatility_currency()
+        if self._secondary_chart_kind() == "volatility":
+            currency = self._active_volatility_currency or self._current_volatility_currency()
             symbol = f"__DVOL_{currency}__" if currency else symbol
         target_index = next(
             (
@@ -7871,6 +7893,7 @@ class KlineAnalysisWindow(QMainWindow):
                 self._symbol_combo.setCurrentText(base_symbol)
                 self._secondary_symbol_combo.setCurrentText(base_symbol)
                 self._secondary_chart_kind_mode = "volatility"
+                self._active_volatility_currency = volatility_currency
                 self._secondary_chart_check.blockSignals(True)
                 self._secondary_chart_check.setChecked(True)
                 self._secondary_chart_check.blockSignals(False)
@@ -7886,25 +7909,17 @@ class KlineAnalysisWindow(QMainWindow):
             self._update_secondary_controls_state()
             self._load_data()
             return
-        # While a DVOL tab is active, BTC/ETH-related tabs are volatility
-        # selectors rather than a request to leave the volatility view.  Keep
-        # the current chart kind and only change its underlying currency; a
-        # different coin is still allowed to leave volatility mode below.
+        # 普通交易对和 DVOL 标签使用同一套切换规则。离开 DVOL 时先
+        # 恢复普通 K 线模式，后续分支再按“全部联动”或当前图处理品种。
         if self._secondary_chart_kind() == "volatility":
-            underlying_currency = _volatility_currency_for_symbol(symbol)
-            if underlying_currency is not None:
-                base_symbol = f"{underlying_currency}-USDT-SWAP"
-                if self._selected_symbol() == base_symbol:
-                    self._on_symbol_confirmed()
-                else:
-                    self._symbol_combo.setCurrentText(base_symbol)
-                return
-            # A volatility four-chart view represents one underlying currency
-            # across all periods.  Selecting any other perpetual/spot pair
-            # must therefore leave volatility mode and switch every chart,
-            # even when the normal "link all K-line windows" option is off.
-            self._switch_all_chart_symbols(symbol)
-            return
+            self._secondary_chart_kind_mode = "kline"
+            self._active_volatility_currency = None
+            self._secondary_pending_payload = None
+            self._loaded_secondary_request_key = None
+            self._refresh_secondary_chart_kind_button()
+            self._refresh_secondary_sync_period_button()
+            self._update_secondary_controls_state()
+            self._apply_secondary_chart_visibility()
         if self._symbol_link_all_check is not None and self._symbol_link_all_check.isChecked():
             self._switch_all_chart_symbols(symbol)
             return
@@ -8915,35 +8930,31 @@ class KlineAnalysisWindow(QMainWindow):
 
     @Slot()
     def _on_symbol_confirmed(self) -> None:
-        was_volatility = self._secondary_chart_kind() == "volatility"
-        self._refresh_symbol_tab_selection()
-        if not self._volatility_available_for_current_symbol() and self._secondary_chart_kind() == "volatility":
+        if self._secondary_chart_kind() == "volatility":
+            selected_symbol = self._selected_symbol()
             self._secondary_chart_kind_mode = "kline"
+            self._active_volatility_currency = None
             self._secondary_pending_payload = None
             self._loaded_secondary_request_key = None
-            if was_volatility and (self._triple_chart_enabled() or self._quad_chart_enabled()):
-                selected_symbol = self._selected_symbol()
-                for combo in (
+            if self._symbol_link_all_check is not None and self._symbol_link_all_check.isChecked():
+                linked_combos = (
                     self._secondary_symbol_combo,
                     self._tertiary_symbol_combo,
                     self._quaternary_symbol_combo,
-                ):
+                )
+                for combo in linked_combos:
                     combo.blockSignals(True)
                 try:
-                    for combo in (
-                        self._secondary_symbol_combo,
-                        self._tertiary_symbol_combo,
-                        self._quaternary_symbol_combo,
-                    ):
+                    for combo in linked_combos:
                         combo.setCurrentText(selected_symbol)
                 finally:
-                    for combo in (
-                        self._secondary_symbol_combo,
-                        self._tertiary_symbol_combo,
-                        self._quaternary_symbol_combo,
-                    ):
+                    for combo in linked_combos:
                         combo.blockSignals(False)
-                self._refresh_symbol_tab_selection()
+            self._refresh_secondary_chart_kind_button()
+            self._refresh_secondary_sync_period_button()
+            self._update_secondary_controls_state()
+            self._apply_secondary_chart_visibility()
+        self._refresh_symbol_tab_selection()
         self._update_secondary_controls_state()
         self._reload_workspace_view()
         self._refresh_rr_trade_hint()
@@ -10581,10 +10592,11 @@ class KlineAnalysisWindow(QMainWindow):
                 str(record.get("r_multiple", "") or ""),
                 str(record.get("bar_entry", "") or ""),
                 "是" if bool(record.get("locked", False)) else "否",
+                _format_rr_table_price(record.get("risk_amount", "100")) or "100",
             )
             for column, value in enumerate(values):
                 item_widget = QTableWidgetItem(value)
-                if column in {1, 2, 3, 5, 6}:
+                if column in {1, 2, 3, 5, 6, 8}:
                     item_widget.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
                 elif column == 7:
                     item_widget.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -10602,6 +10614,7 @@ class KlineAnalysisWindow(QMainWindow):
         self._rr_entry_edit.clear()
         self._rr_stop_edit.clear()
         self._rr_r_edit.setValue(2.0)
+        self._rr_risk_edit.setText("100")
         self._rr_bar_edit.setText("0")
         self._rr_fee_offset_check.setChecked(False)
         self._rr_locked_check.setChecked(False)
@@ -10821,6 +10834,7 @@ class KlineAnalysisWindow(QMainWindow):
         self._rr_entry_edit.setText(_format_rr_table_price(item.get("price_entry", ""), price_increment))
         self._rr_stop_edit.setText(_format_rr_table_price(item.get("price_stop", ""), price_increment))
         self._rr_r_edit.setValue(float(str(item.get("r_multiple", "") or "2")))
+        self._rr_risk_edit.setText(str(item.get("risk_amount", "100") or "100"))
         self._rr_bar_edit.setText(str(item.get("bar_entry", "") or "0"))
         self._rr_execution_mode_combo.setCurrentIndex(
             max(0, self._rr_execution_mode_combo.findData(str(item.get("entry_execution_mode", "limit") or "limit")))
@@ -11471,6 +11485,7 @@ class KlineAnalysisWindow(QMainWindow):
         stop_text = _format_rr_table_price(item.get("price_stop", ""), price_increment) or "-"
         tp_text = _format_rr_table_price(item.get("price_tp", ""), price_increment) or "-"
         r_text = str(item.get("r_multiple", "") or "-")
+        risk_text = _format_rr_table_price(item.get("risk_amount", "100")) or "100"
         locked_text = "已锁定" if bool(item.get("locked", False)) else "未锁定"
         fee_text = "开启" if _rr_fee_offset_enabled(item.get("fee_offset_enabled", False)) else "关闭"
         management_text = _rr_management_mode_text(item.get("management_mode"))
@@ -11498,7 +11513,7 @@ class KlineAnalysisWindow(QMainWindow):
             last_event = ledger_entry.events[-1].message if ledger_entry.events else "-"
             ledger_text = f"交易：{status_text} | 成交 {filled_text}张 | 剩余 {remaining_text}张 | 当前止损 {current_stop_text}"
         summary_text = (
-            f"{rr_id} | {side} | 入场 {entry_text} | 止损 {stop_text} | 止盈 {tp_text} | {management_text} | R 1:{r_text}\n"
+            f"{rr_id} | {side} | 入场 {entry_text} | 止损 {stop_text} | 止盈 {tp_text} | 风险金 {risk_text} U | {management_text} | R 1:{r_text}\n"
             f"状态：{locked_text} | 手续费偏移：{fee_text}\n{ledger_text}"
         )
         tooltip_text = summary_text if ledger_entry is None else f"{summary_text}\n最后事件：{last_event}"
@@ -12536,6 +12551,7 @@ class KlineAnalysisWindow(QMainWindow):
             price_entry = self._parse_rr_decimal(self._rr_entry_edit.text(), "入场价")
             price_stop = self._parse_rr_decimal(self._rr_stop_edit.text(), "止损价")
             r_multiple = self._parse_rr_decimal(self._rr_r_edit.text(), "R 倍数")
+            risk_amount = self._parse_rr_decimal(self._rr_risk_edit.text(), "风险金")
             bar_entry = float(str(self._rr_bar_edit.text() or "").strip())
             existing_payload: dict[str, object] = {}
             rr_items = entry.get("rr")
@@ -12554,6 +12570,7 @@ class KlineAnalysisWindow(QMainWindow):
                 "price_entry": decimal_to_text(price_entry),
                 "price_stop": decimal_to_text(price_stop),
                 "r_multiple": decimal_to_text(r_multiple),
+                "risk_amount": decimal_to_text(risk_amount),
                 "fee_offset_enabled": self._rr_fee_offset_check.isChecked(),
                 "locked": self._rr_locked_check.isChecked(),
             }

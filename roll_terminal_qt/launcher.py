@@ -521,6 +521,8 @@ class LauncherWindow(QMainWindow):
         self._shape_message_dialog = None
         self._shape_monitor_status = "等待后台形态监控启动"
         self._shape_startup_events: list[dict[str, object]] = []
+        self._shape_startup_collecting = True
+        self._shape_startup_summary_shown = False
         self._shape_startup_popup_timer = QTimer(self)
         self._shape_startup_popup_timer.setSingleShot(True)
         self._shape_startup_popup_timer.timeout.connect(self._show_shape_startup_summary)
@@ -958,15 +960,26 @@ class LauncherWindow(QMainWindow):
             return
         current_box = getattr(self, "_shape_popup_box", None)
         if current_box is not None and current_box.isVisible() and displayed_events:
-            event_ts = LauncherWindow._shape_popup_event_time(event_copy)
-            displayed_times = {LauncherWindow._shape_popup_event_time(item) for item in displayed_events}
-            if event_ts in displayed_times:
-                displayed_events.append(event_copy)
-                self._update_shape_popup_box()
-                return
+            # 已有汇总框时继续合并，不再创建第二个窗口。不同周期的信号
+            # 通常时间戳不同，旧逻辑因此会重新弹出窗口。
+            displayed_events.append(event_copy)
+            self._update_shape_popup_box()
+            return
+        source = str(event_copy.get("source") or "").strip().lower()
+        if (
+            source == "startup"
+            and not bool(getattr(self, "_shape_startup_collecting", False))
+            and bool(getattr(self, "_shape_startup_summary_shown", False))
+        ):
+            # 启动汇总已经展示过，迟到的启动事件仍保留在历史中心，
+            # 但不再再次打断用户。
+            return
         # 将短时间内到达的实时信号和启动补算信号合并，避免连续弹出多个窗口。
         self._shape_startup_events.append(event_copy)
-        if not self._shape_startup_popup_timer.isActive():
+        if (
+            not bool(getattr(self, "_shape_startup_collecting", False))
+            and not self._shape_startup_popup_timer.isActive()
+        ):
             self._shape_startup_popup_timer.start(3000)
 
     @staticmethod
@@ -1017,6 +1030,10 @@ class LauncherWindow(QMainWindow):
     @Slot(str)
     def _on_shape_monitor_status(self, message: str) -> None:
         self._shape_monitor_status = str(message)
+        if str(message).strip() == "形态启动补算完成":
+            self._shape_startup_collecting = False
+            if self._shape_startup_events and not self._shape_startup_popup_timer.isActive():
+                self._shape_startup_popup_timer.start(1000)
         self._refresh_shape_message_badge()
         self.statusBar().showMessage(str(message), 5000)
 
@@ -1069,6 +1086,8 @@ class LauncherWindow(QMainWindow):
         self._shape_startup_events = []
         if not events:
             return
+        if any(str(event.get("source") or "").strip().lower() == "startup" for event in events):
+            self._shape_startup_summary_shown = True
         self._shape_popup_display_events = list(events)
         box = QMessageBox(self)
         box.setWindowTitle("形态信号汇总")

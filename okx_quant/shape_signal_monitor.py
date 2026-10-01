@@ -95,6 +95,9 @@ class ShapeSignalMonitor(QObject):
         self._status("启动形态后台监控")
         self._rebuild_connections()
         self._startup_reconcile()
+        # 告知前端启动补算已完成。前端在此之前只收集信号，不逐批弹窗，
+        # 避免多个订阅路由分批返回时连续打断用户。
+        self._status("形态启动补算完成")
         next_flush = time.monotonic() + 8.0
         next_volatility_sync = time.monotonic() + 30.0
         while not self._stop_event.wait(0.25):
