@@ -8649,6 +8649,9 @@ class UiStrategySessionsMixin:
             if not QuantApp._session_counts_toward_running_summary(session):
                 continue
             live_pnl, _refreshed_at = self._session_live_pnl_snapshot(session)
+            runtime_risk_basis = None
+            if getattr(session, "active_trade", None) is not None:
+                runtime_risk_basis = UiStrategySessionsMixin._session_runtime_risk_basis_usdt(self, session)
             risk_amount = UiStrategySessionsMixin._format_optional_positive_entry_decimal(
                 getattr(getattr(session, "config", None), "risk_amount", None)
             ) or "-"
@@ -8665,6 +8668,11 @@ class UiStrategySessionsMixin:
                     account_equity=self._session_account_total_equity_text(session),
                     strategy=session.strategy_name or "-",
                     symbol=session.symbol or "-",
+                    market_price=(
+                        self._session_runtime_market_price_text(session)
+                        if callable(getattr(self, "_session_runtime_market_price_text", None))
+                        else "-"
+                    ),
                     direction=_normalize_strategy_direction_label(
                         getattr(session, "strategy_id", getattr(getattr(session, "config", None), "strategy_id", "")),
                         getattr(session, "config", None),
@@ -8672,9 +8680,23 @@ class UiStrategySessionsMixin:
                     ),
                     open_qty=self._session_open_position_amount_text(session),
                     entry_price=self._session_runtime_entry_price_text(session),
+                    next_stop_price=(
+                        self._session_runtime_next_stop_move_price_text(session)
+                        if callable(getattr(self, "_session_runtime_next_stop_move_price_text", None))
+                        else "-"
+                    ),
                     stop_price=self._session_runtime_stop_price_text(session),
+                    current_r=_format_optional_decimal(
+                        UiStrategySessionsMixin._session_runtime_risk_price_distance(session)
+                    ),
+                    stop_amount=UiStrategySessionsMixin._session_runtime_stop_loss_text(self, session),
                     take_profit=self._session_runtime_take_profit_text(session),
-                    live_pnl=_format_optional_usdt_precise(live_pnl, places=2),
+                    live_pnl=UiStrategySessionsMixin._session_runtime_usdt_with_r_text(
+                        self,
+                        session,
+                        live_pnl,
+                        risk_basis=runtime_risk_basis if live_pnl is not None else None,
+                    ),
                     net_pnl=_format_optional_usdt_precise(session.net_pnl_total, places=2),
                     last_net_pnl=_format_optional_usdt_precise(session.last_net_pnl, places=2),
                     status=status_text or "-",

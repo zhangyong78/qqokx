@@ -112,12 +112,16 @@ def _row(**overrides: str) -> StrategyStatusEmailRow:
         "account_equity": "2734.05",
         "strategy": "EMA 动态委托做多",
         "symbol": "DOGE-USDT-SWAP",
+        "market_price": "0.07312",
         "direction": "只做多",
         "open_qty": "7140 DOGE",
         "entry_price": "0.0724",
+        "next_stop_price": "0.07288",
         "stop_price": "0.07184",
+        "current_r": "0.00056",
+        "stop_amount": "-4.00 U（-1.00R）",
         "take_profit": "-",
-        "live_pnl": "+0.93",
+        "live_pnl": "+0.93 U（+0.23R）",
         "net_pnl": "-0.67",
         "last_net_pnl": "-0.67",
         "status": "持仓监控中",
@@ -145,6 +149,11 @@ class StrategyStatusEmailRenderingTest(TestCase):
         self.assertIn("账户总权益", content.html_body)
         self.assertIn("上次净盈亏", content.html_body)
         self.assertIn("风险金", content.html_body)
+        self.assertIn("实时价格", content.html_body)
+        self.assertIn("下次上移价", content.html_body)
+        self.assertIn("R损失空间", content.html_body)
+        self.assertIn("止损金额", content.html_body)
+        self.assertIn("+0.93 U（+0.23R）", content.body)
 
     def test_rows_are_sorted_by_api_then_session(self) -> None:
         content = build_strategy_status_email(

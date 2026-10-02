@@ -39,6 +39,10 @@ class StrategyStatusEmailRow:
     status: str
     started: str
     risk_amount: str
+    market_price: str = "-"
+    next_stop_price: str = "-"
+    current_r: str = "-"
+    stop_amount: str = "-"
 
 
 @dataclass(frozen=True, slots=True)
@@ -54,10 +58,14 @@ _COLUMN_LABELS: tuple[tuple[str, str], ...] = (
     ("account_equity", "账户总权益"),
     ("strategy", "策略"),
     ("symbol", "标的"),
+    ("market_price", "实时价格"),
     ("direction", "方向"),
     ("open_qty", "开仓数量"),
     ("entry_price", "开仓价"),
+    ("next_stop_price", "下次上移价"),
     ("stop_price", "止损价"),
+    ("current_r", "R损失空间"),
+    ("stop_amount", "止损金额"),
     ("take_profit", "止盈价"),
     ("live_pnl", "实时浮盈亏"),
     ("net_pnl", "净盈亏"),
