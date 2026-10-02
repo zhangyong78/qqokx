@@ -122,6 +122,294 @@ class _PositionHistoryPnlTableWidgetItem(QTableWidgetItem):
             return left < right
         return super().__lt__(other)
 
+
+class _CurrentOrderTpSlDialog(QDialog):
+    """Edit the trigger prices attached to the selected pending order."""
+
+    def __init__(
+        self,
+        parent: QWidget | None,
+        item: object,
+        *,
+        preview_context: dict[str, object] | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("修改止盈止损")
+        self.setModal(True)
+        self.setMinimumWidth(620)
+        self.setStyleSheet(
+            """
+            QFrame#OrderTpSlCard { background: #f8fafc; border: 1px solid #dbe4ee; border-radius: 9px; }
+            QLabel#OrderTpSlTitle { color: #0f172a; font-size: 15px; font-weight: 700; }
+            QLabel#OrderTpSlSection { color: #334155; font-weight: 700; }
+            QLabel#OrderTpSlMetricName { color: #64748b; font-size: 11px; }
+            QLabel#OrderTpSlMetricValue { color: #0f172a; font-size: 13px; font-weight: 650; }
+            QLabel#OrderTpSlHint { color: #64748b; }
+            QLineEdit { min-height: 28px; padding: 2px 8px; }
+            """
+        )
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(20, 18, 20, 18)
+        layout.setSpacing(12)
+        title = QLabel("修改参数")
+        title.setObjectName("OrderTpSlTitle")
+        layout.addWidget(title)
+        hint = QLabel("留空表示保持原值不变；价格必须为正数。预估收益未扣除手续费。")
+        hint.setObjectName("OrderTpSlHint")
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+
+        self._preview_context = dict(preview_context or {})
+        self._current_take_profit = self._decimal_value(getattr(item, "take_profit_trigger_price", None))
+        self._current_stop_loss = self._decimal_value(getattr(item, "stop_loss_trigger_price", None))
+        direction = str(getattr(item, "side", "") or "").strip().lower()
+        direction_text = {"buy": "买入", "sell": "卖出"}.get(direction, direction or "-")
+        order_price = self._decimal_value(self._preview_context.get("entry_price"))
+        if order_price is None:
+            order_price = self._decimal_value(getattr(item, "price", None))
+        entry_text = self._format_value(order_price)
+        latest_text = self._format_value(self._decimal_value(self._preview_context.get("latest_price")))
+        liquidation_text = self._format_value(self._decimal_value(self._preview_context.get("liquidation_price")))
+        summary = QFrame()
+        summary.setObjectName("OrderTpSlCard")
+        summary_layout = QGridLayout(summary)
+        summary_layout.setContentsMargins(12, 10, 12, 10)
+        summary_layout.setHorizontalSpacing(18)
+        summary_layout.setVerticalSpacing(4)
+
+        def add_metric(column: int, name: str, value: str, *, color: str = "") -> None:
+            name_label = QLabel(name)
+            name_label.setObjectName("OrderTpSlMetricName")
+            value_label = QLabel(value)
+            value_label.setObjectName("OrderTpSlMetricValue")
+            if color:
+                value_label.setStyleSheet(f"color: {color};")
+            summary_layout.addWidget(name_label, 0, column)
+            summary_layout.addWidget(value_label, 1, column)
+
+        add_metric(0, "当前方向", direction_text, color="#2563eb" if direction == "buy" else "#dc2626")
+        add_metric(1, "开仓均价", entry_text)
+        add_metric(2, "最新价", latest_text)
+        add_metric(3, "预估强平价", liquidation_text, color="#dc2626")
+        layout.addWidget(summary)
+
+        take_profit_card = QFrame()
+        take_profit_card.setObjectName("OrderTpSlCard")
+        take_profit_layout = QGridLayout(take_profit_card)
+        take_profit_layout.setContentsMargins(12, 10, 12, 10)
+        take_profit_layout.setHorizontalSpacing(10)
+        take_profit_layout.setVerticalSpacing(6)
+        take_profit_title = QLabel("止盈")
+        take_profit_title.setObjectName("OrderTpSlSection")
+        take_profit_title.setStyleSheet("color: #15803d;")
+        take_profit_layout.addWidget(take_profit_title, 0, 0, 1, 2)
+        self._take_profit_edit = QLineEdit(self._value_text(self._current_take_profit))
+        self._take_profit_edit.setPlaceholderText("例如 86500")
+        take_profit_layout.addWidget(QLabel("触发价"), 1, 0)
+        take_profit_layout.addWidget(self._take_profit_edit, 1, 1)
+        self._take_profit_preview = QLabel()
+        self._take_profit_preview.setWordWrap(True)
+        take_profit_layout.addWidget(self._take_profit_preview, 2, 0, 1, 2)
+        layout.addWidget(take_profit_card)
+
+        stop_loss_card = QFrame()
+        stop_loss_card.setObjectName("OrderTpSlCard")
+        stop_loss_layout = QGridLayout(stop_loss_card)
+        stop_loss_layout.setContentsMargins(12, 10, 12, 10)
+        stop_loss_layout.setHorizontalSpacing(10)
+        stop_loss_layout.setVerticalSpacing(6)
+        stop_loss_title = QLabel("止损")
+        stop_loss_title.setObjectName("OrderTpSlSection")
+        stop_loss_title.setStyleSheet("color: #dc2626;")
+        stop_loss_layout.addWidget(stop_loss_title, 0, 0, 1, 2)
+        self._stop_loss_edit = QLineEdit(self._value_text(self._current_stop_loss))
+        self._stop_loss_edit.setPlaceholderText("例如 82800")
+        stop_loss_layout.addWidget(QLabel("触发价"), 1, 0)
+        stop_loss_layout.addWidget(self._stop_loss_edit, 1, 1)
+        self._stop_loss_preview = QLabel()
+        self._stop_loss_preview.setWordWrap(True)
+        stop_loss_layout.addWidget(self._stop_loss_preview, 2, 0, 1, 2)
+        layout.addWidget(stop_loss_card)
+
+        preview_card = QFrame()
+        preview_card.setObjectName("OrderTpSlCard")
+        preview_layout = QVBoxLayout(preview_card)
+        preview_layout.setContentsMargins(12, 10, 12, 10)
+        preview_layout.setSpacing(5)
+        preview_title = QLabel("修改后预估")
+        preview_title.setObjectName("OrderTpSlSection")
+        preview_layout.addWidget(preview_title)
+        self._preview_label = QLabel()
+        self._preview_label.setWordWrap(True)
+        self._preview_label.setObjectName("OrderTpSlHint")
+        preview_layout.addWidget(self._preview_label)
+        layout.addWidget(preview_card)
+
+        quantity_text = str(self._preview_context.get("quantity_text") or "暂无").strip()
+        holding_text = str(self._preview_context.get("holding_text") or "暂无").strip()
+        quantity_card = QFrame()
+        quantity_card.setObjectName("OrderTpSlCard")
+        quantity_layout = QGridLayout(quantity_card)
+        quantity_layout.setContentsMargins(12, 8, 12, 8)
+        quantity_layout.addWidget(QLabel("数量"), 0, 0)
+        quantity_layout.addWidget(QLabel(quantity_text), 0, 1)
+        quantity_layout.addWidget(QLabel("持仓量"), 0, 2)
+        quantity_layout.addWidget(QLabel(holding_text), 0, 3)
+        layout.addWidget(quantity_card)
+        self._take_profit_edit.textChanged.connect(self._refresh_preview)
+        self._stop_loss_edit.textChanged.connect(self._refresh_preview)
+        self._refresh_preview()
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel,
+        )
+        buttons.button(QDialogButtonBox.StandardButton.Ok).setText("提交修改")
+        buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("取消")
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    @staticmethod
+    def _value_text(value: object) -> str:
+        if value is None:
+            return ""
+        text = str(value).strip()
+        return "" if text in {"", "-1", "-"} else text
+
+    @staticmethod
+    def _decimal_value(value: object) -> Decimal | None:
+        if value is None:
+            return None
+        try:
+            parsed = Decimal(str(value).strip())
+        except Exception:
+            return None
+        return parsed if parsed.is_finite() and parsed > 0 else None
+
+    @staticmethod
+    def _format_value(value: Decimal | None) -> str:
+        if value is None or not value.is_finite():
+            return "未设置"
+        absolute = abs(value)
+        if absolute >= Decimal("1"):
+            quantum = Decimal("0.01")
+        elif absolute >= Decimal("0.01"):
+            quantum = Decimal("0.0001")
+        else:
+            quantum = Decimal("0.00000001")
+        return format_decimal(value.quantize(quantum, rounding=ROUND_HALF_UP))
+
+    @staticmethod
+    def _format_percent(value: Decimal) -> str:
+        return format_decimal_fixed(value, 2)
+
+    @staticmethod
+    def _format_amount(value: Decimal) -> str:
+        return format_decimal_fixed(value, 2)
+
+    @classmethod
+    def _preview_value(cls, text: str, current: Decimal | None) -> tuple[Decimal | None, str | None]:
+        value = text.strip()
+        if not value:
+            return current, None
+        try:
+            parsed = Decimal(value)
+        except Exception:
+            return None, "请输入有效数字"
+        if not parsed.is_finite() or parsed <= 0:
+            return None, "价格必须大于 0"
+        return parsed, None
+
+    @classmethod
+    def _preview_line(cls, label: str, current: Decimal | None, proposed: Decimal | None, error: str | None) -> str:
+        current_text = cls._format_value(current)
+        if error:
+            return f"{label}：当前 {current_text} → 预估 {error}"
+        proposed_text = cls._format_value(proposed)
+        if current is None or proposed is None:
+            return f"{label}：当前 {current_text} → 预估 {proposed_text}"
+        delta = proposed - current
+        if delta == 0:
+            return f"当前 {current_text} → 修改后保持不变"
+        percent = (delta / current) * Decimal("100")
+        sign = "+" if delta > 0 else ""
+        return (
+            f"当前 {current_text} → 修改后 {proposed_text}  |  "
+            f"变动 {sign}{self._format_value(delta)}（{sign}{self._format_percent(percent)}%）"
+        )
+
+    def _estimated_pnl_text(self, label: str, target: Decimal | None) -> str:
+        if target is None:
+            return f"{label}预计收益：暂无"
+        entry = self._decimal_value(self._preview_context.get("entry_price"))
+        quantity = self._decimal_value(self._preview_context.get("quantity"))
+        contract_value = self._decimal_value(self._preview_context.get("contract_value"))
+        base_quantity = self._decimal_value(self._preview_context.get("base_quantity"))
+        contract_value_currency = str(self._preview_context.get("contract_value_currency") or "").strip().upper()
+        base_currency = str(self._preview_context.get("base_currency") or "").strip().upper()
+        instrument_type = str(self._preview_context.get("instrument_type") or "").strip().upper()
+        direction = str(self._preview_context.get("position_direction") or "").strip().lower()
+        currency = str(self._preview_context.get("pnl_currency") or "USDT").strip().upper()
+        if entry is None or entry <= 0:
+            return f"{label}预计收益：暂无（缺少开仓均价）"
+        change = target - entry
+        if direction == "short":
+            change = -change
+        if (
+            contract_value is not None
+            and quantity is not None
+            and (instrument_type == "SPOT" or not contract_value_currency or contract_value_currency == base_currency)
+        ):
+            estimated = quantity * contract_value * change
+        elif base_quantity is not None and instrument_type == "SPOT":
+            estimated = base_quantity * change
+        else:
+            return f"{label}预计收益：暂无（合约结算口径暂不支持估算）"
+        sign = "+" if estimated >= 0 else ""
+        return f"预计收益：{sign}{self._format_amount(estimated)} {currency}"
+
+    def _relative_latest_text(self, target: Decimal | None) -> str:
+        latest = self._decimal_value(self._preview_context.get("latest_price"))
+        if target is None or latest is None or latest <= 0:
+            return "相对最新价：暂无"
+        percent = ((target - latest) / latest) * Decimal("100")
+        sign = "+" if percent > 0 else ""
+        return f"相对最新价：{sign}{self._format_percent(percent)}%"
+
+    def _refresh_preview(self) -> None:
+        tp, tp_error = self._preview_value(self._take_profit_edit.text(), self._current_take_profit)
+        sl, sl_error = self._preview_value(self._stop_loss_edit.text(), self._current_stop_loss)
+        self._take_profit_preview.setText(
+            "\n".join(
+                (
+                    self._preview_line("止盈", self._current_take_profit, tp, tp_error),
+                    self._relative_latest_text(tp),
+                    self._estimated_pnl_text("止盈", tp),
+                )
+            )
+        )
+        self._take_profit_preview.setStyleSheet("color: #15803d;")
+        self._stop_loss_preview.setText(
+            "\n".join(
+                (
+                    self._preview_line("止损", self._current_stop_loss, sl, sl_error),
+                    self._relative_latest_text(sl),
+                    self._estimated_pnl_text("止损", sl),
+                )
+            )
+        )
+        self._stop_loss_preview.setStyleSheet("color: #b91c1c;")
+        lines: list[str] = []
+        if tp is not None and sl is not None:
+            lines.append(f"预估止盈止损价差：{self._format_value(tp - sl)}")
+        else:
+            lines.append("填入止盈和止损后，将显示预估止盈止损价差。")
+        self._preview_label.setText("\n".join(lines))
+
+    def values(self) -> tuple[str, str]:
+        return self._take_profit_edit.text().strip(), self._stop_loss_edit.text().strip()
+
 from roll_terminal_qt.app_icon import apply_qt_window_icon
 from roll_terminal_qt.option_roll_window import OptionRollQtDialog
 from okx_quant.log_utils import append_log_line
@@ -129,7 +417,6 @@ from okx_quant.app_paths import data_root
 from okx_quant.models import Candle, Credentials, EmailNotificationConfig, Instrument, OptionTickBand, StrategyConfig
 from okx_quant.notifications import EmailNotifier
 from okx_quant.option_roll import is_short_option_position
-from okx_quant.option_strategy import option_contract_value
 from okx_quant.okx_client import (
     OkxFillHistoryItem,
     OkxOrderResult,
@@ -1219,6 +1506,35 @@ def _position_history_kline_size(item: OkxPositionHistoryItem, *keys: str) -> De
     return _position_kline_positive_decimal(getattr(item, "close_size", None))
 
 
+_POSITION_KLINE_USD_LIKE_CURRENCIES = frozenset({"USD", "USDT", "USDC"})
+
+
+def _position_kline_base_quantity(
+    quantity: Decimal | None,
+    *,
+    instrument: Instrument | None,
+    base_currency: str,
+    reference_price: Decimal | None,
+) -> Decimal | None:
+    """Convert OKX contract count to underlying quantity for chart labels."""
+    if quantity is None:
+        return None
+    if instrument is None or str(instrument.inst_type or "").strip().upper() == "SPOT":
+        return quantity
+    if instrument.ct_val is None or instrument.ct_val <= 0:
+        return None
+    multiplier = instrument.ct_mult if instrument.ct_mult is not None and instrument.ct_mult > 0 else Decimal("1")
+    contract_value = instrument.ct_val * multiplier
+    if contract_value <= 0:
+        return None
+    value_currency = str(instrument.ct_val_ccy or base_currency).strip().upper()
+    if value_currency == base_currency:
+        return quantity * contract_value
+    if value_currency in _POSITION_KLINE_USD_LIKE_CURRENCIES and reference_price is not None and reference_price > 0:
+        return quantity * contract_value / reference_price
+    return None
+
+
 def _position_history_kline_price_markers(
     item: OkxPositionHistoryItem,
     *,
@@ -1237,20 +1553,23 @@ def _position_history_kline_price_markers(
     open_size = _position_history_kline_size(item, "openMaxPos", "maxPos", "openPos")
     close_size = _position_history_kline_size(item, "closeTotalPos", "closePos", "closeSz")
     base_currency = str(getattr(item, "inst_id", "") or "").strip().upper().split("-", 1)[0]
-    is_option = str(getattr(item, "inst_type", "") or "").strip().upper() == "OPTION"
-    contract_value: Decimal | None = Decimal("1")
-    if is_option and instrument is not None:
-        try:
-            contract_value = option_contract_value(instrument)
-        except Exception:
-            contract_value = None
-    elif is_option:
-        contract_value = None
     usdt_rate = None
     if usdt_prices:
         candidate = usdt_prices.get(base_currency)
         if isinstance(candidate, Decimal) and candidate > 0:
             usdt_rate = candidate
+    quantity_base = _position_kline_base_quantity(
+        open_size,
+        instrument=instrument,
+        base_currency=base_currency,
+        reference_price=usdt_rate,
+    )
+    close_quantity_base = _position_kline_base_quantity(
+        close_size,
+        instrument=instrument,
+        base_currency=base_currency,
+        reference_price=usdt_rate,
+    )
     realized_pnl = getattr(item, "realized_pnl", None)
     pnl_currency = ""
     realized_pnl_usdt: Decimal | None = None
@@ -1265,8 +1584,8 @@ def _position_history_kline_price_markers(
             open_price,
             direction,
             quantity=open_size,
-            quantity_unit=base_currency if contract_value is not None else "张",
-            quantity_base=open_size * contract_value if open_size is not None and contract_value is not None else None,
+            quantity_unit=base_currency if quantity_base is not None else "张",
+            quantity_base=quantity_base,
         )
         if entry.quantity_base is not None and usdt_rate is not None:
             entry = replace(
@@ -1284,8 +1603,8 @@ def _position_history_kline_price_markers(
             pnl_currency=pnl_currency,
             realized_pnl_usdt=realized_pnl_usdt,
             quantity=close_size,
-            quantity_unit=base_currency if contract_value is not None else "张",
-            quantity_base=close_size * contract_value if close_size is not None and contract_value is not None else None,
+            quantity_unit=base_currency if close_quantity_base is not None else "张",
+            quantity_base=close_quantity_base,
         )
         if exit_marker.quantity_base is not None and usdt_rate is not None:
             exit_marker = replace(
@@ -1320,15 +1639,13 @@ def _current_position_kline_price_markers(
             if quantity is not None:
                 break
     base_currency = str(getattr(position, "inst_id", "") or "").strip().upper().split("-", 1)[0]
-    contract_value = Decimal("1")
-    is_option = str(getattr(position, "inst_type", "") or "").strip().upper() == "OPTION"
-    if is_option and instrument is not None:
-        try:
-            contract_value = option_contract_value(instrument)
-        except Exception:
-            contract_value = Decimal("1")
-    quantity_base = quantity * contract_value if quantity is not None else None
     usdt_rate = usdt_prices.get(base_currency) if usdt_prices else None
+    quantity_base = _position_kline_base_quantity(
+        quantity,
+        instrument=instrument,
+        base_currency=base_currency,
+        reference_price=usdt_rate if isinstance(usdt_rate, Decimal) and usdt_rate > 0 else None,
+    )
     entry_value_usdt = None
     if quantity_base is not None and isinstance(usdt_rate, Decimal) and usdt_rate > 0:
         entry_value_usdt = price * quantity_base * usdt_rate
@@ -1339,7 +1656,7 @@ def _current_position_kline_price_markers(
             price,
             direction,
             quantity=quantity,
-            quantity_unit=base_currency if not is_option or instrument is not None else "张",
+            quantity_unit=base_currency if quantity_base is not None else "张",
             quantity_base=quantity_base,
             entry_value_usdt=entry_value_usdt,
         ),
@@ -2796,6 +3113,7 @@ class AccountPositionsHomeWidget(QWidget):
         self._position_history_last_sync_text = "-"
         self._position_history_filter_resetting = False
         self._current_order_canceling = False
+        self._current_order_amending = False
         self._selected_position_manual_flatten_running = False
         self._shared_client = OkxRestClient()
         self._realtime_store = get_shared_realtime_account_store(client=self._shared_client)
@@ -6458,6 +6776,7 @@ class AccountPositionsHomeWidget(QWidget):
             ("带入合约", self.apply_selected_option_to_current_order_search),
             ("带入到期前缀", self.apply_selected_option_expiry_prefix_to_current_order_search),
             ("从选中条件单接管动态止盈", self._show_not_ready_action),
+            ("修改止盈止损", self._amend_selected_current_order),
             ("撤单选中", self._cancel_selected_current_order),
             ("批量撤当前筛选", self._show_not_ready_action),
         ):
@@ -7120,6 +7439,384 @@ class AccountPositionsHomeWidget(QWidget):
             return None
         item = filtered[row]
         return item if isinstance(item, OrderStatusView) else None
+
+    @staticmethod
+    def _parse_current_order_amend_price(text: str, label: str) -> Decimal | None:
+        value = text.strip()
+        if not value:
+            return None
+        try:
+            price = Decimal(value)
+        except Exception as exc:  # noqa: BLE001
+            raise ValueError(f"{label}必须是有效数字") from exc
+        if not price.is_finite() or price <= 0:
+            raise ValueError(f"{label}必须大于 0")
+        return price
+
+    def _current_order_tp_sl_preview_context(
+        self,
+        order: OrderStatusView,
+        item: OkxTradeOrderItem,
+    ) -> dict[str, object]:
+        inst_id = str(item.inst_id or order.inst_id or "").strip().upper()
+        base_currency = inst_id.split("-", 1)[0] if inst_id else ""
+        positions = [
+            position
+            for position in getattr(self, "_raw_positions", ())
+            if str(getattr(position, "inst_id", "") or "").strip().upper() == inst_id
+        ]
+        order_pos_side = str(item.pos_side or order.pos_side or "").strip().lower()
+        matching = [
+            position
+            for position in positions
+            if order_pos_side and str(getattr(position, "pos_side", "") or "").strip().lower() == order_pos_side
+        ]
+        position = (matching or positions or [None])[0]
+        instrument = (
+            getattr(self, "_position_instruments", {}).get(inst_id)
+            or getattr(self, "_current_order_instruments", {}).get(inst_id)
+        )
+        ticker = getattr(self, "_position_tickers", {}).get(inst_id)
+
+        def decimal_from(*values: object) -> Decimal | None:
+            for value in values:
+                parsed = _position_kline_positive_decimal(value)
+                if parsed is not None:
+                    return parsed
+            return None
+
+        raw_order = order.raw if isinstance(order.raw, dict) else {}
+        raw_position = getattr(position, "raw", {}) if position is not None else {}
+        raw_position = raw_position if isinstance(raw_position, dict) else {}
+        latest_price = decimal_from(
+            getattr(ticker, "last", None),
+            getattr(ticker, "mark", None),
+            getattr(ticker, "index", None),
+            getattr(position, "mark_price", None) if position is not None else None,
+            getattr(position, "last_price", None) if position is not None else None,
+            raw_order.get("lastPx"),
+            raw_order.get("markPx"),
+        )
+        entry_price = decimal_from(
+            getattr(position, "avg_price", None) if position is not None else None,
+            raw_position.get("avgPx"),
+            raw_position.get("openAvgPx"),
+            item.price,
+        )
+        liquidation_price = decimal_from(
+            getattr(position, "liquidation_price", None) if position is not None else None,
+            raw_position.get("liqPx"),
+        )
+        quantity = decimal_from(
+            abs(getattr(position, "position", Decimal("0"))) if position is not None else None,
+            abs(item.size) if isinstance(item.size, Decimal) else item.size,
+        )
+        instrument_type = str(getattr(instrument, "inst_type", "") or item.inst_type or "").strip().upper()
+        base_quantity = None
+        contract_value = None
+        if instrument is not None:
+            base_quantity = _position_kline_base_quantity(
+                quantity,
+                instrument=instrument,
+                base_currency=base_currency,
+                reference_price=latest_price,
+            )
+            if getattr(instrument, "ct_val", None) is not None and instrument.ct_val > 0:
+                multiplier = instrument.ct_mult if instrument.ct_mult is not None and instrument.ct_mult > 0 else Decimal("1")
+                contract_value = instrument.ct_val * multiplier
+        elif instrument_type == "SPOT":
+            base_quantity = quantity
+
+        position_direction = order_pos_side if order_pos_side in {"long", "short"} else ""
+        if not position_direction and position is not None:
+            candidate = str(getattr(position, "pos_side", "") or "").strip().lower()
+            if candidate in {"long", "short"}:
+                position_direction = candidate
+        if not position_direction:
+            position_direction = "long" if str(item.side or order.side or "").strip().lower() == "buy" else "short"
+
+        if base_quantity is not None:
+            quantity_text = f"{format_decimal(base_quantity)} {base_currency or '币'}"
+            holding_text = f"{format_decimal_fixed(base_quantity, 4)} {base_currency or '币'}"
+        elif quantity is not None:
+            quantity_text = f"{format_decimal(quantity)} 张"
+            holding_text = f"{format_decimal(quantity)} 张"
+        else:
+            quantity_text = holding_text = "暂无"
+        parts = inst_id.split("-")
+        pnl_currency = str(
+            getattr(instrument, "settle_ccy", None) if instrument is not None else None
+        ).strip().upper() or (parts[1] if len(parts) > 1 else "USDT")
+        return {
+            "entry_price": entry_price,
+            "latest_price": latest_price,
+            "liquidation_price": liquidation_price,
+            "quantity": quantity,
+            "base_quantity": base_quantity,
+            "contract_value": contract_value,
+            "contract_value_currency": (
+                str(getattr(instrument, "ct_val_ccy", None) or base_currency).strip().upper()
+                if instrument is not None
+                else base_currency
+            ),
+            "base_currency": base_currency,
+            "instrument_type": instrument_type,
+            "position_direction": position_direction,
+            "pnl_currency": pnl_currency,
+            "quantity_text": quantity_text,
+            "holding_text": holding_text,
+        }
+
+    def _amend_selected_current_order(self) -> None:
+        if self._current_order_amending:
+            QMessageBox.information(self, "修改止盈止损", "当前已有一笔改单请求在处理中，请稍等。")
+            return
+        if self._current_order_canceling:
+            QMessageBox.information(self, "修改止盈止损", "当前正在撤单，请等待撤单完成后再修改。")
+            return
+        if not self._ensure_runtime_ready(force_unlock=True):
+            return
+        order = self._selected_current_order()
+        if order is None:
+            QMessageBox.information(self, "修改止盈止损", "请先在当前委托里选中一条委托。")
+            return
+        item = _current_order_view_to_trade_order_item(order)
+        if item.source_kind not in {"algo", "normal"}:
+            QMessageBox.information(
+                self,
+                "修改止盈止损",
+                f"暂不支持修改来源为“{item.source_label or item.source_kind or '未知'}”的委托。",
+            )
+            return
+        if item.source_kind == "algo":
+            if not (item.algo_id or item.algo_client_order_id or item.client_order_id):
+                QMessageBox.information(self, "修改止盈止损", "这条算法委托缺少可用订单 ID，暂时无法修改。")
+                return
+        elif not (item.order_id or item.client_order_id):
+            QMessageBox.information(self, "修改止盈止损", "这条委托缺少可用订单 ID，暂时无法修改。")
+            return
+
+        dialog = _CurrentOrderTpSlDialog(
+            self,
+            item,
+            preview_context=self._current_order_tp_sl_preview_context(order, item),
+        )
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        tp_text, sl_text = dialog.values()
+        try:
+            new_tp = self._parse_current_order_amend_price(tp_text, "止盈触发价")
+            new_sl = self._parse_current_order_amend_price(sl_text, "止损触发价")
+        except ValueError as exc:
+            QMessageBox.warning(self, "修改止盈止损", str(exc))
+            return
+        if new_tp is None and new_sl is None:
+            QMessageBox.information(self, "修改止盈止损", "至少填写一个要修改的触发价。")
+            return
+
+        changes: list[str] = []
+        if new_tp is not None:
+            changes.append(f"止盈 {new_tp}")
+        if new_sl is not None:
+            changes.append(f"止损 {new_sl}")
+        if QMessageBox.question(
+            self,
+            "确认修改止盈止损",
+            (
+                f"确认修改 {order.inst_id or '-'} 的止盈止损吗？\n\n"
+                f"委托类型：{order.ord_type or '-'}\n"
+                f"修改内容：{'；'.join(changes)}\n"
+                "留空的项目不会改变。"
+            ),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        ) != QMessageBox.StandardButton.Yes:
+            return
+        runtime = self._runtime
+        if runtime is None:
+            QMessageBox.warning(self, "修改止盈止损", "当前没有 API 凭证，无法发起改单。")
+            return
+
+        self._current_order_amending = True
+        self._orders_summary_label.setText(
+            f"正在修改止盈止损：{order.inst_id or '-'} | {'；'.join(changes)}"
+        )
+        threading.Thread(
+            target=self._amend_selected_current_order_worker,
+            args=(runtime.credentials, self._note_environment(), order, new_tp, new_sl),
+            daemon=True,
+        ).start()
+
+    def _amend_selected_current_order_worker(
+        self,
+        credentials: Credentials,
+        environment: str,
+        order: OrderStatusView,
+        new_tp: Decimal | None,
+        new_sl: Decimal | None,
+    ) -> None:
+        try:
+            result = self._amend_selected_current_order_request(
+                credentials,
+                environment=environment,
+                order=order,
+                new_tp=new_tp,
+                new_sl=new_sl,
+            )
+            if _current_order_cancel_result_failed(result):
+                self._ui_callback.emit(
+                    lambda order=order, message=self._current_order_amend_result_error_message(order, result), environment=environment: self._apply_current_order_amend_error(
+                        order,
+                        message,
+                        environment,
+                    )
+                )
+                return
+            note = ""
+            effective_environment = environment
+        except Exception as exc:  # noqa: BLE001
+            message = str(exc)
+            if "50101" in message and "current environment" in message:
+                alternate = "live" if environment == "demo" else "demo"
+                try:
+                    result = self._amend_selected_current_order_request(
+                        credentials,
+                        environment=alternate,
+                        order=order,
+                        new_tp=new_tp,
+                        new_sl=new_sl,
+                    )
+                    if _current_order_cancel_result_failed(result):
+                        self._ui_callback.emit(
+                            lambda order=order, message=self._current_order_amend_result_error_message(order, result), environment=alternate: self._apply_current_order_amend_error(
+                                order,
+                                message,
+                                environment,
+                            )
+                        )
+                        return
+                    note = f"改单自动切换到{'实盘' if alternate == 'live' else '模拟'}环境执行。"
+                    effective_environment = alternate
+                except Exception as retry_exc:  # noqa: BLE001
+                    self._ui_callback.emit(
+                        lambda order=order, message=str(retry_exc), environment=environment: self._apply_current_order_amend_error(
+                            order,
+                            message,
+                            environment,
+                        )
+                    )
+                    return
+            else:
+                self._ui_callback.emit(
+                    lambda order=order, message=message, environment=environment: self._apply_current_order_amend_error(
+                        order,
+                        message,
+                        environment,
+                    )
+                )
+                return
+        self._ui_callback.emit(
+            lambda order=order, result=result, note=note, effective_environment=effective_environment: self._apply_current_order_amend_result(
+                order,
+                result,
+                note,
+                effective_environment,
+            )
+        )
+
+    def _amend_selected_current_order_request(
+        self,
+        credentials: Credentials,
+        *,
+        environment: str,
+        order: OrderStatusView,
+        new_tp: Decimal | None,
+        new_sl: Decimal | None,
+    ) -> OkxOrderResult:
+        item = _current_order_view_to_trade_order_item(order)
+        common = {
+            "new_take_profit_trigger_price": new_tp,
+            "new_take_profit_order_price": item.take_profit_order_price,
+            "new_take_profit_trigger_price_type": item.take_profit_trigger_price_type,
+            "new_stop_loss_trigger_price": new_sl,
+            "new_stop_loss_order_price": item.stop_loss_order_price,
+            "new_stop_loss_trigger_price_type": item.stop_loss_trigger_price_type,
+        }
+        if item.source_kind == "algo":
+            return self._shared_client.amend_algo_order(
+                credentials,
+                environment=environment,
+                inst_id=item.inst_id,
+                algo_id=item.algo_id or None,
+                algo_cl_ord_id=item.algo_client_order_id or item.client_order_id or None,
+                **common,
+            )
+        return self._shared_client.amend_order(
+            credentials,
+            environment=environment,
+            inst_id=item.inst_id,
+            ord_id=item.order_id or None,
+            cl_ord_id=item.client_order_id or None,
+            **common,
+        )
+
+    @staticmethod
+    def _current_order_amend_result_error_message(order: OrderStatusView, result: OkxOrderResult) -> str:
+        amend_id = _current_order_view_cancel_reference(order) or result.ord_id or result.cl_ord_id or "-"
+        return (
+            f"{_current_order_view_source_label(order)} 修改止盈止损失败。\n\n"
+            f"合约：{order.inst_id or '-'}\n"
+            f"标识：{amend_id}\n"
+            f"返回：sCode={result.s_code or '-'} | sMsg={result.s_msg or 'unknown'}"
+        )
+
+    def _apply_current_order_amend_result(
+        self,
+        order: OrderStatusView,
+        result: OkxOrderResult,
+        note: str,
+        effective_environment: str,
+    ) -> None:
+        self._current_order_amending = False
+        amend_id = _current_order_view_cancel_reference(order) or result.ord_id or result.cl_ord_id or "-"
+        summary = f"止盈止损修改请求已提交：{order.inst_id or '-'} | {amend_id}"
+        if note:
+            summary = f"{summary} | {note}"
+        self._orders_summary_label.setText(summary)
+        QMessageBox.information(
+            self,
+            "修改结果",
+            (
+                "止盈止损修改请求已提交。\n\n"
+                f"来源：{_current_order_view_source_label(order)}\n"
+                f"合约：{order.inst_id or '-'}\n"
+                f"环境：{'实盘 live' if effective_environment == 'live' else '模拟 demo'}\n"
+                f"标识：{amend_id}\n"
+                f"返回：sCode={result.s_code} | sMsg={result.s_msg or 'accepted'}"
+            ),
+        )
+        self.refresh_view()
+        self._refresh_order_history()
+
+    def _apply_current_order_amend_error(
+        self,
+        order: OrderStatusView,
+        message: str,
+        environment: str,
+    ) -> None:
+        self._current_order_amending = False
+        friendly_message = _format_network_error_message(message)
+        self._orders_summary_label.setText(f"修改止盈止损失败：{friendly_message}")
+        QMessageBox.warning(
+            self,
+            "修改止盈止损失败",
+            (
+                f"{_current_order_view_source_label(order)} 修改止盈止损失败。\n\n"
+                f"环境：{'实盘 live' if environment == 'live' else '模拟 demo'}\n"
+                f"合约：{order.inst_id or '-'}\n"
+                f"原因：{friendly_message}"
+            ),
+        )
 
     def _cancel_selected_current_order(self) -> None:
         if self._current_order_canceling:

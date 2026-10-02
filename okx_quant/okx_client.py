@@ -3202,6 +3202,68 @@ class OkxRestClient:
             fallback_cl_ord_id=cl_ord_id,
         )
 
+    def amend_order(
+        self,
+        credentials: Credentials,
+        *,
+        environment: str,
+        inst_id: str,
+        ord_id: str | None = None,
+        cl_ord_id: str | None = None,
+        req_id: str | None = None,
+        new_take_profit_trigger_price: Decimal | None = None,
+        new_take_profit_order_price: Decimal | None = None,
+        new_take_profit_trigger_price_type: str | None = None,
+        new_stop_loss_trigger_price: Decimal | None = None,
+        new_stop_loss_order_price: Decimal | None = None,
+        new_stop_loss_trigger_price_type: str | None = None,
+    ) -> OkxOrderResult:
+        """Amend TP/SL attached to a regular pending order (including OCO)."""
+        if not ord_id and not cl_ord_id:
+            raise ValueError("ord_id 和 cl_ord_id 至少需要提供一个")
+        if new_take_profit_trigger_price is None and new_stop_loss_trigger_price is None:
+            raise ValueError("至少需要提供新的止盈或止损触发价")
+
+        body: dict[str, Any] = {"instId": inst_id}
+        if ord_id:
+            body["ordId"] = ord_id
+        if cl_ord_id:
+            body["clOrdId"] = cl_ord_id
+        if req_id:
+            body["reqId"] = req_id
+        if new_take_profit_trigger_price is not None:
+            body["newTpTriggerPx"] = format_decimal(new_take_profit_trigger_price)
+            body["newTpOrdPx"] = (
+                format_decimal(new_take_profit_order_price)
+                if new_take_profit_order_price is not None
+                else "-1"
+            )
+            if new_take_profit_trigger_price_type:
+                body["newTpTriggerPxType"] = new_take_profit_trigger_price_type
+        if new_stop_loss_trigger_price is not None:
+            body["newSlTriggerPx"] = format_decimal(new_stop_loss_trigger_price)
+            body["newSlOrdPx"] = (
+                format_decimal(new_stop_loss_order_price)
+                if new_stop_loss_order_price is not None
+                else "-1"
+            )
+            if new_stop_loss_trigger_price_type:
+                body["newSlTriggerPxType"] = new_stop_loss_trigger_price_type
+
+        payload = self._request(
+            "POST",
+            "/api/v5/trade/amend-order",
+            body=body,
+            auth=True,
+            credentials=credentials,
+            simulated=environment == "demo",
+        )
+        return self._parse_order_result(
+            payload,
+            empty_message="OKX 返回了空的改单结果",
+            fallback_cl_ord_id=cl_ord_id,
+        )
+
     def cancel_algo_order(
         self,
         credentials: Credentials,
@@ -3241,27 +3303,43 @@ class OkxRestClient:
         algo_id: str | None = None,
         algo_cl_ord_id: str | None = None,
         req_id: str | None = None,
+        new_take_profit_trigger_price: Decimal | None = None,
+        new_take_profit_order_price: Decimal | None = None,
+        new_take_profit_trigger_price_type: str | None = None,
         new_stop_loss_trigger_price: Decimal | None = None,
+        new_stop_loss_order_price: Decimal | None = None,
         new_stop_loss_trigger_price_type: str | None = None,
     ) -> OkxOrderResult:
         if not algo_id and not algo_cl_ord_id:
             raise ValueError("algo_id or algo_cl_ord_id is required")
-        if new_stop_loss_trigger_price is None:
-            raise ValueError("new_stop_loss_trigger_price is required")
+        if new_take_profit_trigger_price is None and new_stop_loss_trigger_price is None:
+            raise ValueError("at least one new take-profit or stop-loss trigger price is required")
 
-        body_item: dict[str, Any] = {
-            "instId": inst_id,
-            "newSlTriggerPx": format_decimal(new_stop_loss_trigger_price),
-            "newSlOrdPx": "-1",
-        }
+        body_item: dict[str, Any] = {"instId": inst_id}
         if algo_id:
             body_item["algoId"] = algo_id
         if algo_cl_ord_id:
             body_item["algoClOrdId"] = algo_cl_ord_id
         if req_id:
             body_item["reqId"] = req_id
-        if new_stop_loss_trigger_price_type:
-            body_item["newSlTriggerPxType"] = new_stop_loss_trigger_price_type
+        if new_take_profit_trigger_price is not None:
+            body_item["newTpTriggerPx"] = format_decimal(new_take_profit_trigger_price)
+            body_item["newTpOrdPx"] = (
+                format_decimal(new_take_profit_order_price)
+                if new_take_profit_order_price is not None
+                else "-1"
+            )
+            if new_take_profit_trigger_price_type:
+                body_item["newTpTriggerPxType"] = new_take_profit_trigger_price_type
+        if new_stop_loss_trigger_price is not None:
+            body_item["newSlTriggerPx"] = format_decimal(new_stop_loss_trigger_price)
+            body_item["newSlOrdPx"] = (
+                format_decimal(new_stop_loss_order_price)
+                if new_stop_loss_order_price is not None
+                else "-1"
+            )
+            if new_stop_loss_trigger_price_type:
+                body_item["newSlTriggerPxType"] = new_stop_loss_trigger_price_type
 
         payload = self._request(
             "POST",
