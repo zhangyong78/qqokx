@@ -76,6 +76,7 @@ from okx_quant.deribit_volatility_ui import (
     _aggregate_price_candles_to_resolution,
     _hourly_fetch_start_ts,
     _hourly_history_limit,
+    _load_valid_cached_deribit_hourly_series,
     _merge_deribit_candles,
     _merge_price_candles,
     _to_average_price_candles,
@@ -83,6 +84,8 @@ from okx_quant.deribit_volatility_ui import (
 )
 from okx_quant.kline_rr_execution import RRTradeExecutionService
 from okx_quant.kline_rr_trade import RRTradeLedgerEntry, RRTradePlan, build_rr_trade_plan
+from okx_quant.kline_trade_recommendations import KlineTradeIdea, build_kline_trade_idea
+from roll_terminal_qt.kline_trade_recommendation_dialog import KlineTradeRecommendationDialog
 from okx_quant.okx_client import OkxPosition, OkxPositionHistoryItem, OkxRestClient, infer_inst_type
 from okx_quant.engine import _dynamic_two_taker_fee_offset_live
 from okx_quant.pricing import format_decimal, format_decimal_by_increment, format_decimal_fixed, snap_to_increment
@@ -339,42 +342,7 @@ def _deribit_hourly_cache_key(currency: str) -> str:
 
 
 def _load_cached_deribit_hourly_series(currency: str) -> tuple[str, list[DeribitVolatilityCandle], list[Candle], datetime] | None:
-    item = _load_deribit_volatility_cache_payload().get(_deribit_hourly_cache_key(currency))
-    if not isinstance(item, dict):
-        return None
-    try:
-        volatility_candles = [
-            DeribitVolatilityCandle(
-                ts=int(candle["ts"]),
-                open=Decimal(str(candle["open"])),
-                high=Decimal(str(candle["high"])),
-                low=Decimal(str(candle["low"])),
-                close=Decimal(str(candle["close"])),
-            )
-            for candle in item.get("volatility_hourly", [])
-        ]
-        spot_candles = [
-            Candle(
-                ts=int(candle["ts"]),
-                open=Decimal(str(candle["open"])),
-                high=Decimal(str(candle["high"])),
-                low=Decimal(str(candle["low"])),
-                close=Decimal(str(candle["close"])),
-                volume=Decimal(str(candle.get("volume", "0"))),
-                confirmed=bool(candle.get("confirmed", True)),
-            )
-            for candle in item.get("spot_hourly", [])
-        ]
-        if not volatility_candles or not spot_candles:
-            return None
-        return (
-            str(item.get("spot_inst_id", OKX_SPOT_SYMBOLS[currency])),
-            volatility_candles,
-            [candle for candle in spot_candles if candle.confirmed],
-            datetime.fromisoformat(str(item["fetched_at"])),
-        )
-    except Exception:
-        return None
+    return _load_valid_cached_deribit_hourly_series(currency)
 
 
 def _save_cached_deribit_hourly_series(
@@ -834,9 +802,16 @@ def _default_native_x_range_with_right_padding(
     if not display_times_ms:
         padding_ms = _native_right_padding_ms(display_step_ms, padding_bars=right_padding_bars)
         return 0.0, max(float(display_step_ms), padding_ms)
+    if len(display_times_ms) == 1:
+        start_x = float(display_times_ms[0])
+        padding_ms = _native_right_padding_ms(display_step_ms, padding_bars=right_padding_bars)
+        return start_x, start_x + max(float(display_step_ms), padding_ms)
     left_index, right_index = _default_native_visible_range(len(display_times_ms), target_visible_bars=target_visible_bars)
-    start_x = float(display_times_ms[int(left_index)])
-    end_x = float(display_times_ms[int(right_index)])
+    last_index = len(display_times_ms) - 1
+    left_index = min(max(int(left_index), 0), last_index)
+    right_index = min(max(int(right_index), 0), last_index)
+    start_x = float(display_times_ms[left_index])
+    end_x = float(display_times_ms[right_index])
     span = max(end_x - start_x, float(max(1, display_step_ms)))
     padded_end_x = float(display_times_ms[-1]) + _native_right_padding_ms(display_step_ms, padding_bars=right_padding_bars)
     padded_start_x = max(float(display_times_ms[0]), padded_end_x - span)
@@ -3241,6 +3216,9 @@ if QChartView is not None:
             self._period = "15m"
             self._symbol = ""
             self._venue_label = "OKX"
+            # Latest market price is a paint-only annotation.  It is deliberately
+            # kept outside the candle/axis data so it cannot change scaling.
+            self._latest_price: float | None = None
             self._indicator_series: list[dict[str, Any]] = []
             self._chart_note_lines: list[str] = []
             self._workspace_lines: list[dict[str, object]] = []
@@ -3313,6 +3291,15 @@ if QChartView is not None:
             if self._hover_pos is None:
                 self.viewport().update()
 
+        def set_latest_price(self, price: float | None) -> None:
+            """Set the paint-only latest-price marker without changing the axis."""
+            try:
+                value = float(price) if price is not None else None
+            except (TypeError, ValueError):
+                value = None
+            self._latest_price = value if value is not None and math.isfinite(value) and value > 0 else None
+            self.viewport().update()
+
         def set_preview_line(self, preview_line: dict[str, object] | None) -> None:
             self._preview_line = dict(preview_line) if isinstance(preview_line, dict) else None
             self.viewport().update()
@@ -3378,6 +3365,7 @@ if QChartView is not None:
             selected_workspace_rr_index: int = -1,
             hovered_workspace_line_index: int = -1,
             hovered_workspace_drag_mode: str | None = None,
+            latest_price: float | None = None,
             restore_state: dict[str, float | bool] | None = None,
         ) -> None:
             self._axis_x = axis_x
@@ -3388,6 +3376,15 @@ if QChartView is not None:
             self._period = period.strip() or "15m"
             self._symbol = symbol.strip().upper()
             self._venue_label = venue_label.strip().upper() or "OKX"
+            try:
+                resolved_latest_price = float(latest_price) if latest_price is not None else None
+            except (TypeError, ValueError):
+                resolved_latest_price = None
+            self._latest_price = (
+                resolved_latest_price
+                if resolved_latest_price is not None and math.isfinite(resolved_latest_price) and resolved_latest_price > 0
+                else (float(candles[-1]["close"]) if candles else None)
+            )
             self._indicator_series = list(indicator_series or [])
             self._chart_note_lines = [str(item).strip() for item in (chart_note_lines or []) if str(item).strip()]
             self._trend_indicators = [dict(item) for item in (trend_indicators or []) if isinstance(item, dict)]
@@ -3435,6 +3432,7 @@ if QChartView is not None:
             self._axis_x = None
             self._axis_y = None
             self._candles = []
+            self._latest_price = None
             self._overlay_values = []
             self._trend_indicators = []
             self._display_times_ms = []
@@ -3619,6 +3617,7 @@ if QChartView is not None:
                     return
                 painter = QPainter(self.viewport())
                 painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+                self._draw_latest_price_indicator(painter, plot_area)
                 self._draw_volume_overlay(painter, plot_area)
                 self._draw_channel_overlays(painter, plot_area)
                 self._draw_box_overlays(painter, plot_area)
@@ -3697,6 +3696,38 @@ if QChartView is not None:
                 )
             except Exception:
                 self._hide_hover_overlays()
+
+        def _draw_latest_price_indicator(self, painter: QPainter, plot_area: QRectF) -> None:
+            """Draw a small right-axis price tag without adding a chart series."""
+            price = self._latest_price
+            if price is None or self._axis_y is None or not math.isfinite(price) or price <= 0:
+                return
+            min_y = float(self._axis_y.min())
+            max_y = float(self._axis_y.max())
+            if not math.isfinite(min_y) or not math.isfinite(max_y) or max_y <= min_y:
+                return
+            y = self._y_for_value(price, plot_area)
+            viewport = self.viewport().rect()
+            text = self._format_hover_value(price)
+            font = painter.font()
+            font.setPointSize(8)
+            font.setBold(True)
+            painter.setFont(font)
+            metrics = painter.fontMetrics()
+            padding_x = 7.0
+            padding_y = 3.0
+            width = float(metrics.horizontalAdvance(text)) + padding_x * 2.0
+            height = float(metrics.height()) + padding_y * 2.0
+            right = min(float(viewport.right()) - 3.0, float(plot_area.right()) + width + 5.0)
+            left = max(float(plot_area.right()) + 2.0, right - width)
+            top = _clamp(y - height / 2.0, float(plot_area.top()) + 2.0, float(plot_area.bottom()) - height - 2.0)
+            last_close = float(self._candles[-1].get("close", price)) if self._candles else price
+            color = QColor(_CHART_UP_COLOR if price >= last_close else _CHART_DOWN_COLOR)
+            painter.setPen(QPen(color, 1))
+            painter.setBrush(QColor(15, 23, 42, 235))
+            painter.drawRoundedRect(QRectF(left, top, right - left, height), 4.0, 4.0)
+            painter.setPen(color)
+            painter.drawText(QRectF(left + padding_x, top, width - padding_x * 2.0, height), Qt.AlignmentFlag.AlignCenter, text)
 
         def _draw_chart_header(
             self,
@@ -5588,6 +5619,7 @@ class KlineAnalysisWindow(QMainWindow):
         self._active_primary_request_key: tuple[Any, ...] | None = None
         self._loaded_primary_request_key: tuple[Any, ...] | None = None
         self._loader: KlineDataLoader | None = None
+        self._retired_loaders: set[QThread] = set()
         self._weekly_cache_backfill_loader: WeeklyCacheBackfillLoader | None = None
         self._history_trade_request_id = 0
         self._active_history_trade_request_id = 0
@@ -5652,6 +5684,7 @@ class KlineAnalysisWindow(QMainWindow):
         self._quad_grid_layout = None
         self._primary_period_buttons: dict[str, QPushButton] = {}
         self._active_chart_target = "primary"
+        self._trade_recommendation_dialog: KlineTradeRecommendationDialog | None = None
         self._symbol_tab_bar: QTabBar | None = None
         self._symbol_link_all_check: QCheckBox | None = None
         self._updating_symbol_tabs = False
@@ -6001,7 +6034,7 @@ class KlineAnalysisWindow(QMainWindow):
             except Exception:
                 pass
             self._realtime_candle_unsubscribe = None
-        for loader in (
+        active_loaders = (
             getattr(self, "_loader", None),
             getattr(self, "_secondary_loader", None),
             getattr(self, "_tertiary_loader", None),
@@ -6009,7 +6042,8 @@ class KlineAnalysisWindow(QMainWindow):
             getattr(self, "_secondary_volatility_loader", None),
             getattr(self, "_history_trade_loader", None),
             getattr(self, "_weekly_cache_backfill_loader", None),
-        ):
+        )
+        for loader in (*active_loaders, *tuple(self._retired_loaders)):
             if loader is not None and loader.isRunning():
                 loader.requestInterruption()
         KlineAnalysisWindow._poll_shutdown_loaders(self)
@@ -6056,18 +6090,20 @@ class KlineAnalysisWindow(QMainWindow):
         self._load_request_timer.start(max(0, int(delay_ms)))
 
     def _poll_shutdown_loaders(self) -> None:
+        active_loaders = (
+            getattr(self, "_loader", None),
+            getattr(self, "_secondary_loader", None),
+            getattr(self, "_tertiary_loader", None),
+            getattr(self, "_quaternary_loader", None),
+            getattr(self, "_secondary_volatility_loader", None),
+            getattr(self, "_history_trade_loader", None),
+            getattr(self, "_weekly_cache_backfill_loader", None),
+            getattr(self, "_rr_execution_thread", None),
+            *tuple(self._retired_loaders),
+        )
         active = any(
             loader is not None and loader.isRunning()
-            for loader in (
-                getattr(self, "_loader", None),
-                getattr(self, "_secondary_loader", None),
-                getattr(self, "_tertiary_loader", None),
-                getattr(self, "_quaternary_loader", None),
-                getattr(self, "_secondary_volatility_loader", None),
-                getattr(self, "_history_trade_loader", None),
-                getattr(self, "_weekly_cache_backfill_loader", None),
-                getattr(self, "_rr_execution_thread", None),
-            )
+            for loader in active_loaders
         )
         active = active or any(
             not bool(getattr(child, "_shutdown_complete", False))
@@ -6488,11 +6524,9 @@ class KlineAnalysisWindow(QMainWindow):
         data_options_row.addStretch(1)
         view_options_layout.addLayout(data_options_row)
 
-        display_options_row = QHBoxLayout()
         self._secondary_average_kline_check = QCheckBox("平均K线")
         self._secondary_average_kline_check.setToolTip("开启后，主图和副图都使用平均K线算法显示K线。")
         self._secondary_average_kline_check.toggled.connect(self._on_secondary_average_kline_toggled)
-        display_options_row.addWidget(self._secondary_average_kline_check)
 
         self._primary_average_secondary_normal_check = QCheckBox("主均副普")
         self._primary_average_secondary_normal_check.setToolTip(
@@ -6502,14 +6536,34 @@ class KlineAnalysisWindow(QMainWindow):
         self._primary_average_secondary_normal_check.toggled.connect(
             self._on_primary_average_secondary_normal_toggled
         )
-        display_options_row.addWidget(self._primary_average_secondary_normal_check)
 
         self._reverse_kline_check = QCheckBox("K线反转")
         self._reverse_kline_check.setToolTip("开启后，将当前主图及副图K线按价格镜像反转显示；波动率副图不参与反转。")
         self._reverse_kline_check.toggled.connect(self._load_data)
-        display_options_row.addWidget(self._reverse_kline_check)
-        display_options_row.addStretch(1)
-        view_options_layout.addLayout(display_options_row)
+
+        # 这三个选项使用频率较高，直接放到主工具栏；数量、本地优先等
+        # 低频设置仍保留在“视图选项”菜单中，避免每次操作都要展开菜单。
+        kline_display_group = QFrame()
+        kline_display_group.setObjectName("ToolbarGroup")
+        kline_display_group.setStyleSheet(
+            """
+            QFrame#ToolbarGroup {
+                background: #f8fafc;
+                border: 1px solid #cbd5e1;
+                border-radius: 7px;
+            }
+            """
+        )
+        kline_display_layout = QHBoxLayout(kline_display_group)
+        kline_display_layout.setContentsMargins(10, 3, 10, 3)
+        kline_display_layout.setSpacing(8)
+        kline_display_layout.addWidget(QLabel("显示"))
+        for display_widget in (
+            self._secondary_average_kline_check,
+            self._primary_average_secondary_normal_check,
+            self._reverse_kline_check,
+        ):
+            kline_display_layout.addWidget(display_widget)
 
         chart_options_row = QHBoxLayout()
         self._hide_chart_btn = QPushButton("隐藏图表")
@@ -6542,6 +6596,9 @@ class KlineAnalysisWindow(QMainWindow):
         view_options_button = QPushButton("视图选项")
         view_options_button.setToolTip("设置 K 线数量、数据来源和图表显示选项。")
         view_options_button.setMenu(view_options_menu)
+        self._trade_recommendation_button = QPushButton("做单参考")
+        self._trade_recommendation_button.setToolTip("分析当前选中图的普通已收盘K线，生成现货/永续做单参考；非期权，不会下单。")
+        self._trade_recommendation_button.clicked.connect(self._show_trade_recommendation)
 
         load_btn = QPushButton("加载")
         load_btn.setObjectName("Primary")
@@ -6561,6 +6618,7 @@ class KlineAnalysisWindow(QMainWindow):
         workspace_row.addWidget(self._history_trade_group, 0)
         workspace_row.addWidget(shape_group, 0)
         workspace_row.addWidget(self._shape_settings_button, 0)
+        workspace_row.addWidget(kline_display_group, 0)
         for chart_check in (
             self._secondary_chart_check,
             self._tertiary_chart_check,
@@ -6569,6 +6627,7 @@ class KlineAnalysisWindow(QMainWindow):
             linkage_row.removeWidget(chart_check)
             workspace_row.addWidget(chart_check, 0)
         workspace_row.addStretch(1)
+        workspace_row.addWidget(self._trade_recommendation_button, 0)
         workspace_row.addWidget(view_options_button, 0)
         workspace_row.addWidget(load_btn, 0)
         workspace_row.addWidget(self._auto_refresh_btn, 0)
@@ -7707,6 +7766,10 @@ class KlineAnalysisWindow(QMainWindow):
             self._set_status("波动率视图仅支持 BTC / ETH；请先选择 BTC-USDT-SWAP 或 ETH-USDT-SWAP。")
             return
         self._secondary_chart_kind_mode = ("volatility" if previous_kind == "kline" else "kline")
+        if previous_kind == "volatility":
+            self._retire_loader("_secondary_volatility_loader")
+            if isinstance(self._loader, SecondaryVolatilityDataLoader):
+                self._retire_loader("_loader")
         if self._secondary_chart_kind() == "volatility":
             self._active_volatility_currency = self._current_volatility_currency()
         else:
@@ -7954,6 +8017,34 @@ class KlineAnalysisWindow(QMainWindow):
             return self._selected_secondary_symbol()
         return self._selected_symbol()
 
+    @Slot()
+    def _show_trade_recommendation(self) -> None:
+        if bool(getattr(self, "_shutdown_requested", False)):
+            return
+        symbol = self._symbol_for_chart_target()
+        period = self._active_period_value()
+        now_ms = int(time.time() * 1000)
+        volatility_view = self._all_charts_volatility_enabled() or (
+            self._active_chart_target == "secondary" and self._secondary_chart_check.isChecked()
+            and self._secondary_chart_kind() == "volatility"
+        )
+        try:
+            if volatility_view:
+                idea = KlineTradeIdea(symbol, period, now_ms, reasons=("当前选中的是波动率指数图，请切回现货或永续价格K线后查看做单参考。",))
+            else:
+                # Cache is keyed by the selected symbol and period. Never use a
+                # previous chart's payload or its transformed/average candles.
+                candles = load_candle_cache(symbol, period, limit=250)
+                idea = build_kline_trade_idea(symbol=symbol, period=period, candles=candles, now_ms=now_ms)
+        except Exception as exc:
+            idea = KlineTradeIdea(symbol, period, now_ms, reasons=(f"本次参考生成失败（{type(exc).__name__}）；请刷新K线后再试。",))
+        if self._trade_recommendation_dialog is None:
+            self._trade_recommendation_dialog = KlineTradeRecommendationDialog(self)
+        self._trade_recommendation_dialog.set_result(idea)
+        self._trade_recommendation_dialog.show()
+        self._trade_recommendation_dialog.raise_()
+        self._trade_recommendation_dialog.activateWindow()
+
     def _refresh_symbol_tab_selection(self) -> None:
         tab_bar = self._symbol_tab_bar
         if tab_bar is None:
@@ -8042,6 +8133,9 @@ class KlineAnalysisWindow(QMainWindow):
         target = self._active_chart_target
         if self._secondary_chart_kind() == "volatility":
             self._invalidate_pending_chart_results(targets=("secondary",))
+            self._retire_loader("_secondary_volatility_loader")
+            if isinstance(self._loader, SecondaryVolatilityDataLoader):
+                self._retire_loader("_loader")
             self._secondary_chart_kind_mode = "kline"
             self._active_volatility_currency = None
             self._secondary_pending_payload = None
@@ -8880,6 +8974,11 @@ class KlineAnalysisWindow(QMainWindow):
         if not symbol:
             self._set_status("请输入交易对")
             return
+        all_charts_volatility = self._all_charts_volatility_enabled()
+        if self._loader is not None and self._loader.isRunning():
+            running_volatility_loader = isinstance(self._loader, SecondaryVolatilityDataLoader)
+            if running_volatility_loader != all_charts_volatility:
+                self._retire_loader("_loader")
         if self._loader is not None and self._loader.isRunning():
             self._pending_reload_after_load = True
             self._set_status("当前仍在加载，已排队刷新最新选择，请稍候...")
@@ -8897,7 +8996,6 @@ class KlineAnalysisWindow(QMainWindow):
         self._active_request_id = self._request_id
         self._active_primary_request_key = self._current_primary_request_key()
         previewed_cached_payload = self._preview_cached_primary_payload(self._active_primary_request_key)
-        all_charts_volatility = self._all_charts_volatility_enabled()
         if all_charts_volatility and self._realtime_candle_unsubscribe is not None:
             try:
                 self._realtime_candle_unsubscribe()
@@ -8963,12 +9061,25 @@ class KlineAnalysisWindow(QMainWindow):
         self._release_finished_loader("_loader")
         self._schedule_pending_reload_if_ready()
 
+    def _retire_loader(self, attribute: str) -> None:
+        """Let an obsolete worker finish without occupying its current load slot."""
+        loader = getattr(self, attribute, None)
+        if loader is None:
+            return
+        setattr(self, attribute, None)
+        if loader.isRunning():
+            loader.requestInterruption()
+            self._retired_loaders.add(loader)
+            return
+        loader.deleteLater()
+
     def _release_finished_loader(self, attribute: str) -> None:
         loader = self.sender()
         if loader is None:
             loader = getattr(self, attribute, None)
         if loader is None or loader.isRunning():
             return
+        self._retired_loaders.discard(loader)
         if getattr(self, attribute, None) is loader:
             setattr(self, attribute, None)
         loader.deleteLater()
@@ -9002,6 +9113,11 @@ class KlineAnalysisWindow(QMainWindow):
     def _load_secondary_data(self, *, symbol: str) -> None:
         if bool(getattr(self, "_shutdown_requested", False)):
             return
+        self._pending_secondary_reload = False
+        if self._secondary_chart_kind() == "volatility":
+            self._retire_loader("_secondary_loader")
+        else:
+            self._retire_loader("_secondary_volatility_loader")
         if any(
             loader is not None and loader.isRunning()
             for loader in (self._secondary_loader, self._secondary_volatility_loader)
@@ -9165,6 +9281,9 @@ class KlineAnalysisWindow(QMainWindow):
         reload_secondary_as_kline = False
         if self._secondary_chart_kind() == "volatility":
             selected_symbol = self._selected_symbol()
+            self._retire_loader("_secondary_volatility_loader")
+            if isinstance(self._loader, SecondaryVolatilityDataLoader):
+                self._retire_loader("_loader")
             self._secondary_chart_kind_mode = "kline"
             self._active_volatility_currency = None
             self._secondary_pending_payload = None
@@ -9536,6 +9655,10 @@ class KlineAnalysisWindow(QMainWindow):
             elif series.count() + 1 == len(display_payload.candles):
                 series.append(timestamp, value)
         if self._native_chart_view is not None:
+            # Reuse the existing candle stream for the right-axis latest-price
+            # marker; no extra ticker request or high-frequency timer is added.
+            if isinstance(self._native_chart_view, InteractiveKlineChartView):
+                self._native_chart_view.set_latest_price(float(candle_values["close"]))
             self._native_chart_view.update()
 
     def _subscribe_realtime_candle(self) -> None:
@@ -9591,6 +9714,19 @@ class KlineAnalysisWindow(QMainWindow):
                 combined_status_parts.append(f"副图：{self._secondary_chart_status_text}")
             if combined_status_parts:
                 self._set_status(" | ".join(combined_status_parts))
+        else:
+            loaded = int(payload.stats.get("returned", 0) or 0)
+            source = _source_status_text(str(payload.stats.get("source", "")))
+            local_count = int(payload.stats.get("local_count", 0) or 0)
+            api_count = int(payload.stats.get("remote_added_count", 0) or 0)
+            self._secondary_chart_status_text = (
+                f"{loaded}条 | {source} | 本地{local_count} | 新增{api_count}"
+            )
+            combined_status_parts = []
+            if self._primary_chart_status_text:
+                combined_status_parts.append(f"主图：{self._primary_chart_status_text}")
+            combined_status_parts.append(f"副图：{self._secondary_chart_status_text}")
+            self._set_status(" | ".join(combined_status_parts))
         if self._page_active and self._secondary_chart_check.isChecked() and self._use_native_chart:
             self._render_secondary_chart(payload)
             self._sync_secondary_chart_range_from_primary()
@@ -10651,6 +10787,7 @@ class KlineAnalysisWindow(QMainWindow):
                 selected_workspace_rr_index=self._selected_rr_index if include_workspace_lines else -1,
                 hovered_workspace_line_index=self._hovered_line_index if include_workspace_lines else -1,
                 hovered_workspace_drag_mode=self._hovered_line_drag_mode if include_workspace_lines else None,
+                latest_price=float(candles[-1]["close"]) if candles else None,
                 restore_state=restore_state,
             )
         else:
@@ -12994,6 +13131,7 @@ class KlineAnalysisWindow(QMainWindow):
                 let channelSeries = [];
                 let trendSeries = null;
                 let volumeSeries = null;
+                let latestPriceLine = null;
                 let trendByTime = {};
                 let signalByTime = {};
                 let currentCandles = [];
@@ -13140,6 +13278,27 @@ class KlineAnalysisWindow(QMainWindow):
                   }
                 }
 
+                function syncLatestPriceLine(price, previousClose) {
+                  if (!candlestickSeries) return;
+                  if (latestPriceLine) {
+                    candlestickSeries.removePriceLine(latestPriceLine);
+                    latestPriceLine = null;
+                  }
+                  const value = Number(price);
+                  if (!Number.isFinite(value) || value <= 0) return;
+                  const previous = Number(previousClose);
+                  const color = Number.isFinite(previous) && value < previous ? '#e04f84' : '#22c55e';
+                  latestPriceLine = candlestickSeries.createPriceLine({
+                    price: value,
+                    color,
+                    lineWidth: 1,
+                    lineStyle: 2,
+                    lineVisible: false,
+                    axisLabelVisible: true,
+                    title: '最新',
+                  });
+                }
+
                 function syncChannelSeries(channels, candles) {
                   for (const series of channelSeries) {
                     chart.removeSeries(series);
@@ -13254,6 +13413,10 @@ class KlineAnalysisWindow(QMainWindow):
                     const candles = Array.isArray(safePayload.candles) ? safePayload.candles : [];
                     currentCandles = candles;
                     candlestickSeries.setData(candles);
+                    syncLatestPriceLine(
+                      candles.length ? candles[candles.length - 1]?.close : null,
+                      candles.length > 1 ? candles[candles.length - 2]?.close : null,
+                    );
                     const signalMarkers = Array.isArray(safePayload.signals)
                       ? safePayload.signals.map((item) => ({
                           time: Number(item?.time) || 0,
@@ -13319,6 +13482,10 @@ class KlineAnalysisWindow(QMainWindow):
                     if (index >= 0) currentCandles[index] = candle;
                     else currentCandles.push(candle);
                     candlestickSeries.update(candle);
+                    const previousClose = currentCandles.length > 1
+                      ? currentCandles[currentCandles.length - 2]?.close
+                      : null;
+                    syncLatestPriceLine(candle.close, previousClose);
                     if (volumeSeries) {
                       const color = candle.close >= candle.open ? 'rgba(34, 197, 94, 0.85)' : 'rgba(224, 79, 132, 0.85)';
                       volumeSeries.update({ time, value: Number(candle.volume) || 0, color });

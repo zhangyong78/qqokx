@@ -44,6 +44,7 @@ from roll_terminal_qt.option_strategy_window import OptionStrategyQtWindow
 from roll_terminal_qt.option_roll_execution_window import OptionRollExecutionQtWindow
 from roll_terminal_qt.kline_analysis_window import KlineAnalysisWindow
 from roll_terminal_qt.ai_snapshot_service import AIQuickSnapshotWorker, AISnapshotWorker
+from roll_terminal_qt.btc_dvol_overview import BtcDvolOverviewPanel, EthDvolOverviewPanel
 from roll_terminal_qt.sample_prediction_window import SamplePredictionWindow
 from roll_terminal_qt.perf_metrics import measure_ui_step
 from roll_terminal_qt.profile_access import ensure_profile_unlocked, load_profile_snapshots
@@ -1140,6 +1141,9 @@ class LauncherWindow(QMainWindow):
         if normalized == "ai-snapshot-info":
             self._show_ai_snapshot_contents()
             return
+        if normalized in {"btc-dvol-overview", "eth-dvol-overview"}:
+            self.open_module_window(normalized)
+            return
         if normalized == "sample-prediction":
             self.open_module_window(normalized)
             return
@@ -1471,6 +1475,14 @@ def create_module_window(module_key: str, *, profile_name: str = "") -> QWidget:
         return window
     if normalized == "sample-prediction":
         window = SamplePredictionWindow()
+        apply_qt_window_icon(window)
+        return window
+    if normalized == "btc-dvol-overview":
+        window = BtcDvolOverviewPanel()
+        apply_qt_window_icon(window)
+        return window
+    if normalized == "eth-dvol-overview":
+        window = EthDvolOverviewPanel()
         apply_qt_window_icon(window)
         return window
     for spec in launcher_module_specs():

@@ -6459,6 +6459,62 @@ class RollTerminalQtWindowHelperTests(QtWidgetTestCase):
             finally:
                 self.__class__.dispose_widget(window)
 
+    def test_leaving_dvol_does_not_queue_behind_its_stale_secondary_loader(self) -> None:
+        with patch("roll_terminal_qt.kline_analysis_window.QTimer.singleShot", return_value=None):
+            window = KlineAnalysisWindow()
+            try:
+                window._use_native_chart = True
+                window._secondary_chart_check.blockSignals(True)
+                window._secondary_chart_check.setChecked(True)
+                window._secondary_chart_check.blockSignals(False)
+                window._secondary_chart_kind_mode = "volatility"
+                window._active_volatility_currency = "BTC"
+                window._set_active_chart_target("secondary")
+                state = {"running": True}
+                stale_loader = MagicMock()
+                stale_loader.isRunning.side_effect = lambda: state["running"]
+                stale_loader.requestInterruption.side_effect = lambda: state.__setitem__("running", False)
+                window._secondary_volatility_loader = stale_loader
+                eth_index = next(
+                    index
+                    for index in range(window._symbol_tab_bar.count())
+                    if window._symbol_tab_bar.tabText(index) == "ETH-USDT-SWAP"
+                )
+
+                with patch("roll_terminal_qt.kline_analysis_window.KlineDataLoader.start") as start_loader:
+                    window._symbol_tab_bar.setCurrentIndex(eth_index)
+
+                stale_loader.requestInterruption.assert_called_once()
+                self.assertIsNone(window._secondary_volatility_loader)
+                self.assertEqual(window._secondary_chart_kind(), "kline")
+                self.assertEqual(window._selected_secondary_symbol(), "ETH-USDT-SWAP")
+                start_loader.assert_called_once()
+            finally:
+                self.__class__.dispose_widget(window)
+
+    def test_kline_load_replaces_a_stale_primary_dvol_loader_without_waiting(self) -> None:
+        with patch("roll_terminal_qt.kline_analysis_window.QTimer.singleShot", return_value=None):
+            window = KlineAnalysisWindow()
+            try:
+                window._page_active = True
+                state = {"running": True}
+                stale_loader = MagicMock(spec=kline_analysis_module.SecondaryVolatilityDataLoader)
+                stale_loader.isRunning.side_effect = lambda: state["running"]
+                stale_loader.requestInterruption.side_effect = lambda: state.__setitem__("running", False)
+                window._loader = stale_loader
+
+                with (
+                    patch("roll_terminal_qt.kline_analysis_window.KlineDataLoader.start") as start_loader,
+                    patch.object(window, "_load_history_trades"),
+                ):
+                    window._load_data(refresh_linked_charts=False)
+
+                stale_loader.requestInterruption.assert_called_once()
+                self.assertIsNot(window._loader, stale_loader)
+                start_loader.assert_called_once()
+            finally:
+                self.__class__.dispose_widget(window)
+
     def test_triple_chart_mode_forces_horizontal_layout(self) -> None:
         with patch("roll_terminal_qt.kline_analysis_window.QTimer.singleShot", return_value=None):
             window = KlineAnalysisWindow()
@@ -7253,6 +7309,12 @@ class RollTerminalQtWindowHelperTests(QtWidgetTestCase):
         self.assertEqual(end_x, float(display_times[-1]) + _native_right_padding_ms(900_000))
         self.assertLess(start_x, end_x)
         self.assertGreater(end_x - display_times[-1], 0.0)
+
+    def test_default_native_x_range_with_one_bar_never_indexes_past_data(self) -> None:
+        display_times = [1_790_000_000_000]
+        start_x, end_x = _default_native_x_range_with_right_padding(display_times, display_step_ms=3_600_000)
+        self.assertEqual(start_x, float(display_times[0]))
+        self.assertEqual(end_x, float(display_times[0]) + _native_right_padding_ms(3_600_000))
 
     def test_hover_overlay_layout_moves_tooltip_above_volume_reserved_band(self) -> None:
         layout = _compute_hover_overlay_layout(

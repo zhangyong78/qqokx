@@ -45,6 +45,7 @@ from okx_quant.deribit_volatility_ui import (
     _format_ts,
     _hourly_fetch_start_ts,
     _hourly_history_limit,
+    _load_valid_cached_deribit_hourly_series,
     _max_limit_for_resolution_value,
     _merge_deribit_candles,
     _merge_price_candles,
@@ -1286,43 +1287,7 @@ def _load_cached_hourly_series(
     *,
     payload: dict | None = None,
 ) -> tuple[str, list[DeribitVolatilityCandle], list[Candle], datetime] | None:
-    cache_payload = payload if payload is not None else _load_cache_payload()
-    item = cache_payload.get(_hourly_cache_key(currency))
-    if not isinstance(item, dict):
-        return None
-    try:
-        volatility_candles = [
-            DeribitVolatilityCandle(
-                ts=int(candle["ts"]),
-                open=Decimal(str(candle["open"])),
-                high=Decimal(str(candle["high"])),
-                low=Decimal(str(candle["low"])),
-                close=Decimal(str(candle["close"])),
-            )
-            for candle in item.get("volatility_hourly", [])
-        ]
-        spot_candles = [
-            Candle(
-                ts=int(candle["ts"]),
-                open=Decimal(str(candle["open"])),
-                high=Decimal(str(candle["high"])),
-                low=Decimal(str(candle["low"])),
-                close=Decimal(str(candle["close"])),
-                volume=Decimal(str(candle.get("volume", "0"))),
-                confirmed=bool(candle.get("confirmed", True)),
-            )
-            for candle in item.get("spot_hourly", [])
-        ]
-        if not volatility_candles or not spot_candles:
-            return None
-        return (
-            str(item.get("spot_inst_id", OKX_SPOT_SYMBOLS[currency])),
-            volatility_candles,
-            [candle for candle in spot_candles if candle.confirmed],
-            datetime.fromisoformat(str(item["fetched_at"])),
-        )
-    except Exception:
-        return None
+    return _load_valid_cached_deribit_hourly_series(currency, payload=payload)
 
 
 def _save_cached_hourly_series(

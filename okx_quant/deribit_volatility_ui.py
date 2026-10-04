@@ -45,6 +45,7 @@ DERIBIT_FULL_HISTORY_START_TS = int(datetime(2021, 1, 1, tzinfo=timezone.utc).ti
 DERIBIT_HOURLY_REFRESH_OVERLAP = 240
 DERIBIT_DEFAULT_VISIBLE_CANDLE_COUNT = 300
 DERIBIT_VOLATILITY_UI_STATE_KEY = "_ui_state"
+DERIBIT_HOURLY_CACHE_MIN_USABLE_CANDLES = 24
 
 
 def _hourly_fetch_start_ts(
@@ -56,6 +57,126 @@ def _hourly_fetch_start_ts(
     overlap_ms = DERIBIT_HOURLY_REFRESH_OVERLAP * DERIBIT_RESOLUTION_SECONDS[DERIBIT_BASE_HOURLY_RESOLUTION] * 1000
     latest_cached_ts = min(cached_volatility[-1].ts, cached_spot[-1].ts)
     return max(DERIBIT_FULL_HISTORY_START_TS, latest_cached_ts - overlap_ms)
+
+
+def _parse_cached_deribit_hourly_item(
+    currency: str,
+    item: object,
+) -> tuple[str, list[DeribitVolatilityCandle], list[Candle], datetime] | None:
+    """Parse only structurally valid hourly records from a cache entry.
+
+    A malformed cache can otherwise make a volatility chart render a handful of
+    bogus candles (for example timestamps from 1970).  Keep the validation at
+    the cache boundary so every volatility view receives the same clean data.
+    """
+    if not isinstance(item, dict):
+        return None
+    volatility_by_ts: dict[int, DeribitVolatilityCandle] = {}
+    for raw in item.get("volatility_hourly", []):
+        try:
+            ts = int(raw["ts"])
+            values = tuple(Decimal(str(raw[key])) for key in ("open", "high", "low", "close"))
+            if ts < DERIBIT_FULL_HISTORY_START_TS or ts % 3_600_000:
+                continue
+            if not all(value.is_finite() and value > 0 for value in values):
+                continue
+            open_value, high_value, low_value, close_value = values
+            if high_value < max(open_value, close_value) or low_value > min(open_value, close_value):
+                continue
+            volatility_by_ts[ts] = DeribitVolatilityCandle(
+                ts=ts,
+                open=open_value,
+                high=high_value,
+                low=low_value,
+                close=close_value,
+            )
+        except (KeyError, TypeError, ValueError, ArithmeticError):
+            continue
+
+    spot_by_ts: dict[int, Candle] = {}
+    for raw in item.get("spot_hourly", []):
+        try:
+            ts = int(raw["ts"])
+            values = tuple(Decimal(str(raw[key])) for key in ("open", "high", "low", "close"))
+            volume = Decimal(str(raw.get("volume", "0")))
+            if ts < DERIBIT_FULL_HISTORY_START_TS or ts % 3_600_000:
+                continue
+            if not all(value.is_finite() and value > 0 for value in values) or not volume.is_finite():
+                continue
+            open_value, high_value, low_value, close_value = values
+            if high_value < max(open_value, close_value) or low_value > min(open_value, close_value):
+                continue
+            spot_by_ts[ts] = Candle(
+                ts=ts,
+                open=open_value,
+                high=high_value,
+                low=low_value,
+                close=close_value,
+                volume=volume,
+                confirmed=bool(raw.get("confirmed", True)),
+            )
+        except (KeyError, TypeError, ValueError, ArithmeticError):
+            continue
+
+    volatility_candles = [volatility_by_ts[ts] for ts in sorted(volatility_by_ts)]
+    spot_candles = [spot_by_ts[ts] for ts in sorted(spot_by_ts) if spot_by_ts[ts].confirmed]
+    if not volatility_candles or not spot_candles:
+        return None
+    try:
+        fetched_at = datetime.fromisoformat(str(item["fetched_at"]).replace("Z", "+00:00"))
+    except (KeyError, TypeError, ValueError):
+        return None
+    return (
+        str(item.get("spot_inst_id", OKX_SPOT_SYMBOLS[currency])),
+        volatility_candles,
+        spot_candles,
+        fetched_at,
+    )
+
+
+def _load_valid_cached_deribit_hourly_series(
+    currency: str,
+    *,
+    payload: dict | None = None,
+) -> tuple[str, list[DeribitVolatilityCandle], list[Candle], datetime] | None:
+    """Load a clean cache entry, falling back to a valid sibling backup."""
+    cache_path = deribit_volatility_cache_file_path()
+    primary_payload = payload if payload is not None else _load_cache_payload_from_path(cache_path)
+    primary = _parse_cached_deribit_hourly_item(
+        currency,
+        primary_payload.get(f"{currency}|hourly_base"),
+    )
+    if primary is not None and len(primary[1]) >= DERIBIT_HOURLY_CACHE_MIN_USABLE_CANDLES:
+        return primary
+
+    candidates: list[tuple[str, tuple[str, list[DeribitVolatilityCandle], list[Candle], datetime]]] = []
+    if cache_path.parent.exists():
+        for candidate_path in cache_path.parent.glob(f"{cache_path.stem}*.json"):
+            if candidate_path == cache_path:
+                continue
+            candidate_payload = _load_cache_payload_from_path(candidate_path)
+            candidate = _parse_cached_deribit_hourly_item(
+                currency,
+                candidate_payload.get(f"{currency}|hourly_base"),
+            )
+            if candidate is not None:
+                candidates.append((str(candidate_path), candidate))
+    if candidates:
+        return max(
+            (candidate for _path, candidate in candidates),
+            key=lambda value: (len(value[1]), value[1][-1].ts),
+        )
+    return primary
+
+
+def _load_cache_payload_from_path(path: Path) -> dict:
+    if not path.exists():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        return payload if isinstance(payload, dict) else {}
+    except Exception:
+        return {}
 
 
 @dataclass(frozen=True)
@@ -759,43 +880,7 @@ class DeribitVolatilityWindow:
         *,
         payload: dict | None = None,
     ) -> tuple[str, list[DeribitVolatilityCandle], list[Candle], datetime] | None:
-        cache_payload = payload if payload is not None else self._load_cache_payload()
-        item = cache_payload.get(self._hourly_cache_key(currency))
-        if not isinstance(item, dict):
-            return None
-        try:
-            volatility_candles = [
-                DeribitVolatilityCandle(
-                    ts=int(candle["ts"]),
-                    open=Decimal(str(candle["open"])),
-                    high=Decimal(str(candle["high"])),
-                    low=Decimal(str(candle["low"])),
-                    close=Decimal(str(candle["close"])),
-                )
-                for candle in item.get("volatility_hourly", [])
-            ]
-            spot_candles = [
-                Candle(
-                    ts=int(candle["ts"]),
-                    open=Decimal(str(candle["open"])),
-                    high=Decimal(str(candle["high"])),
-                    low=Decimal(str(candle["low"])),
-                    close=Decimal(str(candle["close"])),
-                    volume=Decimal(str(candle.get("volume", "0"))),
-                    confirmed=bool(candle.get("confirmed", True)),
-                )
-                for candle in item.get("spot_hourly", [])
-            ]
-            if not volatility_candles or not spot_candles:
-                return None
-            return (
-                str(item.get("spot_inst_id", OKX_SPOT_SYMBOLS[currency])),
-                volatility_candles,
-                [candle for candle in spot_candles if candle.confirmed],
-                datetime.fromisoformat(str(item["fetched_at"])),
-            )
-        except Exception:
-            return None
+        return _load_valid_cached_deribit_hourly_series(currency, payload=payload)
 
     def _save_cached_hourly_series(
         self,

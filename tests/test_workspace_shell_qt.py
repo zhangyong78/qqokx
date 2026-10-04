@@ -69,6 +69,9 @@ class WorkspaceShellQtTests(QtWidgetTestCase):
                 "tool:ai-snapshot",
                 "tool:ai-snapshot-info",
                 "tool:ai-quick-snapshot",
+                "tool:btc-dvol-overview",
+                "tool:eth-dvol-overview",
+                "tool:sample-prediction",
                 "settings:font-standard",
                 "settings:font-large",
                 "settings:font-extra_large",
@@ -88,10 +91,10 @@ class WorkspaceShellQtTests(QtWidgetTestCase):
 
     def test_ai_snapshot_menu_contains_generate_and_contents_actions(self) -> None:
         header = WorkspaceHeader()
-        snapshot_menu = next(button for button in header.findChildren(QToolButton) if button.text() == "AI 快照")
+        snapshot_menu = next(button for button in header.findChildren(QToolButton) if button.text() == "AI")
         self.assertEqual(
             [action.text() for action in snapshot_menu.menu().actions()],
-            ["生成 AI 快照", "快照内容说明", "生成 AI 精简快照"],
+            ["生成 AI 快照", "快照内容说明", "生成 AI 精简快照", "BTC × DVOL 总览", "ETH × DVOL 总览", "样本预测"],
         )
 
     def test_workspace_header_marks_trading_tools_active_for_smart_order(self) -> None:

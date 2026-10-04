@@ -10,6 +10,8 @@ from okx_quant.models import Candle
 
 WEEK_MS = 7 * 24 * 60 * 60 * 1000
 BTC_WEEKLY_INST_ID = "BTC-USDT-SWAP"
+PREDICTION_MIN_CONFIDENCE = 0.60
+PREDICTION_MIN_SAMPLE_COUNT = 20
 
 
 @dataclass(frozen=True)
@@ -32,6 +34,9 @@ class PredictionResult:
     close_range: tuple[float, float]
     current_four_week_return: float
     current_volatility: float
+    confidence: float = 0.0
+    is_actionable: bool = True
+    abstain_reason: str | None = None
 
 
 @dataclass(frozen=True)
@@ -44,6 +49,9 @@ class BacktestResult:
     bullish_rate: float
     average_next_return: float
     rows: tuple[dict[str, object], ...]
+    prediction_count: int = 0
+    coverage: float = 0.0
+    selective_accuracy: float = 0.0
 
 
 def load_btc_weekly_candles() -> list[Candle]:
@@ -143,6 +151,19 @@ def _predict_from_history(candles: list[Candle], current_index: int) -> Predicti
     low_price = min(open_price, close_price, base * (1 + _percentile(low_changes, 0.50)))
     four_week_return = _state(candles, current_index)[2]
     volatility = _state(candles, current_index)[3]
+    confidence = max(bullish / len(usable), bearish / len(usable))
+    is_actionable = (
+        confidence >= PREDICTION_MIN_CONFIDENCE
+        and len(usable) >= PREDICTION_MIN_SAMPLE_COUNT
+    )
+    abstain_reason: str | None = None
+    if not is_actionable:
+        reasons: list[str] = []
+        if confidence < PREDICTION_MIN_CONFIDENCE:
+            reasons.append(f"置信度 {confidence:.1%} 低于 {PREDICTION_MIN_CONFIDENCE:.0%}")
+        if len(usable) < PREDICTION_MIN_SAMPLE_COUNT:
+            reasons.append(f"相似样本 {len(usable)} 条少于 {PREDICTION_MIN_SAMPLE_COUNT} 条")
+        abstain_reason = "；".join(reasons)
     return PredictionResult(
         as_of_ts=current.ts,
         target_ts=current.ts + WEEK_MS,
@@ -162,6 +183,9 @@ def _predict_from_history(candles: list[Candle], current_index: int) -> Predicti
         close_range=(base * (1 + _percentile(close_changes, 0.25)), base * (1 + _percentile(close_changes, 0.75))),
         current_four_week_return=four_week_return,
         current_volatility=volatility,
+        confidence=confidence,
+        is_actionable=is_actionable,
+        abstain_reason=abstain_reason,
     )
 
 
@@ -191,7 +215,12 @@ def run_weekly_backtest(candles: list[Candle], *, minimum_history: int = 48) -> 
                 "bullish_probability": prediction.bullish_probability,
                 "predicted_sign": prediction.predicted_sign,
                 "actual_sign": actual_sign,
-                "correct": prediction.predicted_sign == actual_sign,
+                "raw_correct": prediction.predicted_sign == actual_sign,
+                "correct": prediction.is_actionable and prediction.predicted_sign == actual_sign,
+                "is_actionable": prediction.is_actionable,
+                "prediction_status": "PREDICT" if prediction.is_actionable else "ABSTAIN",
+                "confidence": prediction.confidence,
+                "sample_count": prediction.sample_count,
                 "brier": (prediction.bullish_probability - actual_bull) ** 2,
                 "baseline_probability": baseline_probability,
                 "next_return": next_return,
@@ -206,13 +235,22 @@ def run_weekly_backtest(candles: list[Candle], *, minimum_history: int = 48) -> 
         actual_bull = 1.0 if row["actual_sign"] == "B" else 0.0
         baseline_correct.append((probability >= 0.5) == bool(actual_bull))
         baseline_brier.append((probability - actual_bull) ** 2)
+    actionable_rows = [row for row in rows if bool(row["is_actionable"])]
+    selective_accuracy = (
+        sum(bool(row["correct"]) for row in actionable_rows) / len(actionable_rows)
+        if actionable_rows
+        else 0.0
+    )
     return BacktestResult(
         sample_count=len(rows),
-        accuracy=sum(bool(row["correct"]) for row in rows) / len(rows),
+        accuracy=sum(bool(row["raw_correct"]) for row in rows) / len(rows),
         brier_score=mean(float(row["brier"]) for row in rows),
         baseline_accuracy=mean(baseline_correct),
         baseline_brier_score=mean(baseline_brier),
         bullish_rate=mean(float(row["actual_sign"] == "B") for row in rows),
         average_next_return=mean(float(row["next_return"]) for row in rows),
         rows=tuple(rows),
+        prediction_count=len(actionable_rows),
+        coverage=len(actionable_rows) / len(rows),
+        selective_accuracy=selective_accuracy,
     )

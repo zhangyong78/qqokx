@@ -1,5 +1,9 @@
+import json
+from pathlib import Path
+import tempfile
 from datetime import datetime
 from decimal import Decimal
+from unittest.mock import patch
 from unittest import TestCase
 
 from okx_quant.deribit_client import DeribitVolatilityCandle
@@ -12,6 +16,7 @@ from okx_quant.deribit_volatility_ui import (
     DeribitVolatilityWindow,
     _hourly_fetch_start_ts,
     _hourly_history_limit,
+    _load_valid_cached_deribit_hourly_series,
     _max_limit_for_resolution_value,
     _merge_deribit_candles,
     _merge_price_candles,
@@ -27,6 +32,59 @@ from okx_quant.deribit_volatility_ui import (
 
 
 class DeribitVolatilityUiTest(TestCase):
+    def test_cache_loader_ignores_invalid_timestamps_and_recovers_backup(self) -> None:
+        start_ts = 1_609_459_200_000
+
+        def make_item(count: int, *, first_ts: int) -> dict:
+            return {
+                "spot_inst_id": "BTC-USDT",
+                "fetched_at": "2026-10-05T00:00:00+00:00",
+                "volatility_hourly": [
+                    {"ts": first_ts + index * 3_600_000, "open": "40", "high": "42", "low": "39", "close": "41"}
+                    for index in range(count)
+                ],
+                "spot_hourly": [
+                    {
+                        "ts": first_ts + index * 3_600_000,
+                        "open": "80000",
+                        "high": "80100",
+                        "low": "79900",
+                        "close": "80050",
+                        "volume": "1",
+                        "confirmed": True,
+                    }
+                    for index in range(count)
+                ],
+            }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            cache_path = Path(temp_dir) / "deribit_volatility_cache.json"
+            cache_path.write_text(
+                json.dumps(
+                    {
+                        "BTC|hourly_base": make_item(2, first_ts=3_600_000),
+                    }
+                ),
+                encoding="utf-8",
+            )
+            backup_path = Path(temp_dir) / "deribit_volatility_cache.before_recovery.json"
+            backup_path.write_text(
+                json.dumps(
+                    {
+                        "BTC|hourly_base": make_item(24, first_ts=start_ts),
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with patch("okx_quant.deribit_volatility_ui.deribit_volatility_cache_file_path", return_value=cache_path):
+                loaded = _load_valid_cached_deribit_hourly_series("BTC")
+
+        self.assertIsNotNone(loaded)
+        assert loaded is not None
+        self.assertEqual(len(loaded[1]), 24)
+        self.assertEqual(loaded[1][0].ts, start_ts)
+        self.assertEqual(loaded[2][0].ts, start_ts)
+
     def test_aggregate_candles_to_4h(self) -> None:
         candles = [
             DeribitVolatilityCandle(ts=0, open=Decimal("10"), high=Decimal("12"), low=Decimal("9"), close=Decimal("11")),

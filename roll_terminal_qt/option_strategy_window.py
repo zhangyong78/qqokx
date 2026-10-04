@@ -4,6 +4,7 @@ from dataclasses import dataclass, replace
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
 import traceback
+import time
 from typing import Any
 
 from PySide6.QtCharts import (
@@ -15,7 +16,7 @@ from PySide6.QtCharts import (
     QLineSeries,
     QValueAxis,
 )
-from PySide6.QtCore import QDateTime, QObject, QPointF, QRectF, Qt, QThread, QTimer, Signal, Slot
+from PySide6.QtCore import QDateTime, QObject, QPointF, QRectF, QSignalBlocker, Qt, QThread, QTimer, Signal, Slot
 from PySide6.QtGui import QColor, QGuiApplication, QPainter, QPainterPath, QPen, QPolygonF
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -45,6 +46,7 @@ from PySide6.QtWidgets import (
 )
 
 from roll_terminal_qt.app_icon import apply_qt_window_icon
+from roll_terminal_qt.option_recommendation_panel import OptionRecommendationPanel
 from okx_quant.models import Candle, Credentials, Instrument
 from okx_quant.okx_client import OkxPosition, OkxRestClient, OkxTicker
 from okx_quant.option_strategy import (
@@ -80,6 +82,9 @@ from okx_quant.option_strategy import (
 )
 from okx_quant.persistence import load_option_strategies_snapshot, save_option_strategies_snapshot
 from okx_quant.option_roll import OptionRollTransferPayload
+from okx_quant.option_recommendations import (
+    RecommendationSnapshot, StrategySuggestion, build_recommendation_analysis_payload,
+)
 from okx_quant.pricing import format_decimal, format_decimal_fixed
 from okx_quant.option_strategy_ui import (
     BAR_OPTIONS,
@@ -299,6 +304,9 @@ class ChartSnapshot:
     resolved_legs: tuple[ResolvedStrategyLeg, ...]
     implied_volatility_by_alias: dict[str, Decimal]
     payoff_loaded_at: datetime | None
+    volatility_candles: tuple[Candle, ...] = ()
+    volatility_resolution_label: str = ""
+    volatility_resolution_note: str = ""
 
 
 @dataclass(frozen=True)
@@ -811,8 +819,12 @@ class _OptionChainThread(QThread):
         self._client = client
 
     def run(self) -> None:
+        if self.isInterruptionRequested():
+            return
         try:
             family_instruments = self._fetch_family_instruments_remote(self._family)
+            if self.isInterruptionRequested():
+                return
             tickers = self._fetch_family_tickers_remote(self._family)
             tickers_by_inst_id = {item.inst_id: item for item in tickers}
             expiries = sorted({parse_option_contract(item.inst_id).expiry_code for item in family_instruments})
@@ -822,6 +834,8 @@ class _OptionChainThread(QThread):
             ]
             quotes = tuple(_build_option_quote(item, tickers_by_inst_id.get(item.inst_id)) for item in selected_instruments)
             underlying_price = next((item.index_price for item in quotes if item.index_price is not None), None)
+            if self.isInterruptionRequested():
+                return
             position_coin_text_by_inst_id: dict[str, str] = {}
             try:
                 runtime = load_runtime(self._profile_name or None)
@@ -851,9 +865,11 @@ class _OptionChainThread(QThread):
                 underlying_price=underlying_price,
                 position_coin_text_by_inst_id=position_coin_text_by_inst_id,
             )
-            self.snapshot_ready.emit(self._request_id, snapshot)
+            if not self.isInterruptionRequested():
+                self.snapshot_ready.emit(self._request_id, snapshot)
         except Exception as exc:  # noqa: BLE001
-            self.error_raised.emit(self._request_id, str(exc))
+            if not self.isInterruptionRequested():
+                self.error_raised.emit(self._request_id, str(exc))
 
     def _fetch_family_instruments_remote(self, family: str) -> list[Instrument]:
         normalized = family.strip().upper()
@@ -886,11 +902,12 @@ class _OptionChainThread(QThread):
 
 
 class _LegQuoteThread(QThread):
-    snapshot_ready = Signal(object)
-    error_raised = Signal(str)
+    snapshot_ready = Signal(int, object)
+    error_raised = Signal(int, str)
 
-    def __init__(self, *, legs: list[StrategyLegDefinition], instrument_map: dict[str, Instrument], client: OkxRestClient, parent: QObject | None = None) -> None:
+    def __init__(self, *, request_id: int, legs: list[StrategyLegDefinition], instrument_map: dict[str, Instrument], client: OkxRestClient, parent: QObject | None = None) -> None:
         super().__init__(parent)
+        self._request_id = request_id
         self._legs = [StrategyLegDefinition(**leg.__dict__) for leg in legs]
         self._instrument_map = dict(instrument_map)
         self._client = client
@@ -899,12 +916,16 @@ class _LegQuoteThread(QThread):
         try:
             refreshed: list[tuple[str, Instrument, OptionQuote]] = []
             for leg in self._legs:
+                if self.isInterruptionRequested():
+                    return
                 instrument = self._instrument_map.get(leg.inst_id) or self._client.get_instrument(leg.inst_id)
                 ticker = self._client.get_ticker(leg.inst_id)
                 refreshed.append((leg.inst_id, instrument, _build_option_quote(instrument, ticker)))
-            self.snapshot_ready.emit(tuple(refreshed))
+            if not self.isInterruptionRequested():
+                self.snapshot_ready.emit(self._request_id, tuple(refreshed))
         except Exception as exc:  # noqa: BLE001
-            self.error_raised.emit(str(exc))
+            if not self.isInterruptionRequested():
+                self.error_raised.emit(self._request_id, str(exc))
 
 
 class _ImportPositionsThread(QThread):
@@ -935,11 +956,15 @@ class _ImportPositionsThread(QThread):
         self._client = client
 
     def run(self) -> None:
+        if self.isInterruptionRequested():
+            return
         try:
             runtime = load_runtime(self._profile_name) if self._profile_name else (load_runtime("159") or load_runtime())
             if runtime is None:
                 raise ValueError("当前未配置可用运行环境，无法导入账户持仓。")
             positions = self._client.get_positions(runtime.credentials, environment=runtime.environment, inst_type="OPTION")
+            if self.isInterruptionRequested():
+                return
             filtered_positions = _filter_option_positions(
                 positions,
                 family=self._family,
@@ -959,6 +984,8 @@ class _ImportPositionsThread(QThread):
             next_alias = self._alias_start
             imports: list[tuple[StrategyLegDefinition, Instrument, OptionQuote | None]] = []
             for position in filtered_positions:
+                if self.isInterruptionRequested():
+                    return
                 instrument = instrument_lookup.get(position.inst_id) or self._client.get_instrument(position.inst_id)
                 ticker = tickers_by_inst_id.get(position.inst_id)
                 quote = _build_option_quote(instrument, ticker) if ticker is not None else None
@@ -988,7 +1015,8 @@ class _ImportPositionsThread(QThread):
                 family_instruments=tuple(family_instruments),
                 tickers_by_inst_id=tickers_by_inst_id,
             )
-            self.snapshot_ready.emit(self._request_id, snapshot)
+            if not self.isInterruptionRequested():
+                self.snapshot_ready.emit(self._request_id, snapshot)
         except Exception as exc:  # noqa: BLE001
             self.error_raised.emit(self._request_id, str(exc))
 
@@ -1023,6 +1051,8 @@ class _ChartThread(QThread):
         self._current_underlying_price = current_underlying_price
 
     def run(self) -> None:
+        if self.isInterruptionRequested():
+            return
         try:
             active_legs = [item for item in self._legs if item.enabled]
             if not active_legs:
@@ -1035,6 +1065,8 @@ class _ChartThread(QThread):
             source_counts: dict[str, int] = {}
 
             for leg in active_legs:
+                if self.isInterruptionRequested():
+                    return
                 instrument = self._instrument_map.get(leg.inst_id) or self._client.get_instrument(leg.inst_id)
                 ticker = self._client.get_ticker(leg.inst_id)
                 quote = _build_option_quote(instrument, ticker)
@@ -1067,6 +1099,8 @@ class _ChartThread(QThread):
                         contract_value=option_contract_value(instrument),
                     )
 
+            if self.isInterruptionRequested():
+                return
             spot_usdt_price, spot_usdt_candles = self._load_usdt_reference_context(active_legs)
             if current_underlying_price is None and spot_usdt_price is not None:
                 current_underlying_price = spot_usdt_price
@@ -1128,6 +1162,20 @@ class _ChartThread(QThread):
                         for leg in resolved_legs
                         if leg.leg_kind == "option"
                     }
+            volatility_candles: list[Candle] = []
+            volatility_label = ""
+            volatility_note = ""
+            option_leg = next((leg for leg in active_legs if leg.leg_kind == "option"), None)
+            if option_leg is not None and not self.isInterruptionRequested():
+                try:
+                    volatility_candles, volatility_label, volatility_note = _load_deribit_option_chart_candles(
+                        parse_option_contract(option_leg.inst_id).inst_family.split("-", 1)[0],
+                        bar=self._bar, requested_limit=self._candle_limit,
+                    )
+                except Exception:
+                    volatility_note = "波动率数据暂不可用"
+            if self.isInterruptionRequested():
+                return
             snapshot = ChartSnapshot(
                 combo_candles=tuple(combo_candles),
                 requested_limit=self._candle_limit,
@@ -1142,6 +1190,9 @@ class _ChartThread(QThread):
                 resolved_legs=tuple(resolved_legs),
                 implied_volatility_by_alias=implied_volatility_by_alias,
                 payoff_loaded_at=payoff_loaded_at if payoff_snapshot is not None else None,
+                volatility_candles=tuple(volatility_candles),
+                volatility_resolution_label=volatility_label,
+                volatility_resolution_note=volatility_note,
             )
             self.snapshot_ready.emit(self._request_id, snapshot)
         except Exception as exc:  # noqa: BLE001
@@ -1198,6 +1249,8 @@ class _OverlayThread(QThread):
         self._display_in_usdt = display_in_usdt
 
     def run(self) -> None:
+        if self.isInterruptionRequested():
+            return
         try:
             active_legs = [item for item in self._legs if item.enabled]
             if not active_legs:
@@ -1216,6 +1269,8 @@ class _OverlayThread(QThread):
             currency = family.split("-", 1)[0]
             candles_by_alias: dict[str, list[Candle]] = {}
             for leg in active_legs:
+                if self.isInterruptionRequested():
+                    return
                 instrument = self._instrument_map.get(leg.inst_id) or self._client.get_instrument(leg.inst_id)
                 ticker = self._client.get_ticker(leg.inst_id)
                 quote = _build_option_quote(instrument, ticker)
@@ -1247,6 +1302,8 @@ class _OverlayThread(QThread):
                 candles_by_alias,
                 allowed_names={item.alias for item in active_legs},
             )
+            if self.isInterruptionRequested():
+                return
             spot_candles = [item for item in self._client.get_candles_history(spot_inst_id, self._bar, limit=self._candle_limit) if item.confirmed]
             combo_ccy = _native_display_currency(active_legs, self._instrument_map)
             if self._display_in_usdt:
@@ -1260,6 +1317,8 @@ class _OverlayThread(QThread):
                 requested_limit=self._candle_limit,
             )
             triples = _align_overlay_three_series(combo_candles, vol_candles, spot_candles)
+            if self.isInterruptionRequested():
+                return
             if not triples:
                 raise ValueError("组合 K 线、Deribit DVOL 与现货没有可对齐的时间戳。")
             self.snapshot_ready.emit(
@@ -4190,6 +4249,25 @@ class OptionStrategyBigChartDialog(QDialog):
         self._combo_chart = CandlestickChartView()
         combo_page = QWidget()
         combo_layout = QVBoxLayout(combo_page)
+        combo_controls = QHBoxLayout()
+        combo_controls.addWidget(QLabel("K线周期"))
+        self._combo_bar_combo = QComboBox()
+        for bar in BAR_OPTIONS:
+            self._combo_bar_combo.addItem(bar, bar)
+        combo_controls.addWidget(self._combo_bar_combo)
+        combo_controls.addWidget(QLabel("K线数量"))
+        self._combo_candle_limit_edit = QLineEdit()
+        self._combo_candle_limit_edit.setMaximumWidth(120)
+        combo_controls.addWidget(self._combo_candle_limit_edit)
+        combo_controls.addWidget(QLabel("图表币种"))
+        self._combo_display_ccy_combo = QComboBox()
+        self._combo_display_ccy_combo.addItem("结算币", "结算币")
+        self._combo_display_ccy_combo.addItem("USDT", "USDT")
+        combo_controls.addWidget(self._combo_display_ccy_combo)
+        self._combo_hide_wicks_check = QCheckBox("消除影线")
+        combo_controls.addWidget(self._combo_hide_wicks_check)
+        combo_controls.addStretch(1)
+        combo_layout.addLayout(combo_controls)
         combo_layout.addWidget(self._combo_note)
         combo_toolbar = QHBoxLayout()
         combo_toolbar.addStretch(1)
@@ -4306,6 +4384,23 @@ class OptionStrategyBigChartDialog(QDialog):
         button.setText(text)
         QTimer.singleShot(1600, lambda: button.setText("截图到剪贴板"))
 
+    def sync_combo_controls(self, *, bar: str, candle_limit: str, display_ccy: str, hide_wicks: bool) -> None:
+        """Mirror the main window's combination-K-line controls without feedback signals."""
+
+        blockers = [
+            QSignalBlocker(self._combo_bar_combo),
+            QSignalBlocker(self._combo_candle_limit_edit),
+            QSignalBlocker(self._combo_display_ccy_combo),
+            QSignalBlocker(self._combo_hide_wicks_check),
+        ]
+        try:
+            self._combo_bar_combo.setCurrentText(bar)
+            self._combo_candle_limit_edit.setText(candle_limit)
+            self._combo_display_ccy_combo.setCurrentText(display_ccy)
+            self._combo_hide_wicks_check.setChecked(hide_wicks)
+        finally:
+            del blockers
+
     @property
     def overlay_period(self) -> str:
         return str(self._overlay_period_combo.currentData() or "1H")
@@ -4352,7 +4447,18 @@ class OptionStrategyQtWindow(QMainWindow):
         self._position_import_request_id = 0
         self._chart_request_id = 0
         self._overlay_chart_request_id = 0
+        self._leg_quotes_request_id = 0
         self._worker_threads: dict[str, QThread] = {}
+        self._retired_worker_threads: set[QThread] = set()
+        self._closing = False
+        self._chain_display_context: tuple[str, str] | None = None
+        self._payoff_simulation_timer = QTimer(self)
+        self._payoff_simulation_timer.setSingleShot(True)
+        self._payoff_simulation_timer.setInterval(100)
+        self._payoff_simulation_timer.timeout.connect(self._refresh_payoff_simulation)
+        self._close_retry_timer = QTimer(self)
+        self._close_retry_timer.setInterval(100)
+        self._close_retry_timer.timeout.connect(self._retry_close_after_workers)
         self._big_dialog: OptionStrategyBigChartDialog | None = None
         self._chain_linked_chart_dialog: OptionChainLinkedChartDialog | None = None
         self._overlay_triples: list[tuple[Candle, Candle, Candle]] = []
@@ -4371,12 +4477,56 @@ class OptionStrategyQtWindow(QMainWindow):
         QTimer.singleShot(150, self.refresh_chain)
 
     def closeEvent(self, event) -> None:  # type: ignore[override]
-        for thread in list(self._worker_threads.values()):
-            thread.wait(100)
+        if not self._closing:
+            self._closing = True
+            self._chain_request_id += 1
+            self._position_import_request_id += 1
+            self._chart_request_id += 1
+            self._overlay_chart_request_id += 1
+            self._leg_quotes_request_id += 1
+            if self._big_dialog is not None:
+                self._big_dialog.close()
+            if self._chain_linked_chart_dialog is not None:
+                self._chain_linked_chart_dialog.close()
+        recommendation_closed = self._recommendation_panel.shutdown()
+        self._payoff_simulation_timer.stop()
+        threads = set(self._worker_threads.values()) | self._retired_worker_threads
+        running = [thread for thread in threads if thread.isRunning()]
+        for thread in running:
+            thread.requestInterruption()
+        if running or not recommendation_closed:
+            # Keep QObject parents and worker references alive while an in-flight
+            # REST call finishes. No waiting on the GUI thread or forced stop.
+            event.ignore()
+            self.hide()
+            self._close_retry_timer.start()
+            return
+        self._close_retry_timer.stop()
         super().closeEvent(event)
+
+    def _resume_after_close(self) -> None:
+        if self._closing:
+            self._closing = False
+            self._close_retry_timer.stop()
+            self._recommendation_panel.resume()
+
+    def showEvent(self, event) -> None:  # type: ignore[override]
+        self._resume_after_close()
+        super().showEvent(event)
 
     def workspace_profile_name(self) -> str:
         return self._profile_name
+
+    @Slot()
+    def _retry_close_after_workers(self) -> None:
+        if not self._closing:
+            self._close_retry_timer.stop()
+            return
+        threads = set(self._worker_threads.values()) | self._retired_worker_threads
+        if any(thread.isRunning() for thread in threads) or not self._recommendation_panel.shutdown():
+            return
+        self._close_retry_timer.stop()
+        self.close()
 
     def apply_workspace_profile(self, profile_name: str) -> None:
         """Receive the main workspace's active API without adding a second selector."""
@@ -4397,8 +4547,8 @@ class OptionStrategyQtWindow(QMainWindow):
         root = QWidget()
         self.setCentralWidget(root)
         layout = QVBoxLayout(root)
-        layout.setContentsMargins(14, 14, 14, 14)
-        layout.setSpacing(10)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(6)
 
         header = QHBoxLayout()
         title = QLabel("期权策略计算器")
@@ -4412,8 +4562,8 @@ class OptionStrategyQtWindow(QMainWindow):
 
         controls = QGroupBox("策略设置")
         controls_layout = QGridLayout(controls)
-        controls_layout.setHorizontalSpacing(16)
-        controls_layout.setVerticalSpacing(12)
+        controls_layout.setHorizontalSpacing(10)
+        controls_layout.setVerticalSpacing(6)
 
         strategy_box = QGroupBox("策略")
         strategy_form = QGridLayout(strategy_box)
@@ -4456,10 +4606,15 @@ class OptionStrategyQtWindow(QMainWindow):
         import_family_button = QPushButton("导入系列持仓")
         import_family_button.clicked.connect(lambda: self._start_import_positions(scope="family"))
         market_form.addWidget(import_family_button, 0, 6)
-        market_form.addWidget(QLabel("默认数量"), 1, 0)
+        market_form.addWidget(QLabel("默认数量（张）"), 1, 0)
         self._default_qty_edit = QLineEdit("1")
+        self._default_qty_edit.setMaximumWidth(140)
+        self._default_qty_edit.setToolTip("期权合约张数；折合币数 = 张数 × 每张面值（ctVal × ctMult）。")
+        self._default_qty_edit.textChanged.connect(self._update_default_quantity_hint)
         market_form.addWidget(self._default_qty_edit, 1, 1)
-        market_form.addWidget(QLabel("先选系列并刷新；也可直接把当前到期日或整个系列的持仓导入策略腿。"), 1, 2, 1, 5)
+        self._default_qty_hint_label = QLabel("选择行权价后显示面值换算；数量单位为张。")
+        self._default_qty_hint_label.setWordWrap(True)
+        market_form.addWidget(self._default_qty_hint_label, 1, 2, 1, 5)
 
         formula_box = QGroupBox("图表与公式")
         formula_layout = QGridLayout(formula_box)
@@ -4475,6 +4630,9 @@ class OptionStrategyQtWindow(QMainWindow):
         formula_layout.addWidget(default_formula_button, 0, 2)
         formula_layout.addWidget(refresh_chart_button, 0, 3)
         formula_layout.addWidget(big_chart_button, 0, 4)
+        recommendation_button = QPushButton("行情策略推荐")
+        recommendation_button.clicked.connect(lambda: self._tabs.setCurrentWidget(self._recommendation_panel))
+        formula_layout.addWidget(recommendation_button, 0, 5)
         formula_layout.addWidget(QLabel("公式支持线性表达式，例如 L1 - 2*L2 + 0.5。"), 1, 0, 1, 5)
 
         controls_layout.addWidget(strategy_box, 0, 0)
@@ -4491,7 +4649,15 @@ class OptionStrategyQtWindow(QMainWindow):
         self._chain_context_label.setWordWrap(True)
         chain_layout.addWidget(self._chain_context_label)
         self._chain_table = QTableWidget(0, 7)
-        self._chain_table.setHorizontalHeaderLabels(("仓位（折合币数量）", "认购买一", "认购卖一", "行权价", "认沽买一", "认沽卖一", "仓位（折合币数量）"))
+        self._chain_table.setHorizontalHeaderLabels(("认购仓位", "认购买一", "认购卖一", "行权价", "认沽买一", "认沽卖一", "认沽仓位"))
+        for column, tooltip in enumerate((
+            "认购持仓折合币数量；点击查看认购/认沽联动 K 线。",
+            "认购买一报价，单位为合约结算币。", "认购卖一报价，单位为合约结算币。",
+            "行权价（USD）；平值为最接近当前标的指数的行权价。",
+            "认沽买一报价，单位为合约结算币。", "认沽卖一报价，单位为合约结算币。",
+            "认沽持仓折合币数量；点击查看认购/认沽联动 K 线。",
+        )):
+            self._chain_table.horizontalHeaderItem(column).setToolTip(tooltip)
         strike_header = self._chain_table.horizontalHeaderItem(3)
         if strike_header is not None:
             strike_header.setBackground(QColor("#dce8f5"))
@@ -4503,6 +4669,9 @@ class OptionStrategyQtWindow(QMainWindow):
         self._chain_table.cellClicked.connect(self._on_chain_table_clicked)
         chain_layout.addWidget(self._chain_table, 1)
         chain_actions = QHBoxLayout()
+        self._locate_atm_button = QPushButton("定位平值")
+        self._locate_atm_button.clicked.connect(self._locate_atm_strike)
+        chain_actions.addWidget(self._locate_atm_button)
         for text, option_type, side in (
             ("添加认购买入", "C", "buy"),
             ("添加认购卖出", "C", "sell"),
@@ -4519,6 +4688,9 @@ class OptionStrategyQtWindow(QMainWindow):
         self._strategy_summary_label = QLabel("暂无策略腿。")
         self._strategy_summary_label.setWordWrap(True)
         legs_layout.addWidget(self._strategy_summary_label)
+        self._leg_details_check = QCheckBox("详细指标（币种换算 / 面值 / Greeks）")
+        self._leg_details_check.toggled.connect(self._set_leg_details_visible)
+        legs_layout.addWidget(self._leg_details_check)
         self._legs_table = QTableWidget(0, 19)
         self._legs_table.setHorizontalHeaderLabels(
             (
@@ -4574,7 +4746,9 @@ class OptionStrategyQtWindow(QMainWindow):
 
         top_splitter.addWidget(chain_panel)
         top_splitter.addWidget(legs_panel)
-        top_splitter.setSizes([520, 1040])
+        top_splitter.setSizes([700, 1040])
+        top_splitter.setStretchFactor(0, 2)
+        top_splitter.setStretchFactor(1, 3)
         main_splitter.addWidget(top_splitter)
 
         self._tabs = QTabWidget()
@@ -4646,12 +4820,25 @@ class OptionStrategyQtWindow(QMainWindow):
         self._combo_chart = CandlestickChartView()
         combo_layout.addWidget(self._combo_chart, 1)
         self._tabs.addTab(combo_tab, "组合K线")
+        self._recommendation_panel = OptionRecommendationPanel()
+        self._recommendation_panel.analysisRequested.connect(self._import_recommendation_for_analysis)
+        self._tabs.addTab(self._recommendation_panel, "行情策略推荐")
+        self._family_combo.currentTextChanged.connect(self._recommendation_panel.set_family)
+        self._recommendation_panel.set_family(self._family_combo.currentText())
         main_splitter.addWidget(self._tabs)
         main_splitter.setSizes([520, 460])
         layout.addWidget(main_splitter, 1)
 
         self._apply_table_style(self._chain_table)
         self._apply_table_style(self._legs_table)
+        self._chain_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self._set_leg_details_visible(False)
+        self._formula_edit.textChanged.connect(self._on_formula_changed)
+        self._bar_combo.currentTextChanged.connect(lambda: self._invalidate_strategy_charts(strategy_changed=False))
+        self._bar_combo.currentTextChanged.connect(lambda _value: self._sync_big_chart_combo_controls())
+        self._candle_limit_edit.textChanged.connect(lambda _value: self._sync_big_chart_combo_controls())
+        self._combo_ccy_combo.currentIndexChanged.connect(lambda _index: self._sync_big_chart_combo_controls())
+        self._hide_wicks_check.stateChanged.connect(lambda _state: self._sync_big_chart_combo_controls())
         self._payoff_chart.show_message("加入策略腿后，可生成到期盈亏图。")
         self._combo_chart.show_message("组合浮盈亏 K 线按持仓价差计算；先加入策略腿再生成。")
 
@@ -4659,6 +4846,12 @@ class OptionStrategyQtWindow(QMainWindow):
         header = table.horizontalHeader()
         header.setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
         header.setStretchLastSection(True)
+
+    @Slot(bool)
+    def _set_leg_details_visible(self, visible: bool) -> None:
+        # Keep original column indexes and all values, including the edit columns.
+        for column in (2, 3, 9, 11, 12, 14, 15, 16, 17, 18):
+            self._legs_table.setColumnHidden(column, not visible)
 
     def _load_saved_strategies(self) -> None:
         snapshot = load_option_strategies_snapshot()
@@ -4719,7 +4912,14 @@ class OptionStrategyQtWindow(QMainWindow):
 
     @Slot()
     def _on_family_changed(self) -> None:
+        self._chain_request_id += 1
+        self._position_import_request_id += 1
+        chain_thread = self._worker_threads.get("chain")
+        if chain_thread is not None:
+            chain_thread.requestInterruption()
         self._chain_rows = []
+        self._chain_display_context = None
+        self._current_underlying_price = None
         self._chain_table.setRowCount(0)
         self._sync_expiry_options()
         self._status_label.setText("点击“刷新期权链”后，会把当前系列的所有到期日刷新出来。")
@@ -4729,6 +4929,7 @@ class OptionStrategyQtWindow(QMainWindow):
         if getattr(self, "_syncing_expiry_combo", False):
             return
         if self._selected_expiry_code():
+            self._chain_request_id += 1
             if not self._apply_cached_expiry_selection():
                 self.refresh_chain()
 
@@ -4779,12 +4980,22 @@ class OptionStrategyQtWindow(QMainWindow):
         return True
 
     def _start_thread(self, key: str, thread: QThread) -> None:
-        old = self._worker_threads.pop(key, None)
+        if self._closing:
+            thread.deleteLater()
+            return
+        old = self._worker_threads.get(key)
         if old is not None:
-            old.wait(50)
-        thread.finished.connect(lambda: self._worker_threads.pop(key, None))
+            old.requestInterruption()
+            self._retired_worker_threads.add(old)
+        thread.finished.connect(lambda k=key, t=thread: self._clear_worker_thread(k, t))
         self._worker_threads[key] = thread
         thread.start()
+
+    def _clear_worker_thread(self, key: str, thread: QThread) -> None:
+        if self._worker_threads.get(key) is thread:
+            self._worker_threads.pop(key, None)
+        self._retired_worker_threads.discard(thread)
+        thread.deleteLater()
 
     def _selected_chain_row(self) -> OptionChainRow | None:
         row = self._chain_table.currentRow()
@@ -4827,9 +5038,16 @@ class OptionStrategyQtWindow(QMainWindow):
 
     @Slot()
     def refresh_chain(self) -> None:
+        if self._closing:
+            return
         family = self._family_combo.currentText().strip().upper()
         if not family:
             QMessageBox.warning(self, "期权链参数错误", "请先输入或选择期权系列。")
+            return
+        old = self._worker_threads.get("chain")
+        if (old is not None and old.isRunning() and old._request_id == self._chain_request_id
+                and old._family == family and old._preferred_expiry == self._selected_expiry_code()):
+            self._status_label.setText(f"{family} 期权链正在刷新，请稍候。")
             return
         self._chain_request_id += 1
         request_id = self._chain_request_id
@@ -4848,10 +5066,15 @@ class OptionStrategyQtWindow(QMainWindow):
 
     @Slot(int, object)
     def _apply_chain_snapshot(self, request_id: int, snapshot: object) -> None:
-        if request_id != self._chain_request_id and request_id != self._chain_request_id + 1:
+        if self._closing or request_id != self._chain_request_id:
             return
         if not isinstance(snapshot, ChainSnapshot):
             return
+        if snapshot.family != self._family_combo.currentText().strip().upper():
+            return
+        context = (snapshot.family, snapshot.expiry)
+        selected = self._selected_chain_row() if self._chain_display_context == context else None
+        preferred_strike = selected.strike if selected is not None else None
         self._chain_rows = list(snapshot.chain_rows)
         self._current_underlying_price = snapshot.underlying_price
         self._chain_position_coin_text_by_inst_id = dict(snapshot.position_coin_text_by_inst_id)
@@ -4863,18 +5086,23 @@ class OptionStrategyQtWindow(QMainWindow):
         for quote in snapshot.quotes:
             self._quotes_by_inst_id[quote.instrument.inst_id] = quote
         self._sync_expiry_options(preferred=snapshot.expiry)
-        self._render_chain_rows()
+        self._chain_display_context = context
+        self._render_chain_rows(preferred_strike=preferred_strike, preserve_selection=False)
         self._status_label.setText(f"{snapshot.family} 已刷新出 {len(snapshot.expiries)} 个到期日，当前显示 {snapshot.expiry or '-'}。")
         self._refresh_strategy_summary()
 
     @Slot(int, str)
     def _show_chain_error(self, request_id: int, message: str) -> None:
-        if request_id != self._chain_request_id:
+        if self._closing or request_id != self._chain_request_id:
             return
         self._status_label.setText("期权链加载失败")
         QMessageBox.critical(self, "期权链加载失败", message)
 
-    def _render_chain_rows(self) -> None:
+    def _render_chain_rows(self, *, preferred_strike: Decimal | None = None, preserve_selection: bool = True) -> None:
+        selected = self._selected_chain_row()
+        if preserve_selection and preferred_strike is None and selected is not None:
+            preferred_strike = selected.strike
+        self._chain_table.blockSignals(True)
         self._chain_table.setRowCount(len(self._chain_rows))
         atm_strike = None
         if self._chain_rows and self._current_underlying_price is not None and self._current_underlying_price > 0:
@@ -4898,6 +5126,8 @@ class OptionStrategyQtWindow(QMainWindow):
             )
             for column_index, value in enumerate(values):
                 item = QTableWidgetItem(str(value))
+                item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+                item.setToolTip(self._chain_table.horizontalHeaderItem(column_index).toolTip())
                 if column_index == 3:
                     item.setBackground(QColor("#eef4fb"))
                     if row.strike == atm_strike:
@@ -4911,14 +5141,50 @@ class OptionStrategyQtWindow(QMainWindow):
                         )
                 self._chain_table.setItem(row_index, column_index, item)
         self._update_chain_context_ui(row_count=len(self._chain_rows))
+        self._chain_table.blockSignals(False)
         if self._chain_rows:
-            self._chain_table.selectRow(0)
+            target_strike = preferred_strike if any(row.strike == preferred_strike for row in self._chain_rows) else atm_strike
+            target_index = next((index for index, row in enumerate(self._chain_rows) if row.strike == target_strike), 0)
+            self._chain_table.selectRow(target_index)
+            self._chain_table.scrollToItem(self._chain_table.item(target_index, 3), QAbstractItemView.ScrollHint.PositionAtCenter)
             self._on_chain_selected()
         else:
             self._chain_context_label.setText("当前到期日没有拿到可用期权链数据。")
 
     @Slot()
+    def _locate_atm_strike(self) -> None:
+        if not self._chain_rows or self._current_underlying_price is None or self._current_underlying_price <= 0:
+            self._status_label.setText("当前标的指数暂不可用，无法定位平值。")
+            return
+        index = min(range(len(self._chain_rows)), key=lambda i: abs(self._chain_rows[i].strike - self._current_underlying_price))
+        self._chain_table.selectRow(index)
+        self._chain_table.scrollToItem(self._chain_table.item(index, 3), QAbstractItemView.ScrollHint.PositionAtCenter)
+        self._on_chain_selected()
+
+    @Slot()
+    def _update_default_quantity_hint(self) -> None:
+        row = self._selected_chain_row() if hasattr(self, "_chain_table") else None
+        quote = (row.call_quote or row.put_quote) if row is not None else None
+        if quote is None:
+            self._default_qty_hint_label.setText("选择行权价后显示面值换算；数量单位为张。")
+            return
+        try:
+            quantity = self._parse_positive_decimal(self._default_qty_edit.text(), "默认数量")
+            coin_quantity = option_contract_coin_quantity(quote.instrument, quantity)
+            if coin_quantity is None:
+                self._default_qty_hint_label.setText(f"{format_decimal(quantity)} 张 | 合约面值资料不完整，暂不能折算币数量。")
+                return
+            currency = quote.instrument.ct_val_ccy or quote.instrument.inst_id.split("-", 1)[0]
+            self._default_qty_hint_label.setText(
+                f"{format_decimal(quantity)} 张 ≈ {format_decimal(coin_quantity)} {currency}"
+                f" | 每张面值 {format_decimal(option_contract_value(quote.instrument))} {currency}"
+            )
+        except ValueError:
+            self._default_qty_hint_label.setText("数量须为有限正数，单位：张。")
+
+    @Slot()
     def _on_chain_selected(self) -> None:
+        self._update_default_quantity_hint()
         row = self._selected_chain_row()
         if row is None:
             return
@@ -4935,6 +5201,8 @@ class OptionStrategyQtWindow(QMainWindow):
             value = Decimal(text.strip())
         except (InvalidOperation, AttributeError) as exc:
             raise ValueError(f"{field_name} 不是有效数字。") from exc
+        if not value.is_finite():
+            raise ValueError(f"{field_name} 必须是有限数字。")
         if value <= 0:
             raise ValueError(f"{field_name} 必须大于 0。")
         return value
@@ -4963,6 +5231,7 @@ class OptionStrategyQtWindow(QMainWindow):
         except Exception as exc:  # noqa: BLE001
             QMessageBox.critical(self, "数量错误", str(exc))
             return
+        old_default_formula = build_default_formula(self._legs)
         self._alias_counter += 1
         leg = StrategyLegDefinition(
             alias=f"L{self._alias_counter}",
@@ -4977,8 +5246,8 @@ class OptionStrategyQtWindow(QMainWindow):
         self._quotes_by_inst_id[quote.instrument.inst_id] = quote
         if self._current_underlying_price is None:
             self._current_underlying_price = quote.index_price or self._load_spot_reference_price_for_legs(self._legs)
-        if not self._formula_edit.text().strip():
-            self._formula_edit.setText(build_default_formula(self._legs))
+        self._sync_default_formula(old_default_formula)
+        self._invalidate_strategy_charts()
         self._refresh_leg_greeks()
         self._render_legs()
         self._refresh_strategy_summary()
@@ -4989,7 +5258,10 @@ class OptionStrategyQtWindow(QMainWindow):
         if index is None:
             QMessageBox.information(self, "删除策略腿", "请先选择一条策略腿。")
             return
+        old_default_formula = build_default_formula(self._legs)
         self._legs.pop(index)
+        self._sync_default_formula(old_default_formula)
+        self._invalidate_strategy_charts()
         self._render_legs()
         self._refresh_strategy_summary()
 
@@ -4998,7 +5270,7 @@ class OptionStrategyQtWindow(QMainWindow):
         self._legs_table.selectRow(row)
         if column == 6:
             self.edit_selected_leg_quantity()
-        elif column == 7:
+        elif column == 8:
             self.edit_selected_leg_premium()
 
     @Slot()
@@ -5009,7 +5281,7 @@ class OptionStrategyQtWindow(QMainWindow):
             return
         leg = self._legs[index]
         old_default_formula = build_default_formula(self._legs)
-        text, accepted = QInputDialog.getText(self, "修改数量", f"请输入 {leg.alias} 的新数量：", text=format_decimal(leg.quantity))
+        text, accepted = QInputDialog.getText(self, "修改数量", f"请输入 {leg.alias} 的新数量（张）：", text=format_decimal(leg.quantity))
         if not accepted:
             return
         try:
@@ -5017,12 +5289,11 @@ class OptionStrategyQtWindow(QMainWindow):
         except Exception as exc:  # noqa: BLE001
             QMessageBox.critical(self, "修改数量失败", str(exc))
             return
-        if self._formula_edit.text().strip() == old_default_formula:
-            self._formula_edit.setText(build_default_formula(self._legs))
+        self._sync_default_formula(old_default_formula)
+        self._invalidate_strategy_charts()
+        self._refresh_leg_greeks()
         self._render_legs()
         self._refresh_strategy_summary()
-        if self._latest_payoff_snapshot is not None or self._latest_combo_candles:
-            self.refresh_charts()
 
     @Slot()
     def edit_selected_leg_premium(self) -> None:
@@ -5040,19 +5311,70 @@ class OptionStrategyQtWindow(QMainWindow):
             leg.premium = None
         else:
             try:
-                leg.premium = self._parse_positive_decimal(text, "持仓价")
+                value = Decimal(text)
+                if not value.is_finite() or value < 0:
+                    raise ValueError("持仓价须为有限非负数；留空表示缺失。")
+                leg.premium = value
             except Exception as exc:  # noqa: BLE001
                 QMessageBox.critical(self, "修改持仓价失败", str(exc))
                 return
+        self._invalidate_strategy_charts()
+        self._refresh_leg_greeks()
         self._render_legs()
         self._refresh_strategy_summary()
-        if self._latest_payoff_snapshot is not None or self._latest_combo_candles:
-            self._refresh_payoff_simulation()
-            self._refresh_chart_display()
+
+    def _sync_default_formula(self, old_default: str) -> None:
+        current = self._formula_edit.text().strip()
+        if not current or current == old_default:
+            self._formula_edit.setText(build_default_formula(self._legs))
+
+    @Slot()
+    def _on_formula_changed(self) -> None:
+        self._invalidate_strategy_charts(strategy_changed=False)
+        self._refresh_strategy_summary()
+
+    def _invalidate_strategy_charts(self, *, strategy_changed: bool = True) -> None:
+        self._chart_request_id += 1
+        self._overlay_chart_request_id += 1
+        keys = ["chart", "overlay"]
+        if strategy_changed:
+            self._leg_quotes_request_id += 1
+            self._position_import_request_id += 1
+            keys.extend(("leg_quotes", "import_positions"))
+        for key in keys:
+            thread = self._worker_threads.get(key)
+            if thread is not None:
+                thread.requestInterruption()
+        self._payoff_simulation_timer.stop()
+        self._latest_payoff_snapshot = None
+        self._latest_expiry_payoff_snapshot = None
+        self._latest_combo_candles = []
+        self._latest_combo_value = None
+        self._latest_combo_requested_limit = None
+        self._latest_combo_source_counts = {}
+        self._latest_chart_formula = ""
+        self._latest_resolved_legs = []
+        self._latest_implied_volatility_by_alias = {}
+        self._latest_payoff_loaded_at = None
+        self._latest_payoff_expiry_at = None
+        self._latest_deribit_volatility_candles = []
+        self._latest_deribit_resolution_label = ""
+        self._latest_deribit_resolution_note = ""
+        self._overlay_triples = []
+        message = "策略已修改，请点击“刷新图表”重新计算。" if self._legs else "加入策略腿后，可生成图表。"
+        self._payoff_chart.show_message(message)
+        self._combo_chart.show_message(message)
+        self._payoff_summary_label.setText(message)
+        self._combo_summary_label.setText(message)
+        if self._big_dialog is not None:
+            self._refresh_big_chart_window()
 
     @Slot()
     def clear_legs(self) -> None:
+        old_default_formula = build_default_formula(self._legs)
         self._legs.clear()
+        self._sync_default_formula(old_default_formula)
+        self._invalidate_strategy_charts()
         self._latest_payoff_snapshot = None
         self._latest_expiry_payoff_snapshot = None
         self._latest_combo_candles = []
@@ -5240,7 +5562,13 @@ class OptionStrategyQtWindow(QMainWindow):
                 _format_compact_number(theta_usdt),
             )
             for column_index, value in enumerate(values):
-                self._legs_table.setItem(row_index, column_index, QTableWidgetItem(str(value)))
+                cell = QTableWidgetItem(str(value))
+                cell.setToolTip(str(value))
+                if column_index >= 6 or column_index == 4:
+                    cell.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+                if column_index == 5:
+                    cell.setForeground(QColor("#138746" if leg.side == "buy" else "#c94150"))
+                self._legs_table.setItem(row_index, column_index, cell)
 
         if self._legs:
             total_row = len(self._legs)
@@ -5296,7 +5624,7 @@ class OptionStrategyQtWindow(QMainWindow):
             latest_values: dict[str, Decimal | None] = {}
             for leg in self._legs:
                 quote = self._quotes_by_inst_id.get(leg.inst_id)
-                reference_value = quote.reference_price if quote is not None else leg.premium
+                reference_value = quote.reference_price if quote is not None else None
                 instrument = self._instrument_map.get(leg.inst_id)
                 if reference_value is None or leg.premium is None:
                     latest_values[leg.alias] = None
@@ -5357,18 +5685,31 @@ class OptionStrategyQtWindow(QMainWindow):
 
     @Slot()
     def refresh_leg_quotes(self) -> None:
+        if self._closing:
+            return
         if not self._legs:
             QMessageBox.information(self, "刷新腿报价", "当前没有策略腿。")
             return
+        old = self._worker_threads.get("leg_quotes")
+        if old is not None and old.isRunning() and old._request_id == self._leg_quotes_request_id:
+            self._status_label.setText("策略腿报价正在刷新，请稍候。")
+            return
+        self._leg_quotes_request_id += 1
         self._status_label.setText("正在刷新策略腿报价...")
-        thread = _LegQuoteThread(legs=self._legs, instrument_map=self._instrument_map, client=self._client, parent=self)
+        thread = _LegQuoteThread(request_id=self._leg_quotes_request_id, legs=self._legs, instrument_map=self._instrument_map, client=self._client, parent=self)
         thread.snapshot_ready.connect(self._apply_refreshed_leg_quotes)
-        thread.error_raised.connect(lambda message: QMessageBox.critical(self, "刷新腿报价失败", message))
+        thread.error_raised.connect(self._show_leg_quotes_error)
         self._start_thread("leg_quotes", thread)
 
-    @Slot(object)
-    def _apply_refreshed_leg_quotes(self, refreshed: object) -> None:
-        if not isinstance(refreshed, tuple):
+    @Slot(int, str)
+    def _show_leg_quotes_error(self, request_id: int, message: str) -> None:
+        if not self._closing and request_id == self._leg_quotes_request_id:
+            self._status_label.setText("策略腿报价刷新失败")
+            QMessageBox.critical(self, "刷新腿报价失败", message)
+
+    @Slot(int, object)
+    def _apply_refreshed_leg_quotes(self, request_id: int, refreshed: object) -> None:
+        if self._closing or request_id != self._leg_quotes_request_id or not isinstance(refreshed, tuple):
             return
         for inst_id, instrument, quote in refreshed:
             self._instrument_map[inst_id] = instrument
@@ -5383,6 +5724,8 @@ class OptionStrategyQtWindow(QMainWindow):
         self._status_label.setText("策略腿报价已刷新。")
 
     def _start_import_positions(self, *, scope: str) -> None:
+        if self._closing:
+            return
         family = self._family_combo.currentText().strip().upper()
         expiry = self._selected_expiry_code()
         if not family:
@@ -5426,14 +5769,15 @@ class OptionStrategyQtWindow(QMainWindow):
 
     @Slot(int, object)
     def _apply_imported_positions(self, request_id: int, snapshot: object) -> None:
-        if request_id != self._position_import_request_id:
+        if self._closing or request_id != self._position_import_request_id:
             return
         if not isinstance(snapshot, ImportSnapshot):
+            return
+        if snapshot.family != self._family_combo.currentText().strip().upper():
             return
         old_default_formula = build_default_formula(self._legs) if self._legs else ""
         if snapshot.replace_existing:
             self._legs = []
-            self.clear_legs()
         for leg, instrument, quote in snapshot.imported:
             self._legs.append(leg)
             self._instrument_map[instrument.inst_id] = instrument
@@ -5454,6 +5798,7 @@ class OptionStrategyQtWindow(QMainWindow):
             self._current_underlying_price = self._load_spot_reference_price_for_legs(self._legs)
         if not self._formula_edit.text().strip() or self._formula_edit.text().strip() == old_default_formula:
             self._formula_edit.setText(build_default_formula(self._legs))
+        self._invalidate_strategy_charts()
         self._refresh_leg_greeks()
         self._render_legs()
         self._refresh_strategy_summary()
@@ -5463,7 +5808,7 @@ class OptionStrategyQtWindow(QMainWindow):
 
     @Slot(int, str)
     def _show_import_positions_error(self, request_id: int, message: str) -> None:
-        if request_id != self._position_import_request_id:
+        if self._closing or request_id != self._position_import_request_id:
             return
         self._status_label.setText("导入持仓失败")
         QMessageBox.critical(self, "导入持仓失败", message)
@@ -5494,10 +5839,14 @@ class OptionStrategyQtWindow(QMainWindow):
 
     @Slot()
     def refresh_charts(self) -> None:
+        if self._closing:
+            return
         validated = self._validate_chart_inputs()
         if validated is None:
             return
         candle_limit, formula = validated
+        if self._chart_request_in_progress("all", candle_limit, formula):
+            return
         self._chart_request_id += 1
         request_id = self._chart_request_id
         self._status_label.setText("正在生成到期盈亏图和组合 K 线...")
@@ -5519,10 +5868,14 @@ class OptionStrategyQtWindow(QMainWindow):
 
     @Slot()
     def refresh_combo_chart(self) -> None:
+        if self._closing:
+            return
         validated = self._validate_chart_inputs()
         if validated is None:
             return
         candle_limit, formula = validated
+        if self._chart_request_in_progress("combo", candle_limit, formula):
+            return
         self._chart_request_id += 1
         request_id = self._chart_request_id
         self._status_label.setText("正在刷新组合 K 线...")
@@ -5542,9 +5895,18 @@ class OptionStrategyQtWindow(QMainWindow):
         thread.error_raised.connect(self._show_chart_error)
         self._start_thread("chart", thread)
 
+    def _chart_request_in_progress(self, mode: str, candle_limit: int, formula: str) -> bool:
+        old = self._worker_threads.get("chart")
+        if (old is not None and old.isRunning() and old._request_id == self._chart_request_id
+                and old._mode == mode and old._candle_limit == candle_limit and old._formula == formula
+                and old._bar == str(self._bar_combo.currentData() or self._bar_combo.currentText() or "1H")):
+            self._status_label.setText("策略图表正在计算，请稍候。")
+            return True
+        return False
+
     @Slot(int, object)
     def _apply_chart_snapshot(self, request_id: int, snapshot: object) -> None:
-        if request_id != self._chart_request_id:
+        if self._closing or request_id != self._chart_request_id:
             return
         if not isinstance(snapshot, ChartSnapshot):
             return
@@ -5570,7 +5932,9 @@ class OptionStrategyQtWindow(QMainWindow):
                 if item.leg_kind == "option" and item.expiry_code
             ]
             self._latest_payoff_expiry_at = max(option_expiries) if option_expiries else None
-        self._refresh_deribit_volatility_series(snapshot.requested_limit)
+        self._latest_deribit_volatility_candles = list(snapshot.volatility_candles)
+        self._latest_deribit_resolution_label = snapshot.volatility_resolution_label
+        self._latest_deribit_resolution_note = snapshot.volatility_resolution_note
         self._refresh_leg_greeks()
         self._render_legs()
         self._refresh_strategy_summary()
@@ -5583,7 +5947,7 @@ class OptionStrategyQtWindow(QMainWindow):
 
     @Slot(int, str)
     def _show_chart_error(self, request_id: int, message: str) -> None:
-        if request_id != self._chart_request_id:
+        if self._closing or request_id != self._chart_request_id:
             return
         self._status_label.setText("图表生成失败")
         QMessageBox.critical(self, "图表生成失败", message)
@@ -5619,6 +5983,37 @@ class OptionStrategyQtWindow(QMainWindow):
 
     def _combo_display_in_usdt(self) -> bool:
         return str(self._combo_ccy_combo.currentData() or self._combo_ccy_combo.currentText()).strip().upper() == "USDT"
+
+    def _sync_big_chart_combo_controls(self) -> None:
+        dialog = self._big_dialog
+        if dialog is None:
+            return
+        dialog.sync_combo_controls(
+            bar=str(self._bar_combo.currentData() or self._bar_combo.currentText() or "1H"),
+            candle_limit=self._candle_limit_edit.text(),
+            display_ccy=str(self._combo_ccy_combo.currentData() or self._combo_ccy_combo.currentText() or "结算币"),
+            hide_wicks=self._hide_wicks_check.isChecked(),
+        )
+
+    @Slot(str)
+    def _set_combo_bar_from_big_chart(self, bar: str) -> None:
+        if self._bar_combo.currentText() != bar:
+            self._bar_combo.setCurrentText(bar)
+
+    @Slot(str)
+    def _set_combo_candle_limit_from_big_chart(self, candle_limit: str) -> None:
+        if self._candle_limit_edit.text() != candle_limit:
+            self._candle_limit_edit.setText(candle_limit)
+
+    @Slot(str)
+    def _set_combo_display_currency_from_big_chart(self, display_ccy: str) -> None:
+        if self._combo_ccy_combo.currentText() != display_ccy:
+            self._combo_ccy_combo.setCurrentText(display_ccy)
+
+    @Slot(bool)
+    def _set_combo_hide_wicks_from_big_chart(self, hide_wicks: bool) -> None:
+        if self._hide_wicks_check.isChecked() != hide_wicks:
+            self._hide_wicks_check.setChecked(hide_wicks)
 
     def _payoff_snapshot_for_display(self, snapshot: StrategyPayoffSnapshot) -> tuple[StrategyPayoffSnapshot, str]:
         if not self._display_in_usdt():
@@ -5659,7 +6054,8 @@ class OptionStrategyQtWindow(QMainWindow):
     @Slot()
     def _on_payoff_slider_changed(self) -> None:
         self._update_payoff_simulation_labels()
-        self._refresh_payoff_simulation()
+        if not self._closing:
+            self._payoff_simulation_timer.start()
 
     def _update_payoff_simulation_labels(self) -> None:
         valuation_time = self._current_payoff_valuation_time()
@@ -5681,6 +6077,8 @@ class OptionStrategyQtWindow(QMainWindow):
         return "模拟盈亏"
 
     def _refresh_payoff_simulation(self) -> None:
+        if self._closing:
+            return
         if not self._latest_resolved_legs or self._latest_payoff_loaded_at is None:
             self._update_payoff_simulation_labels()
             return
@@ -5714,7 +6112,11 @@ class OptionStrategyQtWindow(QMainWindow):
             compare_text = " | 叠加到期盈亏对比" if reference_snapshot is not None else ""
             self._payoff_summary_label.setText(
                 f"{underlying_text} | 单位 {payoff_ccy} | 估值日 {valuation_text} | 波动率平移 {_format_signed_percent(self._current_volatility_shift_decimal() * Decimal('100'))}\n"
-                f"净权利金 {_format_compact_number(payoff_snapshot.net_premium)} | 盈亏平衡点 {break_even_text}{compare_text}"
+                f"净权利金 {_format_compact_number(payoff_snapshot.net_premium)} {payoff_ccy} | 盈亏平衡点 {break_even_text}{compare_text}\n"
+                f"图示标的价格范围 {_format_compact_number(payoff_snapshot.price_lower)}–{_format_compact_number(payoff_snapshot.price_upper)} USD"
+                f" | 范围内最高盈亏 {_format_compact_number(max((point.pnl for point in payoff_snapshot.points), default=Decimal('0')))} {payoff_ccy}"
+                f" | 范围内最低盈亏 {_format_compact_number(min((point.pnl for point in payoff_snapshot.points), default=Decimal('0')))} {payoff_ccy}"
+                " | 未含手续费"
             )
             self._payoff_chart.set_snapshot(
                 payoff_snapshot,
@@ -5769,9 +6171,61 @@ class OptionStrategyQtWindow(QMainWindow):
             return None
         return spot_ticker.last or spot_ticker.bid or spot_ticker.ask
 
+    @Slot(object, object)
+    def _import_recommendation_for_analysis(self, snapshot: object, suggestion: object) -> None:
+        if (self._closing or not isinstance(snapshot, RecommendationSnapshot)
+                or not isinstance(suggestion, StrategySuggestion)
+                or snapshot is not self._recommendation_panel._snapshot
+                or snapshot.family != self._family_combo.currentText().strip().upper()):
+            return
+        try:
+            quantity = self._parse_positive_decimal(self._default_qty_edit.text(), "默认数量（张）")
+            payload = build_recommendation_analysis_payload(
+                snapshot, suggestion, base_quantity=quantity, now_ms=int(time.time() * 1000),
+            )
+        except (ValueError, InvalidOperation) as exc:
+            QMessageBox.warning(self, "无法带入分析", str(exc))
+            return
+        if self._legs:
+            answer = QMessageBox.question(
+                self, "带入推荐分析", f"将用“{suggestion.name}”替换当前 {len(self._legs)} 条策略腿及公式。\n"
+                "数量按顶部默认张数乘各腿比例，参考权利金作为模拟入场成本，不会下单。\n是否继续？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+            # A modal confirmation can remain open while the recommendation
+            # becomes stale. Validate again before replacing any analysis legs.
+            if snapshot is not self._recommendation_panel._snapshot:
+                return
+            try:
+                payload = build_recommendation_analysis_payload(
+                    snapshot, suggestion, base_quantity=quantity, now_ms=int(time.time() * 1000),
+                )
+            except (ValueError, InvalidOperation) as exc:
+                QMessageBox.warning(self, "无法带入分析", str(exc))
+                return
+        # Prepare the selected expiry without letting an older chain response
+        # overwrite the newly imported analysis context.
+        self._chain_request_id += 1
+        chain_worker = self._worker_threads.get("chain")
+        if chain_worker is not None:
+            chain_worker.requestInterruption()
+        cached = {item.inst_id: item for item in self._family_instruments_cache.get(snapshot.family, ())}
+        cached.update({item.inst_id: item for item in payload.instruments})
+        self._family_instruments_cache[snapshot.family] = list(cached.values())
+        self._chain_rows = []
+        self._chain_display_context = None
+        self._chain_table.setRowCount(0)
+        self.load_roll_transfer_payload(payload)
+        self._sync_expiry_options(preferred=payload.expiry_code)
+        self._tabs.setCurrentIndex(0)
+        self._status_label.setText(f"已带入 {suggestion.name} | 正在生成分析图表 | 模拟参考价，不会下单")
+
     def load_roll_transfer_payload(self, payload: object) -> None:
         if not isinstance(payload, OptionRollTransferPayload):
             raise ValueError("\u5c55\u671f\u7b56\u7565\u8f7d\u8377\u65e0\u6548\u3002")
+        self._resume_after_close()
         self.clear_legs()
         self._legs = list(payload.legs)
         self._instrument_map.update({item.inst_id: item for item in payload.instruments})
@@ -5907,6 +6361,8 @@ class OptionStrategyQtWindow(QMainWindow):
             quantity = self._parse_positive_decimal(str(raw.get("quantity", "1")), "策略腿数量")
             premium_text = str(raw.get("premium", "")).strip()
             premium = Decimal(premium_text) if premium_text else None
+            if premium is not None and not premium.is_finite():
+                raise ValueError("持仓价必须是有限数字。")
             delta_text = str(raw.get("delta", "")).strip()
             gamma_text = str(raw.get("gamma", "")).strip()
             theta_text = str(raw.get("theta", "")).strip()
@@ -5934,6 +6390,7 @@ class OptionStrategyQtWindow(QMainWindow):
             raise ValueError("策略里没有可用的策略腿。")
         self._alias_counter = max(self._alias_counter, max_alias_index)
         self._legs = restored
+        self._invalidate_strategy_charts()
         for leg in restored:
             if leg.inst_id in self._instrument_map:
                 continue
@@ -5953,6 +6410,10 @@ class OptionStrategyQtWindow(QMainWindow):
         if self._big_dialog is None:
             self._big_dialog = OptionStrategyBigChartDialog(self)
             self._big_dialog.auto_refresh_requested.connect(self._auto_refresh_big_chart_window)
+            self._big_dialog._combo_bar_combo.currentTextChanged.connect(self._set_combo_bar_from_big_chart)
+            self._big_dialog._combo_candle_limit_edit.textChanged.connect(self._set_combo_candle_limit_from_big_chart)
+            self._big_dialog._combo_display_ccy_combo.currentTextChanged.connect(self._set_combo_display_currency_from_big_chart)
+            self._big_dialog._combo_hide_wicks_check.toggled.connect(self._set_combo_hide_wicks_from_big_chart)
             self._big_dialog._overlay_refresh_button.clicked.connect(self._request_overlay_chart_refresh)
             self._big_dialog._overlay_period_combo.currentIndexChanged.connect(self._request_overlay_chart_refresh)
             self._big_dialog._overlay_combo_chart.hover_changed.connect(self._sync_overlay_chart_hover)
@@ -5980,6 +6441,7 @@ class OptionStrategyQtWindow(QMainWindow):
         dialog = self._big_dialog
         if dialog is None:
             return
+        self._sync_big_chart_combo_controls()
         dialog._payoff_note.setText(self._payoff_summary_label.text())
         dialog._combo_note.setText(self._combo_summary_label.text())
         if self._latest_payoff_snapshot is not None:
@@ -6057,6 +6519,8 @@ class OptionStrategyQtWindow(QMainWindow):
 
     @Slot()
     def _request_overlay_chart_refresh(self) -> None:
+        if self._closing:
+            return
         if self._big_dialog is None or not self._legs:
             return
         validated = self._validate_chart_inputs()
@@ -6084,7 +6548,7 @@ class OptionStrategyQtWindow(QMainWindow):
 
     @Slot(int, object)
     def _apply_overlay_snapshot(self, request_id: int, snapshot: object) -> None:
-        if request_id != self._overlay_chart_request_id:
+        if self._closing or request_id != self._overlay_chart_request_id:
             return
         if not isinstance(snapshot, OverlaySnapshot):
             return
@@ -6098,7 +6562,7 @@ class OptionStrategyQtWindow(QMainWindow):
 
     @Slot(int, str)
     def _show_overlay_error(self, request_id: int, message: str) -> None:
-        if request_id != self._overlay_chart_request_id:
+        if self._closing or request_id != self._overlay_chart_request_id:
             return
         self._overlay_triples = []
         if self._big_dialog is not None:
