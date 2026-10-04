@@ -5683,6 +5683,8 @@ class KlineAnalysisWindow(QMainWindow):
         self._header_panel: QFrame | None = None
         self._control_panel: QFrame | None = None
         self._control_scroll: QScrollArea | None = None
+        self._control_tabs: QTabWidget | None = None
+        self._layout_context_panel: QFrame | None = None
         self._account_drawer: KlineAccountDrawer | None = None
         self._orders_drawer_button: QPushButton | None = None
         self._positions_drawer_button: QPushButton | None = None
@@ -6224,14 +6226,12 @@ class KlineAnalysisWindow(QMainWindow):
         self._ema21.setToolTip("显示或隐藏 SMA 50 均线。")
         self._ema21.toggled.connect(self._sync_chart_options)
         ma_group_layout.addWidget(self._ema21)
-        top_row.addWidget(ma_group, 0)
 
         self._best_parameter_indicators_check = QCheckBox("最佳参数指标")
         self._best_parameter_indicators_check.setToolTip(
             "显示当前品种已固化的最佳参数均线；会按当前 K 线周期重新计算，开启时隐藏原 EMA 15 / SMA 50。"
         )
         self._best_parameter_indicators_check.toggled.connect(self._on_best_parameter_indicators_changed)
-        top_row.addWidget(self._best_parameter_indicators_check, 0)
 
         self._history_trade_group = QFrame()
         self._history_trade_group.setObjectName("ToolbarGroup")
@@ -6263,7 +6263,6 @@ class KlineAnalysisWindow(QMainWindow):
         self._sync_history_trades_button.setToolTip("重新从 OKX 同步当前品种的历史开多、平多、开空、平空记录。")
         self._sync_history_trades_button.clicked.connect(lambda: self._load_history_trades(force=True))
         history_trade_layout.addWidget(self._sync_history_trades_button)
-        top_row.addWidget(self._history_trade_group, 0)
 
         shape_signal_tooltip = (
             "形态说明：1H/4H/1D/1W 显示核心标志K触发的形态信号。\n"
@@ -6327,7 +6326,6 @@ class KlineAnalysisWindow(QMainWindow):
         self._shape_signal_ma_touch_check.setToolTip(shape_signal_tooltip)
         self._shape_signal_ma_touch_check.toggled.connect(self._sync_chart_options)
         shape_group_layout.addWidget(self._shape_signal_ma_touch_check)
-        top_row.addWidget(shape_group, 0)
 
         self._shape_settings_button = QPushButton("形态：关")
         self._shape_settings_button.setToolTip(shape_signal_tooltip)
@@ -6353,7 +6351,6 @@ class KlineAnalysisWindow(QMainWindow):
         history_action = shape_menu.addAction("历史形态信号")
         history_action.triggered.connect(self._open_shape_signal_history)
         self._shape_settings_button.setMenu(shape_menu)
-        top_row.addWidget(self._shape_settings_button, 0)
         if self._embedded:
             self._shape_signal_group.hide()
         else:
@@ -6363,9 +6360,9 @@ class KlineAnalysisWindow(QMainWindow):
         self._status.setObjectName("Subtle")
         top_row.addStretch(1)
         top_row.addWidget(self._status, 3, Qt.AlignmentFlag.AlignRight)
-        header_layout.addLayout(top_row)
-
-        linkage_row = QHBoxLayout()
+        self._layout_context_panel = QFrame()
+        linkage_row = QHBoxLayout(self._layout_context_panel)
+        linkage_row.setContentsMargins(0, 0, 0, 0)
         linkage_row.setSpacing(10)
         self._secondary_chart_check = QCheckBox("双图联动")
         self._secondary_chart_check.toggled.connect(self._on_secondary_chart_toggled)
@@ -6469,27 +6466,33 @@ class KlineAnalysisWindow(QMainWindow):
         self._daily_timezone_compare_btn.clicked.connect(self._on_daily_timezone_compare_clicked)
         linkage_row.addWidget(self._daily_timezone_compare_btn)
         linkage_row.addStretch(1)
-        header_layout.addLayout(linkage_row)
 
-        action_row = QHBoxLayout()
-        action_row.setSpacing(10)
-        action_row.addWidget(QLabel("数量"))
+        view_options_menu = QMenu(header)
+        view_options_widget = QWidget(view_options_menu)
+        view_options_layout = QVBoxLayout(view_options_widget)
+        view_options_layout.setContentsMargins(8, 8, 8, 8)
+        view_options_layout.setSpacing(6)
+        data_options_row = QHBoxLayout()
+        data_options_row.addWidget(QLabel("K线数量"))
         self._limit_spin = QSpinBox()
         self._limit_spin.setRange(50, 5000)
         self._limit_spin.setSingleStep(50)
         self._limit_spin.setValue(1200)
         self._limit_spin.valueChanged.connect(self._load_data)
-        action_row.addWidget(self._limit_spin)
+        data_options_row.addWidget(self._limit_spin)
 
         self._prefer_local_checkbox = QCheckBox("本地优先")
         self._prefer_local_checkbox.setChecked(False)
         self._prefer_local_checkbox.toggled.connect(self._load_data)
-        action_row.addWidget(self._prefer_local_checkbox)
+        data_options_row.addWidget(self._prefer_local_checkbox)
+        data_options_row.addStretch(1)
+        view_options_layout.addLayout(data_options_row)
 
+        display_options_row = QHBoxLayout()
         self._secondary_average_kline_check = QCheckBox("平均K线")
         self._secondary_average_kline_check.setToolTip("开启后，主图和副图都使用平均K线算法显示K线。")
         self._secondary_average_kline_check.toggled.connect(self._on_secondary_average_kline_toggled)
-        action_row.addWidget(self._secondary_average_kline_check)
+        display_options_row.addWidget(self._secondary_average_kline_check)
 
         self._primary_average_secondary_normal_check = QCheckBox("主均副普")
         self._primary_average_secondary_normal_check.setToolTip(
@@ -6499,53 +6502,82 @@ class KlineAnalysisWindow(QMainWindow):
         self._primary_average_secondary_normal_check.toggled.connect(
             self._on_primary_average_secondary_normal_toggled
         )
-        action_row.addWidget(self._primary_average_secondary_normal_check)
+        display_options_row.addWidget(self._primary_average_secondary_normal_check)
 
         self._reverse_kline_check = QCheckBox("K线反转")
         self._reverse_kline_check.setToolTip("开启后，将当前主图及副图K线按价格镜像反转显示；波动率副图不参与反转。")
         self._reverse_kline_check.toggled.connect(self._load_data)
-        action_row.addWidget(self._reverse_kline_check)
+        display_options_row.addWidget(self._reverse_kline_check)
+        display_options_row.addStretch(1)
+        view_options_layout.addLayout(display_options_row)
 
+        chart_options_row = QHBoxLayout()
         self._hide_chart_btn = QPushButton("隐藏图表")
         self._hide_chart_btn.setCheckable(True)
         self._hide_chart_btn.toggled.connect(self._toggle_chart_visibility)
-        action_row.addWidget(self._hide_chart_btn)
+        chart_options_row.addWidget(self._hide_chart_btn)
 
         self._chart_fullscreen_button = QPushButton("全屏图表")
         self._chart_fullscreen_button.setToolTip("最大化显示当前 K 线布局并保留窗口标题栏；按 F11 切换，Esc 退出。")
         self._chart_fullscreen_button.clicked.connect(self._toggle_chart_fullscreen)
-        action_row.addWidget(self._chart_fullscreen_button)
+        chart_options_row.addWidget(self._chart_fullscreen_button)
 
         self._chart_screenshot_button = QPushButton("截图到剪贴板")
         self._chart_screenshot_button.setToolTip("将当前双图、三图或四图 K 线布局复制到系统剪贴板。")
         self._chart_screenshot_button.clicked.connect(self._copy_chart_screenshot_to_clipboard)
-        action_row.addWidget(self._chart_screenshot_button)
+        chart_options_row.addWidget(self._chart_screenshot_button)
 
         self._orders_drawer_button = QPushButton("委托")
         self._orders_drawer_button.clicked.connect(lambda: self._show_account_drawer("orders"))
-        action_row.addWidget(self._orders_drawer_button)
+        chart_options_row.addWidget(self._orders_drawer_button)
 
         self._positions_drawer_button = QPushButton("持仓")
         self._positions_drawer_button.clicked.connect(lambda: self._show_account_drawer("positions"))
-        action_row.addWidget(self._positions_drawer_button)
-
-        action_row.addStretch(1)
+        chart_options_row.addWidget(self._positions_drawer_button)
+        chart_options_row.addStretch(1)
+        view_options_layout.addLayout(chart_options_row)
+        view_options_action = QWidgetAction(view_options_menu)
+        view_options_action.setDefaultWidget(view_options_widget)
+        view_options_menu.addAction(view_options_action)
+        view_options_button = QPushButton("视图选项")
+        view_options_button.setToolTip("设置 K 线数量、数据来源和图表显示选项。")
+        view_options_button.setMenu(view_options_menu)
 
         load_btn = QPushButton("加载")
         load_btn.setObjectName("Primary")
         load_btn.clicked.connect(self._load_data)
-        action_row.addWidget(load_btn)
 
         self._auto_refresh_btn = QPushButton("自动刷新:开" if _AUTO_REFRESH_DEFAULT_ENABLED else "自动刷新:关")
         self._auto_refresh_btn.setCheckable(True)
         self._auto_refresh_btn.setChecked(_AUTO_REFRESH_DEFAULT_ENABLED)
         self._auto_refresh_btn.toggled.connect(self._toggle_auto_refresh)
-        action_row.addWidget(self._auto_refresh_btn)
 
         self._chart_range_mode_btn = QPushButton("全量视图")
         self._chart_range_mode_btn.clicked.connect(self._toggle_chart_view_range_mode)
-        action_row.addWidget(self._chart_range_mode_btn)
-        header_layout.addLayout(action_row)
+        workspace_row = QHBoxLayout()
+        workspace_row.setSpacing(8)
+        workspace_row.addWidget(ma_group, 0)
+        workspace_row.addWidget(self._best_parameter_indicators_check, 0)
+        workspace_row.addWidget(self._history_trade_group, 0)
+        workspace_row.addWidget(shape_group, 0)
+        workspace_row.addWidget(self._shape_settings_button, 0)
+        for chart_check in (
+            self._secondary_chart_check,
+            self._tertiary_chart_check,
+            self._quaternary_chart_check,
+        ):
+            linkage_row.removeWidget(chart_check)
+            workspace_row.addWidget(chart_check, 0)
+        workspace_row.addStretch(1)
+        workspace_row.addWidget(view_options_button, 0)
+        workspace_row.addWidget(load_btn, 0)
+        workspace_row.addWidget(self._auto_refresh_btn, 0)
+        workspace_row.addWidget(self._chart_range_mode_btn, 0)
+
+        self._layout_context_panel.setVisible(False)
+        header_layout.addLayout(top_row)
+        header_layout.addLayout(workspace_row)
+        header_layout.addWidget(self._layout_context_panel)
 
         self._refresh_api_profiles()
         parent_layout.addWidget(header)
@@ -6588,41 +6620,65 @@ class KlineAnalysisWindow(QMainWindow):
         control_layout.setContentsMargins(8, 8, 8, 8)
         control_layout.setSpacing(6)
 
+        control_tabs = QTabWidget()
+        self._control_tabs = control_tabs
+        control_tabs.setDocumentMode(True)
+        control_tabs.setTabPosition(QTabWidget.TabPosition.North)
+        control_layout.addWidget(control_tabs)
+
+        analysis_page = QWidget()
+        analysis_layout = QVBoxLayout(analysis_page)
+        analysis_layout.setContentsMargins(4, 6, 4, 4)
+        analysis_layout.setSpacing(6)
+        control_tabs.addTab(analysis_page, "分析")
+
+        drawing_page = QWidget()
+        drawing_layout = QVBoxLayout(drawing_page)
+        drawing_layout.setContentsMargins(4, 6, 4, 4)
+        drawing_layout.setSpacing(6)
+        control_tabs.addTab(drawing_page, "画线告警")
+
+        rr_page = QWidget()
+        rr_layout = QVBoxLayout(rr_page)
+        rr_layout.setContentsMargins(4, 6, 4, 4)
+        rr_layout.setSpacing(6)
+        control_tabs.addTab(rr_page, "RR交易")
+
         self._backend_hint = QLabel("")
         self._backend_hint.setObjectName("Subtle")
         self._backend_hint.setWordWrap(True)
-        control_layout.addWidget(self._backend_hint)
+        analysis_layout.addWidget(self._backend_hint)
 
         self._rr_trade_hint = QLabel("")
         self._rr_trade_hint.setObjectName("Subtle")
         self._rr_trade_hint.setWordWrap(True)
-        control_layout.addWidget(self._rr_trade_hint)
+        rr_layout.addWidget(self._rr_trade_hint)
 
-        control_layout.addWidget(QLabel("告警引擎"))
+        analysis_layout.addWidget(QLabel("告警引擎"))
         self._ma_cross_alert_check = QCheckBox("EMA 15 与 SMA 50 交叉")
         self._ma_cross_alert_check.toggled.connect(self._save_workspace_settings)
-        control_layout.addWidget(self._ma_cross_alert_check)
+        analysis_layout.addWidget(self._ma_cross_alert_check)
 
         self._box_breakout_alert_check = QCheckBox("自动箱体突破")
         self._box_breakout_alert_check.toggled.connect(self._save_workspace_settings)
-        control_layout.addWidget(self._box_breakout_alert_check)
+        analysis_layout.addWidget(self._box_breakout_alert_check)
 
-        control_layout.addWidget(QLabel("自动通道"))
+        analysis_layout.addWidget(QLabel("自动通道"))
         self._auto_box_check = QCheckBox("显示自动箱体")
         self._auto_box_check.setChecked(False)
         self._auto_box_check.toggled.connect(self._on_auto_box_visibility_changed)
-        control_layout.addWidget(self._auto_box_check)
+        analysis_layout.addWidget(self._auto_box_check)
 
         self._history_box_check = QCheckBox("显示历史箱体")
         self._history_box_check.setChecked(False)
         self._history_box_check.toggled.connect(self._on_auto_box_visibility_changed)
-        control_layout.addWidget(self._history_box_check)
+        analysis_layout.addWidget(self._history_box_check)
         self._live_box_check = self._history_box_check
 
         self._auto_channel_check = QCheckBox("显示通道")
         self._auto_channel_check.setChecked(False)
         self._auto_channel_check.toggled.connect(self._on_auto_channel_visibility_changed)
-        control_layout.addWidget(self._auto_channel_check)
+        analysis_layout.addWidget(self._auto_channel_check)
 
         self._auto_channel_settings_button = QPushButton("通道参数")
         auto_channel_menu = QMenu(self._auto_channel_settings_button)
@@ -6651,14 +6707,14 @@ class KlineAnalysisWindow(QMainWindow):
             self._auto_channel_violations_spin,
         ):
             spin.valueChanged.connect(self._on_auto_channel_parameters_changed)
-        control_layout.addWidget(self._auto_channel_settings_button)
+        analysis_layout.addWidget(self._auto_channel_settings_button)
 
         self._structure_hint = QLabel("")
         self._structure_hint.setObjectName("Subtle")
         self._structure_hint.setWordWrap(True)
-        control_layout.addWidget(self._structure_hint)
+        analysis_layout.addWidget(self._structure_hint)
 
-        control_layout.addWidget(QLabel("画线预警"))
+        drawing_layout.addWidget(QLabel("画线预警"))
         line_toolbar = QHBoxLayout()
         cursor_btn = QPushButton("光标")
         cursor_btn.clicked.connect(lambda: self._set_draw_tool("none"))
@@ -6675,11 +6731,11 @@ class KlineAnalysisWindow(QMainWindow):
         rr_short_btn = QPushButton("RR空")
         rr_short_btn.clicked.connect(lambda: self._set_draw_tool("rr_short"))
         line_toolbar.addWidget(rr_short_btn)
-        control_layout.addLayout(line_toolbar)
+        drawing_layout.addLayout(line_toolbar)
 
         self._line_label_edit = QLineEdit()
         self._line_label_edit.setPlaceholderText("线条名称")
-        control_layout.addWidget(self._line_label_edit)
+        drawing_layout.addWidget(self._line_label_edit)
 
         line_price_row = QHBoxLayout()
         self._line_price_a_label = QLabel("价格")
@@ -6692,7 +6748,7 @@ class KlineAnalysisWindow(QMainWindow):
         self._line_price_b_edit = QLineEdit()
         self._line_price_b_edit.setPlaceholderText("终点价")
         line_price_row.addWidget(self._line_price_b_edit, 1)
-        control_layout.addLayout(line_price_row)
+        drawing_layout.addLayout(line_price_row)
         self._refresh_line_price_controls(None)
 
         line_rule_row = QHBoxLayout()
@@ -6707,7 +6763,7 @@ class KlineAnalysisWindow(QMainWindow):
         self._line_action_combo.addItem("做空", "short")
         self._line_action_combo.currentIndexChanged.connect(lambda _index: self._refresh_line_email_controls())
         line_rule_row.addWidget(self._line_action_combo, 1)
-        control_layout.addLayout(line_rule_row)
+        drawing_layout.addLayout(line_rule_row)
 
         line_email_row = QHBoxLayout()
         self._line_email_enabled_check = QCheckBox("邮件提醒")
@@ -6719,10 +6775,10 @@ class KlineAnalysisWindow(QMainWindow):
         self._line_email_delivery_mode_combo.addItem("每次触发", "repeat")
         self._line_email_delivery_mode_combo.setToolTip("“仅一次”在该线首次触发并提交邮件后不再重复发送。")
         line_email_row.addWidget(self._line_email_delivery_mode_combo, 1)
-        control_layout.addLayout(line_email_row)
+        drawing_layout.addLayout(line_email_row)
 
         self._line_enabled_check = QCheckBox("启用当前线条")
-        control_layout.addWidget(self._line_enabled_check)
+        drawing_layout.addWidget(self._line_enabled_check)
 
         line_trade_row = QHBoxLayout()
         self._line_trade_enabled_check = QCheckBox("启用线条交易")
@@ -6737,15 +6793,15 @@ class KlineAnalysisWindow(QMainWindow):
         line_trade_config_btn = QPushButton("交易参数")
         line_trade_config_btn.clicked.connect(self._open_line_trade_card_for_selected)
         line_trade_row.addWidget(line_trade_config_btn)
-        control_layout.addLayout(line_trade_row)
+        drawing_layout.addLayout(line_trade_row)
         self._line_trade_armed_check = QCheckBox("全局线条交易")
         self._line_trade_armed_check.setToolTip("总开关默认关闭。开启后，满足条件的线条触发才会自动提交订单。")
         self._line_trade_armed_check.toggled.connect(self._on_line_trade_armed_toggled)
-        control_layout.addWidget(self._line_trade_armed_check)
+        drawing_layout.addWidget(self._line_trade_armed_check)
         self._line_trade_hint = QLabel("线条交易默认关闭：需同时启用当前线条、启用线条交易和全局线条交易。")
         self._line_trade_hint.setObjectName("Subtle")
         self._line_trade_hint.setWordWrap(True)
-        control_layout.addWidget(self._line_trade_hint)
+        drawing_layout.addWidget(self._line_trade_hint)
 
         line_manage_row = QHBoxLayout()
         update_line_btn = QPushButton("更新")
@@ -6754,7 +6810,7 @@ class KlineAnalysisWindow(QMainWindow):
         delete_line_btn = QPushButton("删除")
         delete_line_btn.clicked.connect(self._delete_selected_line)
         line_manage_row.addWidget(delete_line_btn)
-        control_layout.addLayout(line_manage_row)
+        drawing_layout.addLayout(line_manage_row)
 
         self._line_table = QTableWidget(0, 6)
         self._line_table.setHorizontalHeaderLabels(["标签", "类型", "价格", "触发", "操作", "状态"])
@@ -6763,9 +6819,9 @@ class KlineAnalysisWindow(QMainWindow):
         self._line_table.itemSelectionChanged.connect(self._on_line_selected)
         self._line_table.setMinimumHeight(96)
         self._line_table.setMaximumHeight(112)
-        control_layout.addWidget(self._line_table)
+        drawing_layout.addWidget(self._line_table)
 
-        control_layout.addWidget(QLabel("RR 工作区"))
+        rr_layout.addWidget(QLabel("RR 工作区"))
         rr_manage_row = QHBoxLayout()
         save_rr_btn = QPushButton("新增/保存 RR")
         save_rr_btn.clicked.connect(self._save_rr_item)
@@ -6776,7 +6832,7 @@ class KlineAnalysisWindow(QMainWindow):
         monitor_rr_btn = QPushButton("RR 监控")
         monitor_rr_btn.clicked.connect(self.open_rr_monitor_dialog)
         rr_manage_row.addWidget(monitor_rr_btn)
-        control_layout.addLayout(rr_manage_row)
+        rr_layout.addLayout(rr_manage_row)
 
         rr_risk_row = QHBoxLayout()
         rr_risk_row.addWidget(QLabel("风险金(U)"))
@@ -6787,7 +6843,7 @@ class KlineAnalysisWindow(QMainWindow):
         )
         rr_risk_row.addWidget(self._rr_risk_edit, 1)
         rr_risk_row.addWidget(QLabel("默认 100 U；保存 RR 后生效"))
-        control_layout.addLayout(rr_risk_row)
+        rr_layout.addLayout(rr_risk_row)
 
         self._rr_table = QTableWidget(0, 9)
         self._rr_table.setHorizontalHeaderLabels(["方向", "入场", "止损", "止盈", "管理", "R", "K线", "锁定", "风险金"])
@@ -6811,7 +6867,7 @@ class KlineAnalysisWindow(QMainWindow):
         rr_header.setStretchLastSection(False)
         self._rr_table.setMinimumHeight(96)
         self._rr_table.setMaximumHeight(116)
-        control_layout.addWidget(self._rr_table)
+        rr_layout.addWidget(self._rr_table)
 
         rr_form = QWidget()
         self._rr_form = rr_form
@@ -6853,15 +6909,15 @@ class KlineAnalysisWindow(QMainWindow):
         rr_form_layout.addRow(self._rr_fee_offset_check)
         rr_form_layout.addRow(self._rr_locked_check)
         rr_form_layout.addRow(self._rr_preview)
-        control_layout.addWidget(rr_form)
+        rr_layout.addWidget(rr_form)
         rr_form.hide()
 
-        control_layout.addWidget(QLabel("RR 跟踪"))
+        rr_layout.addWidget(QLabel("RR 跟踪"))
         self._rr_tracking_summary = QLabel("选中 RR 后显示入场、止损、止盈和跟踪状态。")
         self._rr_tracking_summary.setObjectName("Subtle")
         self._rr_tracking_summary.setWordWrap(True)
         self._rr_tracking_summary.setFixedHeight(60)
-        control_layout.addWidget(self._rr_tracking_summary)
+        rr_layout.addWidget(self._rr_tracking_summary)
         rr_execution_row = QHBoxLayout()
         self._rr_enable_trade_btn = QPushButton("启用交易")
         self._rr_enable_trade_btn.setObjectName("Primary")
@@ -6870,21 +6926,23 @@ class KlineAnalysisWindow(QMainWindow):
         self._rr_cancel_trade_btn = QPushButton("取消交易")
         self._rr_cancel_trade_btn.clicked.connect(self._cancel_selected_rr_trade)
         rr_execution_row.addWidget(self._rr_cancel_trade_btn)
-        control_layout.addLayout(rr_execution_row)
+        rr_layout.addLayout(rr_execution_row)
         self._rr_condition_status = QLabel("条件单：未启用交易")
         self._rr_condition_status.setObjectName("Subtle")
         self._rr_condition_status.setWordWrap(False)
         self._rr_condition_status.setFixedHeight(24)
-        control_layout.addWidget(self._rr_condition_status)
+        rr_layout.addWidget(self._rr_condition_status)
 
-        control_layout.addWidget(QLabel("事件日志"))
+        rr_layout.addWidget(QLabel("事件日志"))
         self._event_log = QTextEdit()
         self._event_log.setReadOnly(True)
         self._event_log.setMinimumHeight(72)
         self._event_log.setMaximumHeight(84)
-        control_layout.addWidget(self._event_log)
+        rr_layout.addWidget(self._event_log)
 
-        control_layout.addStretch(1)
+        analysis_layout.addStretch(1)
+        drawing_layout.addStretch(1)
+        rr_layout.addStretch(1)
 
         chart_host = QFrame()
         self._chart_host = chart_host
@@ -7069,15 +7127,12 @@ class KlineAnalysisWindow(QMainWindow):
         return bool(self._quaternary_chart_check.isChecked())
 
     def _all_charts_volatility_enabled(self) -> bool:
-        """Whether the current layout should render DVOL in every visible chart.
-
-        Instrument selection and chart layout are deliberately independent.
-        Selecting a DVOL tab must therefore work in single, dual, triple and
-        four-chart layouts without turning on (or off) any layout checkbox.
-        """
+        """Whether an explicit all-window link may switch every chart to DVOL."""
         return bool(
             self._secondary_chart_kind() == "volatility"
             and self._current_volatility_currency()
+            and self._symbol_link_all_check is not None
+            and self._symbol_link_all_check.isChecked()
         )
 
     def _secondary_layout_mode(self) -> str:
@@ -7148,10 +7203,10 @@ class KlineAnalysisWindow(QMainWindow):
         return self._quaternary_symbol_combo.currentText().strip().upper()
 
     def _current_volatility_currency(self) -> str | None:
-        return _volatility_currency_for_symbol(self._selected_symbol())
+        return self._active_volatility_currency or _volatility_currency_for_symbol(self._selected_symbol())
 
     def _volatility_available_for_current_symbol(self) -> bool:
-        return self._current_volatility_currency() is not None
+        return _volatility_currency_for_symbol(self._selected_symbol()) is not None
 
     @staticmethod
     def _kline_venue_label(period: str) -> str:
@@ -7532,6 +7587,12 @@ class KlineAnalysisWindow(QMainWindow):
 
     def _update_secondary_controls_state(self) -> None:
         enabled = bool(self._secondary_chart_check.isChecked())
+        if self._layout_context_panel is not None:
+            self._layout_context_panel.setVisible(
+                enabled
+                or self._tertiary_chart_check.isChecked()
+                or self._quaternary_chart_check.isChecked()
+            )
         secondary_symbol_available = enabled and self._secondary_chart_kind() == "kline"
         self._secondary_symbol_label.setVisible(secondary_symbol_available)
         self._secondary_symbol_combo.setVisible(secondary_symbol_available)
@@ -7926,10 +7987,6 @@ class KlineAnalysisWindow(QMainWindow):
         symbol = str(self._symbol_tab_bar.tabData(index) or "").strip().upper()
         if not symbol:
             return
-        # A tab selection takes precedence over every loader already in
-        # flight.  The completed loader is still released normally, but it
-        # may no longer paint its stale payload into the chart.
-        self._invalidate_pending_chart_results()
         volatility_currency = None
         for _label, tab_value in VOLATILITY_TAB_OPTIONS:
             if symbol == tab_value:
@@ -7937,14 +7994,15 @@ class KlineAnalysisWindow(QMainWindow):
                 break
         if volatility_currency:
             base_symbol = f"{volatility_currency}-USDT-SWAP"
-            # 底部交易对只负责切换数据，不能改变单/双/三/四图布局。
-            # DVOL 在当前布局的所有可见图中渲染，单图模式也不能被强制
-            # 切成双图模式。
+            link_all = bool(self._symbol_link_all_check is not None and self._symbol_link_all_check.isChecked())
             linked_combos = (
                 self._symbol_combo,
                 self._secondary_symbol_combo,
                 self._tertiary_symbol_combo,
                 self._quaternary_symbol_combo,
+            ) if link_all else (self._secondary_symbol_combo,)
+            self._invalidate_pending_chart_results(
+                targets=("primary", "secondary", "tertiary", "quaternary") if link_all else ("secondary",)
             )
             for combo in linked_combos:
                 combo.blockSignals(True)
@@ -7956,22 +8014,34 @@ class KlineAnalysisWindow(QMainWindow):
             finally:
                 for combo in linked_combos:
                     combo.blockSignals(False)
+            if not self._secondary_chart_check.isChecked():
+                self._secondary_chart_check.blockSignals(True)
+                self._secondary_chart_check.setChecked(True)
+                self._secondary_chart_check.blockSignals(False)
+                self._apply_secondary_chart_visibility()
+            self._set_active_chart_target("secondary")
             self._refresh_symbol_tab_selection()
             self._update_secondary_controls_state()
-            for target in ("primary", "secondary", "tertiary", "quaternary"):
-                if target == "primary" or (
-                    target == "secondary" and self._secondary_chart_check.isChecked()
-                ) or (
-                    target == "tertiary" and self._triple_chart_enabled()
-                ) or (
-                    target == "quaternary" and self._quad_chart_enabled()
-                ):
-                    self._prepare_chart_for_symbol_reload(target)
-            self._load_data()
+            if link_all:
+                for target in ("primary", "secondary", "tertiary", "quaternary"):
+                    if target == "primary" or (
+                        target == "secondary" and self._secondary_chart_check.isChecked()
+                    ) or (
+                        target == "tertiary" and self._triple_chart_enabled()
+                    ) or (
+                        target == "quaternary" and self._quad_chart_enabled()
+                    ):
+                        self._prepare_chart_for_symbol_reload(target)
+                self._load_data()
+            else:
+                self._prepare_chart_for_symbol_reload("secondary")
+                self._load_secondary_data(symbol=base_symbol)
             return
         # 普通交易对和 DVOL 标签使用同一套切换规则。离开 DVOL 时先
         # 恢复普通 K 线模式，后续分支再按“全部联动”或当前图处理品种。
+        target = self._active_chart_target
         if self._secondary_chart_kind() == "volatility":
+            self._invalidate_pending_chart_results(targets=("secondary",))
             self._secondary_chart_kind_mode = "kline"
             self._active_volatility_currency = None
             self._secondary_pending_payload = None
@@ -7983,14 +8053,8 @@ class KlineAnalysisWindow(QMainWindow):
         if self._symbol_link_all_check is not None and self._symbol_link_all_check.isChecked():
             self._switch_all_chart_symbols(symbol)
             return
-        target = self._active_chart_target
+        self._invalidate_pending_chart_results(targets=(target,))
         if target == "secondary" and self._secondary_chart_check.isChecked():
-            if self._secondary_chart_kind() == "volatility":
-                if self._selected_symbol() != symbol:
-                    self._symbol_combo.setCurrentText(symbol)
-                else:
-                    self._on_symbol_confirmed()
-                return
             if self._selected_secondary_symbol() != symbol:
                 self._secondary_symbol_combo.setCurrentText(symbol)
             else:
@@ -8028,34 +8092,33 @@ class KlineAnalysisWindow(QMainWindow):
         finally:
             for combo in combos:
                 combo.blockSignals(False)
-        self._on_symbol_confirmed()
-        if self._secondary_chart_check.isChecked() and self._secondary_chart_kind() == "kline":
-            self._on_secondary_symbol_changed(symbol)
-        if self._triple_chart_enabled():
-            self._on_tertiary_symbol_changed(symbol)
-        if self._quad_chart_enabled():
-            self._on_quaternary_symbol_changed(symbol)
+        self._invalidate_pending_chart_results(targets=("primary", "secondary", "tertiary", "quaternary"))
+        self._on_symbol_confirmed(refresh_linked_charts=True)
 
-    def _invalidate_pending_chart_results(self) -> None:
-        """Make in-flight callbacks stale as soon as a bottom tab is selected.
+    def _invalidate_pending_chart_results(self, *, targets: tuple[str, ...]) -> None:
+        """Make only the changed chart's in-flight callbacks stale.
 
         Loaders are intentionally allowed to finish in the background.  The
         request counters prevent an older symbol (for example SOL) from being
         painted after the user has already selected another tab (for example
-        ETH), even while the next request is waiting for a loader slot.
+        ETH), without discarding a still-valid load for another visible chart.
         """
-        self._request_id += 1
-        self._active_request_id = self._request_id
-        self._active_primary_request_key = None
-        self._secondary_request_id += 1
-        self._active_secondary_request_id = self._secondary_request_id
-        self._active_secondary_request_key = None
-        self._tertiary_request_id += 1
-        self._active_tertiary_request_id = self._tertiary_request_id
-        self._active_tertiary_request_key = None
-        self._quaternary_request_id += 1
-        self._active_quaternary_request_id = self._quaternary_request_id
-        self._active_quaternary_request_key = None
+        if "primary" in targets:
+            self._request_id += 1
+            self._active_request_id = self._request_id
+            self._active_primary_request_key = None
+        if "secondary" in targets:
+            self._secondary_request_id += 1
+            self._active_secondary_request_id = self._secondary_request_id
+            self._active_secondary_request_key = None
+        if "tertiary" in targets:
+            self._tertiary_request_id += 1
+            self._active_tertiary_request_id = self._tertiary_request_id
+            self._active_tertiary_request_key = None
+        if "quaternary" in targets:
+            self._quaternary_request_id += 1
+            self._active_quaternary_request_id = self._quaternary_request_id
+            self._active_quaternary_request_key = None
 
     def _apply_chart_mode_period_defaults(self, *, dual_enabled: bool) -> None:
         primary_period = _DEFAULT_DUAL_PRIMARY_PERIOD if dual_enabled else _DEFAULT_SINGLE_CHART_PERIOD
@@ -8807,7 +8870,7 @@ class KlineAnalysisWindow(QMainWindow):
                 retry_timer.stop()
 
     @Slot()
-    def _load_data(self) -> None:
+    def _load_data(self, *, refresh_linked_charts: bool = True) -> None:
         if bool(getattr(self, "_shutdown_requested", False)) or not self._page_active:
             return
         symbol = self._selected_symbol()
@@ -8878,11 +8941,12 @@ class KlineAnalysisWindow(QMainWindow):
         if not self._preview_mode:
             self._load_history_trades()
         if self._secondary_chart_check.isChecked() and self._use_native_chart:
-            self._load_secondary_data(symbol=self._selected_secondary_symbol())
-            if self._triple_chart_enabled():
-                self._load_tertiary_data()
-            if self._quad_chart_enabled():
-                self._load_quaternary_data()
+            if refresh_linked_charts:
+                self._load_secondary_data(symbol=self._selected_secondary_symbol())
+                if self._triple_chart_enabled():
+                    self._load_tertiary_data()
+                if self._quad_chart_enabled():
+                    self._load_quaternary_data()
         else:
             self._active_secondary_request_key = None
             self._loaded_secondary_request_key = None
@@ -9097,13 +9161,19 @@ class KlineAnalysisWindow(QMainWindow):
         self._schedule_pending_reload_if_ready()
 
     @Slot()
-    def _on_symbol_confirmed(self) -> None:
+    def _on_symbol_confirmed(self, *, refresh_linked_charts: bool = False) -> None:
+        reload_secondary_as_kline = False
         if self._secondary_chart_kind() == "volatility":
             selected_symbol = self._selected_symbol()
             self._secondary_chart_kind_mode = "kline"
             self._active_volatility_currency = None
             self._secondary_pending_payload = None
             self._loaded_secondary_request_key = None
+            reload_secondary_as_kline = bool(
+                self._secondary_chart_check.isChecked()
+                and self._use_native_chart
+                and not refresh_linked_charts
+            )
             if self._symbol_link_all_check is not None and self._symbol_link_all_check.isChecked():
                 linked_combos = (
                     self._secondary_symbol_combo,
@@ -9128,7 +9198,10 @@ class KlineAnalysisWindow(QMainWindow):
         self._refresh_rr_trade_hint()
         self._sync_account_drawer_context()
         self._prepare_chart_for_symbol_reload("primary")
-        self._load_data()
+        self._load_data(refresh_linked_charts=refresh_linked_charts)
+        if reload_secondary_as_kline:
+            self._prepare_chart_for_symbol_reload("secondary")
+            self._load_secondary_data(symbol=self._selected_secondary_symbol())
 
     @Slot(str)
     def _on_secondary_symbol_changed(self, _value: str) -> None:

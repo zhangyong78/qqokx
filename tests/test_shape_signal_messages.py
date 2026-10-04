@@ -41,7 +41,7 @@ class ShapeSignalMessageTests(unittest.TestCase):
     def test_volatility_tabs_switch_to_existing_dvol_secondary_loader(self):
         window = KlineAnalysisWindow()
         try:
-            window._load_data = Mock()
+            window._load_secondary_data = Mock()
             dvol_index = window._symbol_tab_bar.count() - 2
             self.assertEqual(window._symbol_tab_bar.tabText(dvol_index), 'BTC-DVOL')
             window._symbol_tab_bar.setCurrentIndex(dvol_index)
@@ -49,7 +49,7 @@ class ShapeSignalMessageTests(unittest.TestCase):
             self.assertEqual(window._secondary_chart_kind(), 'volatility')
             self.assertTrue(window._secondary_chart_check.isChecked())
             self.assertEqual(window._active_chart_target, 'secondary')
-            self.assertGreaterEqual(window._load_data.call_count, 1)
+            window._load_secondary_data.assert_called_once_with(symbol='BTC-USDT-SWAP')
         finally:
             window.close()
 

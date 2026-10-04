@@ -4276,6 +4276,33 @@ class RollTerminalQtWindowHelperTests(QtWidgetTestCase):
             finally:
                 self.__class__.dispose_widget(window)
 
+    def test_kline_left_control_panel_groups_tools_by_workflow(self) -> None:
+        with (
+            patch("roll_terminal_qt.kline_analysis_window.QTimer.singleShot", return_value=None),
+            patch("roll_terminal_qt.kline_analysis_window.load_kline_analysis_workspace_entries", return_value={}),
+        ):
+            window = KlineAnalysisWindow()
+            try:
+                tabs = window._control_tabs
+                self.assertIsNotNone(tabs)
+                self.assertEqual([tabs.tabText(index) for index in range(tabs.count())], ["分析", "画线告警", "RR交易"])
+                self.assertTrue(tabs.widget(0).isAncestorOf(window._backend_hint))
+                self.assertTrue(tabs.widget(1).isAncestorOf(window._line_table))
+                self.assertTrue(tabs.widget(2).isAncestorOf(window._rr_table))
+            finally:
+                self.__class__.dispose_widget(window)
+
+    def test_kline_multi_chart_details_expand_only_when_enabled(self) -> None:
+        with patch("roll_terminal_qt.kline_analysis_window.QTimer.singleShot", return_value=None):
+            window = KlineAnalysisWindow()
+            try:
+                self.assertTrue(window._layout_context_panel.isHidden())
+                with patch.object(window, "_load_data"):
+                    window._secondary_chart_check.setChecked(True)
+                self.assertFalse(window._layout_context_panel.isHidden())
+            finally:
+                self.__class__.dispose_widget(window)
+
     def test_kline_rr_overlay_shows_base_quantity_with_contract_count(self) -> None:
         instrument = SimpleNamespace(
             inst_id="BTC-USDT-SWAP", inst_type="SWAP", tick_size=Decimal("0.1"), lot_size=Decimal("1"), min_size=Decimal("1"),
@@ -6355,6 +6382,80 @@ class RollTerminalQtWindowHelperTests(QtWidgetTestCase):
                     window._symbol_tab_bar.tabData(window._symbol_tab_bar.currentIndex()),
                     "DOGE-USDT-SWAP",
                 )
+            finally:
+                self.__class__.dispose_widget(window)
+
+    def test_dvol_tab_without_all_window_link_refreshes_only_secondary_chart(self) -> None:
+        with patch("roll_terminal_qt.kline_analysis_window.QTimer.singleShot", return_value=None):
+            window = KlineAnalysisWindow()
+            try:
+                window._use_native_chart = True
+                for chart_check in (
+                    window._secondary_chart_check,
+                    window._tertiary_chart_check,
+                    window._quaternary_chart_check,
+                ):
+                    chart_check.blockSignals(True)
+                    chart_check.setChecked(True)
+                    chart_check.blockSignals(False)
+                window._symbol_combo.setCurrentText("SOL-USDT-SWAP")
+                window._secondary_symbol_combo.setCurrentText("ETH-USDT-SWAP")
+                window._tertiary_symbol_combo.setCurrentText("DOGE-USDT-SWAP")
+                window._quaternary_symbol_combo.setCurrentText("BNB-USDT-SWAP")
+                window._set_active_chart_target("quaternary")
+                dvol_index = next(
+                    index
+                    for index in range(window._symbol_tab_bar.count())
+                    if window._symbol_tab_bar.tabText(index) == "BTC-DVOL"
+                )
+
+                with (
+                    patch.object(window, "_load_data") as load_primary,
+                    patch.object(window, "_load_secondary_data") as load_secondary,
+                    patch.object(window, "_prepare_chart_for_symbol_reload") as prepare_chart,
+                ):
+                    window._symbol_tab_bar.setCurrentIndex(dvol_index)
+
+                self.assertFalse(window._symbol_link_all_check.isChecked())
+                self.assertEqual(window._selected_symbol(), "SOL-USDT-SWAP")
+                self.assertEqual(window._selected_secondary_symbol(), "BTC-USDT-SWAP")
+                self.assertEqual(window._selected_tertiary_symbol(), "DOGE-USDT-SWAP")
+                self.assertEqual(window._selected_quaternary_symbol(), "BNB-USDT-SWAP")
+                self.assertEqual(window._secondary_chart_kind(), "volatility")
+                load_primary.assert_not_called()
+                load_secondary.assert_called_once_with(symbol="BTC-USDT-SWAP")
+                prepare_chart.assert_called_once_with("secondary")
+            finally:
+                self.__class__.dispose_widget(window)
+
+    def test_symbol_tab_invalidates_only_the_active_chart_request(self) -> None:
+        with patch("roll_terminal_qt.kline_analysis_window.QTimer.singleShot", return_value=None):
+            window = KlineAnalysisWindow()
+            try:
+                window._use_native_chart = True
+                window._tertiary_chart_check.blockSignals(True)
+                window._tertiary_chart_check.setChecked(True)
+                window._tertiary_chart_check.blockSignals(False)
+                window._set_active_chart_target("tertiary")
+                active_request_ids = (
+                    window._active_request_id,
+                    window._active_secondary_request_id,
+                    window._active_tertiary_request_id,
+                    window._active_quaternary_request_id,
+                )
+                eth_index = next(
+                    index
+                    for index in range(window._symbol_tab_bar.count())
+                    if window._symbol_tab_bar.tabText(index) == "ETH-USDT-SWAP"
+                )
+
+                with patch.object(window, "_on_tertiary_symbol_changed"):
+                    window._symbol_tab_bar.setCurrentIndex(eth_index)
+
+                self.assertEqual(window._active_request_id, active_request_ids[0])
+                self.assertEqual(window._active_secondary_request_id, active_request_ids[1])
+                self.assertGreater(window._active_tertiary_request_id, active_request_ids[2])
+                self.assertEqual(window._active_quaternary_request_id, active_request_ids[3])
             finally:
                 self.__class__.dispose_widget(window)
 
