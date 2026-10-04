@@ -19,6 +19,7 @@ STRATEGY_BODY_RETEST_SHORT_ID = "body_retest_short"
 STRATEGY_BTC_EMA15_MA50_PULLBACK_LONG_ID = "btc_ema15_ma50_pullback_long"
 STRATEGY_BTC_EMA15_MA50_PULLBACK_SHORT_ID = "btc_ema15_ma50_pullback_short"
 STRATEGY_BTC_DAILY_4H_LONG_SHORT_ID = "btc_daily_4h_long_short"
+STRATEGY_TRIPLE_EMA_ID = "triple_ema_trend"
 
 
 def is_ema_atr_breakout_strategy(strategy_id: str) -> bool:
@@ -56,6 +57,10 @@ def is_btc_ema15_ma50_pullback_short_strategy(strategy_id: str) -> bool:
 
 def is_btc_daily_4h_long_short_strategy(strategy_id: str) -> bool:
     return strategy_id == STRATEGY_BTC_DAILY_4H_LONG_SHORT_ID
+
+
+def is_triple_ema_strategy(strategy_id: str) -> bool:
+    return strategy_id == STRATEGY_TRIPLE_EMA_ID
 
 
 def is_dynamic_mtf_strategy_id(strategy_id: str) -> bool:
@@ -101,6 +106,28 @@ class StrategyDefinition:
 
 
 ALL_STRATEGY_DEFINITIONS: tuple[StrategyDefinition, ...] = (
+    StrategyDefinition(
+        strategy_id=STRATEGY_TRIPLE_EMA_ID,
+        name="三均线趋势多空",
+        summary="快、中、慢三条 EMA 完整排列时开仓；趋势失序平仓，反向排列时可反手。",
+        rule_description=(
+            "快线 > 中线 > 慢线为上升趋势，快线 < 中线 < 慢线为下降趋势，其余为震荡。"
+            "仅在趋势刚形成的已收盘 K 线确认信号，下一根 K 线开盘成交。"
+            "多仓转震荡平仓、转下降趋势反手做空；空仓转震荡平仓、转上升趋势反手做多。"
+            "初始止损默认取慢线 EMA；止损 ATR 倍数填写大于 0 时，改为 ATR 倍数止损。"
+        ),
+        parameter_hint=(
+            "快线/趋势均线/大周期均线分别对应快/中/慢 EMA，默认 21/60/200。"
+            "实盘和回测均在已收盘 K 线确认趋势，下一根 K 线开盘时执行；止损 ATR 倍数填 0 使用慢线 EMA。"
+        ),
+        default_signal_label="双向",
+        allowed_signal_labels=("双向", "只做多", "只做空"),
+        supports_trade=True,
+        supports_signal_only=True,
+        supports_backtest=True,
+        supports_batch_observe=False,
+        supports_trader_desk=False,
+    ),
     StrategyDefinition(
         strategy_id=STRATEGY_DYNAMIC_LONG_ID,
         name="EMA 动态委托做多",

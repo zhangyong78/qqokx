@@ -3,7 +3,9 @@ from __future__ import annotations
 import time
 import threading
 from types import SimpleNamespace
+from unittest.mock import patch
 
+from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import QApplication
 
 from okx_quant.models import Credentials
@@ -151,4 +153,94 @@ def test_profile_switch_detaches_slow_websockets_without_blocking_ui_thread() ->
     assert elapsed < 0.2
     assert stopped.wait(timeout=0.5)
     release.set()
+    store.stop()
+
+
+def test_continuous_updates_do_not_starve_coalesced_snapshots() -> None:
+    app = QApplication.instance() or QApplication([])
+    store = RealtimeAccountStore(client=_FakeRealtimeClient(), coalesce_ms=50)
+    store._runtime = _runtime()
+    snapshots = []
+    store.snapshot_ready.connect(snapshots.append)
+    producer = QTimer()
+    producer.setInterval(5)
+    producer.timeout.connect(store._schedule_emit)
+    try:
+        producer.start()
+        _drain_qt_events(timeout=0.25)
+        assert snapshots, "Continuous events must not postpone UI updates indefinitely"
+        assert producer.isActive()
+    finally:
+        producer.stop()
+        store.stop()
+        app.processEvents()
+
+
+def test_ws_burst_is_read_once_and_stop_cancels_scheduled_cache_read() -> None:
+    app = QApplication.instance() or QApplication([])
+    store = RealtimeAccountStore(client=_FakeRealtimeClient(), coalesce_ms=50)
+    store._runtime = _runtime()
+    generation = store._generation
+    try:
+        with patch.object(store, "_run_cache_worker", wraps=store._run_cache_worker) as worker:
+            for version in range(100):
+                store._queue_cache_refresh(generation, "orders", version)
+            assert worker.call_count == 0
+            _drain_qt_events(timeout=0.2)
+            assert worker.call_count == 1
+            store._queue_cache_refresh(generation, "orders", 101)
+            store.stop()
+            _drain_qt_events(timeout=0.1)
+            assert worker.call_count == 1
+    finally:
+        store.stop()
+        app.processEvents()
+
+
+def test_events_during_failed_cache_read_are_retried_without_parallel_worker() -> None:
+    app = QApplication.instance() or QApplication([])
+    store = RealtimeAccountStore(client=_FakeRealtimeClient(), coalesce_ms=50)
+    store._runtime = _runtime()
+    generation = store._generation
+    store._cache_in_flight = True
+    try:
+        with patch.object(store, "_run_cache_worker", wraps=store._run_cache_worker) as worker:
+            for version in range(10):
+                store._queue_cache_refresh(generation, "orders", version)
+            _drain_qt_events(timeout=0.1)
+            assert worker.call_count == 0
+            store._apply_cache_result(generation, RuntimeError("cache unavailable"))
+            _drain_qt_events(timeout=0.2)
+            assert worker.call_count == 1
+            assert not store._cache_in_flight
+    finally:
+        store.stop()
+        app.processEvents()
+
+
+def test_stale_rest_reconcile_does_not_overwrite_newer_ws_snapshot() -> None:
+    store = RealtimeAccountStore(client=_FakeRealtimeClient(), coalesce_ms=0)
+    store._runtime = _runtime()
+    generation = store._generation
+    store._positions = ["newer-ws-position"]
+    store._source = "ws"
+    store._ws_revision = 2
+    statuses: list[str] = []
+    store.status_changed.connect(statuses.append)
+
+    store._reconcile_in_flight = True
+    store._apply_reconcile_result(
+        generation,
+        "safety",
+        {
+            "started_ws_revision": 1,
+            "positions": ["stale-rest-position"],
+            "pending_orders": [],
+        },
+    )
+
+    assert store._reconcile_in_flight is False
+    assert store._positions == ["newer-ws-position"]
+    assert store._source == "ws"
+    assert any("已过期" in message for message in statuses)
     store.stop()

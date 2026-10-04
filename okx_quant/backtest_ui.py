@@ -75,6 +75,7 @@ from okx_quant.strategy_catalog import (
     STRATEGY_BODY_RETEST_SHORT_ID,
     STRATEGY_DYNAMIC_ID,
     STRATEGY_EMA55_SLOPE_SHORT_ID,
+    STRATEGY_TRIPLE_EMA_ID,
     StrategyDefinition,
     get_strategy_definition,
     resolve_dynamic_signal_mode,
@@ -109,6 +110,8 @@ SIGNAL_LABEL_TO_VALUE = {
     "只做空": "short_only",
 }
 def _strategy_fast_line_caption(strategy_id: str) -> str:
+    if strategy_id == STRATEGY_TRIPLE_EMA_ID:
+        return "快线 EMA"
     if strategy_id in {STRATEGY_BTC_EMA55_SLOPE_SHORT_ID, STRATEGY_EMA55_SLOPE_SHORT_ID}:
         return "信号均线（斜率开平仓）"
     return "快线均线"
@@ -969,6 +972,18 @@ def _build_backtest_param_summary(
     trend_label = config.trend_ema_label()
     reference_label = config.entry_reference_line_label()
     profile = get_strategy_runtime_profile(config.strategy_id)
+
+    if config.strategy_id == STRATEGY_TRIPLE_EMA_ID:
+        stop_text = (
+            "慢线EMA止损"
+            if config.atr_stop_multiplier <= 0
+            else f"ATR止损x{format_decimal(config.atr_stop_multiplier)}"
+        )
+        return (
+            f"快EMA{config.ema_period}/中EMA{config.trend_ema_period}/慢EMA{config.big_ema_period} / "
+            f"ATR{config.atr_period} / {stop_text} / "
+            f"方向{SIGNAL_VALUE_TO_LABEL.get(config.signal_mode, config.signal_mode)}"
+        )
 
     if config.strategy_id == STRATEGY_BTC_EMA55_SLOPE_SHORT_ID:
         return (
@@ -2634,8 +2649,14 @@ class BacktestWindow:
             "bar": (self.bar_caption, "K线周期"),
             "signal_mode": (self.signal_caption, "信号方向"),
             "ema_period": (self.ema_period_caption, _strategy_fast_line_caption(strategy_id)),
-            "trend_ema_period": (self.trend_ema_period_caption, "趋势均线"),
-            "big_ema_period": (self.big_ema_caption, "大周期均线"),
+            "trend_ema_period": (
+                self.trend_ema_period_caption,
+                "中线 EMA" if strategy_id == STRATEGY_TRIPLE_EMA_ID else "趋势均线",
+            ),
+            "big_ema_period": (
+                self.big_ema_caption,
+                "慢线 EMA" if strategy_id == STRATEGY_TRIPLE_EMA_ID else "大周期均线",
+            ),
         }
         for key, (widget, base_text) in label_map.items():
             text = f"{base_text}{fixed_suffix}" if strategy_fixed_value(strategy_id, key) is not None else base_text
@@ -4174,9 +4195,19 @@ class BacktestWindow:
     def _refresh_backtest_action_summary(self, *_: str) -> None:
         if not hasattr(self, "_backtest_action_summary"):
             return
+        strategy_id = ""
+        try:
+            strategy_id = self._selected_strategy_definition().strategy_id
+        except (AttributeError, KeyError):
+            pass
+        batch_text = (
+            "三均线策略：仅按当前参数单组回测"
+            if strategy_id == STRATEGY_TRIPLE_EMA_ID
+            else "批量：SL×1/1.5/2，TP×1/2/3，共9组"
+        )
         parts = [
             self._compact_local_data_status(),
-            "批量：SL×1/1.5/2，TP×1/2/3，共9组",
+            batch_text,
             self._compact_history_sync_status(),
         ]
         self._backtest_action_summary.set("；".join(part for part in parts if part))
@@ -5498,8 +5529,16 @@ class BacktestWindow:
             reentry_confirmation_ma_type=reentry_confirmation_ma_type,
             reentry_confirmation_ma_period=reentry_confirmation_ma_period,
             atr_period=self._parse_positive_int(self.atr_period.get(), "ATR 周期"),
-            atr_stop_multiplier=self._parse_positive_decimal(self.stop_atr.get(), "止损 ATR 倍数"),
-            atr_take_multiplier=self._parse_positive_decimal(self.take_atr.get(), "止盈 ATR 倍数"),
+            atr_stop_multiplier=(
+                self._parse_nonnegative_decimal(self.stop_atr.get(), "初始止损 ATR 倍数")
+                if strategy_id == STRATEGY_TRIPLE_EMA_ID
+                else self._parse_positive_decimal(self.stop_atr.get(), "止损 ATR 倍数")
+            ),
+            atr_take_multiplier=(
+                Decimal("1")
+                if strategy_id == STRATEGY_TRIPLE_EMA_ID
+                else self._parse_positive_decimal(self.take_atr.get(), "止盈 ATR 倍数")
+            ),
             order_size=order_size,
             trade_mode=TRADE_MODE_OPTIONS[self.trade_mode_label.get()],
             signal_mode=signal_mode,
@@ -5605,6 +5644,15 @@ class BacktestWindow:
                     widget.grid()
                 else:
                     widget.grid_remove()
+            triple_ema = strategy_id == STRATEGY_TRIPLE_EMA_ID
+            self.stop_atr_caption.configure(
+                text="初始止损（0=慢线EMA）" if triple_ema else "止损 ATR 倍数"
+            )
+            for widget in (self.take_atr_caption, self.take_atr_entry):
+                if triple_ema:
+                    widget.grid_remove()
+                else:
+                    widget.grid()
             entry_reference_widgets = (
                 self.entry_reference_ema_caption,
                 self.entry_reference_ema_entry,
@@ -5953,6 +6001,7 @@ class BacktestWindow:
         self._sync_daily_filter_controls()
         self._sync_trend_slope_filter_controls()
         self._refresh_profile_summary_text()
+        self._refresh_backtest_action_summary()
         self._update_sizing_mode_widgets()
         if self._latest_result is None:
             self.manual_summary.set("当前策略没有额外扩展统计。")
@@ -8318,12 +8367,24 @@ class BacktestWindow:
             f"{identity_text} | 策略：{strategy_name} | 交易对：{config.inst_id} | "
             f"K线：{_normalize_backtest_bar_label(config.bar)} | 方向：{signal_label}"
         )
-        metrics_parts = [
-            f"挂单参考线：{config.entry_reference_line_label()}",
-            f"指标：{moving_average_display_label(result.ema_type, result.ema_period)} / {moving_average_display_label(result.trend_ema_type, result.trend_ema_period)} / ATR{result.atr_period}",
-            f"止损：{format_decimal(config.atr_stop_multiplier)} ATR",
-            f"{exit_metric_label}：{exit_label}",
-        ]
+        if config.strategy_id == STRATEGY_TRIPLE_EMA_ID:
+            stop_text = (
+                "慢线 EMA"
+                if config.atr_stop_multiplier <= 0
+                else f"{format_decimal(config.atr_stop_multiplier)} ATR"
+            )
+            metrics_parts = [
+                f"指标：快EMA{config.ema_period} / 中EMA{config.trend_ema_period} / 慢EMA{config.big_ema_period} / ATR{result.atr_period}",
+                f"初始止损：{stop_text}",
+                "信号：收盘确认，下一根开盘成交",
+            ]
+        else:
+            metrics_parts = [
+                f"挂单参考线：{config.entry_reference_line_label()}",
+                f"指标：{moving_average_display_label(result.ema_type, result.ema_period)} / {moving_average_display_label(result.trend_ema_type, result.trend_ema_period)} / ATR{result.atr_period}",
+                f"止损：{format_decimal(config.atr_stop_multiplier)} ATR",
+                f"{exit_metric_label}：{exit_label}",
+            ]
         if config.uses_daily_filter():
             metrics_parts.append(config.daily_filter_summary())
         if config.strategy_id != STRATEGY_BTC_EMA55_SLOPE_SHORT_ID and config.take_profit_mode == "dynamic":

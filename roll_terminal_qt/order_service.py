@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from decimal import Decimal
 
 from PySide6.QtCore import QThread, Signal
@@ -188,6 +188,9 @@ class OrderFeedThread(QThread):
         self._client = OkxRestClient()
         self._running = True
         self._watched_inst_ids: set[str] = set()
+        self._pending_orders: list[OkxTradeOrderItem] = []
+        self._next_rest_reconcile = 0.0
+        self._ws_connected: bool | None = None
 
     def set_watched_inst_ids(self, inst_ids: set[str]) -> None:
         self._watched_inst_ids = {item.strip().upper() for item in inst_ids if item and item.strip()}
@@ -206,11 +209,7 @@ class OrderFeedThread(QThread):
                 time.sleep(1.0)
                 continue
             try:
-                status_text, views = load_current_order_views(
-                    self._runtime,
-                    client=self._client,
-                    limit=80,
-                )
+                status_text, views = self._load_current_views()
                 self.orders_ready.emit(views)
                 self.status_changed.emit(status_text)
                 time.sleep(0.35)
@@ -218,10 +217,38 @@ class OrderFeedThread(QThread):
                 self.status_changed.emit(f"订单WS异常：{exc}")
                 time.sleep(1.0)
 
+    def _load_current_views(self) -> tuple[str, list[OrderStatusView]]:
+        assert self._runtime is not None
+        status = self._client.get_private_ws_debug_status(
+            self._runtime.credentials,
+            environment=self._runtime.environment,
+        )
+        connected = bool(status.get("connected"))
+        connection_changed = self._ws_connected is not None and connected != self._ws_connected
+        now = time.monotonic()
+        if now >= self._next_rest_reconcile or connection_changed:
+            # Only advance the deadline after success, so a failed REST check
+            # is retried by the next iteration rather than deferred for a minute.
+            self._pending_orders = self._client.get_pending_orders(
+                self._runtime.credentials,
+                environment=self._runtime.environment,
+                limit=80,
+                include_algo=True,
+            )
+            self._next_rest_reconcile = time.monotonic() + (60.0 if connected else 2.0)
+        self._ws_connected = connected
+        return load_current_order_views(
+            self._runtime,
+            client=self._client,
+            limit=80,
+            pending_orders=self._pending_orders,
+        )
+
     def _merge_order_views(
         self,
         ws_statuses: list[OkxOrderStatus],
         pending_orders: list[OkxTradeOrderItem],
+        algo_orders: list[OkxTradeOrderItem] | None = None,
     ) -> list[OrderStatusView]:
         merged: list[OrderStatusView] = []
         seen_keys: set[tuple[str, str]] = set()
@@ -229,6 +256,19 @@ class OrderFeedThread(QThread):
             if not self._is_relevant(status):
                 continue
             view = self._to_view(status)
+            key = self._view_identity(view)
+            if key is not None and key in seen_keys:
+                continue
+            if key is not None:
+                seen_keys.add(key)
+            merged.append(view)
+        for item in algo_orders or []:
+            if not self._is_relevant_trade_order(item):
+                continue
+            view = self._trade_order_to_view(item)
+            raw = dict(view.raw)
+            raw["_feed_source"] = "ws"
+            view = replace(view, raw=raw)
             key = self._view_identity(view)
             if key is not None and key in seen_keys:
                 continue
@@ -333,10 +373,18 @@ def load_current_order_views(
     *,
     client: OkxRestClient | None = None,
     limit: int = 80,
+    pending_orders: list[OkxTradeOrderItem] | None = None,
 ) -> tuple[str, list[OrderStatusView]]:
     if runtime is None:
         raise RuntimeError("订单WS不可用")
     rest_client = client or OkxRestClient()
+    if pending_orders is None:
+        pending_orders = rest_client.get_pending_orders(
+            runtime.credentials,
+            environment=runtime.environment,
+            limit=limit,
+            include_algo=True,
+        )
     payload = rest_client.get_cached_private_order_statuses(
         runtime.credentials,
         environment=runtime.environment,
@@ -346,14 +394,14 @@ def load_current_order_views(
     ws_statuses: list[OkxOrderStatus] = []
     if payload is not None:
         ws_version, ws_statuses = payload
-    pending_orders = rest_client.get_pending_orders(
-        runtime.credentials,
-        environment=runtime.environment,
-        limit=limit,
-        include_algo=True,
-    )
+    algo_orders: list[OkxTradeOrderItem] = []
+    read_algo_cache = getattr(rest_client, "get_cached_algo_order_statuses", None)
+    if callable(read_algo_cache):
+        algo_payload = read_algo_cache(runtime.credentials, environment=runtime.environment, limit=limit)
+        if algo_payload is not None:
+            algo_orders = list(algo_payload[1])
     feed = OrderFeedThread(runtime)
-    views = feed._merge_order_views(ws_statuses, pending_orders)
+    views = feed._merge_order_views(ws_statuses, pending_orders, algo_orders)
     if payload is None:
         return (f"订单REST pending | 相关 {len(views)}", views)
     return (f"订单WS v{ws_version} + REST | 相关 {len(views)}", views)

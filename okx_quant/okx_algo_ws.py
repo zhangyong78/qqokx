@@ -4,6 +4,7 @@ import asyncio
 import json
 import threading
 import time
+from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Any, Callable
 
@@ -18,6 +19,8 @@ except Exception:  # noqa: BLE001
 
 Logger = Callable[[str], None]
 UpdateListener = Callable[[str, int], None]
+_TERMINAL_ORDER_STATES = frozenset({"effective", "canceled", "order_failed", "partially_failed"})
+_TERMINAL_ORDER_CACHE_LIMIT = 2000
 
 
 def _ws_timestamp_seconds() -> str:
@@ -36,7 +39,13 @@ def _algo_order_key(item: dict[str, Any]) -> tuple[str, str, str] | None:
     ord_id = str(item.get("ordId") or item.get("actualOrdId") or "").strip()
     if not algo_id and not algo_cl_ord_id and not ord_id:
         return None
-    return algo_id, algo_cl_ord_id, ord_id
+    # The resulting ordinary order ID may arrive only when the algo triggers.
+    # It must not create a second entry beside the same algo's old live state.
+    if algo_id:
+        return algo_id, "", ""
+    if algo_cl_ord_id:
+        return "", algo_cl_ord_id, ""
+    return "", "", ord_id
 
 
 @dataclass(frozen=True)
@@ -74,6 +83,7 @@ class OkxAlgoWsConnection:
         self._last_error_logged = ""
         self._version = 0
         self._orders_by_key: dict[tuple[str, str, str], OkxAlgoWsRecord] = {}
+        self._terminal_order_keys: OrderedDict[tuple[str, str, str], None] = OrderedDict()
         self._update_listeners: set[UpdateListener] = set()
 
     def debug_status(self) -> dict[str, Any]:
@@ -248,6 +258,7 @@ class OkxAlgoWsConnection:
                 key = _algo_order_key(item)
                 if key is None:
                     continue
+                self._terminal_order_keys.pop(key, None)
                 changed = True
                 self._version += 1
                 self._orders_by_key[key] = OkxAlgoWsRecord(
@@ -255,6 +266,11 @@ class OkxAlgoWsConnection:
                     payload=dict(item),
                     received_at=time.time(),
                 )
+                if str(item.get("state") or "").strip().lower() in _TERMINAL_ORDER_STATES:
+                    self._terminal_order_keys[key] = None
+            while len(self._terminal_order_keys) > _TERMINAL_ORDER_CACHE_LIMIT:
+                key, _ = self._terminal_order_keys.popitem(last=False)
+                self._orders_by_key.pop(key, None)
             update_version = self._version
             self._lock.notify_all()
         if changed:

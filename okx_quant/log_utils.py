@@ -150,24 +150,22 @@ def read_daily_log_tail(
     base_dir: str | Path | None = None,
 ) -> list[str]:
     """Return the last ``max_lines`` non-empty lines from today's daily log file (for UI bootstrap)."""
+    if max_lines <= 0:
+        return []
     path = daily_log_file_path(for_time=for_time, base_dir=base_dir)
-    if not path.exists() or not path.is_file():
-        return []
     try:
-        size = path.stat().st_size
+        with path.open("rb") as handle:
+            size = handle.seek(0, 2)
+            start = max(0, size - _RUN_LOG_TAIL_MAX_READ_BYTES)
+            handle.seek(start)
+            raw = handle.read(_RUN_LOG_TAIL_MAX_READ_BYTES)
     except OSError:
         return []
-    try:
-        with path.open("r", encoding="utf-8", errors="replace", newline="") as handle:
-            if size <= _RUN_LOG_TAIL_MAX_READ_BYTES:
-                text = handle.read()
-            else:
-                handle.seek(max(0, size - _RUN_LOG_TAIL_MAX_READ_BYTES))
-                handle.readline()
-                text = handle.read()
-    except OSError:
-        return []
-    lines = text.splitlines()
+    if start:
+        # Drop the partial first line before decoding, including any split UTF-8 character.
+        newline = raw.find(b"\n")
+        raw = raw[newline + 1 :] if newline >= 0 else b""
+    lines = [line for line in raw.decode("utf-8", errors="replace").splitlines() if line.strip()]
     if len(lines) > max_lines:
         return lines[-max_lines:]
     return lines

@@ -235,6 +235,7 @@ from okx_quant.strategy_catalog import (
     STRATEGY_DEFINITIONS,
     STRATEGY_DYNAMIC_ID,
     STRATEGY_EMA55_SLOPE_SHORT_ID,
+    STRATEGY_TRIPLE_EMA_ID,
     StrategyDefinition,
     get_strategy_definition,
     is_ema55_slope_short_strategy,
@@ -321,6 +322,8 @@ def _bind_mixin_to_shell_globals(mixin_cls):
 
 
 def _strategy_fast_line_caption(strategy_id: str) -> str:
+    if strategy_id == STRATEGY_TRIPLE_EMA_ID:
+        return "快线 EMA"
     if strategy_id in {STRATEGY_BTC_EMA55_SLOPE_SHORT_ID, STRATEGY_EMA55_SLOPE_SHORT_ID}:
         return "信号均线（斜率开平仓）"
     return "快线均线"
@@ -3381,6 +3384,31 @@ class _DynamicProtectionRuleEditorRow:
     delete_button: ttk.Button
 
 
+_RUN_LOG_QUEUE_LIMIT = 2000
+_RUN_LOG_WIDGET_LINE_LIMIT = 2000
+_RUN_LOG_DRAIN_BATCH_SIZE = 200
+
+
+class _RecentLogQueue(queue.Queue[str]):
+    """Keep recent display lines without ever blocking a strategy worker.
+
+    Producers persist the complete log before enqueueing. This queue only
+    contains display strings; runtime callbacks use their own queue.
+    """
+
+    def __init__(self, maxsize: int = _RUN_LOG_QUEUE_LIMIT) -> None:
+        super().__init__(maxsize=max(1, maxsize))
+
+    def put(self, item: str, block: bool = True, timeout: float | None = None) -> None:
+        with self.not_full:
+            if self._qsize() >= self.maxsize:
+                self._get()
+                self.unfinished_tasks -= 1
+            self._put(item)
+            self.unfinished_tasks += 1
+            self.not_empty.notify()
+
+
 class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStrategySessionsMixin):
     def __init__(self) -> None:
         self.root = Tk()
@@ -3399,7 +3427,7 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         self.client = OkxRestClient()
         self.market_data_hub = MarketDataHub(self.client, logger=self._enqueue_log)
         self.deribit_client = DeribitRestClient()
-        self.log_queue: queue.Queue[str] = queue.Queue()
+        self.log_queue: queue.Queue[str] = _RecentLogQueue()
         self.instruments: list[Instrument] = []
         self._fixed_order_size_hint_instrument_cache: dict[str, Instrument] = {}
         self._fixed_order_size_hint_fetching_inst_ids: set[str] = set()
@@ -4291,12 +4319,26 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
             "bar": (self._bar_label, "K线周期"),
             "signal_mode": (self._signal_label, "信号方向"),
             "ema_period": (self._ema_label, _strategy_fast_line_caption(strategy_id)),
-            "trend_ema_period": (self._trend_ema_label, "趋势均线"),
-            "big_ema_period": (self._big_ema_label, "大周期均线"),
+            "trend_ema_period": (
+                self._trend_ema_label,
+                "中线 EMA" if strategy_id == STRATEGY_TRIPLE_EMA_ID else "趋势均线",
+            ),
+            "big_ema_period": (
+                self._big_ema_label,
+                "慢线 EMA" if strategy_id == STRATEGY_TRIPLE_EMA_ID else "大周期均线",
+            ),
         }
         for key, (widget, base_text) in label_map.items():
             text = f"{base_text}{fixed_suffix}" if strategy_fixed_value(strategy_id, key) is not None else base_text
             widget.configure(text=text)
+        if hasattr(self, "_stop_atr_label"):
+            triple_ema = strategy_id == STRATEGY_TRIPLE_EMA_ID
+            self._stop_atr_label.configure(text="初始止损（0=慢线EMA）" if triple_ema else "止损 ATR 倍数")
+            for widget in (self._take_atr_label, self._take_atr_entry):
+                if triple_ema:
+                    widget.grid_remove()
+                else:
+                    widget.grid()
 
     def _build_menu(self) -> None:
         menu_bar = Menu(self.root)
@@ -5902,7 +5944,8 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         else:
             show = lines
         if show:
-            self.log_text.insert(END, "\n".join(show) + "\n")
+            self.log_text.insert(END, "\n".join(show[-_RUN_LOG_WIDGET_LINE_LIMIT:]) + "\n")
+            self._trim_run_log_widget()
             self.log_text.see(END)
 
     def _open_run_logs_directory(self) -> None:
@@ -9652,8 +9695,16 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
                 trend_ema_period=self._parse_nonnegative_int(self.trend_ema_period.get(), "趋势均线周期"),
                 big_ema_period=self._parse_nonnegative_int(self.big_ema_period.get(), "EMA大周期"),
                 atr_period=self._parse_nonnegative_int(self.atr_period.get(), "ATR周期"),
-                atr_stop_multiplier=self._parse_positive_decimal(self.stop_atr.get(), "止损 ATR 倍数"),
-                atr_take_multiplier=self._parse_positive_decimal(self.take_atr.get(), "止盈 ATR 倍数"),
+                atr_stop_multiplier=(
+                    self._parse_nonnegative_decimal(self.stop_atr.get(), "初始止损 ATR 倍数")
+                    if definition.strategy_id == STRATEGY_TRIPLE_EMA_ID
+                    else self._parse_positive_decimal(self.stop_atr.get(), "止损 ATR 倍数")
+                ),
+                atr_take_multiplier=(
+                    Decimal("1")
+                    if definition.strategy_id == STRATEGY_TRIPLE_EMA_ID
+                    else self._parse_positive_decimal(self.take_atr.get(), "止盈 ATR 倍数")
+                ),
                 order_size=_parse_positive_decimal_hint(self.order_size.get()) or Decimal("1"),
                 trade_mode=TRADE_MODE_OPTIONS.get(self.trade_mode_label.get(), "cross"),
                 signal_mode=SIGNAL_LABEL_TO_VALUE.get(self.signal_mode_label.get(), definition.default_signal_mode),
@@ -10152,6 +10203,15 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
             raise ValueError(f"{field_name} 必须大于 0")
         return value
 
+    def _parse_nonnegative_decimal(self, raw: str, field_name: str) -> Decimal:
+        try:
+            value = Decimal(raw)
+        except InvalidOperation as exc:
+            raise ValueError(f"{field_name} 不是有效数字") from exc
+        if value < 0:
+            raise ValueError(f"{field_name} 不能小于 0")
+        return value
+
     def _parse_optional_positive_decimal(self, raw: str, field_name: str) -> Decimal | None:
         cleaned = raw.strip()
         if not cleaned:
@@ -10221,12 +10281,24 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         self.log_queue.put(append_log_line(message))
 
     def _drain_log_queue(self) -> None:
-        while not self.log_queue.empty():
-            line = self.log_queue.get_nowait()
-            self.log_text.insert(END, line + "\n")
+        lines: list[str] = []
+        for _ in range(_RUN_LOG_DRAIN_BATCH_SIZE):
+            try:
+                lines.append(self.log_queue.get_nowait())
+            except queue.Empty:
+                break
+        if lines:
+            self.log_text.insert(END, "\n".join(lines) + "\n")
+            self._trim_run_log_widget()
             self.log_text.see(END)
         self._drain_pending_runtime_session_updates()
         self.root.after(250, self._drain_log_queue)
+
+    def _trim_run_log_widget(self) -> None:
+        line_count = int(self.log_text.index("end-1c").split(".")[0]) - 1
+        excess = line_count - _RUN_LOG_WIDGET_LINE_LIMIT
+        if excess > 0:
+            self.log_text.delete("1.0", f"{excess + 1}.0")
 
     def _trader_desk_handle_stopped_session(self, session: StrategySession) -> None:
         trader_id = getattr(session, "trader_id", "").strip()
@@ -10669,7 +10741,14 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
                     f"请手动重新打开程序。\n\n错误信息：{exc}",
                     parent=self.root,
                 )
-        self.root.destroy()
+        try:
+            close_client = getattr(self.client, "close", None)
+            if callable(close_client):
+                close_client()
+        except Exception as exc:
+            self._enqueue_log(f"关闭行情连接失败：{exc}")
+        finally:
+            self.root.destroy()
 
 def _format_optional_decimal(value: Decimal | None, *, with_sign: bool = False) -> str:
     if value is None:

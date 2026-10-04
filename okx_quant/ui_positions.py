@@ -3344,7 +3344,12 @@ class UiPositionsMixin:
 
     def _refresh_position_history_worker(self, credentials: Credentials, environment: str, profile_name: str) -> None:
         try:
-            position_history = self.client.get_positions_history(credentials, environment=environment, limit=self._position_history_fetch_limit)
+            position_history = self.client.get_positions_history(
+                credentials,
+                environment=environment,
+                limit=self._position_history_fetch_limit,
+                fetch_all=True,
+            )
             usdt_prices = _build_position_history_usdt_price_map(self.client, position_history)
             instruments = _safe_build_history_instrument_map(self.client, [item.inst_id for item in position_history])
             note = None
@@ -3354,7 +3359,12 @@ class UiPositionsMixin:
             if "50101" in message and "current environment" in message:
                 alternate = "live" if environment == "demo" else "demo"
                 try:
-                    position_history = self.client.get_positions_history(credentials, environment=alternate, limit=self._position_history_fetch_limit)
+                    position_history = self.client.get_positions_history(
+                        credentials,
+                        environment=alternate,
+                        limit=self._position_history_fetch_limit,
+                        fetch_all=True,
+                    )
                     usdt_prices = _build_position_history_usdt_price_map(self.client, position_history)
                     instruments = _safe_build_history_instrument_map(self.client, [item.inst_id for item in position_history])
                     note = f"历史数据自动切换到 {'实盘' if alternate == 'live' else '模拟'} 环境读取。"

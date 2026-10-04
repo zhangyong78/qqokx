@@ -6,6 +6,7 @@ import hashlib
 import json
 import secrets
 import sys
+import tempfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -69,6 +70,37 @@ class _DataBlob(ctypes.Structure):
         ("cbData", ctypes.c_ulong),
         ("pbData", ctypes.POINTER(ctypes.c_ubyte)),
     ]
+
+
+def _write_json_atomic(target: Path, payload: object) -> Path:
+    """Commit a complete JSON snapshot without sharing a temporary file between writers."""
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            prefix=f".{target.name}.",
+            suffix=".tmp",
+            dir=target.parent,
+            delete=False,
+        ) as handle:
+            temp_path = Path(handle.name)
+            json.dump(payload, handle, ensure_ascii=False, indent=2)
+        for attempt in range(4):
+            try:
+                temp_path.replace(target)
+                return target
+            except PermissionError:
+                if attempt == 3:
+                    raise
+                time.sleep(0.05)
+    finally:
+        if temp_path is not None:
+            try:
+                temp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
 
 
 def credentials_file_path(base_dir: Path | None = None) -> Path:
@@ -186,10 +218,7 @@ def save_arbitrage_ledger_snapshot(*, entries: list[dict[str, object]], path: Pa
         "entries": entries,
         "updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
     }
-    temp_path = target.with_suffix(target.suffix + ".tmp")
-    temp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    temp_path.replace(target)
-    return target
+    return _write_json_atomic(target, payload)
 
 
 def load_arbitrage_settings_snapshot(path: Path | None = None) -> dict[str, object]:
@@ -210,10 +239,7 @@ def save_arbitrage_settings_snapshot(settings: dict[str, object], path: Path | N
         **settings,
         "updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
     }
-    temp_path = target.with_suffix(target.suffix + ".tmp")
-    temp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    temp_path.replace(target)
-    return target
+    return _write_json_atomic(target, payload)
 
 
 def option_strategies_file_path(base_dir: Path | None = None) -> Path:
@@ -330,10 +356,7 @@ def save_line_trading_desk_annotations_entries(entries: dict[str, dict[str, obje
         "entries": dict(entries),
         "updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
     }
-    temp_path = target.with_suffix(target.suffix + ".tmp")
-    temp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    temp_path.replace(target)
-    return target
+    return _write_json_atomic(target, payload)
 
 
 def load_kline_analysis_workspace_entries(path: Path | None = None) -> dict[str, dict[str, object]]:
@@ -366,10 +389,7 @@ def save_kline_analysis_workspace_entries(entries: dict[str, dict[str, object]],
         "entries": dict(entries),
         "updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
     }
-    temp_path = target.with_suffix(target.suffix + ".tmp")
-    temp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    temp_path.replace(target)
-    return target
+    return _write_json_atomic(target, payload)
 
 
 def load_kline_rr_trade_ledger_snapshot(path: Path | None = None) -> dict[str, object]:
@@ -394,10 +414,7 @@ def save_kline_rr_trade_ledger_snapshot(entries: list[dict[str, object]], path: 
         "entries": entries,
         "updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
     }
-    temp_path = target.with_suffix(target.suffix + ".tmp")
-    temp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    temp_path.replace(target)
-    return target
+    return _write_json_atomic(target, payload)
 
 
 def _normalize_journal_entry_record(item: object) -> dict[str, object] | None:
@@ -463,10 +480,7 @@ def save_journal_entries_snapshot(entries: list[dict[str, object]], path: Path |
         "entries": normalized,
         "updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
     }
-    temp_path = target.with_suffix(target.suffix + ".tmp")
-    temp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    temp_path.replace(target)
-    return target
+    return _write_json_atomic(target, payload)
 
 
 def load_btc_research_workbench_state(path: Path | None = None) -> dict[str, object]:
@@ -496,25 +510,7 @@ def save_btc_research_workbench_state(snapshot: dict[str, object], path: Path | 
         "viewports": dict(snapshot.get("viewports", {})) if isinstance(snapshot, dict) else {},
         "updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
     }
-    temp_path = target.with_suffix(target.suffix + ".tmp")
-    raw_text = json.dumps(payload, ensure_ascii=False, indent=2)
-    last_error: PermissionError | None = None
-    for _attempt in range(4):
-        try:
-            temp_path.write_text(raw_text, encoding="utf-8")
-            temp_path.replace(target)
-            return target
-        except PermissionError as exc:
-            last_error = exc
-            try:
-                if temp_path.exists():
-                    temp_path.unlink()
-            except Exception:
-                pass
-            time.sleep(0.05)
-    if last_error is not None:
-        raise last_error
-    return target
+    return _write_json_atomic(target, payload)
 
 
 def load_btc_market_email_state(path: Path | None = None) -> dict[str, str]:
@@ -549,10 +545,7 @@ def save_btc_market_email_state(
         "last_report_path": str(last_report_path or "").strip(),
         "updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
     }
-    temp_path = target.with_suffix(target.suffix + ".tmp")
-    temp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    temp_path.replace(target)
-    return target
+    return _write_json_atomic(target, payload)
 
 
 def _normalize_history_profile_name(profile_name: object) -> str:
@@ -721,10 +714,7 @@ def save_account_positions_home_view_prefs(
         ),
         "updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
     }
-    temp_path = target.with_suffix(target.suffix + ".tmp")
-    temp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    temp_path.replace(target)
-    return target
+    return _write_json_atomic(target, payload)
 
 
 def load_position_history_view_prefs(path: Path | None = None) -> dict[str, str]:
@@ -757,10 +747,7 @@ def save_position_history_view_prefs(
         "local_range_end": str(local_range_end or ""),
         "updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
     }
-    temp_path = target.with_suffix(target.suffix + ".tmp")
-    temp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    temp_path.replace(target)
-    return target
+    return _write_json_atomic(target, payload)
 
 
 def history_cache_file_path(
@@ -830,10 +817,7 @@ def save_history_sync_state(
         "sources": dict(sources) if isinstance(sources, dict) else {},
         "updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
     }
-    temp_path = target.with_suffix(target.suffix + ".tmp")
-    temp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    temp_path.replace(target)
-    return target
+    return _write_json_atomic(target, payload)
 
 
 def account_equity_curve_file_path(
@@ -879,10 +863,7 @@ def save_account_equity_curve_records(
         "records": normalized_records,
         "updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
     }
-    temp_path = target.with_suffix(target.suffix + ".tmp")
-    temp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    temp_path.replace(target)
-    return target
+    return _write_json_atomic(target, payload)
 
 
 def load_history_cache_records(
@@ -920,10 +901,7 @@ def save_history_cache_records(
         "records": normalized_records,
         "updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
     }
-    temp_path = target.with_suffix(target.suffix + ".tmp")
-    temp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    temp_path.replace(target)
-    return target
+    return _write_json_atomic(target, payload)
 
 
 def _normalize_strategy_parameter_record(payload: object) -> dict[str, object]:
@@ -951,10 +929,7 @@ def save_strategy_parameter_global_defaults(values: dict[str, object], path: Pat
         "values": _normalize_strategy_parameter_record(values),
         "updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
     }
-    temp_path = target.with_suffix(target.suffix + ".tmp")
-    temp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    temp_path.replace(target)
-    return target
+    return _write_json_atomic(target, payload)
 
 
 def load_strategy_parameter_drafts(path: Path | None = None) -> dict[str, object]:
@@ -996,10 +971,7 @@ def save_strategy_parameter_drafts(snapshot: dict[str, object], path: Path | Non
             if str(strategy_id).strip()
         }
     payload["updated_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
-    temp_path = target.with_suffix(target.suffix + ".tmp")
-    temp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    temp_path.replace(target)
-    return target
+    return _write_json_atomic(target, payload)
 
 
 def _empty_credentials_snapshot() -> dict[str, str]:
@@ -1263,10 +1235,7 @@ def save_credentials_profiles_snapshot(
         "profiles": normalized_profiles,
         "updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
     }
-    temp_path = target.with_suffix(target.suffix + ".tmp")
-    temp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    temp_path.replace(target)
-    return target
+    return _write_json_atomic(target, payload)
 
 
 def load_credentials_snapshot(path: Path | None = None, profile_name: str | None = None) -> dict[str, str]:
@@ -1433,10 +1402,7 @@ def save_notification_snapshot(
         ],
         "updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
     }
-    temp_path = target.with_suffix(target.suffix + ".tmp")
-    temp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    temp_path.replace(target)
-    return target
+    return _write_json_atomic(target, payload)
 
 
 def load_smart_order_tasks_snapshot(path: Path | None = None) -> dict[str, object]:
@@ -1489,10 +1455,7 @@ def save_smart_order_tasks_snapshot(
         "tasks": tasks,
         "updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
     }
-    temp_path = target.with_suffix(target.suffix + ".tmp")
-    temp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    temp_path.replace(target)
-    return target
+    return _write_json_atomic(target, payload)
 
 
 def _normalize_smart_order_favorite(item: object) -> dict[str, str] | None:
@@ -1553,10 +1516,7 @@ def save_smart_order_favorites_snapshot(
         "favorites": normalized_favorites,
         "updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
     }
-    temp_path = target.with_suffix(target.suffix + ".tmp")
-    temp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    temp_path.replace(target)
-    return target
+    return _write_json_atomic(target, payload)
 
 
 def _normalize_strategy_history_record(item: object) -> dict[str, object] | None:
@@ -1634,10 +1594,7 @@ def save_strategy_history_snapshot(
         "records": normalized_records,
         "updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
     }
-    temp_path = target.with_suffix(target.suffix + ".tmp")
-    temp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    temp_path.replace(target)
-    return target
+    return _write_json_atomic(target, payload)
 
 
 def _normalize_strategy_trade_ledger_record(item: object) -> dict[str, object] | None:
@@ -1715,10 +1672,7 @@ def save_strategy_trade_ledger_snapshot(
         "records": normalized_records,
         "updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
     }
-    temp_path = target.with_suffix(target.suffix + ".tmp")
-    temp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    temp_path.replace(target)
-    return target
+    return _write_json_atomic(target, payload)
 
 
 def _normalize_recoverable_strategy_session_record(item: object) -> dict[str, object] | None:
@@ -1787,10 +1741,7 @@ def save_recoverable_strategy_sessions_snapshot(
         "sessions": normalized_sessions,
         "updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
     }
-    temp_path = target.with_suffix(target.suffix + ".tmp")
-    temp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    temp_path.replace(target)
-    return target
+    return _write_json_atomic(target, payload)
 
 
 def _normalize_position_note_text(value: object) -> str:
@@ -1928,10 +1879,7 @@ def save_position_notes_snapshot(
         "history_notes": normalized_history_notes,
         "updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
     }
-    temp_path = target.with_suffix(target.suffix + ".tmp")
-    temp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    temp_path.replace(target)
-    return target
+    return _write_json_atomic(target, payload)
 
 
 def _normalize_option_strategy_leg(item: object) -> dict[str, object] | None:
@@ -2020,7 +1968,4 @@ def save_option_strategies_snapshot(
         "strategies": normalized,
         "updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
     }
-    temp_path = target.with_suffix(target.suffix + ".tmp")
-    temp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    temp_path.replace(target)
-    return target
+    return _write_json_atomic(target, payload)

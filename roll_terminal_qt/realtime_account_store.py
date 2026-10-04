@@ -61,6 +61,7 @@ class RealtimeAccountStore(QObject):
         self._position_tickers: dict[str, object] = {}
         self._upl_usdt_prices: dict[str, object] = {}
         self._source = "startup"
+        self._ws_revision = 0
         self._unsubscribers: list[Callable[[], None]] = []
         self._reconcile_in_flight = False
         self._cache_in_flight = False
@@ -68,6 +69,9 @@ class RealtimeAccountStore(QObject):
         self._emit_timer = QTimer(self)
         self._emit_timer.setSingleShot(True)
         self._emit_timer.timeout.connect(self._emit_snapshot)
+        self._cache_refresh_timer = QTimer(self)
+        self._cache_refresh_timer.setSingleShot(True)
+        self._cache_refresh_timer.timeout.connect(self._start_cache_worker)
         self._reconcile_timer = QTimer(self)
         self._reconcile_timer.setInterval(max(1, int(reconcile_seconds)) * 1000)
         self._reconcile_timer.timeout.connect(lambda: self.request_reconcile("safety"))
@@ -89,6 +93,7 @@ class RealtimeAccountStore(QObject):
         self._position_tickers = {}
         self._upl_usdt_prices = {}
         self._source = "startup"
+        self._ws_revision = 0
         self._subscribe_ws_updates(self._generation)
         self._reconcile_timer.start()
         self.request_reconcile("startup")
@@ -98,6 +103,7 @@ class RealtimeAccountStore(QObject):
         self._generation += 1
         self._reconcile_timer.stop()
         self._emit_timer.stop()
+        self._cache_refresh_timer.stop()
         self._reconcile_in_flight = False
         self._cache_in_flight = False
         self._pending_cache_refresh = False
@@ -219,6 +225,7 @@ class RealtimeAccountStore(QObject):
                 self._unsubscribers.append(unsubscribe)
 
     def _run_reconcile_worker(self, generation: int, reason: str, runtime: object) -> None:
+        started_ws_revision = self._ws_revision
         try:
             credentials = getattr(runtime, "credentials")
             environment = str(getattr(runtime, "environment", "") or "")
@@ -264,6 +271,7 @@ class RealtimeAccountStore(QObject):
                 generation,
                 reason,
                 {
+                    "started_ws_revision": started_ws_revision,
                     "positions": positions,
                     "account": account,
                     "account_updated_at": account_updated_at,
@@ -287,6 +295,9 @@ class RealtimeAccountStore(QObject):
             return
         if not isinstance(result, dict):
             return
+        if int(result.get("started_ws_revision", self._ws_revision)) != self._ws_revision:
+            self.status_changed.emit(f"账户 REST {reason} 校验结果已过期，保留较新的 WS 状态")
+            return
         self._positions = list(result.get("positions") or [])
         self._account = result.get("account")
         self._account_updated_at = result.get("account_updated_at")
@@ -305,9 +316,15 @@ class RealtimeAccountStore(QObject):
         if generation != self._generation or self._runtime is None:
             return
         self._pending_cache_refresh = True
-        if self._cache_in_flight:
+        self._schedule_cache_refresh()
+
+    def _schedule_cache_refresh(self) -> None:
+        if self._runtime is None or self._cache_in_flight or not self._pending_cache_refresh:
             return
-        self._start_cache_worker()
+        if self._coalesce_ms == 0:
+            self._start_cache_worker()
+        elif not self._cache_refresh_timer.isActive():
+            self._cache_refresh_timer.start(self._coalesce_ms)
 
     def _start_cache_worker(self) -> None:
         if self._runtime is None or self._cache_in_flight:
@@ -346,8 +363,10 @@ class RealtimeAccountStore(QObject):
         self._cache_in_flight = False
         if isinstance(result, Exception):
             self.status_changed.emit(f"账户 WS 缓存读取失败：{result}")
+            self._schedule_cache_refresh()
             return
         if not isinstance(result, dict):
+            self._schedule_cache_refresh()
             return
         positions_payload = result.get("positions")
         if positions_payload is not None:
@@ -367,11 +386,11 @@ class RealtimeAccountStore(QObject):
             updates.extend(self._views_from_algo_orders(list(algo_payload[1])))
         if updates:
             self._orders = self._merge_order_updates(self._orders, updates)
+        self._ws_revision += 1
         self._source = "ws"
         self.status_changed.emit("账户由 WS 实时更新")
         self._schedule_emit()
-        if self._pending_cache_refresh:
-            self._start_cache_worker()
+        self._schedule_cache_refresh()
 
     def _views_from_pending_orders(self, orders: list[OkxTradeOrderItem]) -> list[OrderStatusView]:
         feed = OrderFeedThread(None)
@@ -405,7 +424,8 @@ class RealtimeAccountStore(QObject):
         if self._coalesce_ms == 0:
             self._emit_snapshot()
             return
-        self._emit_timer.start(self._coalesce_ms)
+        if not self._emit_timer.isActive():
+            self._emit_timer.start(self._coalesce_ms)
 
     @Slot()
     def _emit_snapshot(self) -> None:

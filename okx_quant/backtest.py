@@ -72,10 +72,12 @@ from okx_quant.strategy_catalog import (
     STRATEGY_BTC_EMA55_SLOPE_SHORT_ID,
     STRATEGY_CROSS_ID,
     STRATEGY_DYNAMIC_ID,
+    STRATEGY_TRIPLE_EMA_ID,
     is_adaptive_ema_rail_strategy,
     is_btc_ema15_ma50_pullback_long_strategy,
     is_btc_ema15_ma50_pullback_short_strategy,
     is_btc_ema55_slope_short_strategy,
+    is_triple_ema_strategy,
     resolve_dynamic_signal_mode,
 )
 
@@ -106,6 +108,9 @@ EXIT_REASON_LABELS = {
     "slope_turn_positive": "斜率转正平仓",
     "trend_ema_close_exit": "跌破趋势EMA收盘平仓",
     "ema15_close_exit": "EMA15收破离场",
+    "triple_ema_sideway_exit": "三均线转震荡平仓",
+    "triple_ema_reverse_to_long": "三均线反手做多",
+    "triple_ema_reverse_to_short": "三均线反手做空",
 }
 
 
@@ -871,6 +876,8 @@ def build_parameter_batch_configs(
     max_entries_options: tuple[int, ...] = BATCH_MAX_ENTRIES_OPTIONS,
 ) -> list[StrategyConfig]:
     family = _backtest_strategy_family(base_config.strategy_id)
+    if family == "triple_ema":
+        return [base_config]
     if is_btc_ema55_slope_short_strategy(base_config.strategy_id):
         return build_btc_slope_short_batch_configs(
             base_config,
@@ -1361,6 +1368,13 @@ def _run_backtest_with_loaded_data(
             maker_fee_rate=maker_fee_rate,
             taker_fee_rate=taker_fee_rate,
             direction_filter_bias=direction_filter_bias,
+        )
+    elif family == "triple_ema":
+        trades, terminal_open_position = _run_triple_ema_backtest(
+            candles,
+            instrument,
+            config,
+            taker_fee_rate=taker_fee_rate,
         )
     elif strategy_is_cross_family(config.strategy_id):
         trades, terminal_open_position = _run_cross_backtest(
@@ -2048,6 +2062,13 @@ def _required_backtest_preload_candles(config: StrategyConfig) -> int:
         minimum = adaptive_rail_minimum_candles(config)
     elif family == "ema5_ema8":
         minimum = max(config.ema_period, config.trend_ema_period) + 1
+    elif family == "triple_ema":
+        minimum = max(
+            int(config.ema_period),
+            int(config.trend_ema_period),
+            int(config.big_ema_period),
+            int(config.atr_period) if config.atr_stop_multiplier > 0 else 0,
+        ) + 1
     else:
         trend_slope_filter_enabled = (
             bool(config.trend_ema_slope_filter_enabled)
@@ -3027,6 +3048,300 @@ def _btc_daily_4h_wave_stop_price(
         if fallback_high > entry_price_raw:
             return snap_to_increment(fallback_high, tick_size, "up"), "fallback_10_high"
     return None, "unresolved"
+
+
+def _triple_ema_trend_state(
+    fast_ema: Decimal,
+    middle_ema: Decimal,
+    slow_ema: Decimal,
+) -> str:
+    if fast_ema > middle_ema > slow_ema:
+        return "UPTREND"
+    if fast_ema < middle_ema < slow_ema:
+        return "DOWNTREND"
+    return "SIDEWAY"
+
+
+def _triple_ema_stop_loss(
+    *,
+    signal: str,
+    entry_price: Decimal,
+    slow_ema: Decimal,
+    atr_value: Decimal | None,
+    config: StrategyConfig,
+    tick_size: Decimal,
+) -> tuple[Decimal, str] | None:
+    if config.atr_stop_multiplier > 0:
+        if atr_value is None or atr_value <= 0:
+            return None
+        raw_stop = (
+            entry_price - (atr_value * config.atr_stop_multiplier)
+            if signal == "long"
+            else entry_price + (atr_value * config.atr_stop_multiplier)
+        )
+        source = "atr"
+    else:
+        raw_stop = slow_ema
+        source = "slow_ema"
+
+    direction = "down" if signal == "long" else "up"
+    stop_loss = snap_to_increment(raw_stop, tick_size, direction)
+    if (signal == "long" and stop_loss >= entry_price) or (
+        signal == "short" and stop_loss <= entry_price
+    ):
+        return None
+    return stop_loss, source
+
+
+def _triple_ema_open_position(
+    *,
+    candles: list[Candle],
+    instrument: Instrument,
+    config: StrategyConfig,
+    trades: list[BacktestTrade],
+    entry_index: int,
+    signal_index: int,
+    signal: str,
+    slow_ema: Decimal,
+    atr_value: Decimal | None,
+    entry_sequence: int,
+    taker_fee_rate: Decimal,
+) -> _OpenPosition | None:
+    entry_candle = candles[entry_index]
+    entry_price = snap_to_increment(entry_candle.open, instrument.tick_size, "nearest")
+    stop = _triple_ema_stop_loss(
+        signal=signal,
+        entry_price=entry_price,
+        slow_ema=slow_ema,
+        atr_value=atr_value,
+        config=config,
+        tick_size=instrument.tick_size,
+    )
+    if stop is None:
+        return None
+    stop_loss, stop_source = stop
+    resolved_config = _resolve_backtest_config(config, trades)
+    size = _determine_backtest_order_size(
+        instrument=instrument,
+        config=resolved_config,
+        entry_price=entry_price,
+        stop_loss=stop_loss,
+        risk_price_compatible=True,
+    )
+    return _create_open_position(
+        instrument=instrument,
+        signal=signal,
+        entry_index=entry_index,
+        entry_ts=entry_candle.ts,
+        entry_price_raw=entry_price,
+        stop_loss=stop_loss,
+        take_profit=entry_price,
+        atr_value=atr_value or Decimal("0"),
+        size=size,
+        entry_fee_rate=taker_fee_rate,
+        exit_fee_rate=taker_fee_rate,
+        entry_fee_type="taker",
+        entry_slippage_rate=config.resolved_backtest_entry_slippage_rate(),
+        exit_slippage_rate=config.resolved_backtest_exit_slippage_rate(),
+        funding_rate=config.backtest_funding_rate,
+        entry_sequence=entry_sequence,
+        take_profit_enabled=False,
+        metadata={
+            "entry_signal_index": signal_index,
+            "entry_execution": "next_open",
+            "initial_stop_source": stop_source,
+            "slow_ema_at_signal": slow_ema,
+            "atr_at_signal": atr_value,
+        },
+    )
+
+
+def _triple_ema_close_at_open(
+    position: _OpenPosition,
+    candle: Candle,
+    candle_index: int,
+    *,
+    exit_reason: str,
+    taker_fee_rate: Decimal,
+) -> BacktestTrade:
+    exit_price_raw = snap_to_increment(candle.open, position.tick_size, "nearest")
+    exit_price = _apply_slippage_price(
+        exit_price_raw,
+        signal=position.signal,
+        tick_size=position.tick_size,
+        slippage_rate=position.exit_slippage_rate,
+        is_entry=False,
+    )
+    return _build_closed_trade(
+        position,
+        candle,
+        candle_index,
+        exit_price_raw=exit_price_raw,
+        exit_price=exit_price,
+        exit_reason=exit_reason,
+        exit_fee_rate=taker_fee_rate,
+        exit_fee_type="taker",
+    )
+
+
+def _triple_ema_gap_stop_trade(
+    position: _OpenPosition,
+    candle: Candle,
+    candle_index: int,
+    *,
+    taker_fee_rate: Decimal,
+) -> BacktestTrade | None:
+    stop_gapped = (
+        candle.open <= position.stop_loss
+        if position.signal == "long"
+        else candle.open >= position.stop_loss
+    )
+    if not stop_gapped:
+        return None
+    return _triple_ema_close_at_open(
+        position,
+        candle,
+        candle_index,
+        exit_reason="stop_loss",
+        taker_fee_rate=taker_fee_rate,
+    )
+
+
+def _run_triple_ema_backtest(
+    candles: list[Candle],
+    instrument: Instrument,
+    config: StrategyConfig,
+    *,
+    taker_fee_rate: Decimal = Decimal("0"),
+) -> tuple[list[BacktestTrade], BacktestOpenPosition | None]:
+    if not is_triple_ema_strategy(config.strategy_id):
+        raise RuntimeError("三均线策略回测配置不匹配。")
+    if min(config.ema_period, config.trend_ema_period, config.big_ema_period, config.atr_period) <= 0:
+        raise BacktestInvalidConfigError("三均线和 ATR 周期必须大于 0。")
+    if config.atr_stop_multiplier < 0:
+        raise BacktestInvalidConfigError("三均线 ATR 止损倍数不能小于 0。")
+
+    minimum = max(
+        int(config.ema_period),
+        int(config.trend_ema_period),
+        int(config.big_ema_period),
+        int(config.atr_period) if config.atr_stop_multiplier > 0 else 0,
+    ) + 1
+    if len(candles) < minimum:
+        raise RuntimeError(f"已收盘 K 线不足，至少需要 {minimum} 根。")
+    trade_start_index = _backtest_trade_start_index(minimum)
+    if len(candles) <= trade_start_index:
+        return [], None
+
+    closes = [candle.close for candle in candles]
+    fast_values = ema(closes, int(config.ema_period))
+    middle_values = ema(closes, int(config.trend_ema_period))
+    slow_values = ema(closes, int(config.big_ema_period))
+    atr_values = atr(candles, int(config.atr_period))
+    states = [
+        _triple_ema_trend_state(fast_value, middle_value, slow_value)
+        for fast_value, middle_value, slow_value in zip(fast_values, middle_values, slow_values)
+    ]
+    allow_long = config.signal_mode != "short_only"
+    allow_short = config.signal_mode != "long_only"
+    trades: list[BacktestTrade] = []
+    open_position: _OpenPosition | None = None
+    pending_action: str | None = None
+    pending_signal_index = -1
+    entry_sequence = 0
+
+    for index in range(trade_start_index, len(candles)):
+        candle = candles[index]
+        opened_this_candle = False
+
+        if pending_action is not None:
+            if pending_action in {"exit", "reverse_to_long", "reverse_to_short"} and open_position is not None:
+                exit_reason = (
+                    "triple_ema_sideway_exit"
+                    if pending_action == "exit"
+                    else f"triple_ema_{pending_action}"
+                )
+                trades.append(
+                    _triple_ema_close_at_open(
+                        open_position,
+                        candle,
+                        index,
+                        exit_reason=exit_reason,
+                        taker_fee_rate=taker_fee_rate,
+                    )
+                )
+                open_position = None
+
+            action_signal = {
+                "buy": "long",
+                "sell": "short",
+                "reverse_to_long": "long",
+                "reverse_to_short": "short",
+            }.get(pending_action)
+            if action_signal is not None and open_position is None:
+                entry_sequence += 1
+                open_position = _triple_ema_open_position(
+                    candles=candles,
+                    instrument=instrument,
+                    config=config,
+                    trades=trades,
+                    entry_index=index,
+                    signal_index=pending_signal_index,
+                    signal=action_signal,
+                    slow_ema=slow_values[pending_signal_index],
+                    atr_value=atr_values[pending_signal_index],
+                    entry_sequence=entry_sequence,
+                    taker_fee_rate=taker_fee_rate,
+                )
+                opened_this_candle = open_position is not None
+            pending_action = None
+            pending_signal_index = -1
+
+        if open_position is not None and not opened_this_candle:
+            gap_stop_trade = _triple_ema_gap_stop_trade(
+                open_position,
+                candle,
+                index,
+                taker_fee_rate=taker_fee_rate,
+            )
+            if gap_stop_trade is not None:
+                trades.append(gap_stop_trade)
+                open_position = None
+
+        if open_position is not None:
+            closed_trade = _try_close_position(
+                open_position,
+                candle,
+                index,
+                allow_same_candle=opened_this_candle,
+                exit_fee_rate=taker_fee_rate,
+                exit_fee_type="taker",
+            )
+            if closed_trade is not None:
+                trades.append(closed_trade)
+                open_position = None
+
+        current_state = states[index]
+        previous_state = states[index - 1] if index > 0 else "SIDEWAY"
+        if open_position is None:
+            if current_state == "UPTREND" and previous_state != "UPTREND" and allow_long:
+                pending_action = "buy"
+            elif current_state == "DOWNTREND" and previous_state != "DOWNTREND" and allow_short:
+                pending_action = "sell"
+        elif open_position.signal == "long":
+            if current_state == "SIDEWAY":
+                pending_action = "exit"
+            elif current_state == "DOWNTREND":
+                pending_action = "reverse_to_short" if allow_short else "exit"
+        else:
+            if current_state == "SIDEWAY":
+                pending_action = "exit"
+            elif current_state == "UPTREND":
+                pending_action = "reverse_to_long" if allow_long else "exit"
+        if pending_action is not None:
+            pending_signal_index = index
+
+    return trades, _build_terminal_open_position(open_position, candles)
 
 
 def _run_btc_daily_4h_long_short_backtest(
@@ -5992,6 +6307,22 @@ def _append_backtest_strategy_notes(
     reference_label: str,
 ) -> None:
     family = _backtest_strategy_family(result.strategy_id)
+    if family == "triple_ema":
+        stop_text = (
+            f"慢线 {moving_average_display_label('ema', result.big_ema_period)}"
+            if result.atr_stop_multiplier <= 0
+            else f"ATR{result.atr_period} × {format_decimal_fixed(result.atr_stop_multiplier, 2)}"
+        )
+        lines.append(
+            "交易逻辑：快EMA>中EMA>慢EMA时形成上升趋势，快EMA<中EMA<慢EMA时形成下降趋势，其余均为震荡。"
+        )
+        lines.append(
+            "成交规则：仅在趋势首次形成时入场；持仓后趋势反向则反手，转震荡则平仓。所有信号在收盘确认，并在下一根K线开盘成交。"
+        )
+        lines.append(f"初始止损：{stop_text}；不设置固定止盈。")
+        lines.append("费用口径：开仓、信号平仓和止损均按 Taker 手续费，并计入项目现有滑点配置。")
+        lines.append("方向说明：可通过方向参数限制只做多、只做空或双向。")
+        return
     if family == "dynamic_order":
         lines.append(
             f"趋势过滤：{fast_label} 与 {trend_label} 组成趋势过滤，当前策略方向={_backtest_dynamic_direction_text(result)}"

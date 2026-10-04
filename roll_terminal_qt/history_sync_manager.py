@@ -184,6 +184,7 @@ class HistorySyncThread(QThread):
                 self._runtime.credentials,
                 environment=self._environment,
                 limit=remote_limit,
+                fetch_all=True,
             )
             items = merge_position_history_cache(
                 profile_name=self._profile_name,

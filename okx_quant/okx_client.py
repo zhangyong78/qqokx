@@ -2372,46 +2372,69 @@ class OkxRestClient:
         limit: int = 100,
         after_ms: int | None = None,
         before_ms: int | None = None,
+        fetch_all: bool = False,
     ) -> list[OkxPositionHistoryItem]:
         items: list[OkxPositionHistoryItem] = []
         per_type_limit = max(1, min(limit, 100))
         for inst_type in inst_types:
-            params = {"instType": inst_type, "limit": str(per_type_limit)}
-            if after_ms is not None:
-                params["after"] = str(int(after_ms))
-            if before_ms is not None:
-                params["before"] = str(int(before_ms))
-            payload = self._request(
-                "GET",
-                "/api/v5/account/positions-history",
-                params=params,
-                auth=True,
-                credentials=credentials,
-                simulated=environment == "demo",
-            )
-            for item in payload.get("data", []):
-                items.append(
-                    OkxPositionHistoryItem(
-                        update_time=_to_int(item.get("uTime"), item.get("cTime"), item.get("ts")),
-                        inst_id=item.get("instId", ""),
-                        inst_type=item.get("instType", inst_type),
-                        mgn_mode=item.get("mgnMode"),
-                        pos_side=item.get("posSide"),
-                        direction=item.get("direction"),
-                        open_avg_price=_to_decimal(item.get("openAvgPx")),
-                        close_avg_price=_to_decimal(item.get("closeAvgPx")),
-                        close_size=_first_decimal(item.get("closeTotalPos"), item.get("closePos"), item.get("closeSz")),
-                        pnl=_to_decimal(item.get("pnl")),
-                        realized_pnl=_to_decimal(item.get("realizedPnl")),
-                        settle_pnl=_to_decimal(item.get("settledPnl")),
-                        raw=item,
-                        fee=_first_decimal(item.get("fee"), item.get("fillFee")),
-                        fee_currency=(str(item.get("feeCcy") or item.get("ccy") or "").strip() or None),
-                        funding_fee=_to_decimal(item.get("fundingFee")),
-                    )
+            cursor = int(after_ms) if after_ms is not None else None
+            seen: set[tuple[object, ...]] = set()
+            while True:
+                params = {"instType": inst_type, "limit": str(per_type_limit)}
+                if cursor is not None:
+                    params["after"] = str(cursor)
+                if before_ms is not None:
+                    params["before"] = str(int(before_ms))
+                payload = self._request(
+                    "GET",
+                    "/api/v5/account/positions-history",
+                    params=params,
+                    auth=True,
+                    credentials=credentials,
+                    simulated=environment == "demo",
                 )
+                batch = payload.get("data", [])
+                for item in batch:
+                    item_key = (
+                        item.get("instId", inst_type),
+                        item.get("posId"),
+                        item.get("cTime"),
+                        item.get("uTime") or item.get("ts"),
+                        item.get("posSide"),
+                        item.get("direction"),
+                        item.get("closeTotalPos") or item.get("closePos") or item.get("closeSz"),
+                    )
+                    if item_key in seen:
+                        continue
+                    seen.add(item_key)
+                    items.append(
+                        OkxPositionHistoryItem(
+                            update_time=_to_int(item.get("uTime"), item.get("cTime"), item.get("ts")),
+                            inst_id=item.get("instId", ""),
+                            inst_type=item.get("instType", inst_type),
+                            mgn_mode=item.get("mgnMode"),
+                            pos_side=item.get("posSide"),
+                            direction=item.get("direction"),
+                            open_avg_price=_to_decimal(item.get("openAvgPx")),
+                            close_avg_price=_to_decimal(item.get("closeAvgPx")),
+                            close_size=_first_decimal(item.get("closeTotalPos"), item.get("closePos"), item.get("closeSz")),
+                            pnl=_to_decimal(item.get("pnl")),
+                            realized_pnl=_to_decimal(item.get("realizedPnl")),
+                            settle_pnl=_to_decimal(item.get("settledPnl")),
+                            raw=item,
+                            fee=_first_decimal(item.get("fee"), item.get("fillFee")),
+                            fee_currency=(str(item.get("feeCcy") or item.get("ccy") or "").strip() or None),
+                            funding_fee=_to_decimal(item.get("fundingFee")),
+                        )
+                    )
+                if not fetch_all or len(batch) < per_type_limit:
+                    break
+                next_cursor = _to_int(batch[-1].get("uTime"), batch[-1].get("cTime"), batch[-1].get("ts"))
+                if next_cursor is None or next_cursor == cursor:
+                    break
+                cursor = next_cursor
         items.sort(key=lambda item: item.update_time or 0, reverse=True)
-        return items[:limit]
+        return items if fetch_all else items[:limit]
 
     def get_pending_orders(
         self,

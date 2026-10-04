@@ -133,7 +133,14 @@ class OkxCandleWsConnection:
         return _unsubscribe
 
     def _run_forever(self) -> None:
-        asyncio.run(self._run_forever_async())
+        try:
+            asyncio.run(self._run_forever_async())
+        finally:
+            with self._lock:
+                self._connected = False
+                self._socket = None
+                self._loop = None
+                self._subscribed.clear()
 
     async def _run_forever_async(self) -> None:
         self._loop = asyncio.get_running_loop()
@@ -141,6 +148,8 @@ class OkxCandleWsConnection:
             try:
                 await self._run_connection_once()
             except Exception as exc:  # noqa: BLE001
+                if self._stop_event.is_set():
+                    break
                 self._logger(f"OKX candle WS reconnect: {exc}")
                 await asyncio.sleep(1)
 
@@ -150,16 +159,22 @@ class OkxCandleWsConnection:
         headers = {"x-simulated-trading": "1"} if self._environment == "demo" else None
         kwargs: dict[str, Any] = {"ping_interval": 20, "ping_timeout": 20, "open_timeout": 20}
         context = connect_okx_websocket(url, headers=headers, **kwargs)
-        async with context as socket:
+        try:
+            async with context as socket:
+                with self._lock:
+                    self._socket = socket
+                    self._connected = True
+                    self._subscribed.clear()
+                    keys = tuple(self._listeners)
+                for key in keys:
+                    await self._ensure_subscription(key)
+                while not self._stop_event.is_set():
+                    await self._handle_message(await socket.recv())
+        finally:
             with self._lock:
-                self._socket = socket
-                self._connected = True
+                self._connected = False
+                self._socket = None
                 self._subscribed.clear()
-                keys = tuple(self._listeners)
-            for key in keys:
-                await self._ensure_subscription(key)
-            while not self._stop_event.is_set():
-                await self._handle_message(await socket.recv())
 
     async def _ensure_subscription(self, key: CandleStreamKey) -> None:
         with self._lock:
@@ -167,7 +182,12 @@ class OkxCandleWsConnection:
                 return
             self._subscribed.add(key)
             socket = self._socket
-        await socket.send(json.dumps({"op": "subscribe", "args": [{"channel": key.channel, "instId": key.inst_id}]}, separators=(",", ":")))
+        try:
+            await socket.send(json.dumps({"op": "subscribe", "args": [{"channel": key.channel, "instId": key.inst_id}]}, separators=(",", ":")))
+        except Exception:
+            with self._lock:
+                self._subscribed.discard(key)
+            raise
 
     async def _remove_subscription(self, key: CandleStreamKey) -> None:
         with self._lock:
@@ -181,7 +201,18 @@ class OkxCandleWsConnection:
     async def _handle_message(self, message: object) -> None:
         if isinstance(message, bytes):
             message = message.decode("utf-8", errors="replace")
+        if message == "ping":
+            socket = self._socket
+            if socket is not None:
+                await socket.send("pong")
+            return
+        if message == "pong":
+            return
         payload = json.loads(str(message))
+        if not isinstance(payload, dict):
+            return
+        if payload.get("event") == "error":
+            raise RuntimeError(str(payload.get("msg") or payload.get("code") or "OKX candle WS error"))
         arg = payload.get("arg")
         rows = payload.get("data")
         if not isinstance(arg, dict) or not isinstance(rows, list):
@@ -196,4 +227,7 @@ class OkxCandleWsConnection:
         for row in rows:
             candle = _parse_okx_candle(row)
             for listener in listeners:
-                listener(candle, candle.confirmed)
+                try:
+                    listener(candle, candle.confirmed)
+                except Exception as exc:  # noqa: BLE001
+                    self._logger(f"OKX candle WS listener failed: {exc}")

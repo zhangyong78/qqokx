@@ -124,13 +124,17 @@ _INITIAL_WINDOW_LOAD_DELAY_MS = 80
 _NATIVE_BOOTSTRAP_RENDER_BARS = 360
 _NATIVE_BOOTSTRAP_RENDER_DELAY_MS = 90
 _AUTO_REFRESH_DEFAULT_ENABLED = True
-_NATIVE_RIGHT_PADDING_BARS = 24
-_RECENT_VIEW_BARS = 240
+# Keep a visible tail after the latest candle.  Four-chart layouts make the
+# previous 24-bar gap look cramped, especially on the 1W/1D panels.
+_NATIVE_RIGHT_PADDING_BARS = 32
+# Recent view keeps the 1H chart at about 250 candles.  Higher timeframes
+# need fewer candles to keep their structure readable in linked layouts.
+_RECENT_VIEW_BARS = 250
 _LINKED_MIN_VISIBLE_BARS = {
-    "1W": 80,
-    "1D": 240,
-    "4H": 240,
-    "1H": 240,
+    "1W": 120,
+    "1D": 180,
+    "4H": 220,
+    "1H": 250,
 }
 _KLINE_PAYLOAD_CACHE_LIMIT = 8
 _KLINE_SPLITTER_LEFT_RATIO = 0.11
@@ -3936,10 +3940,27 @@ if QChartView is not None:
             plot_area = self.chart().plotArea()
             if plot_area.width() <= 0 or not self._candles:
                 return None
+            external_time = int(self._external_hover_time)
+            # Do not clamp a linked cursor to the first/last candle when the
+            # source chart is outside this chart's data or visible range.
+            # In that case this panel should simply have no linked cursor.
+            try:
+                first_time = int(self._candles[0]["time"])
+                last_time = int(self._candles[-1]["time"])
+            except (KeyError, TypeError, ValueError):
+                return None
+            if external_time < first_time or external_time > last_time:
+                return None
             hover_index = self._index_for_candle_time(self._external_hover_time)
             candle = self._candles[hover_index]
+            if hover_index >= len(self._display_times_ms):
+                return None
+            display_time = float(self._display_times_ms[hover_index])
+            start_x, end_x = self.current_x_range()
+            if display_time < start_x or display_time > end_x:
+                return None
             snapped_x = self._x_for_index(hover_index, plot_area)
-            return candle, hover_index, int(self._external_hover_time), snapped_x
+            return candle, hover_index, external_time, snapped_x
 
         def _emit_hover_time_from_position(self, hover_pos: QPointF) -> None:
             if not self._candles:
@@ -4765,6 +4786,10 @@ if QChartView is not None:
             return _default_native_x_range_with_right_padding(
                 self._display_times_ms,
                 display_step_ms=self._display_step_ms,
+                target_visible_bars=_LINKED_MIN_VISIBLE_BARS.get(
+                    self._period.strip().upper(),
+                    _RECENT_VIEW_BARS,
+                ),
             )
 
         def _index_for_display_x(self, x_value: float, *, mode: str) -> int:
@@ -5683,6 +5708,9 @@ class KlineAnalysisWindow(QMainWindow):
         self._secondary_volatility_loader: SecondaryVolatilityDataLoader | None = None
         self._syncing_chart_range = False
         self._pending_reload_after_load = False
+        self._pending_secondary_reload = False
+        self._pending_tertiary_reload = False
+        self._pending_quaternary_reload = False
         self._primary_chart_status_text = ""
         self._secondary_chart_status_text = ""
         self._runtime = load_runtime("159") or load_runtime()
@@ -5739,6 +5767,9 @@ class KlineAnalysisWindow(QMainWindow):
         self._load_request_timer = QTimer(self)
         self._load_request_timer.setSingleShot(True)
         self._load_request_timer.timeout.connect(self._load_data)
+        self._pending_reload_retry_timer = QTimer(self)
+        self._pending_reload_retry_timer.setSingleShot(True)
+        self._pending_reload_retry_timer.timeout.connect(self._schedule_pending_reload_if_ready)
         self._clamping_window_to_screen = False
         _debug_log("[kline] __init__ ready")
 
@@ -5952,7 +5983,13 @@ class KlineAnalysisWindow(QMainWindow):
             child.begin_shutdown()
         self._refresh_timer.stop()
         self._rr_monitor_timer.stop()
-        for name in ("_load_request_timer", "_deferred_chart_render_timer", "_layout_refresh_timer", "_account_prefetch_timer"):
+        for name in (
+            "_load_request_timer",
+            "_pending_reload_retry_timer",
+            "_deferred_chart_render_timer",
+            "_layout_refresh_timer",
+            "_account_prefetch_timer",
+        ):
             timer = getattr(self, name, None)
             if timer is not None:
                 timer.stop()
@@ -7032,9 +7069,14 @@ class KlineAnalysisWindow(QMainWindow):
         return bool(self._quaternary_chart_check.isChecked())
 
     def _all_charts_volatility_enabled(self) -> bool:
+        """Whether the current layout should render DVOL in every visible chart.
+
+        Instrument selection and chart layout are deliberately independent.
+        Selecting a DVOL tab must therefore work in single, dual, triple and
+        four-chart layouts without turning on (or off) any layout checkbox.
+        """
         return bool(
-            self._quad_chart_enabled()
-            and self._secondary_chart_kind() == "volatility"
+            self._secondary_chart_kind() == "volatility"
             and self._current_volatility_currency()
         )
 
@@ -7251,6 +7293,11 @@ class KlineAnalysisWindow(QMainWindow):
         if self._triple_chart_enabled() or self._quad_chart_enabled():
             self._syncing_chart_range = True
             try:
+                set_range = (
+                    InteractiveKlineChartView.set_full_view_range
+                    if self._chart_view_range_is_full()
+                    else InteractiveKlineChartView.set_recent_view_range
+                )
                 for view in (
                     self._native_chart_view,
                     self._secondary_native_chart_view,
@@ -7258,7 +7305,7 @@ class KlineAnalysisWindow(QMainWindow):
                     self._quaternary_native_chart_view if self._quad_chart_enabled() else None,
                 ):
                     if isinstance(view, InteractiveKlineChartView):
-                        view.set_recent_view_range()
+                        set_range(view)
             finally:
                 self._syncing_chart_range = False
             return
@@ -7879,6 +7926,10 @@ class KlineAnalysisWindow(QMainWindow):
         symbol = str(self._symbol_tab_bar.tabData(index) or "").strip().upper()
         if not symbol:
             return
+        # A tab selection takes precedence over every loader already in
+        # flight.  The completed loader is still released normally, but it
+        # may no longer paint its stale payload into the chart.
+        self._invalidate_pending_chart_results()
         volatility_currency = None
         for _label, tab_value in VOLATILITY_TAB_OPTIONS:
             if symbol == tab_value:
@@ -7886,27 +7937,36 @@ class KlineAnalysisWindow(QMainWindow):
                 break
         if volatility_currency:
             base_symbol = f"{volatility_currency}-USDT-SWAP"
-            # DVOL 复用现有副图加载器；主图仍保留对应基础品种行情。
-            self._symbol_combo.blockSignals(True)
-            self._secondary_symbol_combo.blockSignals(True)
+            # 底部交易对只负责切换数据，不能改变单/双/三/四图布局。
+            # DVOL 在当前布局的所有可见图中渲染，单图模式也不能被强制
+            # 切成双图模式。
+            linked_combos = (
+                self._symbol_combo,
+                self._secondary_symbol_combo,
+                self._tertiary_symbol_combo,
+                self._quaternary_symbol_combo,
+            )
+            for combo in linked_combos:
+                combo.blockSignals(True)
             try:
-                self._symbol_combo.setCurrentText(base_symbol)
-                self._secondary_symbol_combo.setCurrentText(base_symbol)
+                for combo in linked_combos:
+                    combo.setCurrentText(base_symbol)
                 self._secondary_chart_kind_mode = "volatility"
                 self._active_volatility_currency = volatility_currency
-                self._secondary_chart_check.blockSignals(True)
-                self._secondary_chart_check.setChecked(True)
-                self._secondary_chart_check.blockSignals(False)
-                if self._quad_chart_enabled():
-                    self._apply_quad_chart_period_defaults()
-                else:
-                    self._secondary_period_combo.setCurrentText(self._period_combo.currentText())
             finally:
-                self._symbol_combo.blockSignals(False)
-                self._secondary_symbol_combo.blockSignals(False)
-            self._set_active_chart_target("secondary")
-            self._apply_secondary_chart_visibility()
+                for combo in linked_combos:
+                    combo.blockSignals(False)
+            self._refresh_symbol_tab_selection()
             self._update_secondary_controls_state()
+            for target in ("primary", "secondary", "tertiary", "quaternary"):
+                if target == "primary" or (
+                    target == "secondary" and self._secondary_chart_check.isChecked()
+                ) or (
+                    target == "tertiary" and self._triple_chart_enabled()
+                ) or (
+                    target == "quaternary" and self._quad_chart_enabled()
+                ):
+                    self._prepare_chart_for_symbol_reload(target)
             self._load_data()
             return
         # 普通交易对和 DVOL 标签使用同一套切换规则。离开 DVOL 时先
@@ -7975,6 +8035,27 @@ class KlineAnalysisWindow(QMainWindow):
             self._on_tertiary_symbol_changed(symbol)
         if self._quad_chart_enabled():
             self._on_quaternary_symbol_changed(symbol)
+
+    def _invalidate_pending_chart_results(self) -> None:
+        """Make in-flight callbacks stale as soon as a bottom tab is selected.
+
+        Loaders are intentionally allowed to finish in the background.  The
+        request counters prevent an older symbol (for example SOL) from being
+        painted after the user has already selected another tab (for example
+        ETH), even while the next request is waiting for a loader slot.
+        """
+        self._request_id += 1
+        self._active_request_id = self._request_id
+        self._active_primary_request_key = None
+        self._secondary_request_id += 1
+        self._active_secondary_request_id = self._secondary_request_id
+        self._active_secondary_request_key = None
+        self._tertiary_request_id += 1
+        self._active_tertiary_request_id = self._tertiary_request_id
+        self._active_tertiary_request_key = None
+        self._quaternary_request_id += 1
+        self._active_quaternary_request_id = self._quaternary_request_id
+        self._active_quaternary_request_key = None
 
     def _apply_chart_mode_period_defaults(self, *, dual_enabled: bool) -> None:
         primary_period = _DEFAULT_DUAL_PRIMARY_PERIOD if dual_enabled else _DEFAULT_SINGLE_CHART_PERIOD
@@ -8073,14 +8154,18 @@ class KlineAnalysisWindow(QMainWindow):
         super().keyPressEvent(event)
 
     def _has_active_loaders(self) -> bool:
-        # Retain ownership until the queued finished signal has been handled.
-        # isRunning() becomes false BEFORE that signal reaches the GUI thread.
-        return bool(
-            self._loader is not None
-            or self._secondary_loader is not None
-            or self._tertiary_loader is not None
-            or self._quaternary_loader is not None
-            or self._secondary_volatility_loader is not None
+        # A finished QThread may remain referenced until its queued ``finished``
+        # slot runs. It is no longer an active request, so do not block a new
+        # symbol load on that stale reference.
+        return any(
+            loader is not None and loader.isRunning()
+            for loader in (
+                self._loader,
+                self._secondary_loader,
+                self._tertiary_loader,
+                self._quaternary_loader,
+                self._secondary_volatility_loader,
+            )
         )
 
     def _refresh_api_profiles(self) -> None:
@@ -8666,10 +8751,60 @@ class KlineAnalysisWindow(QMainWindow):
     def _schedule_pending_reload_if_ready(self) -> None:
         if bool(getattr(self, "_shutdown_requested", False)):
             return
-        if not self._pending_reload_after_load or self._has_active_loaders() or not self._page_active:
+        if not self._pending_reload_after_load and not (
+            self._pending_secondary_reload
+            or self._pending_tertiary_reload
+            or self._pending_quaternary_reload
+        ):
             return
-        self._pending_reload_after_load = False
-        self._schedule_load_data(10)
+        if not self._page_active:
+            return
+        primary_busy = self._loader is not None and self._loader.isRunning()
+        if self._pending_reload_after_load and not primary_busy:
+            self._pending_reload_after_load = False
+            self._schedule_load_data(10)
+        if self._pending_secondary_reload and not any(
+            loader is not None and loader.isRunning()
+            for loader in (self._secondary_loader, self._secondary_volatility_loader)
+        ):
+            self._pending_secondary_reload = False
+            self._load_secondary_data(symbol=self._selected_secondary_symbol())
+        if self._pending_tertiary_reload and not (
+            self._tertiary_loader is not None and self._tertiary_loader.isRunning()
+        ):
+            self._pending_tertiary_reload = False
+            self._load_tertiary_data()
+        if self._pending_quaternary_reload and not (
+            self._quaternary_loader is not None and self._quaternary_loader.isRunning()
+        ):
+            self._pending_quaternary_reload = False
+            self._load_quaternary_data()
+        still_waiting = (
+            (self._pending_reload_after_load and primary_busy)
+            or (
+                self._pending_secondary_reload
+                and any(
+                    loader is not None and loader.isRunning()
+                    for loader in (self._secondary_loader, self._secondary_volatility_loader)
+                )
+            )
+            or (
+                self._pending_tertiary_reload
+                and self._tertiary_loader is not None
+                and self._tertiary_loader.isRunning()
+            )
+            or (
+                self._pending_quaternary_reload
+                and self._quaternary_loader is not None
+                and self._quaternary_loader.isRunning()
+            )
+        )
+        retry_timer = getattr(self, "_pending_reload_retry_timer", None)
+        if retry_timer is not None:
+            if still_waiting and not retry_timer.isActive():
+                retry_timer.start(120)
+            elif not still_waiting and retry_timer.isActive():
+                retry_timer.stop()
 
     @Slot()
     def _load_data(self) -> None:
@@ -8682,9 +8817,10 @@ class KlineAnalysisWindow(QMainWindow):
         if not symbol:
             self._set_status("请输入交易对")
             return
-        if self._has_active_loaders():
+        if self._loader is not None and self._loader.isRunning():
             self._pending_reload_after_load = True
             self._set_status("当前仍在加载，已排队刷新最新选择，请稍候...")
+            self._schedule_pending_reload_if_ready()
             return
         requested_limit = max(50, self._limit_spin.value())
         workspace_entry = self._workspace_entry(symbol=symbol, period=period)
@@ -8773,11 +8909,41 @@ class KlineAnalysisWindow(QMainWindow):
             setattr(self, attribute, None)
         loader.deleteLater()
 
+    def _prepare_chart_for_symbol_reload(self, target: str) -> None:
+        """Remove the previous series while a newly selected symbol loads."""
+        chart_map = {
+            "primary": (self._native_chart, self._native_chart_view),
+            "secondary": (self._secondary_native_chart, self._secondary_native_chart_view),
+            "tertiary": (self._tertiary_native_chart, self._tertiary_native_chart_view),
+            "quaternary": (self._quaternary_native_chart, self._quaternary_native_chart_view),
+        }
+        pending_names = {
+            "primary": ("_pending_payload", "_loaded_primary_request_key"),
+            "secondary": ("_secondary_pending_payload", "_loaded_secondary_request_key"),
+            "tertiary": ("_tertiary_pending_payload", "_loaded_tertiary_request_key"),
+            "quaternary": ("_quaternary_pending_payload", "_loaded_quaternary_request_key"),
+        }
+        chart, chart_view = chart_map.get(target, (None, None))
+        for name in pending_names.get(target, ()):
+            setattr(self, name, None)
+        if chart is None:
+            return
+        if isinstance(chart_view, InteractiveKlineChartView):
+            chart_view.clear_chart_context()
+        chart.removeAllSeries()
+        for axis in list(chart.axes()):
+            chart.removeAxis(axis)
+        chart.setTitle("正在加载最新交易对...")
+
     def _load_secondary_data(self, *, symbol: str) -> None:
         if bool(getattr(self, "_shutdown_requested", False)):
             return
-        if self._secondary_loader is not None or self._secondary_volatility_loader is not None:
-            self._pending_reload_after_load = True
+        if any(
+            loader is not None and loader.isRunning()
+            for loader in (self._secondary_loader, self._secondary_volatility_loader)
+        ):
+            self._pending_secondary_reload = True
+            self._schedule_pending_reload_if_ready()
             return
         secondary_period = self._secondary_period_combo.currentText().strip()
         requested_limit = max(50, self._limit_spin.value())
@@ -8825,8 +8991,9 @@ class KlineAnalysisWindow(QMainWindow):
     def _load_tertiary_data(self) -> None:
         if bool(getattr(self, "_shutdown_requested", False)):
             return
-        if self._tertiary_loader is not None:
-            self._pending_reload_after_load = True
+        if self._tertiary_loader is not None and self._tertiary_loader.isRunning():
+            self._pending_tertiary_reload = True
+            self._schedule_pending_reload_if_ready()
             return
         request_key = self._current_tertiary_request_key()
         if request_key is None:
@@ -8868,8 +9035,9 @@ class KlineAnalysisWindow(QMainWindow):
     def _load_quaternary_data(self) -> None:
         if bool(getattr(self, "_shutdown_requested", False)):
             return
-        if self._quaternary_loader is not None:
-            self._pending_reload_after_load = True
+        if self._quaternary_loader is not None and self._quaternary_loader.isRunning():
+            self._pending_quaternary_reload = True
+            self._schedule_pending_reload_if_ready()
             return
         request_key = self._current_quaternary_request_key()
         if request_key is None:
@@ -8959,6 +9127,7 @@ class KlineAnalysisWindow(QMainWindow):
         self._reload_workspace_view()
         self._refresh_rr_trade_hint()
         self._sync_account_drawer_context()
+        self._prepare_chart_for_symbol_reload("primary")
         self._load_data()
 
     @Slot(str)
@@ -8970,10 +9139,7 @@ class KlineAnalysisWindow(QMainWindow):
             or self._secondary_chart_kind() != "kline"
         ):
             return
-        if self._has_active_loaders():
-            self._pending_reload_after_load = True
-            self._set_status("当前仍在加载，已排队刷新最新副图交易对，请稍候...")
-            return
+        self._prepare_chart_for_symbol_reload("secondary")
         self._load_secondary_data(symbol=self._selected_secondary_symbol())
 
     @Slot(str)
@@ -8981,10 +9147,7 @@ class KlineAnalysisWindow(QMainWindow):
         self._refresh_symbol_tab_selection()
         if not self._triple_chart_enabled() or not self._use_native_chart:
             return
-        if self._has_active_loaders():
-            self._pending_reload_after_load = True
-            self._set_status("当前仍在加载，已排队刷新最新第三图交易对，请稍候...")
-            return
+        self._prepare_chart_for_symbol_reload("tertiary")
         self._load_tertiary_data()
 
     @Slot(str)
@@ -8999,10 +9162,7 @@ class KlineAnalysisWindow(QMainWindow):
         self._refresh_symbol_tab_selection()
         if not self._quad_chart_enabled() or not self._use_native_chart:
             return
-        if self._has_active_loaders():
-            self._pending_reload_after_load = True
-            self._set_status("当前仍在加载，已排队刷新最新第四图交易对，请稍候...")
-            return
+        self._prepare_chart_for_symbol_reload("quaternary")
         self._load_quaternary_data()
 
     @Slot(str)
@@ -9909,17 +10069,13 @@ class KlineAnalysisWindow(QMainWindow):
         if isinstance(self._native_chart_view, InteractiveKlineChartView) and isinstance(self._secondary_native_chart_view, InteractiveKlineChartView):
             self._native_chart_view.hoverTimeChanged.connect(self._on_primary_hover_time_changed)
             self._secondary_native_chart_view.hoverTimeChanged.connect(self._on_secondary_hover_time_changed)
-            self._native_chart_view.xRangeChanged.connect(self._on_primary_x_range_changed)
-            self._secondary_native_chart_view.xRangeChanged.connect(self._on_secondary_x_range_changed)
             self._native_chart_view.chartActivated.connect(lambda: self._set_active_chart_target("primary"))
             self._secondary_native_chart_view.chartActivated.connect(lambda: self._set_active_chart_target("secondary"))
             if isinstance(self._tertiary_native_chart_view, InteractiveKlineChartView):
                 self._tertiary_native_chart_view.hoverTimeChanged.connect(self._on_tertiary_hover_time_changed)
-                self._tertiary_native_chart_view.xRangeChanged.connect(self._on_tertiary_x_range_changed)
                 self._tertiary_native_chart_view.chartActivated.connect(lambda: self._set_active_chart_target("tertiary"))
             if isinstance(self._quaternary_native_chart_view, InteractiveKlineChartView):
                 self._quaternary_native_chart_view.hoverTimeChanged.connect(self._on_quaternary_hover_time_changed)
-                self._quaternary_native_chart_view.xRangeChanged.connect(self._on_quaternary_x_range_changed)
                 self._quaternary_native_chart_view.chartActivated.connect(lambda: self._set_active_chart_target("quaternary"))
         elif isinstance(self._native_chart_view, InteractiveKlineChartView):
             self._native_chart_view.chartActivated.connect(lambda: self._set_active_chart_target("primary"))

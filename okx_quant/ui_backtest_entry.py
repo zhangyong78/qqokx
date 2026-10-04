@@ -6,9 +6,16 @@ from decimal import Decimal
 
 
 class UiBacktestEntryMixin:
-    @staticmethod
-
     def open_backtest_window(self) -> None:
+        try:
+            self._open_backtest_window()
+        except Exception as exc:
+            self._backtest_window = None
+            message = f"打开策略回测窗口失败：{type(exc).__name__}: {exc}"
+            self._enqueue_log(message)
+            messagebox.showerror("打开策略回测窗口失败", str(exc), parent=self.root)
+
+    def _open_backtest_window(self) -> None:
         if self._backtest_window is not None and self._backtest_window.window.winfo_exists():
             self._backtest_window.window.focus_force()
             return

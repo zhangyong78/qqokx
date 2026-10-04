@@ -47,6 +47,7 @@ from okx_quant.engine_session_runner import EngineSessionRunner
 from okx_quant.engine_strategy_router import EngineStrategyRouter
 from okx_quant.strategies.ema_atr import EmaAtrStrategy
 from okx_quant.strategies.ema_cross_ema_stop import EmaCrossEmaStopStrategy
+from okx_quant.strategies.triple_ema import evaluate_triple_ema_signal, live_position_action
 from okx_quant.strategies.ema_dynamic import EmaDynamicOrderStrategy
 from okx_quant.strategies.ema_dynamic_multi_timeframe import EmaDynamicMultiTimeframeStrategy
 from okx_quant.strategies.ema55_slope_short import (
@@ -66,6 +67,7 @@ from okx_quant.strategy_catalog import (
     STRATEGY_DYNAMIC_ID,
     STRATEGY_DYNAMIC_LONG_ID,
     STRATEGY_DYNAMIC_SHORT_ID,
+    STRATEGY_TRIPLE_EMA_ID,
     is_btc_ema55_slope_short_strategy,
     resolve_dynamic_signal_mode,
 )
@@ -237,6 +239,13 @@ def _take_profit_mode_description_for_signal_email(config: StrategyConfig) -> st
             "止盈止损说明：本策略以快慢线交叉为信号、慢线 EMA 为止损参考；"
             "与 ATR 固定/动态止盈倍数无关。"
         )
+    if get_strategy_runtime_profile(config.strategy_id).family == "triple_ema":
+        stop_text = (
+            f"慢线 EMA{config.big_ema_period}"
+            if config.atr_stop_multiplier <= 0
+            else f"ATR{config.atr_period} × {format_decimal(config.atr_stop_multiplier)}"
+        )
+        return f"止盈止损说明：趋势转震荡平仓、趋势反向反手；初始止损使用{stop_text}。"
     if _live_dynamic_take_profit_enabled(config):
         dynamic_two_r_break_even = _live_ema55_slope_dynamic_two_r_break_even_enabled(config)
         dynamic_fee_offset_enabled = _live_ema55_slope_dynamic_fee_offset_enabled(config)
@@ -3309,6 +3318,172 @@ class StrategyEngine:
             f"{STRATEGY_BTC_DAILY_4H_LONG_SHORT_ID} 当前仅开放研究/回测，不支持本地交易模式。"
         )
 
+    def _run_triple_ema_signal_only(
+        self,
+        config: StrategyConfig,
+        instrument: Instrument,
+    ) -> None:
+        lookback = recommended_indicator_lookback(
+            config.ema_period,
+            config.trend_ema_period,
+            config.big_ema_period,
+            config.atr_period,
+        )
+        last_candle_ts: int | None = None
+        self._logger(f"启动信号监控 | 策略={self._strategy_name} | 标的={instrument.inst_id} | K线周期={config.bar}")
+        self._logger(
+            f"运行模式：只监控信号，不下单。快/中/慢 EMA={config.ema_period}/{config.trend_ema_period}/{config.big_ema_period} "
+            "完整排列首次形成时发送通知。"
+        )
+
+        while not self._stop_event.is_set():
+            candles = self._get_candles_with_retry(config.inst_id, config.bar, limit=lookback)
+            confirmed = [candle for candle in candles if candle.confirmed]
+            decision = evaluate_triple_ema_signal(confirmed, config, price_increment=instrument.tick_size)
+            if decision.candle_ts is None:
+                self._logger(decision.reason)
+                self._stop_event.wait(config.poll_seconds)
+                continue
+            if decision.candle_ts == last_candle_ts:
+                self._stop_event.wait(config.poll_seconds)
+                continue
+            last_candle_ts = decision.candle_ts
+            if decision.signal is None or decision.entry_reference is None:
+                self._logger(f"{_fmt_ts(decision.candle_ts)} | 当前无三均线开仓信号 | {decision.reason}")
+                self._stop_event.wait(config.poll_seconds)
+                continue
+            self._logger(
+                f"{_fmt_ts(decision.candle_ts)} | 信号触发 | 方向={decision.signal.upper()} | "
+                f"收盘确认价={format_decimal(decision.entry_reference)} | {decision.reason}"
+            )
+            self._notify_signal(
+                config,
+                signal=decision.signal,
+                trigger_symbol=instrument.inst_id,
+                entry_reference=decision.entry_reference,
+                tick_size=instrument.tick_size,
+                reason=decision.reason,
+            )
+            self._stop_event.wait(config.poll_seconds)
+
+    def _run_triple_ema_local_strategy(
+        self,
+        credentials: Credentials,
+        config: StrategyConfig,
+        signal_instrument: Instrument,
+        trade_instrument: Instrument,
+    ) -> None:
+        if resolve_trade_inst_id(config) != config.inst_id:
+            raise RuntimeError("三均线趋势策略目前只支持信号标的与下单标的相同")
+        lookback = recommended_indicator_lookback(
+            config.ema_period,
+            config.trend_ema_period,
+            config.big_ema_period,
+            config.atr_period,
+        )
+        last_candle_ts: int | None = None
+        active_position: FilledPosition | None = None
+        active_signal: Literal["long", "short"] | None = None
+        active_stop_loss: Decimal | None = None
+
+        self._log_strategy_start(config, signal_instrument, trade_instrument)
+        stop_description = (
+            f"慢EMA{config.big_ema_period}"
+            if config.atr_stop_multiplier <= 0
+            else f"ATR{config.atr_period}×{format_decimal(config.atr_stop_multiplier)}"
+        )
+        self._logger(
+            f"运行模式：已收盘K线确认三均线趋势，下一根K线开盘市价成交 | "
+            f"转震荡平仓、反向趋势反手 | 初始止损={stop_description}"
+        )
+        self._logger(f"风险金={format_decimal(config.risk_amount or Decimal('10'))} | 信号方向={config.signal_mode}")
+
+        while not self._stop_event.is_set():
+            if active_position is not None and active_stop_loss is not None:
+                current_price = self._get_trigger_price_with_retry(
+                    signal_instrument.inst_id,
+                    config.tp_sl_trigger_type,
+                    environment=config.environment,
+                )
+                stop_hit = (
+                    current_price <= active_stop_loss
+                    if active_signal == "long"
+                    else current_price >= active_stop_loss
+                )
+                if stop_hit:
+                    self._logger(
+                        f"初始止损触发 | 方向={active_signal.upper() if active_signal else '-'} | "
+                        f"触发价={format_decimal(current_price)} | 止损={format_decimal(active_stop_loss)}"
+                    )
+                    self._close_position(credentials, config, trade_instrument, active_position, "初始止损")
+                    active_position = None
+                    active_signal = None
+                    active_stop_loss = None
+            candles = self._get_candles_with_retry(config.inst_id, config.bar, limit=lookback)
+            confirmed = [candle for candle in candles if candle.confirmed]
+            decision = evaluate_triple_ema_signal(confirmed, config, price_increment=signal_instrument.tick_size)
+            if decision.candle_ts is None:
+                self._logger(decision.reason)
+                self._stop_event.wait(config.poll_seconds)
+                continue
+            if decision.candle_ts == last_candle_ts:
+                self._stop_event.wait(config.poll_seconds)
+                continue
+            last_candle_ts = decision.candle_ts
+
+            if active_position is not None and active_signal is not None:
+                action = live_position_action(confirmed, config, active_signal)
+                if action == "hold":
+                    self._logger(f"{_fmt_ts(decision.candle_ts)} | 持仓监控 | 方向={active_signal.upper()} | {decision.reason}")
+                    self._stop_event.wait(config.poll_seconds)
+                    continue
+                reason = "三均线转震荡" if action == "exit" else "三均线趋势反向"
+                self._logger(f"{_fmt_ts(decision.candle_ts)} | {reason}，按新K线开盘时机平仓")
+                self._close_position(credentials, config, trade_instrument, active_position, reason)
+                active_position = None
+                active_signal = None
+                active_stop_loss = None
+                if action == "exit":
+                    self._stop_event.wait(config.poll_seconds)
+                    continue
+                reverse_signal: Literal["long", "short"] = "long" if action == "reverse_to_long" else "short"
+                try:
+                    active_position, active_stop_loss = self._open_triple_ema_position(
+                        credentials,
+                        config,
+                        trade_instrument=trade_instrument,
+                        signal=reverse_signal,
+                        slow_ema=decision.ema_value,
+                        atr_value=decision.atr_value,
+                        signal_candle_ts=decision.candle_ts,
+                    )
+                    active_signal = reverse_signal
+                    self._logger(f"{_fmt_ts(decision.candle_ts)} | 已反手开{reverse_signal.upper()}仓")
+                except (OrderSizeTooSmallError, InvalidProtectionPlanError) as exc:
+                    self._logger(f"{_fmt_ts(decision.candle_ts)} | 反手开仓被拒绝 | {exc}")
+                self._stop_event.wait(config.poll_seconds)
+                continue
+
+            if decision.signal is None or decision.ema_value is None:
+                self._logger(f"{_fmt_ts(decision.candle_ts)} | 当前无三均线开仓信号 | {decision.reason}")
+                self._stop_event.wait(config.poll_seconds)
+                continue
+            try:
+                active_position, active_stop_loss = self._open_triple_ema_position(
+                    credentials,
+                    config,
+                    trade_instrument=trade_instrument,
+                    signal=decision.signal,
+                    slow_ema=decision.ema_value,
+                    atr_value=decision.atr_value,
+                    signal_candle_ts=decision.candle_ts,
+                )
+                active_signal = decision.signal
+                self._logger(f"{_fmt_ts(decision.candle_ts)} | 三均线趋势策略已开仓 | 方向={decision.signal.upper()}")
+            except (OrderSizeTooSmallError, InvalidProtectionPlanError) as exc:
+                self._logger(f"{_fmt_ts(decision.candle_ts)} | 当前无法下单 | {exc}")
+            self._stop_event.wait(config.poll_seconds)
+
     def _run_ema5_ema8_signal_only(
         self,
         config: StrategyConfig,
@@ -3447,6 +3622,85 @@ class StrategyEngine:
                 f"方向={decision.signal.upper()} | EMA{config.trend_ema_period} 止损线={format_decimal(current_stop_line)}"
             )
             self._stop_event.wait(config.poll_seconds)
+
+    def _open_triple_ema_position(
+        self,
+        credentials: Credentials,
+        config: StrategyConfig,
+        *,
+        trade_instrument: Instrument,
+        signal: Literal["long", "short"],
+        slow_ema: Decimal,
+        atr_value: Decimal | None,
+        signal_candle_ts: int,
+    ) -> tuple[FilledPosition, Decimal]:
+        trade_side: Literal["buy", "sell"] = "buy" if signal == "long" else "sell"
+        pos_side = resolve_open_pos_side(config, trade_side)
+        price_for_size = self._estimate_trade_entry_price_with_retry(trade_instrument, trade_side)
+        if config.atr_stop_multiplier > 0:
+            if atr_value is None or atr_value <= 0:
+                raise InvalidProtectionPlanError("ATR 止损需要有效的 ATR 值")
+            raw_stop = (
+                price_for_size - (atr_value * config.atr_stop_multiplier)
+                if signal == "long"
+                else price_for_size + (atr_value * config.atr_stop_multiplier)
+            )
+            stop_source = f"ATR{config.atr_period}×{format_decimal(config.atr_stop_multiplier)}"
+        else:
+            raw_stop = slow_ema
+            stop_source = f"慢EMA{config.big_ema_period}"
+        stop_price = snap_to_increment(
+            raw_stop,
+            trade_instrument.tick_size,
+            "down" if signal == "long" else "up",
+        )
+        if (signal == "long" and stop_price >= price_for_size) or (
+            signal == "short" and stop_price <= price_for_size
+        ):
+            raise InvalidProtectionPlanError(
+                f"{stop_source} 止损方向无效：预估入场价={format_decimal(price_for_size)}，"
+                f"止损价={format_decimal(stop_price)}"
+            )
+        size = determine_order_size(
+            instrument=trade_instrument,
+            config=config,
+            entry_price=price_for_size,
+            stop_loss=stop_price,
+            risk_price_compatible=True,
+        )
+        self._logger(
+            f"{_fmt_ts(signal_candle_ts)} | 准备三均线开仓 | 方向={signal.upper()} | "
+            f"预估入场价={format_decimal(price_for_size)} | {stop_source}止损={format_decimal(stop_price)} | "
+            f"下单数量={_format_size_with_contract_equivalent(trade_instrument, size)}"
+        )
+        result = self._place_entry_order(credentials, config, trade_instrument, trade_side, size, pos_side)
+        filled = self._wait_for_order_fill(
+            credentials,
+            config,
+            trade_instrument=trade_instrument,
+            side=trade_side,
+            pos_side=pos_side,
+            result=result,
+            estimated_entry=price_for_size,
+        )
+        self._logger(
+            f"三均线开仓已成交 | ordId={filled.ord_id} | 标的={trade_instrument.inst_id} | "
+            f"方向={trade_side.upper()} | 成交均价={_format_notify_price_by_tick_size(filled.entry_price, trade_instrument.tick_size)} | "
+            f"成交数量={_format_size_with_contract_equivalent(trade_instrument, filled.size)}"
+        )
+        self._notify_trade_fill(
+            config,
+            title="开仓成交",
+            symbol=trade_instrument.inst_id,
+            side=trade_side,
+            size=filled.size,
+            size_text=_format_notify_size_with_unit(trade_instrument, filled.size),
+            price=filled.entry_price,
+            tick_size=trade_instrument.tick_size,
+            reason=f"三均线趋势信号成交 | 初始止损={stop_source}",
+        )
+        self._logger(f"委托追踪 | clOrdId={filled.cl_ord_id or '-'} | ordId={filled.ord_id}")
+        return filled, stop_price
 
     def _open_ema_stop_position(
         self,

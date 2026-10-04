@@ -559,6 +559,38 @@ class OkxHistoryParsingTest(TestCase):
         self.assertEqual(items[1].fee, Decimal("-0.0002"))
         self.assertEqual(items[1].fee_currency, "USDT")
 
+    def test_get_positions_history_fetch_all_paginates_with_update_cursor(self) -> None:
+        client = OkxRestClient()
+        calls: list[dict[str, str]] = []
+
+        def _stub_request(method: str, path: str, params=None, **kwargs):
+            self.assertEqual(path, "/api/v5/account/positions-history")
+            calls.append(dict(params))
+            cursor = params.get("after")
+            if cursor is None:
+                data = [
+                    {"instId": "BTC-USDT-SWAP", "posId": str(index), "cTime": str(index), "uTime": str(400 - index), "realizedPnl": "0"}
+                    for index in range(1, 100)
+                ]
+                data.append({"instId": "BTC-USDT-SWAP", "posId": "1", "cTime": "100", "uTime": "300", "realizedPnl": "3"})
+                return {"data": data}
+            if cursor == "300":
+                return {"data": [{"instId": "BTC-USDT-SWAP", "posId": "2", "cTime": "200", "uTime": "200", "realizedPnl": "2"}]}
+            return {"data": []}
+
+        client._request = _stub_request  # type: ignore[method-assign]
+        items = client.get_positions_history(
+            Credentials(api_key="", secret_key="", passphrase=""),
+            environment="live",
+            inst_types=("SWAP",),
+            limit=100,
+            fetch_all=True,
+        )
+
+        self.assertIn(Decimal("3"), [item.realized_pnl for item in items])
+        self.assertIn(Decimal("2"), [item.realized_pnl for item in items])
+        self.assertEqual([call.get("after") for call in calls], [None, "300"])
+
     def test_get_fills_history_reads_fee_field_from_okx_response(self) -> None:
         client = OkxRestClient()
 

@@ -184,6 +184,7 @@ class PositionHistoryFeedThread(QThread):
                 self._runtime.credentials,
                 environment=environment,
                 limit=self._limit,
+                fetch_all=True,
                 after_ms=self._after_ms,
                 before_ms=self._before_ms,
             )

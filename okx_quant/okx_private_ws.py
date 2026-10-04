@@ -4,6 +4,7 @@ import asyncio
 import json
 import time
 import threading
+from collections import OrderedDict
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from typing import Any, Callable
@@ -19,6 +20,8 @@ except Exception:  # noqa: BLE001
 
 Logger = Callable[[str], None]
 UpdateListener = Callable[[str, int], None]
+_TERMINAL_ORDER_STATES = frozenset({"filled", "canceled", "mmp_canceled"})
+_TERMINAL_ORDER_CACHE_LIMIT = 2000
 
 
 def _position_snapshot_key(item: dict[str, Any]) -> tuple[str, str, str] | None:
@@ -84,6 +87,7 @@ class OkxPrivateWsConnection:
         self._version = 0
         self._order_by_ord_id: dict[str, OkxPrivateWsRecord] = {}
         self._order_by_cl_ord_id: dict[str, OkxPrivateWsRecord] = {}
+        self._terminal_orders: OrderedDict[int, OkxPrivateWsRecord] = OrderedDict()
         self._positions_snapshot: OkxPrivateWsRecord | None = None
         self._account_snapshot: OkxPrivateWsRecord | None = None
         self._update_listeners: set[UpdateListener] = set()
@@ -363,13 +367,37 @@ class OkxPrivateWsConnection:
                 cl_ord_id = str(item.get("clOrdId") or "").strip()
                 if not ord_id and not cl_ord_id:
                     continue
+                previous = self._resolve_order_record_locked(ord_id=ord_id, cl_ord_id=cl_ord_id)
+                payload = dict(item)
+                if previous is not None:
+                    # Some updates omit one identifier. Keep both lookups on
+                    # the latest record so eviction cannot leave a stale alias.
+                    ord_id = ord_id or str(previous.payload.get("ordId") or "").strip()
+                    cl_ord_id = cl_ord_id or str(previous.payload.get("clOrdId") or "").strip()
+                    if ord_id:
+                        payload["ordId"] = ord_id
+                    if cl_ord_id:
+                        payload["clOrdId"] = cl_ord_id
+                for old_record in (self._order_by_ord_id.get(ord_id), self._order_by_cl_ord_id.get(cl_ord_id)):
+                    if old_record is not None:
+                        self._terminal_orders.pop(old_record.version, None)
                 self._version += 1
-                record = OkxPrivateWsRecord(version=self._version, payload=dict(item), received_at=time.time())
+                record = OkxPrivateWsRecord(version=self._version, payload=payload, received_at=time.time())
                 if ord_id:
                     self._order_by_ord_id[ord_id] = record
                 if cl_ord_id:
                     self._order_by_cl_ord_id[cl_ord_id] = record
+                if str(payload.get("state") or "").strip().lower() in _TERMINAL_ORDER_STATES:
+                    self._terminal_orders[record.version] = record
                 update_version = record.version
+            while len(self._terminal_orders) > _TERMINAL_ORDER_CACHE_LIMIT:
+                _, expired = self._terminal_orders.popitem(last=False)
+                ord_id = str(expired.payload.get("ordId") or "").strip()
+                cl_ord_id = str(expired.payload.get("clOrdId") or "").strip()
+                if self._order_by_ord_id.get(ord_id) is expired:
+                    del self._order_by_ord_id[ord_id]
+                if self._order_by_cl_ord_id.get(cl_ord_id) is expired:
+                    del self._order_by_cl_ord_id[cl_ord_id]
             self._lock.notify_all()
         if update_version is not None:
             self._notify_update("orders", update_version)

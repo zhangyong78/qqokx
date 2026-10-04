@@ -35,8 +35,8 @@ class ArbitrageFastApp:
         self.root = Tk()
         self.root.withdraw()
         apply_window_icon(self.root)
+        self._log_queue: queue.Queue[str] = queue.Queue(maxsize=2000)
         self.client = OkxRestClient(logger=self._enqueue_log)
-        self._log_queue: queue.Queue[str] = queue.Queue()
         self._selected_profile_name = self._load_selected_profile_name()
         self.window = ArbitrageWindow(
             self.root,
@@ -50,8 +50,15 @@ class ArbitrageFastApp:
     def _enqueue_log(self, message: str) -> None:
         try:
             self._log_queue.put_nowait(message)
-        except Exception:
-            pass
+        except queue.Full:
+            try:
+                self._log_queue.get_nowait()
+            except queue.Empty:
+                return
+            try:
+                self._log_queue.put_nowait(message)
+            except queue.Full:
+                return
 
     @staticmethod
     def _load_selected_profile_name() -> str:
@@ -86,7 +93,14 @@ class ArbitrageFastApp:
 
     def _on_close(self) -> None:
         self.window._on_close()
-        self.root.after(0, self.root.destroy)
+        try:
+            close_client = getattr(self.client, "close", None)
+            if callable(close_client):
+                close_client()
+        except Exception as exc:
+            self._enqueue_log(f"关闭行情连接失败：{exc}")
+        finally:
+            self.root.after(0, self.root.destroy)
 
 
 def run_app() -> None:

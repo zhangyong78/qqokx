@@ -1,6 +1,11 @@
+import json
 import shutil
+import tempfile
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest import TestCase
+from unittest.mock import patch
 from uuid import uuid4
 
 from okx_quant.persistence import (
@@ -24,6 +29,7 @@ from okx_quant.persistence import (
     save_btc_research_workbench_state,
     save_credentials_snapshot,
     save_history_cache_records,
+    save_kline_analysis_workspace_entries,
     save_position_history_view_prefs,
     save_option_strategies_snapshot,
     save_smart_order_favorites_snapshot,
@@ -35,6 +41,100 @@ from okx_quant.persistence import (
     strategy_history_file_path,
     strategy_trade_ledger_file_path,
 )
+
+
+class AtomicSnapshotPersistenceTest(TestCase):
+    def test_concurrent_saves_use_distinct_temporary_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "workspace.json"
+            barrier = threading.Barrier(2)
+            capture_lock = threading.Lock()
+            snapshots: dict[Path, dict[str, object]] = {}
+            original_replace = Path.replace
+
+            def replace_together(source: Path, destination: Path) -> Path:
+                with capture_lock:
+                    first_attempt = source not in snapshots
+                    snapshots[source] = json.loads(source.read_text(encoding="utf-8"))
+                if first_attempt:
+                    barrier.wait(timeout=5)
+                return original_replace(source, destination)
+
+            with patch.object(Path, "replace", replace_together):
+                with ThreadPoolExecutor(max_workers=2) as executor:
+                    futures = [
+                        executor.submit(
+                            save_kline_analysis_workspace_entries,
+                            {name: {"owner": name}},
+                            target,
+                        )
+                        for name in ("local", "server")
+                    ]
+                    self.assertEqual([future.result(timeout=10) for future in futures], [target, target])
+
+            self.assertEqual(len(snapshots), 2)
+            self.assertEqual(
+                {next(iter(snapshot["entries"])) for snapshot in snapshots.values()},
+                {"local", "server"},
+            )
+            self.assertTrue(all(path.parent == target.parent for path in snapshots))
+            self.assertIn(json.loads(target.read_text(encoding="utf-8")), snapshots.values())
+            self.assertEqual(list(target.parent.iterdir()), [target])
+
+    def test_failed_write_preserves_previous_snapshot_and_removes_temporary_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "workspace.json"
+            original = '{"previous": true}'
+            target.write_text(original, encoding="utf-8")
+
+            def fail_write(payload: object, handle: object, **kwargs: object) -> None:
+                handle.write('{"partial":')
+                raise OSError("disk write failed")
+
+            with patch("okx_quant.persistence.json.dump", side_effect=fail_write):
+                with self.assertRaisesRegex(OSError, "disk write failed"):
+                    save_kline_analysis_workspace_entries({"new": {}}, target)
+
+            self.assertEqual(target.read_text(encoding="utf-8"), original)
+            self.assertEqual(list(target.parent.iterdir()), [target])
+
+    def test_failed_replace_preserves_previous_snapshot_and_removes_temporary_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "workspace.json"
+            original = '{"previous": true}'
+            target.write_text(original, encoding="utf-8")
+            with (
+                patch.object(Path, "replace", side_effect=PermissionError("file busy")) as replace,
+                patch("okx_quant.persistence.time.sleep") as sleep,
+            ):
+                with self.assertRaisesRegex(PermissionError, "file busy"):
+                    save_kline_analysis_workspace_entries({"new": {}}, target)
+            self.assertEqual(replace.call_count, 4)
+            self.assertEqual(sleep.call_count, 3)
+            self.assertEqual(target.read_text(encoding="utf-8"), original)
+            self.assertEqual(list(target.parent.iterdir()), [target])
+
+    def test_transient_replace_error_retries_complete_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "workspace.json"
+            original_replace = Path.replace
+            attempts: list[Path] = []
+
+            def replace_after_unlock(source: Path, destination: Path) -> Path:
+                attempts.append(source)
+                if len(attempts) == 1:
+                    raise PermissionError("file busy")
+                return original_replace(source, destination)
+
+            with (
+                patch.object(Path, "replace", replace_after_unlock),
+                patch("okx_quant.persistence.time.sleep"),
+            ):
+                save_kline_analysis_workspace_entries({"new": {"owner": "local"}}, target)
+            self.assertEqual(len(attempts), 2)
+            self.assertEqual(len(set(attempts)), 1)
+            self.assertEqual(json.loads(target.read_text(encoding="utf-8"))["entries"]["new"], {"owner": "local"})
+            self.assertEqual(list(target.parent.iterdir()), [target])
 
 
 class PersistenceTest(TestCase):

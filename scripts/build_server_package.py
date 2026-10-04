@@ -18,11 +18,16 @@ def write_text(path: Path, content: str, *, encoding: str = "utf-8-sig") -> None
 def package_ignore(_src: str, names: list[str]) -> set[str]:
     ignored: set[str] = set()
     for name in names:
+        lowered = name.lower()
         if (
-            name == "__pycache__"
-            or name.endswith(".pyc")
-            or name.endswith(".pyo")
-            or ".bak_" in name
+            lowered == "__pycache__"
+            or lowered.endswith((".pyc", ".pyo", ".bak", ".brokenbak", ".corrupted_backup", ".tmp", ".temp", ".swp", ".swo", "~"))
+            or ".bak_" in lowered
+            or lowered == ".env"
+            or lowered.startswith(".env.")
+            or lowered.startswith(".okx_quant_")
+            or lowered in {"credentials.json", "settings.json"}
+            or lowered.endswith((".pem", ".key", ".p12", ".pfx"))
         ):
             ignored.add(name)
     return ignored

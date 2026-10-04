@@ -4,6 +4,7 @@ import tempfile
 import unittest
 from datetime import datetime
 from pathlib import Path
+from unittest.mock import patch
 
 from okx_quant.log_utils import (
     append_line_desk_log_line,
@@ -88,6 +89,40 @@ class LogUtilsTest(unittest.TestCase):
             tail = read_daily_log_tail(3, for_time=now, base_dir=temp_dir)
             self.assertEqual(len(tail), 3)
             self.assertTrue(tail[-1].endswith("line-4"))
+
+    def test_read_daily_log_tail_with_nonpositive_limit_returns_empty(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            now = datetime(2026, 4, 9, 10, 35, 12)
+            append_log_line("line", now=now, base_dir=temp_dir)
+            self.assertEqual(read_daily_log_tail(0, for_time=now, base_dir=temp_dir), [])
+            self.assertEqual(read_daily_log_tail(-2, for_time=now, base_dir=temp_dir), [])
+
+    def test_read_daily_log_tail_skips_blank_lines(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            now = datetime(2026, 4, 9, 10, 35, 12)
+            path = daily_log_file_path(for_time=now, base_dir=temp_dir)
+            path.parent.mkdir(parents=True)
+            path.write_text("first\n\n  \nsecond\n\n", encoding="utf-8")
+            self.assertEqual(read_daily_log_tail(1, for_time=now, base_dir=temp_dir), ["second"])
+
+    def test_read_daily_log_tail_discards_split_utf8_first_line(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            now = datetime(2026, 4, 9, 10, 35, 12)
+            path = daily_log_file_path(for_time=now, base_dir=temp_dir)
+            path.parent.mkdir(parents=True)
+            path.write_bytes("很长的历史消息\n最后一行\n".encode("utf-8"))
+            with patch("okx_quant.log_utils._RUN_LOG_TAIL_MAX_READ_BYTES", 16):
+                tail = read_daily_log_tail(5, for_time=now, base_dir=temp_dir)
+            self.assertEqual(tail, ["最后一行"])
+
+    def test_read_daily_log_tail_bounds_read_for_a_long_single_line(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            now = datetime(2026, 4, 9, 10, 35, 12)
+            path = daily_log_file_path(for_time=now, base_dir=temp_dir)
+            path.parent.mkdir(parents=True)
+            path.write_bytes(b"x" * 100)
+            with patch("okx_quant.log_utils._RUN_LOG_TAIL_MAX_READ_BYTES", 16):
+                self.assertEqual(read_daily_log_tail(5, for_time=now, base_dir=temp_dir), [])
 
     def test_append_log_line_preserves_existing_timestamp(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

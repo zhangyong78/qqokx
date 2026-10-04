@@ -17,6 +17,7 @@ from okx_quant.strategy_runtime_registry import (
 )
 from okx_quant.strategy_catalog import (
     STRATEGY_DEFINITIONS,
+    STRATEGY_TRIPLE_EMA_ID,
     StrategyDefinition,
     get_strategy_definition,
     is_ema55_slope_short_strategy,
@@ -6580,8 +6581,16 @@ class UiStrategySessionsMixin:
             reentry_confirmation_ma_type=reentry_confirmation_ma_type,
             reentry_confirmation_ma_period=reentry_confirmation_ma_period,
             atr_period=self._parse_positive_int(self.atr_period.get(), "ATR 周期"),
-            atr_stop_multiplier=self._parse_positive_decimal(self.stop_atr.get(), "止损 ATR 倍数"),
-            atr_take_multiplier=self._parse_positive_decimal(self.take_atr.get(), "止盈 ATR 倍数"),
+            atr_stop_multiplier=(
+                self._parse_nonnegative_decimal(self.stop_atr.get(), "初始止损 ATR 倍数")
+                if strategy_id == STRATEGY_TRIPLE_EMA_ID
+                else self._parse_positive_decimal(self.stop_atr.get(), "止损 ATR 倍数")
+            ),
+            atr_take_multiplier=(
+                Decimal("1")
+                if strategy_id == STRATEGY_TRIPLE_EMA_ID
+                else self._parse_positive_decimal(self.take_atr.get(), "止盈 ATR 倍数")
+            ),
             order_size=order_size,
             trade_mode=TRADE_MODE_OPTIONS[self.trade_mode_label.get()],
             signal_mode=effective_signal_mode,
@@ -12106,6 +12115,11 @@ class UiStrategySessionsMixin:
         if getattr(self, "_historical_manual_close_repair_started", False):
             return
         self._historical_manual_close_repair_started = True
+        # This is a startup recovery for sessions that were active when the
+        # app last closed.  Do not scan archived history on machines with no
+        # recoverable strategy sessions (for example, a clean test machine).
+        if not getattr(self, "_recoverable_strategy_sessions", {}):
+            return
         history_records = list(getattr(self, "_strategy_history_records", []))
         known_exit_orders = {
             (str(record.session_id or "").strip(), str(record.exit_order_id or "").strip())
@@ -12130,6 +12144,7 @@ class UiStrategySessionsMixin:
         credential_by_api: dict[str, Credentials | None],
     ) -> None:
         from okx_quant.strategy_trade_ledger_backfill import backfill_strategy_trade_ledger, parse_trade_rounds_for_history_record
+        from okx_quant.app_paths import state_dir_path
 
         repaired_count = 0
         queried_count = 0
@@ -12160,7 +12175,10 @@ class UiStrategySessionsMixin:
                     "log_file_path": history.log_file_path,
                     "config_snapshot": history.config_snapshot,
                 }
-                rounds = parse_trade_rounds_for_history_record(history_payload)
+                rounds = parse_trade_rounds_for_history_record(
+                    history_payload,
+                    state_dir=state_dir_path(),
+                )
                 for round_info in rounds:
                     exit_order_id = str(round_info.exit_order_id or "").strip()
                     if (

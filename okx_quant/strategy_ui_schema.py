@@ -17,6 +17,7 @@ from okx_quant.strategy_catalog import (
     STRATEGY_EMA55_SLOPE_SHORT_ID,
     STRATEGY_EMA_BREAKDOWN_SHORT_ID,
     STRATEGY_EMA_BREAKOUT_LONG_ID,
+    STRATEGY_TRIPLE_EMA_ID,
     is_dynamic_mtf_strategy_id,
 )
 from okx_quant.strategy_parameters import (
@@ -58,6 +59,46 @@ _SCOPE_OBSERVER: PageScope = "observer"
 
 
 STRATEGY_UI_SCHEMAS: dict[str, StrategyUiSchema] = {
+    STRATEGY_TRIPLE_EMA_ID: StrategyUiSchema(
+        strategy_id=STRATEGY_TRIPLE_EMA_ID,
+        parameter_defaults={
+            _SCOPE_LAUNCHER: {
+                "bar": "1H",
+                "ema_type": "ema",
+                "ema_period": 21,
+                "trend_ema_type": "ema",
+                "trend_ema_period": 60,
+                "big_ema_period": 200,
+                "atr_period": 14,
+                "atr_stop_multiplier": "0",
+            },
+            _SCOPE_BACKTEST: {
+                "bar": "1H",
+                "ema_type": "ema",
+                "ema_period": 21,
+                "trend_ema_type": "ema",
+                "trend_ema_period": 60,
+                "big_ema_period": 200,
+                "atr_period": 14,
+                "atr_stop_multiplier": "0",
+            },
+        },
+        extra_defaults={
+            _SCOPE_LAUNCHER: {
+                "entry_side_mode": "follow_signal",
+                "risk_amount": "10",
+                "tp_sl_mode": "local_trade",
+                "take_profit_mode": "fixed",
+            },
+            _SCOPE_BACKTEST: {
+                "risk_amount": "100",
+                "sizing_mode": "fixed_risk",
+                "take_profit_mode": "fixed",
+            },
+        },
+        force_follow_signal=True,
+        force_local_trade=True,
+    ),
     STRATEGY_DYNAMIC_LONG_ID: StrategyUiSchema(
         strategy_id=STRATEGY_DYNAMIC_LONG_ID,
         parameter_defaults={

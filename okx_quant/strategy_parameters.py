@@ -20,6 +20,7 @@ from okx_quant.strategy_catalog import (
     STRATEGY_EMA55_SLOPE_SHORT_ID,
     STRATEGY_EMA_BREAKDOWN_SHORT_ID,
     STRATEGY_EMA_BREAKOUT_LONG_ID,
+    STRATEGY_TRIPLE_EMA_ID,
 )
 
 PageScope = Literal["launcher", "backtest", "observer"]
@@ -128,6 +129,24 @@ PARAMETERS: dict[str, ParameterDefinition] = {
 
 
 STRATEGY_PARAMETER_PROFILES: dict[str, StrategyParameterProfile] = {
+    STRATEGY_TRIPLE_EMA_ID: StrategyParameterProfile(
+        strategy_id=STRATEGY_TRIPLE_EMA_ID,
+        parameter_keys=(
+            "bar",
+            "signal_mode",
+            "ema_type",
+            "ema_period",
+            "trend_ema_type",
+            "trend_ema_period",
+            "big_ema_period",
+            "atr_period",
+            "atr_stop_multiplier",
+        ),
+        fixed_values={
+            "ema_type": "ema",
+            "trend_ema_type": "ema",
+        },
+    ),
     STRATEGY_DYNAMIC_ID: StrategyParameterProfile(
         strategy_id=STRATEGY_DYNAMIC_ID,
         parameter_keys=(
