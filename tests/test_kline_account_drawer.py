@@ -313,7 +313,7 @@ class KlineAccountDrawerWidgetTests(QtWidgetTestCase):
 
             self.assertIn("TP 65000", drawer._orders_table.item(0, tp_sl_col).text())
             self.assertIn("SL 59000", drawer._orders_table.item(0, tp_sl_col).text())
-            self.assertEqual(drawer._orders_table.item(0, headers.index("折合币数")).text(), "0.026 BTC")
+            self.assertEqual(drawer._orders_table.item(0, headers.index("币数量")).text(), "0.026 BTC")
             self.assertEqual(drawer._orders_table.item(0, order_id_col).text(), "3730927321386143744")
             self.assertEqual(drawer._orders_table.item(0, cl_ord_col).text(), "rrsto77e9a3508b0457d3688e9631")
             self.assertEqual(drawer._orders_table.item(0, direction_col).text(), "卖出")
