@@ -107,6 +107,7 @@ from okx_quant.option_strategy_ui import (
     _strategy_leg_quote_currency,
     supplement_deribit_option_history,
 )
+from roll_terminal_qt.profile_access import load_profile_snapshots
 from roll_terminal_qt.runtime import load_runtime
 
 
@@ -118,6 +119,26 @@ def _shared_client() -> OkxRestClient:
     if _SHARED_CLIENT is None:
         _SHARED_CLIENT = OkxRestClient()
     return _SHARED_CLIENT
+
+
+_OPTION_PREMIUM_FEE_CAP_RATE = Decimal("0.07")
+
+
+def _configured_option_taker_fee_rate(profile_name: str) -> Decimal:
+    """Return the configured option taker fee as a decimal rate."""
+    try:
+        profiles, _selected = load_profile_snapshots()
+        profile = profiles.get(str(profile_name or "").strip(), {})
+        raw = profile.get("option_taker_fee_rate") or profile.get("futures_taker_fee_rate") or "0.0300"
+        return max(Decimal(str(raw)) / Decimal("100"), Decimal("0"))
+    except Exception:
+        return Decimal("0.0003")
+
+
+def _option_fee_per_premium_unit(premium: Decimal, fee_rate: Decimal) -> Decimal:
+    if premium <= 0:
+        return Decimal("0")
+    return min(max(fee_rate, Decimal("0")), _OPTION_PREMIUM_FEE_CAP_RATE * premium)
 
 
 def build_option_position_import_payload(
@@ -4443,6 +4464,7 @@ class OptionStrategyQtWindow(QMainWindow):
         self._profile_name = str(
             profile_name or getattr(initial_runtime, "credential_profile_name", "") or "159"
         ).strip()
+        self._option_taker_fee_rate = _configured_option_taker_fee_rate(self._profile_name)
         self._chain_request_id = 0
         self._position_import_request_id = 0
         self._chart_request_id = 0
@@ -4535,6 +4557,7 @@ class OptionStrategyQtWindow(QMainWindow):
         if not target or target == self._profile_name:
             return
         self._profile_name = target
+        self._option_taker_fee_rate = _configured_option_taker_fee_rate(target)
         self._chain_position_coin_text_by_inst_id.clear()
         if self._chain_rows:
             self._render_chain_rows()
@@ -4691,7 +4714,7 @@ class OptionStrategyQtWindow(QMainWindow):
         self._leg_details_check = QCheckBox("详细指标（币种换算 / 面值 / Greeks）")
         self._leg_details_check.toggled.connect(self._set_leg_details_visible)
         legs_layout.addWidget(self._leg_details_check)
-        self._legs_table = QTableWidget(0, 19)
+        self._legs_table = QTableWidget(0, 20)
         self._legs_table.setHorizontalHeaderLabels(
             (
                 "别名",
@@ -4703,6 +4726,7 @@ class OptionStrategyQtWindow(QMainWindow):
                 "数量（张）",
                 "折合币数",
                 "持仓价",
+                "对手价（市价）",
                 "持仓价≈USDT",
                 "标记价",
                 "标记价≈USDT",
@@ -4724,6 +4748,9 @@ class OptionStrategyQtWindow(QMainWindow):
         self._legs_table.horizontalHeaderItem(6).setToolTip("合约张数，单位：张。")
         self._legs_table.horizontalHeaderItem(7).setToolTip(
             "折合币数 = 张数 × ctVal × ctMult；按合约面值币种显示，不用 BTC/ETH 价格换算。"
+        )
+        self._legs_table.horizontalHeaderItem(9).setToolTip(
+            "买入取卖一价（Ask），卖出取买一价（Bid）；盘口缺失时回退最新价或标记价。"
         )
         self._legs_table.verticalHeader().setVisible(False)
         self._legs_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
@@ -4850,7 +4877,7 @@ class OptionStrategyQtWindow(QMainWindow):
     @Slot(bool)
     def _set_leg_details_visible(self, visible: bool) -> None:
         # Keep original column indexes and all values, including the edit columns.
-        for column in (2, 3, 9, 11, 12, 14, 15, 16, 17, 18):
+        for column in (2, 3, 10, 12, 13, 15, 16, 17, 18, 19):
             self._legs_table.setColumnHidden(column, not visible)
 
     def _load_saved_strategies(self) -> None:
@@ -5396,7 +5423,36 @@ class OptionStrategyQtWindow(QMainWindow):
 
     def _leg_mark_price(self, inst_id: str) -> Decimal | None:
         quote = self._quotes_by_inst_id.get(inst_id)
-        return quote.reference_price if quote is not None else None
+        # “标记价”必须来自 OKX 的 markPx；reference_price 会在 markPx
+        # 缺失时回退到 last/bid/ask，不能用于这个明确标注为标记价的列。
+        return quote.mark_price if quote is not None else None
+
+    def _leg_counterparty_price(self, inst_id: str, side: str) -> Decimal | None:
+        """Return the quote that would be hit by this leg's market order."""
+        quote = self._quotes_by_inst_id.get(inst_id)
+        if quote is None:
+            return None
+        preferred = quote.ask_price if side == "buy" else quote.bid_price
+        fallback = quote.bid_price if side == "buy" else quote.ask_price
+        for value in (preferred, quote.last_price, quote.mark_price, fallback):
+            if value is not None:
+                return value
+        return None
+
+    def _estimate_leg_fee_total(self, leg: StrategyLegDefinition) -> Decimal | None:
+        """Estimate one option leg's taker fee in its premium currency."""
+        if leg.leg_kind == "underlying":
+            return Decimal("0")
+        instrument = self._instrument_map.get(leg.inst_id)
+        if instrument is None:
+            return None
+        execution_price = self._leg_counterparty_price(leg.inst_id, leg.side)
+        if execution_price is None:
+            execution_price = leg.premium
+        if execution_price is None or execution_price <= 0:
+            return None
+        fee_per_unit = _option_fee_per_premium_unit(execution_price, self._option_taker_fee_rate)
+        return fee_per_unit * option_contract_value(instrument) * leg.quantity
 
     def _option_value_approx_usdt(
         self,
@@ -5485,6 +5541,15 @@ class OptionStrategyQtWindow(QMainWindow):
         missing_greeks = False
         greek_currencies: set[str] = set()
         coin_quantity_totals: dict[str, Decimal] = {}
+        net_premium_totals: dict[str, Decimal] = {}
+        fee_totals: dict[str, Decimal] = {}
+        total_quantity = Decimal("0")
+        buy_quantity = Decimal("0")
+        sell_quantity = Decimal("0")
+        net_premium_usdt = Decimal("0")
+        net_premium_usdt_complete = True
+        net_mark_usdt = Decimal("0")
+        net_mark_usdt_complete = True
         for row_index, leg in enumerate(self._legs):
             instrument = self._instrument_map.get(leg.inst_id)
             is_underlying = leg.leg_kind == "underlying"
@@ -5500,7 +5565,9 @@ class OptionStrategyQtWindow(QMainWindow):
             if currency:
                 greek_currencies.add(currency)
             premium = leg.premium
+            counterparty_price = self._leg_counterparty_price(leg.inst_id, leg.side)
             mark_price = self._leg_mark_price(leg.inst_id)
+            fee_total = self._estimate_leg_fee_total(leg)
             premium_usdt = self._option_value_approx_usdt(leg.inst_id, premium, leg_kind=leg.leg_kind)
             mark_price_usdt = self._option_value_approx_usdt(leg.inst_id, mark_price, leg_kind=leg.leg_kind)
             theta_usdt = self._option_value_approx_usdt(leg.inst_id, leg.theta, leg_kind=leg.leg_kind)
@@ -5518,6 +5585,46 @@ class OptionStrategyQtWindow(QMainWindow):
                     greek_counts[key] += 1
             contract_value = option_contract_value(instrument) if instrument is not None else Decimal("1")
             premium_total = premium * contract_value * leg.quantity if premium is not None and not is_underlying else None
+            total_quantity += leg.quantity
+            if leg.side == "buy":
+                buy_quantity += leg.quantity
+            else:
+                sell_quantity += leg.quantity
+            if premium_total is not None:
+                premium_currency = str(
+                    getattr(instrument, "ct_val_ccy", None) or leg.inst_id.split("-", 1)[0]
+                ).strip().upper()
+                net_premium_totals[premium_currency] = net_premium_totals.get(premium_currency, Decimal("0")) + (
+                    premium_total if leg.side == "buy" else -premium_total
+                )
+                premium_usdt = self._option_value_approx_usdt(leg.inst_id, premium_total, leg_kind=leg.leg_kind)
+                if premium_usdt is None:
+                    net_premium_usdt_complete = False
+                else:
+                    net_premium_usdt += premium_usdt if leg.side == "buy" else -premium_usdt
+            elif not is_underlying:
+                net_premium_usdt_complete = False
+            if fee_total is not None and not is_underlying:
+                fee_currency = str(
+                    getattr(instrument, "ct_val_ccy", None) or leg.inst_id.split("-", 1)[0]
+                ).strip().upper()
+                fee_totals[fee_currency] = fee_totals.get(fee_currency, Decimal("0")) + fee_total
+                fee_usdt = self._option_value_approx_usdt(leg.inst_id, fee_total, leg_kind=leg.leg_kind)
+                if fee_usdt is None:
+                    net_premium_usdt_complete = False
+                else:
+                    net_premium_usdt += fee_usdt
+            elif not is_underlying:
+                net_premium_usdt_complete = False
+            if mark_price is None:
+                net_mark_usdt_complete = False
+            elif instrument is not None:
+                mark_total = mark_price * contract_value * leg.quantity
+                mark_usdt = self._option_value_approx_usdt(leg.inst_id, mark_total, leg_kind=leg.leg_kind)
+                if mark_usdt is None:
+                    net_mark_usdt_complete = False
+                else:
+                    net_mark_usdt += mark_usdt if leg.side == "buy" else -mark_usdt
             coin_quantity = (
                 option_contract_coin_quantity(instrument, leg.quantity)
                 if instrument is not None
@@ -5550,6 +5657,7 @@ class OptionStrategyQtWindow(QMainWindow):
                 format_decimal(leg.quantity),
                 f"{format_decimal(coin_quantity)} {coin_currency}" if coin_quantity is not None else "-",
                 _format_price(premium, instrument.tick_size if instrument is not None else None),
+                _format_price(counterparty_price, instrument.tick_size if instrument is not None else None),
                 _format_compact_number(premium_usdt),
                 _format_price(mark_price, instrument.tick_size if instrument is not None else None),
                 _format_compact_number(mark_price_usdt),
@@ -5573,7 +5681,9 @@ class OptionStrategyQtWindow(QMainWindow):
         if self._legs:
             total_row = len(self._legs)
             mixed_greek_currencies = len(greek_currencies) > 1
-            label = "组合合计（多币种）" if mixed_greek_currencies else ("组合合计*" if missing_greeks else "组合合计")
+            mixed_premium_currencies = len(net_premium_totals) > 1
+            mixed_summary_currencies = mixed_greek_currencies or mixed_premium_currencies
+            label = "组合合计（多币种）" if mixed_summary_currencies else ("组合合计*" if missing_greeks else "组合合计")
 
             def total_text(key: str, *, coin_denominated: bool = True) -> str:
                 if coin_denominated and mixed_greek_currencies:
@@ -5586,31 +5696,55 @@ class OptionStrategyQtWindow(QMainWindow):
                 f"{currency} {format_decimal(amount)}"
                 for currency, amount in sorted(coin_quantity_totals.items())
             ) or "-"
-            totals = (
-                (label,)
-                + ("",) * 6
-                + (coin_total_text,)
-                + ("",) * 6
-                + (
-                    total_text("delta"),
-                    total_text("gamma"),
-                    total_text("vega"),
-                    total_text("theta"),
-                    _format_compact_number(greek_totals["theta_usdt"]) if greek_counts["theta_usdt"] else "-",
-                )
-            )
+            net_cash_texts = []
+            net_cash_totals = dict(net_premium_totals)
+            for currency, amount in fee_totals.items():
+                net_cash_totals[currency] = net_cash_totals.get(currency, Decimal("0")) + amount
+            for currency, amount in sorted(net_cash_totals.items()):
+                if amount > 0:
+                    prefix = "净支出"
+                elif amount < 0:
+                    prefix = "净收入"
+                else:
+                    prefix = "净额"
+                fee_text = f"（含手续费 {format_decimal(fee_totals[currency])}）" if currency in fee_totals else ""
+                net_cash_texts.append(f"{currency} {prefix} {_format_compact_number(abs(amount))}{fee_text}")
+            net_premium_text = " | ".join(net_cash_texts) or "-"
+            quantity_text = f"总 {format_decimal(total_quantity)} 张（买 {format_decimal(buy_quantity)} / 卖 {format_decimal(sell_quantity)}）"
+            totals = [""] * 20
+            totals[0] = label
+            totals[6] = quantity_text
+            totals[7] = coin_total_text
+            totals[10] = _format_compact_number(net_premium_usdt) if net_premium_usdt_complete else "-"
+            totals[12] = _format_compact_number(net_mark_usdt) if net_mark_usdt_complete else "-"
+            totals[14] = net_premium_text
+            totals[15] = total_text("delta")
+            totals[16] = total_text("gamma")
+            totals[17] = total_text("vega")
+            totals[18] = total_text("theta")
+            totals[19] = _format_compact_number(greek_totals["theta_usdt"]) if greek_counts["theta_usdt"] else "-"
             for column_index, value in enumerate(totals):
                 cell = QTableWidgetItem(value)
                 cell.setBackground(QColor("#e8f0fb"))
                 font = cell.font()
                 font.setBold(True)
                 cell.setFont(font)
-                if column_index in {14, 15, 16, 17, 18}:
+                if column_index >= 6:
+                    cell.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+                if column_index in {15, 16, 17, 18, 19}:
                     cell.setToolTip(
                         "所有策略腿按买卖方向和数量求和；Delta/Gamma 为 PA 口径。"
                         + (" *有未计算腿，当前合计只包含已计算腿。" if missing_greeks else "")
-                        + (" 多种结算币的 Greeks 单位不同，因此不直接相加。" if mixed_greek_currencies and column_index != 16 else "")
+                        + (" 多种结算币的 Greeks 单位不同，因此不直接相加。" if mixed_greek_currencies and column_index != 17 else "")
                     )
+                elif column_index == 6:
+                    cell.setToolTip("策略腿合计张数，并分别列出买入和卖出数量。")
+                elif column_index == 10:
+                    cell.setToolTip("组合净支出/净收入的 USDT 折合，已包含估算手续费。")
+                elif column_index == 12:
+                    cell.setToolTip("按标记价、每张面值和数量折合后的组合 USDT 参考值。")
+                elif column_index == 14:
+                    cell.setToolTip("净支出 = 买入权利金 - 卖出权利金 + 手续费；负数表示净收入。")
                 self._legs_table.setItem(total_row, column_index, cell)
 
     def _refresh_strategy_summary(self) -> None:
@@ -5655,6 +5789,9 @@ class OptionStrategyQtWindow(QMainWindow):
             combo_value = "-"
         net_premium: Decimal | None = Decimal("0")
         premium_ccy: str | None = None
+        premium_inst_id: str | None = None
+        fee_total_summary = Decimal("0")
+        fee_summary_complete = True
         for leg in self._legs:
             if leg.leg_kind != "option":
                 continue
@@ -5665,16 +5802,70 @@ class OptionStrategyQtWindow(QMainWindow):
             currency = instrument.ct_val_ccy or leg.inst_id.split("-", 1)[0]
             if premium_ccy is None:
                 premium_ccy = currency
+                premium_inst_id = leg.inst_id
             elif premium_ccy != currency:
                 net_premium = None
+                fee_summary_complete = False
                 break
             direction = Decimal("1") if leg.side == "buy" else Decimal("-1")
             premium_cost = leg.premium * option_contract_value(instrument) * leg.quantity
-            net_premium += -direction * premium_cost
-        premium_text = f"{_format_compact_number(net_premium)} {premium_ccy or ''}".strip() if net_premium is not None else "跨币种/待刷新"
+            fee_total = self._estimate_leg_fee_total(leg)
+            if fee_total is None:
+                fee_summary_complete = False
+            else:
+                fee_total_summary += fee_total
+            net_premium += direction * premium_cost + (fee_total or Decimal("0"))
+        if net_premium is None:
+            premium_text = "跨币种/待刷新"
+        else:
+            net_premium_usdt = (
+                self._option_value_approx_usdt(premium_inst_id, net_premium, leg_kind="option")
+                if premium_inst_id is not None
+                else None
+            )
+            usdt_suffix = (
+                f"（≈{_format_compact_number(abs(net_premium_usdt))} USDT）"
+                if net_premium_usdt is not None
+                else ""
+            )
+            if net_premium > 0:
+                premium_text = f"净支出 {_format_compact_number(net_premium)} {premium_ccy or ''}{usdt_suffix}".strip()
+            elif net_premium < 0:
+                premium_text = f"净收入 {_format_compact_number(abs(net_premium))} {premium_ccy or ''}{usdt_suffix}".strip()
+            else:
+                premium_text = f"净额 0 {premium_ccy or ''}{usdt_suffix}".strip()
+        if fee_summary_complete and fee_total_summary > 0 and premium_ccy:
+            fee_text = f"手续费估算 {format_decimal(fee_total_summary)} {premium_ccy}"
+        elif fee_summary_complete:
+            fee_text = "手续费估算 0"
+        else:
+            fee_text = "手续费待刷新"
+        quantity_total = sum((leg.quantity for leg in self._legs), Decimal("0"))
+        buy_quantity = sum((leg.quantity for leg in self._legs if leg.side == "buy"), Decimal("0"))
+        sell_quantity = sum((leg.quantity for leg in self._legs if leg.side == "sell"), Decimal("0"))
+        quantity_text = f"总张数 {format_decimal(quantity_total)}（买 {format_decimal(buy_quantity)} / 卖 {format_decimal(sell_quantity)}）"
+        greek_currencies = {
+            str(
+                getattr(self._instrument_map.get(leg.inst_id), "ct_val_ccy", None)
+                or leg.inst_id.split("-", 1)[0]
+            ).strip().upper()
+            for leg in self._legs
+        }
+        greek_summary: list[str] = []
+        for key, label in (("delta", "Delta"), ("gamma", "Gamma"), ("vega", "Vega"), ("theta", "Theta")):
+            values = [getattr(leg, key) for leg in self._legs]
+            if len(greek_currencies) > 1:
+                value_text = "跨币种"
+            elif any(value is None for value in values):
+                value_text = "待刷新"
+            else:
+                value_text = _format_greek_number(sum((value for value in values if value is not None), Decimal("0")))
+            greek_summary.append(f"{label} {value_text}")
         underlying_text = f" | 标的≈{_format_compact_number(self._current_underlying_price)}" if self._current_underlying_price else ""
+        self._strategy_summary_label.setToolTip("数量为合约张数；净支出按买入权利金减卖出权利金；Greeks 为 PA 口径。")
         self._strategy_summary_label.setText(
-            f"策略腿 {len(self._legs)} 条 | 净权利金 {premium_text} | 当前组合浮盈亏 {combo_value}{underlying_text}\n"
+            f"策略腿 {len(self._legs)} 条 | {quantity_text} | {premium_text} | {fee_text} | 当前组合浮盈亏 {combo_value}{underlying_text}\n"
+            f"组合 Greeks：{' | '.join(greek_summary)}\n"
             f"组合公式 {formula or '-'}"
         )
 

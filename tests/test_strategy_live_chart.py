@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 from decimal import Decimal
 from unittest import TestCase
+from unittest.mock import patch
 
 from okx_quant.analysis import BoxDetectionConfig, ChannelDetectionConfig, PivotDetectionConfig
 from okx_quant.analysis.structure_models import PriceLine
@@ -35,6 +36,38 @@ from okx_quant.strategy_live_chart import (
 
 
 class StrategyLiveChartHelpersTest(TestCase):
+    def test_auto_channel_snapshot_skips_disabled_structure_detectors(self) -> None:
+        candles = [
+            Candle(
+                ts=1714330800000 + index * 60_000,
+                open=Decimal("100"),
+                high=Decimal("102"),
+                low=Decimal("98"),
+                close=Decimal("100"),
+                volume=Decimal("1"),
+                confirmed=True,
+            )
+            for index in range(16)
+        ]
+        with (
+            patch("okx_quant.strategy_live_chart.detect_boxes") as detect_boxes_mock,
+            patch("okx_quant.strategy_live_chart.detect_trendlines") as detect_trendlines_mock,
+            patch("okx_quant.strategy_live_chart.detect_triangles") as detect_triangles_mock,
+        ):
+            build_auto_channel_live_chart_snapshot(
+                session_id="channel-only",
+                candles=candles,
+                max_channels=1,
+                max_boxes=0,
+                max_trendlines=0,
+                max_triangles=0,
+                show_pivots=False,
+            )
+
+        detect_boxes_mock.assert_not_called()
+        detect_trendlines_mock.assert_not_called()
+        detect_triangles_mock.assert_not_called()
+
     def test_build_auto_channel_snapshot_adds_structure_overlays(self) -> None:
         candles = []
         for index in range(16):

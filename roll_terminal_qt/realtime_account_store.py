@@ -260,7 +260,11 @@ class RealtimeAccountStore(QObject):
             except Exception:
                 upl_usdt_prices = {}
             try:
-                position_instruments = _build_position_instrument_map(self._client, positions)
+                # Current orders can refer to an instrument with no open
+                # position.  Keep the same instrument map for both sources so
+                # order tables can convert raw contract lots to coin amounts.
+                instrument_items = [*positions, *pending_orders]
+                position_instruments = _build_position_instrument_map(self._client, instrument_items)
             except Exception:
                 position_instruments = {}
             try:

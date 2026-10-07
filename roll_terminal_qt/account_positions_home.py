@@ -3068,6 +3068,11 @@ class AccountPositionsHomeWidget(QWidget):
         self._shutdown_deadline_monotonic = 0.0
         self._shutdown_force_terminate_sent = False
         self._shutdown_poll_timer: QTimer | None = None
+        self._history_sync_waiting_for_realtime = False
+        self._history_sync_started_after_realtime = False
+        self._history_sync_deferred_timer = QTimer(self)
+        self._history_sync_deferred_timer.setSingleShot(True)
+        self._history_sync_deferred_timer.timeout.connect(self._start_deferred_history_sync)
 
         self._raw_positions: list[OkxPosition] = []
         self._visible_positions: list[OkxPosition] = []
@@ -3089,6 +3094,7 @@ class AccountPositionsHomeWidget(QWidget):
         self._position_instruments: dict[str, object] = {}
         self._position_tickers: dict[str, object] = {}
         self._upl_usdt_prices: dict[str, Decimal] = {}
+        self._account_overview: object | None = None
         self._position_row_payloads: dict[str, dict[str, object]] = {}
         self._unchecked_position_row_keys: set[str] = set()
         self._show_checked_positions_only = False
@@ -3282,6 +3288,9 @@ class AccountPositionsHomeWidget(QWidget):
                 profile_name=str(self._last_profile_name or "").strip(),
                 environment=self._note_environment(),
             )
+        self._account_overview = None
+        if hasattr(self, "_render_account_equity"):
+            self._render_account_equity()
         self._stop_private_threads(wait_ms=0)
         self._stop_order_history_thread(wait_ms=0)
         self._stop_fill_history_thread(wait_ms=0)
@@ -3820,6 +3829,7 @@ class AccountPositionsHomeWidget(QWidget):
         layout.setSpacing(6)
 
         layout.addWidget(self._build_header())
+        layout.addWidget(self._build_equity_panel())
         layout.addWidget(self._build_filter_bar())
         layout.addWidget(self._build_positions_panel(), 1)
 
@@ -3827,6 +3837,7 @@ class AccountPositionsHomeWidget(QWidget):
         self.setStyleSheet(
             """
             QFrame#HeaderPanel,
+            QFrame#EquityPanel,
             QFrame#Panel,
             QFrame#Guide {
                 background: #ffffff;
@@ -3852,6 +3863,29 @@ class AccountPositionsHomeWidget(QWidget):
                 border-radius: 6px;
                 padding: 2px 8px;
                 font-weight: 700;
+            }
+            QLabel#EquityTitle {
+                color: #0f172a;
+                font-size: 14px;
+                font-weight: 700;
+            }
+            QLabel#EquityMetricName {
+                color: #64748b;
+                font-size: 11px;
+            }
+            QLabel#EquityMetricValue {
+                color: #0f172a;
+                font-size: 14px;
+                font-weight: 700;
+            }
+            QLabel#EquityPrimaryValue {
+                color: #075985;
+                font-size: 19px;
+                font-weight: 800;
+            }
+            QLabel#EquityUpdated {
+                color: #94a3b8;
+                font-size: 10px;
             }
             QPushButton {
                 padding: 2px 8px;
@@ -3975,6 +4009,67 @@ class AccountPositionsHomeWidget(QWidget):
         actions.addStretch(1)
         layout.addWidget(toolbar)
         return panel
+
+    def _build_equity_panel(self) -> QWidget:
+        panel = QFrame()
+        panel.setObjectName("EquityPanel")
+        layout = QHBoxLayout(panel)
+        layout.setContentsMargins(12, 8, 12, 8)
+        layout.setSpacing(18)
+
+        title = QLabel("账户权益")
+        title.setObjectName("EquityTitle")
+        title.setToolTip("来自当前 API 账户的余额接口 / 私有 WS 快照")
+        layout.addWidget(title)
+
+        primary = QVBoxLayout()
+        primary.setSpacing(0)
+        primary_name = QLabel("总权益")
+        primary_name.setObjectName("EquityMetricName")
+        self._equity_total_value = QLabel("- USDT")
+        self._equity_total_value.setObjectName("EquityPrimaryValue")
+        primary.addWidget(primary_name)
+        primary.addWidget(self._equity_total_value)
+        layout.addLayout(primary)
+
+        self._equity_metric_labels: dict[str, QLabel] = {}
+        for key, label_text in (
+            ("available_equity", "可用权益"),
+            ("adjusted_equity", "调整后权益"),
+            ("unrealized_pnl", "未实现盈亏"),
+            ("initial_margin", "初始保证金"),
+            ("maintenance_margin", "维持保证金"),
+        ):
+            metric = QVBoxLayout()
+            metric.setSpacing(0)
+            name = QLabel(label_text)
+            name.setObjectName("EquityMetricName")
+            value = QLabel("-")
+            value.setObjectName("EquityMetricValue")
+            self._equity_metric_labels[key] = value
+            metric.addWidget(name)
+            metric.addWidget(value)
+            layout.addLayout(metric)
+
+        layout.addStretch(1)
+        self._equity_updated_label = QLabel("等待账户权益")
+        self._equity_updated_label.setObjectName("EquityUpdated")
+        layout.addWidget(self._equity_updated_label, 0, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        return panel
+
+    def _render_account_equity(self) -> None:
+        overview = getattr(self, "_account_overview", None)
+        total = getattr(overview, "total_equity", None) if overview is not None else None
+        self._equity_total_value.setText(
+            f"{_format_optional_usdt_precise(total, places=2, with_sign=False)} USDT"
+            if total is not None else "- USDT"
+        )
+        for key, label in getattr(self, "_equity_metric_labels", {}).items():
+            value = getattr(overview, key, None) if overview is not None else None
+            label.setText(_format_optional_usdt_precise(value, places=2, with_sign=key == "unrealized_pnl"))
+        self._equity_updated_label.setText(
+            "权益暂不可用" if overview is None else f"更新时间 {time.strftime('%H:%M:%S')}"
+        )
 
     def _build_filter_bar(self) -> QWidget:
         panel = QFrame()
@@ -4278,6 +4373,10 @@ class AccountPositionsHomeWidget(QWidget):
         return "" if text == "未配置" else text
 
     def _stop_private_threads(self, *, wait_ms: int = 1600) -> None:
+        deferred_timer = getattr(self, "_history_sync_deferred_timer", None)
+        if deferred_timer is not None:
+            deferred_timer.stop()
+        self._history_sync_waiting_for_realtime = False
         self._private_thread_generation += 1
         realtime_store = getattr(self, "_realtime_store", None)
         if realtime_store is not None:
@@ -6663,12 +6762,15 @@ class AccountPositionsHomeWidget(QWidget):
         next_instruments = dict(instruments) if isinstance(instruments, dict) else {}
         next_tickers = dict(tickers) if isinstance(tickers, dict) else {}
         next_prices = dict(prices) if isinstance(prices, dict) else {}
+        next_account = payload.get("account_overview")
+        account_changed = next_account is not None and next_account != getattr(self, "_account_overview", None)
         positions_changed = next_positions != self._raw_positions
         if (
             not positions_changed
             and next_instruments == self._position_instruments
             and next_tickers == self._position_tickers
             and next_prices == self._upl_usdt_prices
+            and not account_changed
         ):
             return
         self._raw_positions = next_positions
@@ -6677,6 +6779,10 @@ class AccountPositionsHomeWidget(QWidget):
         self._position_instruments = next_instruments
         self._position_tickers = next_tickers
         self._upl_usdt_prices = next_prices
+        if next_account is not None:
+            self._account_overview = next_account
+            if hasattr(self, "_render_account_equity"):
+                self._render_account_equity()
         if self._last_profile_name and positions_changed:
             notes_changed = _reconcile_current_position_note_records(
                 self._current_notes,
@@ -6707,6 +6813,10 @@ class AccountPositionsHomeWidget(QWidget):
             return
         if snapshot.environment != str(getattr(runtime, "environment", "") or ""):
             return
+        if snapshot.account is not None:
+            self._account_overview = snapshot.account
+            if hasattr(self, "_render_account_equity"):
+                self._render_account_equity()
         latest_positions = list(snapshot.positions)
         if latest_positions != self._raw_positions:
             instruments = snapshot.position_instruments or self._position_instruments
@@ -6721,12 +6831,21 @@ class AccountPositionsHomeWidget(QWidget):
                 }
             )
             self._apply_positions_summary(latest_positions)
+        if snapshot.source == "rest":
+            self._set_account_status(f"现有持仓已检查：{len(latest_positions)} 条")
         self._apply_orders(list(snapshot.orders))
+        if snapshot.source == "rest":
+            self._set_order_status(f"当前委托已同步：{len(snapshot.orders)} 条")
+            self._start_deferred_history_sync()
 
     @Slot(str)
     def _set_realtime_status(self, text: str) -> None:
         self._set_account_status(text)
         self._set_order_status(text)
+        if self._history_sync_waiting_for_realtime and "REST" in text and "失败" in text:
+            # A failed urgent check must not leave lower-priority history work
+            # blocked forever; the failure is already visible in the status.
+            self._start_deferred_history_sync()
 
     @Slot(object)
     def _apply_position_history_payload(self, payload: object) -> None:
@@ -7120,9 +7239,40 @@ class AccountPositionsHomeWidget(QWidget):
         generation = self._private_thread_generation
         profile_name = self._last_profile_name or "-"
         _debug_log(f"[profile_switch] start_realtime_store | profile={profile_name} | generation={generation}")
+        history_manager = getattr(self, "_history_sync_manager", None)
+        self._history_sync_waiting_for_realtime = bool(start_history and history_manager is not None)
+        self._history_sync_started_after_realtime = False
+        if self._history_sync_waiting_for_realtime:
+            # Current positions and pending orders are fetched by the shared
+            # realtime reconcile worker in that order.  Historical fills,
+            # historical orders and closed positions must not compete with
+            # that urgent account check during the initial page load.
+            self._history_sync_deferred_timer.start(15_000)
+        if hasattr(self, "_set_account_status"):
+            self._set_account_status("正在检查现有持仓...")
+        if hasattr(self, "_set_order_status"):
+            self._set_order_status("等待持仓检查完成后同步当前委托...")
         self._realtime_store.start(self._runtime)
-        if start_history:
-            self._request_history_sync(sources=("fills", "orders", "positions"), deep=False)
+        if start_history and not self._history_sync_waiting_for_realtime:
+            # Compatibility path for lightweight callers that do not install
+            # the shared history manager around this widget.
+            self._start_position_history_refresh(force_restart=False)
+            self._start_order_history_refresh(force_restart=False)
+            self._start_fill_history_refresh(force_restart=False)
+
+    @Slot()
+    def _start_deferred_history_sync(self) -> None:
+        if not self._history_sync_waiting_for_realtime or self._history_sync_started_after_realtime:
+            return
+        # The timer is only a safety wake-up.  Never start lower-priority
+        # history work while the urgent REST account check is still running.
+        if bool(getattr(self._realtime_store, "_reconcile_in_flight", False)):
+            self._history_sync_deferred_timer.start(5_000)
+            return
+        self._history_sync_deferred_timer.stop()
+        self._history_sync_waiting_for_realtime = False
+        self._history_sync_started_after_realtime = True
+        self._request_history_sync(sources=("orders", "positions", "fills"), deep=False)
 
     def _clear_pending_order_filters(self) -> None:
         self._pending_type_combo.setCurrentIndex(0)

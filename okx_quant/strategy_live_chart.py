@@ -359,10 +359,30 @@ def build_auto_channel_live_chart_snapshot(
     if resolved_triangle_config is None and channel_config is not None:
         resolved_triangle_config = TriangleDetectionConfig(pivot=channel_config.pivot)
 
-    channels = tuple(detect_channels(candle_items, channel_config))[: max(0, max_channels)]
-    boxes = tuple(detect_boxes(candle_items, box_config))[: max(0, max_boxes)]
-    trendlines = tuple(detect_trendlines(candle_items, resolved_trendline_config))[: max(0, max_trendlines)]
-    triangles = tuple(detect_triangles(candle_items, resolved_triangle_config))[: max(0, max_triangles)]
+    # Detection is intentionally opt-in per overlay type.  Some callers only
+    # need the current channel band; running the box/trendline/triangle
+    # searches anyway makes a large chart needlessly slow even though their
+    # results are discarded below.
+    channels = (
+        tuple(detect_channels(candle_items, channel_config))[:max(0, max_channels)]
+        if max_channels > 0
+        else ()
+    )
+    boxes = (
+        tuple(detect_boxes(candle_items, box_config))[:max(0, max_boxes)]
+        if max_boxes > 0
+        else ()
+    )
+    trendlines = (
+        tuple(detect_trendlines(candle_items, resolved_trendline_config))[:max(0, max_trendlines)]
+        if max_trendlines > 0
+        else ()
+    )
+    triangles = (
+        tuple(detect_triangles(candle_items, resolved_triangle_config))[:max(0, max_triangles)]
+        if max_triangles > 0
+        else ()
+    )
     pivot_config = channel_config.pivot if channel_config is not None else None
     pivots = tuple(detect_pivots(candle_items, pivot_config)) if show_pivots else ()
 

@@ -25,7 +25,13 @@ from roll_terminal_qt.account_positions_home import (
     _group_row_values_with_break_even,
     _position_display_foreground_colors,
 )
-from okx_quant.okx_client import Instrument, OkxFillHistoryItem, OkxOrderResult, OkxPositionHistoryItem
+from okx_quant.okx_client import (
+    Instrument,
+    OkxAccountOverview,
+    OkxFillHistoryItem,
+    OkxOrderResult,
+    OkxPositionHistoryItem,
+)
 from okx_quant.models import OptionTickBand
 from okx_quant.position_protection import ProtectionSessionSnapshot
 from roll_terminal_qt.order_service import OrderStatusView
@@ -404,6 +410,38 @@ class PositionDisplayForegroundColorsTest(TestCase):
 
 
 class AccountPositionsHistoryTabWiringTest(QtWidgetTestCase):
+    def test_account_equity_is_visible_on_positions_page(self) -> None:
+        overview = OkxAccountOverview(
+            total_equity=Decimal("2831.69499695"),
+            adjusted_equity=Decimal("2831.69499695"),
+            isolated_equity=Decimal("0"),
+            available_equity=Decimal("2802.47679695"),
+            unrealized_pnl=Decimal("29.218200"),
+            initial_margin=Decimal("100"),
+            maintenance_margin=Decimal("50"),
+            order_frozen=Decimal("0"),
+            notional_usd=Decimal("1000"),
+            details=(),
+            raw={},
+        )
+        with patch.object(AccountPositionsHomeWidget, "_start_private_threads"):
+            widget = AccountPositionsHomeWidget()
+            try:
+                widget._apply_positions_payload(
+                    {
+                        "positions": [],
+                        "position_instruments": {},
+                        "position_tickers": {},
+                        "upl_usdt_prices": {},
+                        "account_overview": overview,
+                    }
+                )
+                self.assertEqual(widget._equity_total_value.text(), "2831.69 USDT")
+                self.assertEqual(widget._equity_metric_labels["available_equity"].text(), "2802.48")
+                self.assertEqual(widget._equity_metric_labels["unrealized_pnl"].text(), "+29.22")
+            finally:
+                self.dispose_widget(widget)
+
     def test_active_history_table_click_is_wired_to_kline_handler(self) -> None:
         with (
             patch.object(AccountPositionsHomeWidget, "_start_private_threads"),

@@ -203,11 +203,51 @@ class OptionStrategyOptimizationTest(QtWidgetTestCase):
     def test_core_columns_hide_details_without_discarding_data(self):
         self.add_leg()
         self.assertFalse(self.window._legs_table.isColumnHidden(8))
-        self.assertTrue(self.window._legs_table.isColumnHidden(14))
-        before = self.window._legs_table.item(0, 12).text()
+        self.assertFalse(self.window._legs_table.isColumnHidden(9))
+        self.assertTrue(self.window._legs_table.isColumnHidden(15))
+        before = self.window._legs_table.item(0, 13).text()
         self.window._leg_details_check.setChecked(True)
-        self.assertFalse(self.window._legs_table.isColumnHidden(14))
-        self.assertEqual(self.window._legs_table.item(0, 12).text(), before)
+        self.assertFalse(self.window._legs_table.isColumnHidden(15))
+        self.assertEqual(self.window._legs_table.item(0, 13).text(), before)
+
+    def test_counterparty_price_uses_ask_for_buy_and_bid_for_sell(self):
+        self.add_leg()
+        inst_id = self.window._legs[0].inst_id
+        current = self.window._quotes_by_inst_id[inst_id]
+        self.window._quotes_by_inst_id[inst_id] = replace(
+            current,
+            bid_price=Decimal("0.0490"),
+            ask_price=Decimal("0.0510"),
+            last_price=Decimal("0.0500"),
+        )
+        self.window._render_legs()
+        self.assertEqual(self.window._legs_table.item(0, 9).text(), "0.0510")
+        self.window._legs[0].side = "sell"
+        self.window._render_legs()
+        self.assertEqual(self.window._legs_table.item(0, 9).text(), "0.0490")
+
+    def test_mark_price_does_not_fall_back_to_last_trade_price(self):
+        self.add_leg()
+        inst_id = self.window._legs[0].inst_id
+        current = self.window._quotes_by_inst_id[inst_id]
+        self.window._quotes_by_inst_id[inst_id] = replace(
+            current,
+            mark_price=None,
+            last_price=Decimal("0.0175"),
+            bid_price=Decimal("0.0090"),
+            ask_price=Decimal("0.0105"),
+        )
+        self.window._render_legs()
+        self.assertIsNone(self.window._leg_mark_price(inst_id))
+        self.assertEqual(self.window._legs_table.item(0, 11).text(), "-")
+
+        self.window._quotes_by_inst_id[inst_id] = replace(
+            self.window._quotes_by_inst_id[inst_id],
+            mark_price=Decimal("0.0073"),
+        )
+        self.window._render_legs()
+        self.assertEqual(self.window._leg_mark_price(inst_id), Decimal("0.0073"))
+        self.assertEqual(self.window._legs_table.item(0, 11).text(), "0.0073")
 
     def test_default_quantity_is_contracts_and_coin_conversion_is_visible(self):
         self.seed_chain()
@@ -217,6 +257,34 @@ class OptionStrategyOptimizationTest(QtWidgetTestCase):
         self.assertEqual(self.window._legs[0].quantity, Decimal("5"))
         self.assertEqual(self.window._legs_table.item(0, 6).text(), "5")
         self.assertEqual(self.window._legs_table.item(0, 7).text(), "0.05 BTC")
+
+    def test_combo_total_shows_contracts_net_premium_and_greeks(self):
+        self.add_leg()
+        self.window.add_selected_chain_leg("C", "sell")
+        self.window._legs[1].premium = Decimal("0.04")
+        self.window._legs[0].delta = Decimal("0.10")
+        self.window._legs[1].delta = Decimal("-0.03")
+        self.window._legs[0].gamma = Decimal("0.01")
+        self.window._legs[1].gamma = Decimal("-0.02")
+        self.window._legs[0].vega = Decimal("0.20")
+        self.window._legs[1].vega = Decimal("0.10")
+        self.window._legs[0].theta = Decimal("-0.04")
+        self.window._legs[1].theta = Decimal("0.01")
+        self.window._option_taker_fee_rate = Decimal("0.0003")
+        self.window._render_legs()
+        self.window._refresh_strategy_summary()
+
+        total_row = 2
+        self.assertIn("总 2 张", self.window._legs_table.item(total_row, 6).text())
+        self.assertIn("BTC 净支出 0.0001", self.window._legs_table.item(total_row, 14).text())
+        self.assertIn("含手续费 0.000006", self.window._legs_table.item(total_row, 14).text())
+        self.assertEqual(self.window._legs_table.item(total_row, 10).text(), "8.533")
+        self.assertEqual(self.window._legs_table.item(total_row, 12).text(), "0")
+        self.assertEqual(self.window._legs_table.item(total_row, 15).text(), "0.07")
+        self.assertIn("总张数 2", self.window._strategy_summary_label.text())
+        self.assertIn("净支出 0.0001 BTC", self.window._strategy_summary_label.text())
+        self.assertIn("手续费估算 0.000006 BTC", self.window._strategy_summary_label.text())
+        self.assertIn("Delta 0.07", self.window._strategy_summary_label.text())
 
     def test_double_click_edits_quantity_and_premium_only_on_correct_columns(self):
         self.add_leg()

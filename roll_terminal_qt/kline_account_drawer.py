@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+from decimal import Decimal
 from typing import Iterable
 
 from PySide6.QtCore import QThread, QTimer, Qt, Signal
@@ -22,6 +23,7 @@ from PySide6.QtWidgets import (
 
 from okx_quant.okx_client import OkxPosition, OkxTradeOrderItem
 from okx_quant.okx_client import OkxRestClient
+from okx_quant.pricing import format_decimal
 from roll_terminal_qt.account_positions_home import (
     POSITION_COLUMNS,
     _break_even_taker_fee_rate,
@@ -217,6 +219,79 @@ def order_display_ids(item: object) -> tuple[str, str]:
     return order_id, client_order_id
 
 
+def order_display_coin_size(item: object, instruments: dict[str, object] | None = None) -> str:
+    """Show the raw order size as an approximate base-coin amount.
+
+    OKX derivative orders use ``sz`` in contracts (张), while spot orders use
+    the base-coin quantity directly.  The instrument metadata is therefore
+    required for a reliable conversion; when it is unavailable we show ``-``
+    rather than guessing a contract value.
+    """
+    size = getattr(item, "size", None)
+    try:
+        quantity = Decimal(str(size))
+    except (TypeError, ValueError, ArithmeticError):
+        return "-"
+    if quantity < 0:
+        quantity = abs(quantity)
+    inst_id = str(getattr(item, "inst_id", "") or "").strip().upper()
+    inst_type = str(getattr(item, "inst_type", "") or "").strip().upper()
+    if not inst_id or quantity == 0:
+        return "-"
+    instrument = dict(instruments or {}).get(inst_id)
+    base_currency = inst_id.split("-", 1)[0] or "-"
+    if inst_type in {"SPOT", "MARGIN"}:
+        return f"{format_decimal(quantity)} {base_currency}"
+    if instrument is None:
+        return "-"
+    try:
+        contract_value = Decimal(str(getattr(instrument, "ct_val", None)))
+        multiplier_raw = getattr(instrument, "ct_mult", None)
+        multiplier = Decimal(str(multiplier_raw)) if multiplier_raw not in (None, "") else Decimal("1")
+    except (TypeError, ValueError, ArithmeticError):
+        return "-"
+    if contract_value <= 0 or multiplier <= 0:
+        return "-"
+    notional = quantity * contract_value * multiplier
+    value_currency = str(getattr(instrument, "ct_val_ccy", "") or "").strip().upper()
+    if value_currency in {"USD", "USDT", "USDC"}:
+        reference_price = None
+        for field_name in ("actual_price", "order_price", "price", "trigger_price"):
+            raw_price = getattr(item, field_name, None)
+            try:
+                candidate = Decimal(str(raw_price))
+            except (TypeError, ValueError, ArithmeticError):
+                continue
+            if candidate > 0:
+                reference_price = candidate
+                break
+        if reference_price is None:
+            return "-"
+        notional /= reference_price
+        value_currency = base_currency
+    if not value_currency:
+        value_currency = base_currency
+    return f"{format_decimal(notional)} {value_currency}"
+
+
+def _order_table_values(order: object, instruments: dict[str, object] | None = None) -> list[object]:
+    return [
+        getattr(order, "inst_id", ""),
+        getattr(order, "source_label", "") or order_source_kind(order),
+        order_display_direction(order),
+        getattr(order, "ord_type", ""),
+        order_display_price(order),
+        getattr(order, "size", ""),
+        getattr(order, "filled_size", ""),
+        order_display_coin_size(order, instruments),
+        getattr(order, "state", ""),
+        getattr(order, "update_time", None) or getattr(order, "created_time", None) or "",
+        order_display_tp_sl(order),
+        order_display_ids(order)[0],
+        order_display_ids(order)[1],
+    ]
+
+
 class AccountDrawerLoadThread(QThread):
     completed = Signal(int, object)
     failed = Signal(int, str)
@@ -328,6 +403,13 @@ class KlineAccountDrawer(QWidget):
         self._load_thread: AccountDrawerLoadThread | None = None
         self._cancel_thread: AccountDrawerCancelThread | None = None
         self._cancel_in_flight = False
+        # Current positions are the urgent source of truth.  Defer the shared
+        # current-order refresh until the REST position check has completed.
+        self._orders_refresh_waiting_for_realtime = False
+        self._orders_refresh_started_after_realtime = False
+        self._orders_refresh_deferred_timer = QTimer(self)
+        self._orders_refresh_deferred_timer.setSingleShot(True)
+        self._orders_refresh_deferred_timer.timeout.connect(self._start_deferred_order_refresh)
         self._shared_order_store = get_shared_order_store()
         self._shared_order_store.snapshot_changed.connect(self._apply_shared_order_snapshot)
         self._shared_order_store.refresh_failed.connect(self._apply_shared_order_refresh_error)
@@ -373,8 +455,9 @@ class KlineAccountDrawer(QWidget):
                 "方向",
                 "类型",
                 "价格/触发价",
-                "数量",
-                "已成交",
+                "数量（张）",
+                "已成交（张）",
+                "折合币数",
                 "状态",
                 "更新时间",
                 "TP/SL",
@@ -415,8 +498,9 @@ class KlineAccountDrawer(QWidget):
                 "方向",
                 "类型",
                 "价格/触发价",
-                "数量",
-                "已成交",
+                "数量（张）",
+                "已成交（张）",
+                "折合币数",
                 "状态",
                 "更新时间",
                 "TP/SL",
@@ -571,21 +655,9 @@ class KlineAccountDrawer(QWidget):
     def _populate_orders_table(self, orders: list[object]) -> None:
         self._visible_orders = list(orders)
         self._orders_table.setRowCount(len(orders))
+        instruments = dict(self._snapshot.position_instruments or {})
         for row, order in enumerate(orders):
-            values = [
-                getattr(order, "inst_id", ""),
-                getattr(order, "source_label", "") or order_source_kind(order),
-                order_display_direction(order),
-                getattr(order, "ord_type", ""),
-                order_display_price(order),
-                getattr(order, "size", ""),
-                getattr(order, "filled_size", ""),
-                getattr(order, "state", ""),
-                getattr(order, "update_time", None) or getattr(order, "created_time", None) or "",
-                order_display_tp_sl(order),
-                order_display_ids(order)[0],
-                order_display_ids(order)[1],
-            ]
+            values = _order_table_values(order, instruments)
             for column, value in enumerate(values):
                 item = QTableWidgetItem(self._format_value(value))
                 self._orders_table.setItem(row, column, item)
@@ -617,21 +689,9 @@ class KlineAccountDrawer(QWidget):
 
     def _populate_history_orders_table(self, orders: list[object]) -> None:
         self._history_orders_table.setRowCount(len(orders))
+        instruments = dict(self._snapshot.position_instruments or {})
         for row, order in enumerate(orders):
-            values = [
-                getattr(order, "inst_id", ""),
-                getattr(order, "source_label", "") or order_source_kind(order),
-                order_display_direction(order),
-                getattr(order, "ord_type", ""),
-                order_display_price(order),
-                getattr(order, "size", ""),
-                getattr(order, "filled_size", ""),
-                getattr(order, "state", ""),
-                getattr(order, "update_time", None) or getattr(order, "created_time", None) or "",
-                order_display_tp_sl(order),
-                order_display_ids(order)[0],
-                order_display_ids(order)[1],
-            ]
+            values = _order_table_values(order, instruments)
             for column, value in enumerate(values):
                 item = QTableWidgetItem(self._format_value(value))
                 self._history_orders_table.setItem(row, column, item)
@@ -739,6 +799,9 @@ def _shared_set_context(
     self._environment = environment
     self._symbol = normalized_symbol
     if changed:
+        self._orders_refresh_deferred_timer.stop()
+        self._orders_refresh_waiting_for_realtime = False
+        self._orders_refresh_started_after_realtime = False
         self._load_shared_order_snapshot()
         if runtime is not None:
             self._realtime_store.start_if_needed(runtime)
@@ -763,10 +826,34 @@ def _shared_refresh_data(self: KlineAccountDrawer) -> None:
     # loop pass, so the drawer itself can become visible without waiting for
     # any table construction or network reconciliation.
     self._schedule_active_table_refresh()
-    self._shared_order_store.request_refresh(runtime=self._runtime, profile_name=self._profile_name)
+    self._orders_refresh_deferred_timer.stop()
+    self._orders_refresh_waiting_for_realtime = True
+    self._orders_refresh_started_after_realtime = False
+    # Keep a bounded fallback for an unavailable REST endpoint.  This preserves
+    # the priority while avoiding an indefinitely waiting drawer.
+    self._orders_refresh_deferred_timer.start(15_000)
     self._realtime_store.start_if_needed(self._runtime)
     self._realtime_store.request_reconcile("drawer")
-    self._status_label.setText("同步持仓中...")
+    self._status_label.setText("正在检查现有持仓...")
+
+
+def _start_deferred_order_refresh(self: KlineAccountDrawer) -> None:
+    if not self._orders_refresh_waiting_for_realtime or self._orders_refresh_started_after_realtime:
+        return
+    # The timer is only a safety wake-up.  Never start the lower-priority
+    # current-order refresh while the urgent REST account check is in flight.
+    if bool(getattr(self._realtime_store, "_reconcile_in_flight", False)):
+        self._orders_refresh_deferred_timer.start(5_000)
+        return
+    self._orders_refresh_deferred_timer.stop()
+    self._orders_refresh_waiting_for_realtime = False
+    self._orders_refresh_started_after_realtime = True
+    if self._runtime is None:
+        return
+    self._shared_order_store.request_refresh(runtime=self._runtime, profile_name=self._profile_name)
+    self._status_label.setText(
+        f"现有持仓已检查，正在同步当前委托（{len(self._snapshot.positions)} 条持仓）..."
+    )
 
 
 def _shared_apply_snapshot(self: KlineAccountDrawer, generation: int, snapshot: AccountDrawerSnapshot) -> None:
@@ -810,6 +897,20 @@ def _shared_apply_shared_order_snapshot(
         orders=tuple(snapshot.current_order_items),
         order_history=tuple(snapshot.history_orders),
     )
+    known_order_instruments = dict(self._snapshot.position_instruments or {})
+    missing_order_instruments = {
+        str(getattr(order, "inst_id", "") or "").strip().upper()
+        for order in snapshot.current_order_items
+        if str(getattr(order, "inst_id", "") or "").strip().upper()
+        and str(getattr(order, "inst_id", "") or "").strip().upper()
+        not in known_order_instruments
+    }
+    if missing_order_instruments and self._runtime is not None:
+        # A new order may exist before the next account reconciliation and
+        # may have no matching open position.  Ask the shared account store
+        # for one bounded reconciliation so its public instrument metadata is
+        # available for the conversion column.
+        self._realtime_store.request_reconcile("order instrument")
     self._status_label.setText(f"委托 {len(self._snapshot.orders)} | 持仓 {len(self._snapshot.positions)}")
     self._schedule_active_table_refresh()
 
@@ -830,6 +931,8 @@ def _shared_apply_realtime_snapshot(self: KlineAccountDrawer, snapshot: object) 
     # Avoid constructing any wide tables while the drawer is collapsed; when
     # visible, coalesce updates and repaint the selected tab only.
     self._schedule_active_table_refresh()
+    if snapshot.source == "rest":
+        _start_deferred_order_refresh(self)
 
 
 def _shared_apply_shared_order_refresh_error(
@@ -850,3 +953,4 @@ KlineAccountDrawer._load_shared_order_snapshot = _shared_load_shared_order_snaps
 KlineAccountDrawer._apply_shared_order_snapshot = _shared_apply_shared_order_snapshot
 KlineAccountDrawer._apply_shared_order_refresh_error = _shared_apply_shared_order_refresh_error
 KlineAccountDrawer._apply_realtime_snapshot = _shared_apply_realtime_snapshot
+KlineAccountDrawer._start_deferred_order_refresh = _start_deferred_order_refresh

@@ -15,6 +15,7 @@ from roll_terminal_qt.kline_account_drawer import (
     KlineAccountDrawer,
     filter_account_items,
     order_cancel_reference,
+    order_display_coin_size,
     order_source_kind,
 )
 from roll_terminal_qt.account_positions_home import POSITION_COLUMNS
@@ -58,6 +59,24 @@ class KlineAccountDrawerHelperTests(TestCase):
         self.assertEqual(order_cancel_reference(normal), "ord-1")
         self.assertEqual(order_source_kind(algo), "algo")
         self.assertEqual(order_cancel_reference(algo), "algo-1")
+
+    def test_order_display_coin_size_uses_contract_value(self) -> None:
+        order = SimpleNamespace(
+            inst_id="BTC-USDT-SWAP",
+            inst_type="SWAP",
+            size=Decimal("6.75"),
+            price=Decimal("83609"),
+        )
+        instrument = SimpleNamespace(
+            ct_val=Decimal("0.01"),
+            ct_mult=Decimal("1"),
+            ct_val_ccy="BTC",
+        )
+
+        self.assertEqual(
+            order_display_coin_size(order, {"BTC-USDT-SWAP": instrument}),
+            "0.0675 BTC",
+        )
 
 
 class KlineAccountDrawerWidgetTests(QtWidgetTestCase):
@@ -269,7 +288,16 @@ class KlineAccountDrawerWidgetTests(QtWidgetTestCase):
                 inst_type="SWAP",
             )
             drawer._symbol = "BTC-USDT-SWAP"
-            drawer._snapshot = AccountDrawerSnapshot(orders=(algo_order,))
+            drawer._snapshot = AccountDrawerSnapshot(
+                orders=(algo_order,),
+                position_instruments={
+                    "BTC-USDT-SWAP": SimpleNamespace(
+                        ct_val=Decimal("0.01"),
+                        ct_mult=Decimal("1"),
+                        ct_val_ccy="BTC",
+                    )
+                },
+            )
             drawer._refresh_tables()
 
             headers = [
@@ -285,6 +313,7 @@ class KlineAccountDrawerWidgetTests(QtWidgetTestCase):
 
             self.assertIn("TP 65000", drawer._orders_table.item(0, tp_sl_col).text())
             self.assertIn("SL 59000", drawer._orders_table.item(0, tp_sl_col).text())
+            self.assertEqual(drawer._orders_table.item(0, headers.index("折合币数")).text(), "0.026 BTC")
             self.assertEqual(drawer._orders_table.item(0, order_id_col).text(), "3730927321386143744")
             self.assertEqual(drawer._orders_table.item(0, cl_ord_col).text(), "rrsto77e9a3508b0457d3688e9631")
             self.assertEqual(drawer._orders_table.item(0, direction_col).text(), "卖出")

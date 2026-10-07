@@ -154,6 +154,10 @@ _RR_MULTIPLE_STEP = Decimal("0.1")
 _RR_DRAG_ACTIVATION_DISTANCE_PX = 6.0
 _BOX_HISTORY_SCAN_LIMIT = 240
 _BOX_HISTORY_MAX_SEGMENTS = 8
+# The chart layer renders only the currently active channel.  Searching the
+# full 1200-bar history is prohibitively expensive and does not improve the
+# current structure shown to the user.
+_AUTO_CHANNEL_SCAN_LIMIT = 240
 _BOX_HISTORY_OUTLINE_COLOR = "#f97316"
 _BOX_HISTORY_FILL_COLOR = "#f97316"
 _BOX_ACTIVE_OUTLINE_COLOR = "#fb923c"
@@ -2419,9 +2423,11 @@ def _build_channel_current_overlays(
     """Reuse the research module's channel detector as a K-line chart layer."""
     if len(candles) < 12:
         return []
+    scan_candles = list(candles[-_AUTO_CHANNEL_SCAN_LIMIT:])
+    scan_offset = len(candles) - len(scan_candles)
     snapshot = build_auto_channel_live_chart_snapshot(
         session_id="kline-auto-channel",
-        candles=list(candles),
+        candles=scan_candles,
         channel_config=config,
         max_channels=1,
         max_boxes=0,
@@ -2438,8 +2444,8 @@ def _build_channel_current_overlays(
         overlays.append(
             {
                 "mode": "current",
-                "start_index": start_index,
-                "end_index": end_index,
+                "start_index": start_index + scan_offset,
+                "end_index": end_index + scan_offset,
                 "upper_start": float(item.upper_line.value_at(start_index)),
                 "upper_end": float(item.upper_line.value_at(end_index)),
                 "lower_start": float(item.lower_line.value_at(start_index)),

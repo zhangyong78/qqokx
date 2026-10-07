@@ -1184,6 +1184,44 @@ class OkxRestClient:
                     raw=row,
                 )
             )
+        # OKX 的期权 /api/v5/market/tickers 经常不返回 markPx，只返回
+        # last/bid/ask。标记价不能用最新成交价代替，因此在缺失时用同一
+        # 品种的 public/mark-price 批量补齐，避免上层把 last 误显示成标记价。
+        if inst_type.upper() == "OPTION" and any(item.mark is None for item in items):
+            try:
+                mark_params = {"instType": "OPTION"}
+                family = str(inst_family or uly or "").strip().upper()
+                if family:
+                    mark_params["uly"] = family
+                mark_payload = self._request(
+                    "GET",
+                    "/api/v5/public/mark-price",
+                    params=mark_params,
+                )
+                marks = {
+                    str(row.get("instId") or "").strip().upper(): _to_decimal(row.get("markPx"))
+                    for row in mark_payload.get("data", [])
+                    if isinstance(row, dict) and row.get("instId")
+                }
+                if marks:
+                    items = [
+                        item
+                        if item.mark is not None or marks.get(item.inst_id.upper()) is None
+                        else OkxTicker(
+                            inst_id=item.inst_id,
+                            last=item.last,
+                            bid=item.bid,
+                            ask=item.ask,
+                            mark=marks[item.inst_id.upper()],
+                            index=item.index,
+                            raw={**item.raw, "markPx": str(marks[item.inst_id.upper()])},
+                        )
+                        for item in items
+                    ]
+            except Exception:
+                # 标记价接口短暂不可用时仍保留盘口/成交价，调用方可以明确
+                # 处理 mark=None；绝不能静默把 last 写入 mark。
+                pass
         items.sort(key=lambda item: item.inst_id)
         return items
 
@@ -1192,7 +1230,23 @@ class OkxRestClient:
         if not payload["data"]:
             raise OkxApiError(f"OKX 鏈繑鍥炶鎯咃細{inst_id}")
         first = payload["data"][0]
-        return self._build_ticker_from_public_item(inst_id=inst_id, item=first)
+        ticker = self._build_ticker_from_public_item(inst_id=inst_id, item=first)
+        if ticker.mark is None and infer_inst_type(inst_id) == "OPTION":
+            try:
+                mark_price = self.get_mark_price(inst_id)
+            except Exception:
+                mark_price = None
+            if mark_price is not None:
+                ticker = OkxTicker(
+                    inst_id=ticker.inst_id,
+                    last=ticker.last,
+                    bid=ticker.bid,
+                    ask=ticker.ask,
+                    mark=mark_price,
+                    index=ticker.index,
+                    raw={**ticker.raw, "markPx": str(mark_price)},
+                )
+        return ticker
 
     def get_order_book(self, inst_id: str, depth: int = 50) -> OkxOrderBook:
         size = max(1, min(depth, 400))

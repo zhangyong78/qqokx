@@ -669,6 +669,35 @@ class RollTerminalQtWindowHelperTests(QtWidgetTestCase):
         self.assertEqual(overlays[0]["upper_start"], 101.0)
         self.assertEqual(overlays[0]["lower_start"], 99.0)
 
+    def test_current_channel_overlay_scans_only_recent_candles_and_rebases_indices(self) -> None:
+        class Line:
+            def value_at(self, _index: int) -> Decimal:
+                return Decimal("100")
+
+        band = SimpleNamespace(
+            start_index=4,
+            end_index=9,
+            upper_line=Line(),
+            lower_line=Line(),
+            label="自动通道",
+            outline="#2563eb",
+            fill="#dbeafe",
+        )
+        candles = [
+            Candle(index * 60_000, Decimal("100"), Decimal("102"), Decimal("98"), Decimal("100"), Decimal("1"), False)
+            for index in range(300)
+        ]
+
+        with patch(
+            "roll_terminal_qt.kline_analysis_window.build_auto_channel_live_chart_snapshot",
+            return_value=SimpleNamespace(band_overlays=(band,)),
+        ) as build_snapshot:
+            overlays = _build_channel_current_overlays(candles)
+
+        self.assertEqual(len(build_snapshot.call_args.kwargs["candles"]), 240)
+        self.assertEqual(overlays[0]["start_index"], 64)
+        self.assertEqual(overlays[0]["end_index"], 69)
+
     def test_disabled_auto_channel_does_not_expose_channel_layer(self) -> None:
         check = MagicMock()
         check.isChecked.return_value = False

@@ -660,6 +660,63 @@ class OkxHistoryParsingTest(TestCase):
         self.assertEqual(items[0].mark, Decimal("0.0121"))
         self.assertEqual(items[0].index, Decimal("98500"))
 
+    def test_get_option_tickers_fills_missing_mark_from_public_mark_price(self) -> None:
+        client = OkxRestClient()
+        requests: list[tuple[str, dict[str, str]]] = []
+
+        def _stub_request(method: str, path: str, params=None, **kwargs):
+            requests.append((path, dict(params or {})))
+            if path == "/api/v5/market/tickers":
+                return {
+                    "data": [{
+                        "instId": "BTC-USD-261005-85000-C",
+                        "last": "0.0175",
+                        "bidPx": "0.0090",
+                        "askPx": "0.0105",
+                        "idxPx": "85000",
+                    }]
+                }
+            self.assertEqual(path, "/api/v5/public/mark-price")
+            return {
+                "data": [{
+                    "instId": "BTC-USD-261005-85000-C",
+                    "markPx": "0.0073",
+                }]
+            }
+
+        client._request = _stub_request  # type: ignore[method-assign]
+        items = client.get_tickers("OPTION", inst_family="BTC-USD")
+
+        self.assertEqual(items[0].last, Decimal("0.0175"))
+        self.assertEqual(items[0].mark, Decimal("0.0073"))
+        self.assertEqual(requests[1][0], "/api/v5/public/mark-price")
+        self.assertEqual(requests[1][1]["uly"], "BTC-USD")
+
+    def test_get_option_ticker_fills_missing_mark_from_public_mark_price(self) -> None:
+        client = OkxRestClient()
+        requests: list[str] = []
+
+        def _stub_request(method: str, path: str, params=None, **kwargs):
+            requests.append(path)
+            if path == "/api/v5/market/ticker":
+                return {
+                    "data": [{
+                        "instId": "BTC-USD-261005-85000-C",
+                        "last": "0.0175",
+                        "bidPx": "0.0090",
+                        "askPx": "0.0105",
+                    }]
+                }
+            self.assertEqual(path, "/api/v5/public/mark-price")
+            return {"data": [{"markPx": "0.0073", "ts": "1"}]}
+
+        client._request = _stub_request  # type: ignore[method-assign]
+        ticker = client.get_ticker("BTC-USD-261005-85000-C")
+
+        self.assertEqual(ticker.last, Decimal("0.0175"))
+        self.assertEqual(ticker.mark, Decimal("0.0073"))
+        self.assertEqual(requests, ["/api/v5/market/ticker", "/api/v5/public/mark-price"])
+
     def test_get_mark_price_candles_pages_when_limit_exceeds_public_cap(self) -> None:
         client = OkxRestClient()
         requests: list[dict[str, str]] = []

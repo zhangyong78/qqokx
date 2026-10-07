@@ -8,7 +8,7 @@ from PySide6.QtCore import QThread, Signal
 
 from okx_quant.arbitrage.models import ArbitrageTradeRuntime
 from okx_quant.models import Instrument
-from okx_quant.okx_client import OkxPosition, OkxRestClient
+from okx_quant.okx_client import OkxAccountOverview, OkxPosition, OkxRestClient
 from okx_quant.ui_shell import _build_position_instrument_map, _build_position_ticker_map, _build_upl_usdt_price_map
 
 
@@ -58,8 +58,9 @@ class AccountFeedThread(QThread):
             try:
                 raw_positions = self._load_raw_positions()
                 positions = [self._to_view(item) for item in raw_positions]
-                self.payload_ready.emit(self._build_payload(raw_positions))
-                spot_balances = self._load_spot_balance_lookup()
+                account_overview = self._load_account_overview()
+                self.payload_ready.emit(self._build_payload(raw_positions, account_overview))
+                spot_balances = self._load_spot_balance_lookup(account_overview)
                 self.positions_ready.emit(positions)
                 self.spot_balances_ready.emit(spot_balances)
                 self.status_changed.emit(self._build_status_text(len(positions)))
@@ -101,7 +102,11 @@ class AccountFeedThread(QThread):
         ]
         return rest_positions
 
-    def _build_payload(self, positions: list[OkxPosition]) -> dict[str, object]:
+    def _build_payload(
+        self,
+        positions: list[OkxPosition],
+        account_overview: OkxAccountOverview | None = None,
+    ) -> dict[str, object]:
         try:
             upl_usdt_prices = _build_upl_usdt_price_map(self._client, positions)
         except Exception:
@@ -119,17 +124,31 @@ class AccountFeedThread(QThread):
             "upl_usdt_prices": upl_usdt_prices,
             "position_instruments": position_instruments,
             "position_tickers": position_tickers,
+            "account_overview": account_overview,
         }
 
-    def _load_spot_balance_lookup(self) -> dict[str, str]:
+    def _load_account_overview(self) -> OkxAccountOverview | None:
         assert self._runtime is not None
-        overview = None
-        cached_payload = self._client.get_cached_private_account_overview(
-            self._runtime.credentials,
-            environment=self._runtime.environment,
-        )
+        try:
+            cached_payload = self._client.get_cached_private_account_overview(
+                self._runtime.credentials,
+                environment=self._runtime.environment,
+            )
+        except Exception:
+            cached_payload = None
         if cached_payload is not None:
-            _, overview = cached_payload
+            return cached_payload[1]
+        try:
+            return self._client.get_account_overview(
+                self._runtime.credentials,
+                environment=self._runtime.environment,
+                prefer_cache=False,
+            )
+        except Exception:
+            return None
+
+    def _load_spot_balance_lookup(self, overview: OkxAccountOverview | None = None) -> dict[str, str]:
+        assert self._runtime is not None
         if overview is None:
             try:
                 overview = self._client.get_account_overview(
