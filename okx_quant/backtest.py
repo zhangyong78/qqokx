@@ -79,6 +79,7 @@ from okx_quant.strategy_catalog import (
     is_btc_ema55_slope_short_strategy,
     is_triple_ema_strategy,
     resolve_dynamic_signal_mode,
+    resolve_triple_ema_signal_mode,
 )
 
 
@@ -108,9 +109,6 @@ EXIT_REASON_LABELS = {
     "slope_turn_positive": "斜率转正平仓",
     "trend_ema_close_exit": "跌破趋势EMA收盘平仓",
     "ema15_close_exit": "EMA15收破离场",
-    "triple_ema_sideway_exit": "三均线转震荡平仓",
-    "triple_ema_reverse_to_long": "三均线反手做多",
-    "triple_ema_reverse_to_short": "三均线反手做空",
 }
 
 
@@ -3121,6 +3119,9 @@ def _triple_ema_open_position(
         return None
     stop_loss, stop_source = stop
     resolved_config = _resolve_backtest_config(config, trades)
+    dynamic_rules = _dynamic_protection_rules(resolved_config)
+    dynamic_enabled = str(resolved_config.take_profit_mode or "") == "dynamic"
+    first_dynamic_trigger_r = _first_dynamic_rule_trigger_r(resolved_config) if dynamic_rules else 2
     size = _determine_backtest_order_size(
         instrument=instrument,
         config=resolved_config,
@@ -3145,6 +3146,15 @@ def _triple_ema_open_position(
         exit_slippage_rate=config.resolved_backtest_exit_slippage_rate(),
         funding_rate=config.backtest_funding_rate,
         entry_sequence=entry_sequence,
+        dynamic_take_profit_enabled=dynamic_enabled,
+        dynamic_exit_fee_rate=taker_fee_rate,
+        dynamic_two_r_break_even=bool(resolved_config.dynamic_two_r_break_even),
+        dynamic_break_even_trigger_r=resolved_config.resolved_dynamic_break_even_trigger_r(),
+        dynamic_first_lock_r=resolved_config.resolved_dynamic_first_lock_r(),
+        dynamic_trailing_step_r=resolved_config.resolved_dynamic_trailing_step_r(),
+        dynamic_fee_offset_enabled=bool(resolved_config.dynamic_fee_offset_enabled),
+        dynamic_protection_rules=dynamic_rules,
+        next_dynamic_trigger_r=first_dynamic_trigger_r,
         take_profit_enabled=False,
         metadata={
             "entry_signal_index": signal_index,
@@ -3242,8 +3252,9 @@ def _run_triple_ema_backtest(
         _triple_ema_trend_state(fast_value, middle_value, slow_value)
         for fast_value, middle_value, slow_value in zip(fast_values, middle_values, slow_values)
     ]
-    allow_long = config.signal_mode != "short_only"
-    allow_short = config.signal_mode != "long_only"
+    signal_mode = resolve_triple_ema_signal_mode(config.strategy_id, str(config.signal_mode or "both"))
+    allow_long = signal_mode != "short_only"
+    allow_short = signal_mode != "long_only"
     trades: list[BacktestTrade] = []
     open_position: _OpenPosition | None = None
     pending_action: str | None = None
@@ -3255,29 +3266,7 @@ def _run_triple_ema_backtest(
         opened_this_candle = False
 
         if pending_action is not None:
-            if pending_action in {"exit", "reverse_to_long", "reverse_to_short"} and open_position is not None:
-                exit_reason = (
-                    "triple_ema_sideway_exit"
-                    if pending_action == "exit"
-                    else f"triple_ema_{pending_action}"
-                )
-                trades.append(
-                    _triple_ema_close_at_open(
-                        open_position,
-                        candle,
-                        index,
-                        exit_reason=exit_reason,
-                        taker_fee_rate=taker_fee_rate,
-                    )
-                )
-                open_position = None
-
-            action_signal = {
-                "buy": "long",
-                "sell": "short",
-                "reverse_to_long": "long",
-                "reverse_to_short": "short",
-            }.get(pending_action)
+            action_signal = {"buy": "long", "sell": "short"}.get(pending_action)
             if action_signal is not None and open_position is None:
                 entry_sequence += 1
                 open_position = _triple_ema_open_position(
@@ -3328,16 +3317,7 @@ def _run_triple_ema_backtest(
                 pending_action = "buy"
             elif current_state == "DOWNTREND" and previous_state != "DOWNTREND" and allow_short:
                 pending_action = "sell"
-        elif open_position.signal == "long":
-            if current_state == "SIDEWAY":
-                pending_action = "exit"
-            elif current_state == "DOWNTREND":
-                pending_action = "reverse_to_short" if allow_short else "exit"
-        else:
-            if current_state == "SIDEWAY":
-                pending_action = "exit"
-            elif current_state == "UPTREND":
-                pending_action = "reverse_to_long" if allow_long else "exit"
+        # 持仓期间不因震荡或趋势反向平仓/反手，只由普通止损和移动止损管理。
         if pending_action is not None:
             pending_signal_index = index
 
@@ -6317,7 +6297,7 @@ def _append_backtest_strategy_notes(
             "交易逻辑：快EMA>中EMA>慢EMA时形成上升趋势，快EMA<中EMA<慢EMA时形成下降趋势，其余均为震荡。"
         )
         lines.append(
-            "成交规则：仅在趋势首次形成时入场；持仓后趋势反向则反手，转震荡则平仓。所有信号在收盘确认，并在下一根K线开盘成交。"
+            "成交规则：仅在趋势首次形成时入场；持仓期间趋势反向或转震荡不平仓、不反手。所有信号在收盘确认，并在下一根K线开盘成交。"
         )
         lines.append(f"初始止损：{stop_text}；不设置固定止盈。")
         lines.append("费用口径：开仓、信号平仓和止损均按 Taker 手续费，并计入项目现有滑点配置。")

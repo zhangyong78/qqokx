@@ -17,10 +17,10 @@ from okx_quant.strategy_runtime_registry import (
 )
 from okx_quant.strategy_catalog import (
     STRATEGY_DEFINITIONS,
-    STRATEGY_TRIPLE_EMA_ID,
     StrategyDefinition,
     get_strategy_definition,
     is_ema55_slope_short_strategy,
+    is_triple_ema_strategy,
     supports_startup_chase_current_signal,
 )
 from okx_quant.models import (
@@ -6534,6 +6534,11 @@ class UiStrategySessionsMixin:
             passphrase=passphrase,
             profile_name=self._current_credential_profile(),
         )
+        raw_take_profit_mode = str(self.take_profit_mode_label.get()).strip()
+        resolved_take_profit_mode = TAKE_PROFIT_MODE_OPTIONS.get(
+            raw_take_profit_mode,
+            raw_take_profit_mode if raw_take_profit_mode in {"fixed", "dynamic"} else "dynamic",
+        )
         config = StrategyConfig(
             inst_id=symbol,
             bar=str(self._resolve_strategy_parameter_value(strategy_id, "bar", self.bar.get())),
@@ -6583,12 +6588,12 @@ class UiStrategySessionsMixin:
             atr_period=self._parse_positive_int(self.atr_period.get(), "ATR 周期"),
             atr_stop_multiplier=(
                 self._parse_nonnegative_decimal(self.stop_atr.get(), "初始止损 ATR 倍数")
-                if strategy_id == STRATEGY_TRIPLE_EMA_ID
+                if is_triple_ema_strategy(strategy_id)
                 else self._parse_positive_decimal(self.stop_atr.get(), "止损 ATR 倍数")
             ),
             atr_take_multiplier=(
                 Decimal("1")
-                if strategy_id == STRATEGY_TRIPLE_EMA_ID
+                if is_triple_ema_strategy(strategy_id)
                 else self._parse_positive_decimal(self.take_atr.get(), "止盈 ATR 倍数")
             ),
             order_size=order_size,
@@ -6605,7 +6610,7 @@ class UiStrategySessionsMixin:
             local_tp_sl_inst_id=local_tp_sl_symbol,
             entry_side_mode=entry_side_mode,
             run_mode=run_mode,
-            take_profit_mode=TAKE_PROFIT_MODE_OPTIONS[self.take_profit_mode_label.get()],
+            take_profit_mode=resolved_take_profit_mode,
             max_entries_per_trend=max_entries_per_trend,
             trend_ema_slope_filter_enabled=trend_ema_slope_filter_enabled,
             trend_ema_slope_filter_min_ratio=trend_ema_slope_filter_min_ratio,

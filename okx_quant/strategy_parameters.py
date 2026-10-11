@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Literal
 
 from okx_quant.strategy_catalog import (
@@ -21,6 +21,8 @@ from okx_quant.strategy_catalog import (
     STRATEGY_EMA_BREAKDOWN_SHORT_ID,
     STRATEGY_EMA_BREAKOUT_LONG_ID,
     STRATEGY_TRIPLE_EMA_ID,
+    STRATEGY_TRIPLE_EMA_LONG_ID,
+    STRATEGY_TRIPLE_EMA_SHORT_ID,
 )
 
 PageScope = Literal["launcher", "backtest", "observer"]
@@ -141,10 +143,19 @@ STRATEGY_PARAMETER_PROFILES: dict[str, StrategyParameterProfile] = {
             "big_ema_period",
             "atr_period",
             "atr_stop_multiplier",
+            "take_profit_mode",
+            "dynamic_two_r_break_even",
+            "dynamic_break_even_trigger_r",
+            "dynamic_protection_rules",
+            "dynamic_fee_offset_enabled",
+            "ema55_slope_lock_profit_trigger_r",
+            "dynamic_first_lock_r",
+            "dynamic_trailing_step_r",
         ),
         fixed_values={
             "ema_type": "ema",
             "trend_ema_type": "ema",
+            "take_profit_mode": "dynamic",
         },
     ),
     STRATEGY_DYNAMIC_ID: StrategyParameterProfile(
@@ -653,6 +664,17 @@ STRATEGY_PARAMETER_PROFILES: dict[str, StrategyParameterProfile] = {
         fixed_values={"signal_mode": "short_only"},
     ),
 }
+
+_TRIPLE_EMA_BASE_PROFILE = STRATEGY_PARAMETER_PROFILES[STRATEGY_TRIPLE_EMA_ID]
+for _strategy_id, _signal_mode in (
+    (STRATEGY_TRIPLE_EMA_LONG_ID, "long_only"),
+    (STRATEGY_TRIPLE_EMA_SHORT_ID, "short_only"),
+):
+    STRATEGY_PARAMETER_PROFILES[_strategy_id] = replace(
+        _TRIPLE_EMA_BASE_PROFILE,
+        strategy_id=_strategy_id,
+        fixed_values={**_TRIPLE_EMA_BASE_PROFILE.fixed_values, "signal_mode": _signal_mode},
+    )
 
 
 def get_parameter_definition(key: str) -> ParameterDefinition:

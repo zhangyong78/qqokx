@@ -14,10 +14,10 @@ from okx_quant.strategy_catalog import (
     STRATEGY_EMA5_EMA8_ID,
     STRATEGY_EMA55_SLOPE_SHORT_ID,
     STRATEGY_EMA_BREAKDOWN_SHORT_ID,
-    STRATEGY_TRIPLE_EMA_ID,
     is_dynamic_mtf_strategy_id,
     is_dynamic_strategy_id,
     is_ema_atr_breakout_strategy,
+    is_triple_ema_strategy,
     resolve_dynamic_signal_mode,
 )
 
@@ -163,7 +163,7 @@ def get_strategy_runtime_profile(strategy_id: str) -> StrategyRuntimeProfile:
         return _EMA5_EMA8_PROFILE
     if strategy_id == STRATEGY_ADAPTIVE_EMA_RAIL_LONG_ID:
         return _ADAPTIVE_EMA_RAIL_PROFILE
-    if strategy_id == STRATEGY_TRIPLE_EMA_ID:
+    if is_triple_ema_strategy(strategy_id):
         return _TRIPLE_EMA_PROFILE
     raise KeyError(f"unknown strategy runtime profile: {strategy_id}")
 

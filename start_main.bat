@@ -5,14 +5,10 @@ cd /d "%~dp0"
 set "QQOKX_DATA_DIR=D:\qqokx_data"
 set "MPLCONFIGDIR=%~dp0.mplconfig"
 
-if exist ".venv\Scripts\pythonw.exe" (
-    start "QQOKX Workbench" ".venv\Scripts\pythonw.exe" "%~dp0main.py"
-    exit /b 0
-)
-
 if exist ".venv\Scripts\python.exe" (
-    start "QQOKX Workbench" ".venv\Scripts\python.exe" "%~dp0main.py"
-    exit /b 0
+    ".venv\Scripts\python.exe" "%~dp0main.py"
+    pause
+    exit /b %errorlevel%
 )
 
 echo [ERROR] Project virtual environment not found: .venv

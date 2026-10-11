@@ -145,7 +145,7 @@ class TripleEmaStrategyTest(TestCase):
         entry_index = int(signals["long_entry"].to_numpy().argmax())
         self.assertEqual(generate_signal(signals.iloc[: entry_index + 1], position=None).action, "buy")
 
-    def test_position_exit_and_reverse_rules(self) -> None:
+    def test_position_holds_through_sideway_and_reverse_trend(self) -> None:
         frame = pd.DataFrame(
             {
                 "close": [100],
@@ -158,9 +158,9 @@ class TripleEmaStrategyTest(TestCase):
             index=pd.date_range("2026-01-01", periods=1, freq="h"),
         )
 
-        self.assertEqual(generate_signal(frame, position="short").action, "reverse_to_long")
+        self.assertIsNone(generate_signal(frame, position="short"))
         sideway = frame.assign(trend_state=TREND_SIDEWAY)
-        self.assertEqual(generate_signal(sideway, position="long").action, "exit")
+        self.assertIsNone(generate_signal(sideway, position="long"))
 
     def test_backtest_enters_next_open_and_uses_slow_ema_stop_by_default(self) -> None:
         result = _run_backtest_with_loaded_data(_candles(), _instrument(), _config())
@@ -183,14 +183,14 @@ class TripleEmaStrategyTest(TestCase):
         self.assertEqual(len(result.trades), 1)
         self.assertEqual(result.trades[0].metadata["initial_stop_source"], "atr")
 
-    def test_live_signal_uses_first_completed_trend_and_reverses_position(self) -> None:
+    def test_live_signal_uses_first_completed_trend_and_holds_position(self) -> None:
         config = replace(_config(), ema_period=2, trend_ema_period=3, big_ema_period=4)
         candles = _live_candles(["100", "100", "100", "100", "90", "120"])
 
         decision = evaluate_triple_ema_signal(candles, config)
 
         self.assertEqual(decision.signal, "long")
-        self.assertEqual(live_position_action(candles, config, "short"), "reverse_to_long")
+        self.assertEqual(live_position_action(candles, config, "short"), "hold")
 
     def test_batch_and_report_keep_the_triple_ema_rules(self) -> None:
         config = _config()

@@ -3233,6 +3233,8 @@ class BacktestTest(TestCase):
         self.assertEqual(_normalize_backtest_bar_label("15分钟"), "15分钟")
         self.assertEqual(_normalize_backtest_bar_label("1H"), "1小时")
         self.assertEqual(_normalize_backtest_bar_label("4H"), "4小时")
+        self.assertEqual(_normalize_backtest_bar_label("1D"), "日线")
+        self.assertEqual(_backtest_bar_value_from_label("日线"), "1D")
         self.assertEqual(_backtest_bar_value_from_label("1小时"), "1H")
 
     def test_backtest_bar_label_mapping_falls_back_to_15_minutes(self) -> None:

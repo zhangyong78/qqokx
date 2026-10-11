@@ -7,6 +7,8 @@ from okx_quant.strategy_catalog import (
     STRATEGY_BODY_RETEST_SHORT_ID,
     STRATEGY_DYNAMIC_LONG_ID,
     STRATEGY_EMA55_SLOPE_SHORT_ID,
+    STRATEGY_TRIPLE_EMA_LONG_ID,
+    STRATEGY_TRIPLE_EMA_SHORT_ID,
 )
 
 
@@ -489,6 +491,97 @@ _BODY_RETEST_SHORT_SYMBOL_DEFAULTS: dict[str, dict[str, object]] = {
 }
 
 
+def _xiaoyu_dynamic_rules() -> tuple[dict[str, object], ...]:
+    return (
+        {
+            "trigger_r": 2,
+            "action": "break_even",
+            "lock_r": None,
+            "trail_mode": "none",
+            "trail_every_r": None,
+            "trail_add_r": None,
+        },
+        {
+            "trigger_r": 5,
+            "action": "lock_profit",
+            "lock_r": 4,
+            "trail_mode": "step",
+            "trail_every_r": 1,
+            "trail_add_r": 1,
+        },
+    )
+
+
+def _xiaoyu_symbol_defaults(
+    *,
+    bar: str,
+    atr_period: int,
+    atr_stop_multiplier: str,
+    risk_amount: str,
+) -> dict[str, object]:
+    return {
+        "bar": bar,
+        "ema_type": "ema",
+        "ema_period": 20,
+        "trend_ema_type": "ema",
+        "trend_ema_period": 25,
+        "big_ema_period": 30,
+        "atr_period": atr_period,
+        "atr_stop_multiplier": atr_stop_multiplier,
+        "atr_take_multiplier": "0",
+        "take_profit_mode": "dynamic",
+        "dynamic_two_r_break_even": True,
+        "dynamic_break_even_trigger_r": 2,
+        "dynamic_fee_offset_enabled": True,
+        "dynamic_protection_rules": _xiaoyu_dynamic_rules(),
+        "ema55_slope_exit_enabled": False,
+        "trend_ema_close_exit_after_trigger_r_enabled": False,
+        "time_stop_break_even_enabled": False,
+        "time_stop_break_even_bars": 0,
+        "trend_ema_slope_filter_enabled": False,
+        "max_entries_per_trend": 1,
+        "reentry_confirmation_enabled": False,
+        "order_size": "0",
+        "risk_amount": risk_amount,
+    }
+
+
+_XIAOYU_TRIPLE_SYMBOL_DEFAULTS: dict[str, dict[str, dict[str, object]]] = {
+    "BTC-USDT-SWAP": {
+        STRATEGY_TRIPLE_EMA_LONG_ID: _xiaoyu_symbol_defaults(
+            bar="4H", atr_period=10, atr_stop_multiplier="3", risk_amount="3"
+        ),
+        STRATEGY_TRIPLE_EMA_SHORT_ID: _xiaoyu_symbol_defaults(
+            bar="4H", atr_period=10, atr_stop_multiplier="1", risk_amount="3"
+        ),
+    },
+    "ETH-USDT-SWAP": {
+        STRATEGY_TRIPLE_EMA_LONG_ID: _xiaoyu_symbol_defaults(
+            bar="4H", atr_period=10, atr_stop_multiplier="1.5", risk_amount="0"
+        ),
+        STRATEGY_TRIPLE_EMA_SHORT_ID: _xiaoyu_symbol_defaults(
+            bar="4H", atr_period=10, atr_stop_multiplier="1", risk_amount="0"
+        ),
+    },
+    "SOL-USDT-SWAP": {
+        STRATEGY_TRIPLE_EMA_LONG_ID: _xiaoyu_symbol_defaults(
+            bar="1H", atr_period=10, atr_stop_multiplier="3", risk_amount="10"
+        ),
+        STRATEGY_TRIPLE_EMA_SHORT_ID: _xiaoyu_symbol_defaults(
+            bar="1H", atr_period=10, atr_stop_multiplier="1", risk_amount="10"
+        ),
+    },
+    "DOGE-USDT-SWAP": {
+        STRATEGY_TRIPLE_EMA_LONG_ID: _xiaoyu_symbol_defaults(
+            bar="4H", atr_period=10, atr_stop_multiplier="3", risk_amount="5"
+        ),
+        STRATEGY_TRIPLE_EMA_SHORT_ID: _xiaoyu_symbol_defaults(
+            bar="4H", atr_period=14, atr_stop_multiplier="2", risk_amount="5"
+        ),
+    },
+}
+
+
 def get_strategy_symbol_parameter_defaults(
     strategy_id: str,
     symbol: str,
@@ -503,6 +596,8 @@ def get_strategy_symbol_parameter_defaults(
         defaults = _SLOPE_SHORT_SYMBOL_DEFAULTS.get(normalized_symbol)
     elif strategy_id == STRATEGY_BODY_RETEST_SHORT_ID:
         defaults = _BODY_RETEST_SHORT_SYMBOL_DEFAULTS.get(normalized_symbol)
+    elif strategy_id in {STRATEGY_TRIPLE_EMA_LONG_ID, STRATEGY_TRIPLE_EMA_SHORT_ID}:
+        defaults = _XIAOYU_TRIPLE_SYMBOL_DEFAULTS.get(normalized_symbol, {}).get(strategy_id)
     else:
         defaults = None
     if not defaults:

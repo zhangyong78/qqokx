@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 from okx_quant.strategy_catalog import (
     STRATEGY_ADAPTIVE_EMA_RAIL_LONG_ID,
@@ -18,6 +18,8 @@ from okx_quant.strategy_catalog import (
     STRATEGY_EMA_BREAKDOWN_SHORT_ID,
     STRATEGY_EMA_BREAKOUT_LONG_ID,
     STRATEGY_TRIPLE_EMA_ID,
+    STRATEGY_TRIPLE_EMA_LONG_ID,
+    STRATEGY_TRIPLE_EMA_SHORT_ID,
     is_dynamic_mtf_strategy_id,
 )
 from okx_quant.strategy_parameters import (
@@ -65,39 +67,89 @@ STRATEGY_UI_SCHEMAS: dict[str, StrategyUiSchema] = {
             _SCOPE_LAUNCHER: {
                 "bar": "1H",
                 "ema_type": "ema",
-                "ema_period": 21,
+                "ema_period": 20,
                 "trend_ema_type": "ema",
-                "trend_ema_period": 60,
-                "big_ema_period": 200,
-                "atr_period": 14,
-                "atr_stop_multiplier": "0",
+                "trend_ema_period": 25,
+                "big_ema_period": 30,
+                "atr_period": 10,
+                "atr_stop_multiplier": "1",
             },
             _SCOPE_BACKTEST: {
                 "bar": "1H",
                 "ema_type": "ema",
-                "ema_period": 21,
+                "ema_period": 20,
                 "trend_ema_type": "ema",
-                "trend_ema_period": 60,
-                "big_ema_period": 200,
-                "atr_period": 14,
-                "atr_stop_multiplier": "0",
+                "trend_ema_period": 25,
+                "big_ema_period": 30,
+                "atr_period": 10,
+                "atr_stop_multiplier": "1",
             },
         },
         extra_defaults={
             _SCOPE_LAUNCHER: {
                 "entry_side_mode": "follow_signal",
+                "order_size": "0",
                 "risk_amount": "10",
                 "tp_sl_mode": "local_trade",
-                "take_profit_mode": "fixed",
+                "take_profit_mode": "dynamic",
+                "dynamic_two_r_break_even": True,
+                "dynamic_break_even_trigger_r": 2,
+                "dynamic_fee_offset_enabled": True,
+                "dynamic_protection_rules": (
+                    {
+                        "trigger_r": 2,
+                        "action": "break_even",
+                        "lock_r": None,
+                        "trail_mode": "none",
+                        "trail_every_r": None,
+                        "trail_add_r": None,
+                    },
+                    {
+                        "trigger_r": 5,
+                        "action": "lock_profit",
+                        "lock_r": 4,
+                        "trail_mode": "step",
+                        "trail_every_r": 1,
+                        "trail_add_r": 1,
+                    },
+                ),
+                "ema55_slope_lock_profit_trigger_r": 5,
+                "dynamic_first_lock_r": 4,
+                "dynamic_trailing_step_r": 1,
             },
             _SCOPE_BACKTEST: {
                 "risk_amount": "100",
                 "sizing_mode": "fixed_risk",
-                "take_profit_mode": "fixed",
+                "take_profit_mode": "dynamic",
+                "dynamic_two_r_break_even": True,
+                "dynamic_break_even_trigger_r": 2,
+                "dynamic_fee_offset_enabled": True,
+                "dynamic_protection_rules": (
+                    {
+                        "trigger_r": 2,
+                        "action": "break_even",
+                        "lock_r": None,
+                        "trail_mode": "none",
+                        "trail_every_r": None,
+                        "trail_add_r": None,
+                    },
+                    {
+                        "trigger_r": 5,
+                        "action": "lock_profit",
+                        "lock_r": 4,
+                        "trail_mode": "step",
+                        "trail_every_r": 1,
+                        "trail_add_r": 1,
+                    },
+                ),
+                "ema55_slope_lock_profit_trigger_r": 5,
+                "dynamic_first_lock_r": 4,
+                "dynamic_trailing_step_r": 1,
             },
         },
         force_follow_signal=True,
         force_local_trade=True,
+        supports_dynamic_take_profit=True,
     ),
     STRATEGY_DYNAMIC_LONG_ID: StrategyUiSchema(
         strategy_id=STRATEGY_DYNAMIC_LONG_ID,
@@ -821,6 +873,13 @@ STRATEGY_UI_SCHEMAS: dict[str, StrategyUiSchema] = {
         supports_dynamic_take_profit=True,
     ),
 }
+
+_TRIPLE_EMA_BASE_SCHEMA = STRATEGY_UI_SCHEMAS[STRATEGY_TRIPLE_EMA_ID]
+for _strategy_id in (STRATEGY_TRIPLE_EMA_LONG_ID, STRATEGY_TRIPLE_EMA_SHORT_ID):
+    STRATEGY_UI_SCHEMAS[_strategy_id] = replace(
+        _TRIPLE_EMA_BASE_SCHEMA,
+        strategy_id=_strategy_id,
+    )
 
 
 def get_strategy_ui_schema(strategy_id: str) -> StrategyUiSchema:

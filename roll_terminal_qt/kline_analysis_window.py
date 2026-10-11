@@ -89,6 +89,7 @@ from roll_terminal_qt.kline_trade_recommendation_dialog import KlineTradeRecomme
 from okx_quant.okx_client import OkxPosition, OkxPositionHistoryItem, OkxRestClient, infer_inst_type
 from okx_quant.engine import _dynamic_two_taker_fee_offset_live
 from okx_quant.pricing import format_decimal, format_decimal_by_increment, format_decimal_fixed, snap_to_increment
+from okx_quant.ui_shell import _format_history_size_amount, _history_display_amount
 from okx_quant.persistence import (
     deribit_volatility_cache_file_path,
     load_kline_analysis_workspace_entries,
@@ -8586,6 +8587,34 @@ class KlineAnalysisWindow(QMainWindow):
         self._instrument_cache[normalized] = instrument
         return instrument
 
+    def _format_rr_size_with_coin(self, inst_id: str, size: object) -> str:
+        """Show RR filled/remaining size as coin amount followed by contracts."""
+        try:
+            contracts = Decimal(str(size or "0"))
+        except Exception:
+            return "-"
+        contract_text = format_decimal(contracts)
+        normalized_id = str(inst_id or "").strip().upper()
+        inst_type = infer_inst_type(normalized_id)
+        instrument = self._instrument_for_symbol(normalized_id)
+        instruments = {normalized_id: instrument} if instrument is not None else {}
+        amount, currency = _history_display_amount(
+            inst_id=normalized_id,
+            inst_type=inst_type,
+            size=abs(contracts),
+            reference_price=None,
+            instruments=instruments,
+            use_swap_contract_fallback=True,
+        )
+        coin_text = _format_history_size_amount(amount, currency)
+        if inst_type not in {"SWAP", "FUTURES", "OPTION"}:
+            return coin_text or contract_text
+        if contracts == 0:
+            return f"0（{contract_text} 张）"
+        if not coin_text or coin_text == "-" or coin_text.endswith(" 张"):
+            return f"{contract_text} 张"
+        return f"{coin_text}（{contract_text} 张）"
+
     def _current_rr_price_increment(self, item: dict[str, object] | None = None) -> Decimal | None:
         symbol = ""
         if isinstance(item, dict):
@@ -8684,7 +8713,7 @@ class KlineAnalysisWindow(QMainWindow):
 
         table = QTableWidget(len(entries), 9, dialog)
         table.setHorizontalHeaderLabels(
-            ["账户", "环境", "合约", "方向", "状态", "已成交", "剩余", "止损/止盈", "最后更新"]
+            ["账户", "环境", "合约", "方向", "状态", "已成交（币/张）", "剩余（币/张）", "止损/止盈", "最后更新"]
         )
         table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
@@ -8706,8 +8735,8 @@ class KlineAnalysisWindow(QMainWindow):
                 plan.inst_id or "-",
                 "多" if plan.direction == "long" else "空",
                 entry.status or "-",
-                format_decimal(entry.filled_size),
-                format_decimal(entry.remaining_size),
+                self._format_rr_size_with_coin(plan.inst_id, entry.filled_size),
+                self._format_rr_size_with_coin(plan.inst_id, entry.remaining_size),
                 protection_text,
                 entry.updated_at or entry.created_at or "-",
             )
@@ -11878,12 +11907,18 @@ class KlineAnalysisWindow(QMainWindow):
                 "cancelled": "已取消",
                 "manual_review": "需人工处理",
             }.get(str(ledger_entry.status or ""), str(ledger_entry.status or "未知"))
-            filled_text = format_decimal(ledger_entry.filled_size or Decimal("0"))
-            remaining_text = format_decimal(ledger_entry.remaining_size or Decimal("0"))
+            filled_text = self._format_rr_size_with_coin(
+                ledger_entry.plan.inst_id,
+                ledger_entry.filled_size or Decimal("0"),
+            )
+            remaining_text = self._format_rr_size_with_coin(
+                ledger_entry.plan.inst_id,
+                ledger_entry.remaining_size or Decimal("0"),
+            )
             current_stop = getattr(getattr(ledger_entry, "stop_loss_order", None), "trigger_price", None)
             current_stop_text = _format_rr_table_price(current_stop, price_increment) or "-"
             last_event = ledger_entry.events[-1].message if ledger_entry.events else "-"
-            ledger_text = f"交易：{status_text} | 成交 {filled_text}张 | 剩余 {remaining_text}张 | 当前止损 {current_stop_text}"
+            ledger_text = f"交易：{status_text} | 成交 {filled_text} | 剩余 {remaining_text} | 当前止损 {current_stop_text}"
         summary_text = (
             f"{rr_id} | {side} | 入场 {entry_text} | 止损 {stop_text} | 止盈 {tp_text} | 风险金 {risk_text} U | {management_text} | R 1:{r_text}\n"
             f"状态：{locked_text} | 手续费偏移：{fee_text}\n{ledger_text}"

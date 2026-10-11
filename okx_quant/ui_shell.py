@@ -235,10 +235,10 @@ from okx_quant.strategy_catalog import (
     STRATEGY_DEFINITIONS,
     STRATEGY_DYNAMIC_ID,
     STRATEGY_EMA55_SLOPE_SHORT_ID,
-    STRATEGY_TRIPLE_EMA_ID,
     StrategyDefinition,
     get_strategy_definition,
     is_ema55_slope_short_strategy,
+    is_triple_ema_strategy,
     resolve_dynamic_signal_mode,
     supports_startup_chase_current_signal,
     supports_trader_desk,
@@ -322,7 +322,7 @@ def _bind_mixin_to_shell_globals(mixin_cls):
 
 
 def _strategy_fast_line_caption(strategy_id: str) -> str:
-    if strategy_id == STRATEGY_TRIPLE_EMA_ID:
+    if is_triple_ema_strategy(strategy_id):
         return "快线 EMA"
     if strategy_id in {STRATEGY_BTC_EMA55_SLOPE_SHORT_ID, STRATEGY_EMA55_SLOPE_SHORT_ID}:
         return "信号均线（斜率开平仓）"
@@ -4302,6 +4302,8 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
                 )
             elif key == "mtf_reversal_mode":
                 variable.set(_reverse_lookup_label(MTF_REVERSAL_MODE_OPTIONS, str(fixed_value), self.mtf_reversal_mode_label.get()))
+            elif key == "take_profit_mode":
+                variable.set(_reverse_lookup_label(TAKE_PROFIT_MODE_OPTIONS, str(fixed_value), self.take_profit_mode_label.get()))
             elif key.endswith("_type"):
                 variable.set(str(fixed_value).upper())
             else:
@@ -4321,18 +4323,18 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
             "ema_period": (self._ema_label, _strategy_fast_line_caption(strategy_id)),
             "trend_ema_period": (
                 self._trend_ema_label,
-                "中线 EMA" if strategy_id == STRATEGY_TRIPLE_EMA_ID else "趋势均线",
+                "中线 EMA" if is_triple_ema_strategy(strategy_id) else "趋势均线",
             ),
             "big_ema_period": (
                 self._big_ema_label,
-                "慢线 EMA" if strategy_id == STRATEGY_TRIPLE_EMA_ID else "大周期均线",
+                "慢线 EMA" if is_triple_ema_strategy(strategy_id) else "大周期均线",
             ),
         }
         for key, (widget, base_text) in label_map.items():
             text = f"{base_text}{fixed_suffix}" if strategy_fixed_value(strategy_id, key) is not None else base_text
             widget.configure(text=text)
         if hasattr(self, "_stop_atr_label"):
-            triple_ema = strategy_id == STRATEGY_TRIPLE_EMA_ID
+            triple_ema = is_triple_ema_strategy(strategy_id)
             self._stop_atr_label.configure(text="初始止损（0=慢线EMA）" if triple_ema else "止损 ATR 倍数")
             for widget in (self._take_atr_label, self._take_atr_entry):
                 if triple_ema:
@@ -6191,8 +6193,8 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
             "side": "方向",
             "ord_type": "委托类型",
             "price": "委托价",
-            "size": "委托量",
-            "filled": "已成交",
+            "size": "委托量（币/张）",
+            "filled": "已成交（币/张）",
             "fee": "手续费",
             "tp_sl": "TP/SL",
             "order_id": "订单ID",
@@ -6207,8 +6209,8 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
             ("side", 96),
             ("ord_type", 110),
             ("price", 100),
-            ("size", 100),
-            ("filled", 100),
+            ("size", 150),
+            ("filled", 150),
             ("fee", 220),
             ("tp_sl", 180),
             ("order_id", 120),
@@ -9697,12 +9699,12 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
                 atr_period=self._parse_nonnegative_int(self.atr_period.get(), "ATR周期"),
                 atr_stop_multiplier=(
                     self._parse_nonnegative_decimal(self.stop_atr.get(), "初始止损 ATR 倍数")
-                    if definition.strategy_id == STRATEGY_TRIPLE_EMA_ID
+                    if is_triple_ema_strategy(definition.strategy_id)
                     else self._parse_positive_decimal(self.stop_atr.get(), "止损 ATR 倍数")
                 ),
                 atr_take_multiplier=(
                     Decimal("1")
-                    if definition.strategy_id == STRATEGY_TRIPLE_EMA_ID
+                    if is_triple_ema_strategy(definition.strategy_id)
                     else self._parse_positive_decimal(self.take_atr.get(), "止盈 ATR 倍数")
                 ),
                 order_size=_parse_positive_decimal_hint(self.order_size.get()) or Decimal("1"),
@@ -14089,6 +14091,31 @@ def _format_trade_order_coin_filled_size(item: OkxTradeOrderItem, instruments: d
     return _format_history_size_amount(amount, currency)
 
 
+def _format_trade_order_coin_size_with_fallback(item: OkxTradeOrderItem, instruments: dict[str, Instrument]) -> str:
+    """Coin amount for the unified positions tables, including cached-swap fallback."""
+    amount, currency = _history_display_amount(
+        inst_id=item.inst_id,
+        inst_type=item.inst_type,
+        size=item.size,
+        reference_price=item.price if item.price and item.price > 0 else item.avg_price,
+        instruments=instruments,
+        use_swap_contract_fallback=True,
+    )
+    return _format_history_size_amount(amount, currency)
+
+
+def _format_trade_order_coin_filled_size_with_fallback(item: OkxTradeOrderItem, instruments: dict[str, Instrument]) -> str:
+    amount, currency = _history_display_amount(
+        inst_id=item.inst_id,
+        inst_type=item.inst_type,
+        size=item.filled_size,
+        reference_price=item.avg_price or item.price,
+        instruments=instruments,
+        use_swap_contract_fallback=True,
+    )
+    return _format_history_size_amount(amount, currency)
+
+
 def _format_trade_order_tp_sl(item: OkxTradeOrderItem) -> str:
     def _build_tp_sl_segment(label: str, trigger_price: Decimal | None, order_price: Decimal | None) -> str | None:
         if trigger_price is None:
@@ -14645,6 +14672,20 @@ def _format_fill_history_size(item: OkxFillHistoryItem, instruments: dict[str, I
     return _format_history_size_amount(amount, currency)
 
 
+def _format_fill_history_size_with_fallback(item: OkxFillHistoryItem, instruments: dict[str, Instrument]) -> str:
+    amount, currency = _history_fill_display_amount(item, instruments)
+    if amount is None or currency is None or currency == "张":
+        amount, currency = _history_display_amount(
+            inst_id=item.inst_id,
+            inst_type=item.inst_type,
+            size=item.fill_size,
+            reference_price=item.fill_price,
+            instruments=instruments,
+            use_swap_contract_fallback=True,
+        )
+    return _format_history_size_amount(amount, currency)
+
+
 def _history_fill_display_amount(
     item: OkxFillHistoryItem,
     instruments: dict[str, Instrument],
@@ -14695,6 +14736,18 @@ def _format_position_history_size(item: OkxPositionHistoryItem, instruments: dic
         size=item.close_size,
         reference_price=item.close_avg_price,
         instruments=instruments,
+    )
+    return _format_history_size_amount(amount, currency)
+
+
+def _format_position_history_size_with_fallback(item: OkxPositionHistoryItem, instruments: dict[str, Instrument]) -> str:
+    amount, currency = _history_display_amount(
+        inst_id=item.inst_id,
+        inst_type=item.inst_type,
+        size=item.close_size,
+        reference_price=item.close_avg_price,
+        instruments=instruments,
+        use_swap_contract_fallback=True,
     )
     return _format_history_size_amount(amount, currency)
 

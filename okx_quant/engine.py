@@ -47,7 +47,7 @@ from okx_quant.engine_session_runner import EngineSessionRunner
 from okx_quant.engine_strategy_router import EngineStrategyRouter
 from okx_quant.strategies.ema_atr import EmaAtrStrategy
 from okx_quant.strategies.ema_cross_ema_stop import EmaCrossEmaStopStrategy
-from okx_quant.strategies.triple_ema import evaluate_triple_ema_signal, live_position_action
+from okx_quant.strategies.triple_ema import evaluate_triple_ema_signal
 from okx_quant.strategies.ema_dynamic import EmaDynamicOrderStrategy
 from okx_quant.strategies.ema_dynamic_multi_timeframe import EmaDynamicMultiTimeframeStrategy
 from okx_quant.strategies.ema55_slope_short import (
@@ -67,7 +67,6 @@ from okx_quant.strategy_catalog import (
     STRATEGY_DYNAMIC_ID,
     STRATEGY_DYNAMIC_LONG_ID,
     STRATEGY_DYNAMIC_SHORT_ID,
-    STRATEGY_TRIPLE_EMA_ID,
     is_btc_ema55_slope_short_strategy,
     resolve_dynamic_signal_mode,
 )
@@ -245,7 +244,7 @@ def _take_profit_mode_description_for_signal_email(config: StrategyConfig) -> st
             if config.atr_stop_multiplier <= 0
             else f"ATR{config.atr_period} × {format_decimal(config.atr_stop_multiplier)}"
         )
-        return f"止盈止损说明：趋势转震荡平仓、趋势反向反手；初始止损使用{stop_text}。"
+        return f"止盈止损说明：持仓期间不因趋势状态变化平仓或反手；初始止损使用{stop_text}。"
     if _live_dynamic_take_profit_enabled(config):
         dynamic_two_r_break_even = _live_ema55_slope_dynamic_two_r_break_even_enabled(config)
         dynamic_fee_offset_enabled = _live_ema55_slope_dynamic_fee_offset_enabled(config)
@@ -3385,6 +3384,9 @@ class StrategyEngine:
         active_position: FilledPosition | None = None
         active_signal: Literal["long", "short"] | None = None
         active_stop_loss: Decimal | None = None
+        active_risk_per_unit: Decimal | None = None
+        active_next_trigger_r = 1
+        dynamic_rules = config.resolved_dynamic_protection_rules()
 
         self._log_strategy_start(config, signal_instrument, trade_instrument)
         stop_description = (
@@ -3394,7 +3396,8 @@ class StrategyEngine:
         )
         self._logger(
             f"运行模式：已收盘K线确认三均线趋势，下一根K线开盘市价成交 | "
-            f"转震荡平仓、反向趋势反手 | 初始止损={stop_description}"
+            f"持仓期间趋势变化不平仓、不反手 | 初始止损={stop_description} | "
+            f"动态止损={'；'.join(describe_dynamic_protection_rules(dynamic_rules, fee_offset_enabled=bool(config.dynamic_fee_offset_enabled))) or '关闭'}"
         )
         self._logger(f"风险金={format_decimal(config.risk_amount or Decimal('10'))} | 信号方向={config.signal_mode}")
 
@@ -3405,6 +3408,36 @@ class StrategyEngine:
                     config.tp_sl_trigger_type,
                     environment=config.environment,
                 )
+                if active_risk_per_unit is not None and active_signal is not None:
+                    previous_stop = active_stop_loss
+                    (
+                        active_stop_loss,
+                        _next_trigger_price,
+                        active_next_trigger_r,
+                        stop_moved,
+                    ) = _advance_dynamic_stop_live(
+                        direction=active_signal,
+                        current_price=current_price,
+                        entry_price=active_position.entry_price,
+                        risk_per_unit=active_risk_per_unit,
+                        current_stop_loss=active_stop_loss,
+                        next_trigger_r=active_next_trigger_r,
+                        tick_size=trade_instrument.tick_size,
+                        two_r_break_even=bool(config.dynamic_two_r_break_even),
+                        break_even_trigger_r=config.resolved_dynamic_break_even_trigger_r(),
+                        trailing_start_r=config.resolved_dynamic_trailing_start_r(),
+                        first_lock_r=config.resolved_dynamic_first_lock_r(),
+                        trailing_step_r=config.resolved_dynamic_trailing_step_r(),
+                        separate_break_even_enabled=True,
+                        taker_fee_rate=LIVE_DYNAMIC_TAKER_FEE_RATE,
+                        dynamic_fee_offset_enabled=bool(config.dynamic_fee_offset_enabled),
+                        dynamic_protection_rules=dynamic_rules,
+                    )
+                    if stop_moved and active_stop_loss != previous_stop:
+                        self._logger(
+                            f"动态止损上移 | 方向={active_signal.upper()} | 当前价={format_decimal(current_price)} | "
+                            f"止损={format_decimal(active_stop_loss)} | 下个触发={active_next_trigger_r}R"
+                        )
                 stop_hit = (
                     current_price <= active_stop_loss
                     if active_signal == "long"
@@ -3412,13 +3445,15 @@ class StrategyEngine:
                 )
                 if stop_hit:
                     self._logger(
-                        f"初始止损触发 | 方向={active_signal.upper() if active_signal else '-'} | "
+                        f"动态止损触发 | 方向={active_signal.upper() if active_signal else '-'} | "
                         f"触发价={format_decimal(current_price)} | 止损={format_decimal(active_stop_loss)}"
                     )
-                    self._close_position(credentials, config, trade_instrument, active_position, "初始止损")
+                    self._close_position(credentials, config, trade_instrument, active_position, "动态止损")
                     active_position = None
                     active_signal = None
                     active_stop_loss = None
+                    active_risk_per_unit = None
+                    active_next_trigger_r = 1
             candles = self._get_candles_with_retry(config.inst_id, config.bar, limit=lookback)
             confirmed = [candle for candle in candles if candle.confirmed]
             decision = evaluate_triple_ema_signal(confirmed, config, price_increment=signal_instrument.tick_size)
@@ -3432,35 +3467,10 @@ class StrategyEngine:
             last_candle_ts = decision.candle_ts
 
             if active_position is not None and active_signal is not None:
-                action = live_position_action(confirmed, config, active_signal)
-                if action == "hold":
-                    self._logger(f"{_fmt_ts(decision.candle_ts)} | 持仓监控 | 方向={active_signal.upper()} | {decision.reason}")
-                    self._stop_event.wait(config.poll_seconds)
-                    continue
-                reason = "三均线转震荡" if action == "exit" else "三均线趋势反向"
-                self._logger(f"{_fmt_ts(decision.candle_ts)} | {reason}，按新K线开盘时机平仓")
-                self._close_position(credentials, config, trade_instrument, active_position, reason)
-                active_position = None
-                active_signal = None
-                active_stop_loss = None
-                if action == "exit":
-                    self._stop_event.wait(config.poll_seconds)
-                    continue
-                reverse_signal: Literal["long", "short"] = "long" if action == "reverse_to_long" else "short"
-                try:
-                    active_position, active_stop_loss = self._open_triple_ema_position(
-                        credentials,
-                        config,
-                        trade_instrument=trade_instrument,
-                        signal=reverse_signal,
-                        slow_ema=decision.ema_value,
-                        atr_value=decision.atr_value,
-                        signal_candle_ts=decision.candle_ts,
-                    )
-                    active_signal = reverse_signal
-                    self._logger(f"{_fmt_ts(decision.candle_ts)} | 已反手开{reverse_signal.upper()}仓")
-                except (OrderSizeTooSmallError, InvalidProtectionPlanError) as exc:
-                    self._logger(f"{_fmt_ts(decision.candle_ts)} | 反手开仓被拒绝 | {exc}")
+                self._logger(
+                    f"{_fmt_ts(decision.candle_ts)} | 持仓监控 | 方向={active_signal.upper()} | "
+                    f"趋势变化不触发平仓或反手 | {decision.reason}"
+                )
                 self._stop_event.wait(config.poll_seconds)
                 continue
 
@@ -3479,6 +3489,8 @@ class StrategyEngine:
                     signal_candle_ts=decision.candle_ts,
                 )
                 active_signal = decision.signal
+                active_risk_per_unit = abs(active_position.entry_price - active_stop_loss)
+                active_next_trigger_r = dynamic_rules[0].resolved_trigger_r() if dynamic_rules else 1
                 self._logger(f"{_fmt_ts(decision.candle_ts)} | 三均线趋势策略已开仓 | 方向={decision.signal.upper()}")
             except (OrderSizeTooSmallError, InvalidProtectionPlanError) as exc:
                 self._logger(f"{_fmt_ts(decision.candle_ts)} | 当前无法下单 | {exc}")

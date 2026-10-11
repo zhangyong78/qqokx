@@ -484,8 +484,8 @@ from okx_quant.ui_shell import (
     _option_search_shortcuts,
     _format_trade_order_price,
     _format_trade_order_size,
-    _format_trade_order_coin_size,
-    _format_trade_order_coin_filled_size,
+    _format_trade_order_coin_size_with_fallback,
+    _format_trade_order_coin_filled_size_with_fallback,
     _format_trade_order_state,
     _format_trade_order_fee_cell,
     _format_trade_order_tp_sl,
@@ -498,12 +498,12 @@ from okx_quant.ui_shell import (
     _format_fill_history_fee_cell,
     _format_fill_history_pnl,
     _format_fill_history_price,
-    _format_fill_history_size,
+    _format_fill_history_size_with_fallback,
     _format_position_history_fee_cell,
     _format_position_history_pnl,
     _format_position_history_filter_stats,
     _format_position_history_price,
-    _format_position_history_size,
+    _format_position_history_size_with_fallback,
     _format_position_history_trade_side,
     _infer_position_history_pnl_currency,
     _position_history_realized_pnl_usdt,
@@ -1454,13 +1454,39 @@ POSITION_KLINE_BAR_OPTIONS: tuple[tuple[str, str], ...] = (
 
 
 def _format_trade_order_size_with_coin(item: object, instruments: dict[str, object], *, filled: bool) -> str:
-    size_text = _format_trade_order_size(getattr(item, "filled_size" if filled else "size", None))
     coin_text = (
-        _format_trade_order_coin_filled_size(item, instruments)
+        _format_trade_order_coin_filled_size_with_fallback(item, instruments)
         if filled
-        else _format_trade_order_coin_size(item, instruments)
+        else _format_trade_order_coin_size_with_fallback(item, instruments)
     )
-    return size_text if coin_text in {"-", size_text} else f"{size_text} ({coin_text})"
+    return _format_coin_then_contract_size(
+        coin_text,
+        getattr(item, "filled_size" if filled else "size", None),
+        getattr(item, "inst_type", ""),
+    )
+
+
+def _format_coin_then_contract_size(coin_text: str, raw_size: object, inst_type: object) -> str:
+    """Use one quantity presentation across orders, fills, and position history."""
+    size_text = _format_trade_order_size(raw_size)
+    if coin_text in {"-", "", size_text}:
+        return coin_text if coin_text not in {"", "-"} else size_text
+    normalized_type = str(inst_type or "").strip().upper()
+    if normalized_type in {"SWAP", "FUTURES", "OPTION"}:
+        # Historical fallbacks may already be expressed as 张 when metadata is
+        # unavailable.  Do not produce the misleading "张（张）" duplicate.
+        if coin_text.endswith(" 张"):
+            return coin_text
+        return f"{coin_text}（{size_text} 张）"
+    return coin_text
+
+
+def _format_fill_history_size_with_contracts(item: object, instruments: dict[str, object]) -> str:
+    return _format_coin_then_contract_size(
+        _format_fill_history_size_with_fallback(item, instruments),
+        getattr(item, "fill_size", None),
+        getattr(item, "inst_type", ""),
+    )
 POSITION_KLINE_BAR_MS = {
     "15m": 15 * 60 * 1000,
     "1H": 60 * 60 * 1000,
@@ -1747,7 +1773,8 @@ def _position_history_raw_size_text(
         except Exception:
             continue
         if value >= 0:
-            return _format_position_history_size(replace(item, close_size=value), instruments)
+            coin_text = _format_position_history_size_with_fallback(replace(item, close_size=value), instruments)
+            return _format_coin_then_contract_size(coin_text, value, item.inst_type)
     return "-"
 
 
@@ -4246,7 +4273,7 @@ class AccountPositionsHomeWidget(QWidget):
 
         self._orders_table = QTableWidget(0, 11)
         self._orders_table.setHorizontalHeaderLabels(
-            ("时间", "合约", "类型", "状态", "方向", "委托类型", "委托价", "委托量", "已成交", "交易模式", "clOrdId")
+            ("时间", "合约", "类型", "状态", "方向", "委托类型", "委托价", "委托量（币/张）", "已成交（币/张）", "交易模式", "clOrdId")
         )
         self._orders_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self._orders_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
@@ -4309,7 +4336,7 @@ class AccountPositionsHomeWidget(QWidget):
 
         self._position_history_table = QTableWidget(0, 15)
         self._position_history_table.setHorizontalHeaderLabels(
-            ("平仓时间", "开仓时间", "持仓时间", "合约", "保证金模式", "持仓模式", "交易方向", "开仓均价", "平仓均价", "最大持仓量", "已平仓量", "手续费", "盈亏", "仓位状态", "备注")
+            ("平仓时间", "开仓时间", "持仓时间", "合约", "保证金模式", "持仓模式", "交易方向", "开仓均价", "平仓均价", "最大持仓（币/张）", "已平仓（币/张）", "手续费", "盈亏", "仓位状态", "备注")
         )
         self._position_history_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self._position_history_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
@@ -6191,8 +6218,8 @@ class AccountPositionsHomeWidget(QWidget):
                 _format_history_side(order.side or "-", order.pos_side or ""),
                 order.ord_type or "-",
                 _format_trade_order_price(order.price, order.inst_id, order.inst_type or ""),
-                _format_trade_order_size(order.size),
-                _format_trade_order_size(order.filled_size),
+                self._format_current_order_size_with_coin(order, filled=False),
+                self._format_current_order_size_with_coin(order, filled=True),
                 order.td_mode or "-",
                 order.client_order_id or "-",
             )
@@ -6231,8 +6258,8 @@ class AccountPositionsHomeWidget(QWidget):
             f"交易模式：{order.td_mode or '-'}",
             f"委托类型：{order.ord_type or '-'}",
             f"委托价：{_format_trade_order_price(order.price, order.inst_id, order.inst_type or '')}",
-            f"委托量：{_format_trade_order_size(order.size)}",
-            f"已成交：{_format_trade_order_size(order.filled_size)}",
+            f"委托量：{self._format_current_order_size_with_coin(order, filled=False)}",
+            f"已成交：{self._format_current_order_size_with_coin(order, filled=True)}",
             f"成交均价：{_format_trade_order_price(order.avg_price, order.inst_id, order.inst_type or '')}",
             f"更新时间：{_format_okx_ms_timestamp(order.update_time)}",
             f"创建时间：{_format_okx_ms_timestamp(order.created_time)}",
@@ -6952,7 +6979,7 @@ class AccountPositionsHomeWidget(QWidget):
         layout.addLayout(filter_row)
 
         self._orders_table = self._build_history_table(
-            ("时间", "来源", "类型", "合约", "状态", "方向", "委托类型", "委托价", "委托量", "已成交", "手续费", "TP/SL", "订单ID", "clOrdId"),
+            ("时间", "来源", "类型", "合约", "状态", "方向", "委托类型", "委托价", "委托量（币/张）", "已成交（币/张）", "手续费", "TP/SL", "订单ID", "clOrdId"),
             stretch_columns={3, 11, 13},
         )
         self._orders_table.setColumnWidth(8, 180)
@@ -7026,7 +7053,7 @@ class AccountPositionsHomeWidget(QWidget):
         layout.addLayout(filter_row)
 
         self._order_history_table = self._build_history_table(
-            ("时间", "来源", "类型", "合约", "状态", "方向", "委托类型", "委托价", "委托量", "已成交", "手续费", "TP/SL", "订单ID", "clOrdId"),
+            ("时间", "来源", "类型", "合约", "状态", "方向", "委托类型", "委托价", "委托量（币/张）", "已成交（币/张）", "手续费", "TP/SL", "订单ID", "clOrdId"),
             stretch_columns={3, 11, 13},
         )
         layout.addWidget(self._order_history_table, 1)
@@ -7095,7 +7122,7 @@ class AccountPositionsHomeWidget(QWidget):
         layout.addLayout(filter_row)
 
         self._fill_history_table = self._build_history_table(
-            ("时间", "类型", "合约", "方向", "成交价", "成交量", "手续费", "已实现盈亏", "成交类型"),
+            ("时间", "类型", "合约", "方向", "成交价", "成交量（币/张）", "手续费", "已实现盈亏", "成交类型"),
             stretch_columns={2},
         )
         layout.addWidget(self._fill_history_table, 1)
@@ -7198,7 +7225,7 @@ class AccountPositionsHomeWidget(QWidget):
         layout.addLayout(filter_row)
 
         self._position_history_table = self._build_history_table(
-            ("选择", "平仓时间", "开仓时间", "持仓时间", "合约", "保证金模式", "持仓模式", "交易方向", "开仓均价", "平仓均价", "最大持仓量", "已平仓量", "手续费", "盈亏", "仓位状态", "备注"),
+            ("选择", "平仓时间", "开仓时间", "持仓时间", "合约", "保证金模式", "持仓模式", "交易方向", "开仓均价", "平仓均价", "最大持仓（币/张）", "已平仓（币/张）", "手续费", "盈亏", "仓位状态", "备注"),
             stretch_columns={4, 15},
         )
         self._position_history_table.cellDoubleClicked.connect(self._on_position_history_table_clicked)
@@ -7493,6 +7520,27 @@ class AccountPositionsHomeWidget(QWidget):
             if instrument is not None:
                 instruments[inst_id] = instrument
         return _format_trade_order_size_with_coin(order, instruments, filled=filled)
+
+    def _format_order_history_size_with_coin(self, order: object, *, filled: bool) -> str:
+        instruments = dict(getattr(self, "_position_instruments", {}) or {})
+        instruments.update(dict(getattr(self, "_fill_history_instruments", {}) or {}))
+        instruments.update(dict(getattr(self, "_position_history_instruments", {}) or {}))
+        inst_id = str(getattr(order, "inst_id", "") or "").strip()
+        inst_type = str(getattr(order, "inst_type", "") or "").upper()
+        if inst_id and inst_type in {"SWAP", "FUTURES", "OPTION"} and inst_id not in instruments:
+            cache = getattr(self, "_current_order_instruments", {})
+            instrument = cache.get(inst_id)
+            if instrument is None:
+                try:
+                    instrument = self._shared_client.get_instrument(inst_id, prefer_cached=True)
+                except Exception:
+                    instrument = None
+                if instrument is not None:
+                    cache[inst_id] = instrument
+                    self._current_order_instruments = cache
+            if instrument is not None:
+                instruments[inst_id] = instrument
+        return _format_trade_order_size_with_coin(order, instruments, filled=filled)
     def _refresh_current_orders_table(self) -> None:
         if not hasattr(self, "_orders_table"):
             return
@@ -7566,8 +7614,8 @@ class AccountPositionsHomeWidget(QWidget):
             f"方向：{_format_history_side(order.side or '-', order.pos_side or '')}",
             f"委托类型：{order.ord_type or '-'}",
             f"委托价：{_format_trade_order_price(order.price, order.inst_id, order.inst_type or '')}",
-            f"委托量：{_format_trade_order_size(order.size)}",
-            f"已成交：{_format_trade_order_size(order.filled_size)}",
+            f"委托量：{self._format_current_order_size_with_coin(order, filled=False)}",
+            f"已成交：{self._format_current_order_size_with_coin(order, filled=True)}",
             f"交易模式：{order.td_mode or '-'}",
             f"订单ID：{order.ord_id or '-'}",
             f"clOrdId：{order.client_order_id or '-'}",
@@ -8220,8 +8268,8 @@ class AccountPositionsHomeWidget(QWidget):
                 _format_history_side(item.side, item.pos_side),
                 item.ord_type or "-",
                 _format_trade_order_price(item.price, item.inst_id, item.inst_type),
-                _format_trade_order_size(item.size),
-                _format_trade_order_size(item.filled_size),
+                self._format_order_history_size_with_coin(item, filled=False),
+                self._format_order_history_size_with_coin(item, filled=True),
                 _format_trade_order_fee_cell(item, self._order_history_usdt_prices),
                 _format_trade_order_tp_sl(item),
                 item.order_id or item.algo_id or "-",
@@ -8304,7 +8352,7 @@ class AccountPositionsHomeWidget(QWidget):
                     item.inst_id or "-",
                     _format_history_side(item.side, item.pos_side),
                     _format_fill_history_price(item),
-                    _format_fill_history_size(item, self._fill_history_instruments),
+                    _format_fill_history_size_with_contracts(item, self._fill_history_instruments),
                     _format_fill_history_fee_cell(item, self._fill_history_usdt_prices),
                     _format_fill_history_pnl(item, self._fill_history_usdt_prices),
                     _format_fill_history_exec_type(item.exec_type),
@@ -8729,8 +8777,8 @@ class AccountPositionsHomeWidget(QWidget):
             "交易方向",
             "开仓均价",
             "平仓均价",
-            "最大持仓量",
-            "已平仓量",
+            "最大持仓（币/张）",
+            "已平仓（币/张）",
             "手续费",
             "盈亏",
             "仓位状态",
@@ -8899,7 +8947,7 @@ class AccountPositionsHomeWidget(QWidget):
             "方向",
             "持仓方向",
             "成交价",
-            "成交量",
+            "成交量（币/张）",
             "手续费",
             "已实现盈亏",
             "成交类型",
@@ -8961,7 +9009,7 @@ class AccountPositionsHomeWidget(QWidget):
                     _format_history_side(item.side, item.pos_side),
                     item.pos_side or "",
                     _format_fill_history_price(item),
-                    _format_fill_history_size(item, self._fill_history_instruments),
+                    _format_fill_history_size_with_contracts(item, self._fill_history_instruments),
                     _format_fill_history_fee_cell(item, self._fill_history_usdt_prices),
                     _format_fill_history_pnl(item, self._fill_history_usdt_prices),
                     _format_fill_history_exec_type(item.exec_type),

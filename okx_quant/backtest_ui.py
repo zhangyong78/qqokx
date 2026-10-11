@@ -75,9 +75,9 @@ from okx_quant.strategy_catalog import (
     STRATEGY_BODY_RETEST_SHORT_ID,
     STRATEGY_DYNAMIC_ID,
     STRATEGY_EMA55_SLOPE_SHORT_ID,
-    STRATEGY_TRIPLE_EMA_ID,
     StrategyDefinition,
     get_strategy_definition,
+    is_triple_ema_strategy,
     resolve_dynamic_signal_mode,
 )
 from okx_quant.strategy_runtime_registry import (
@@ -110,7 +110,7 @@ SIGNAL_LABEL_TO_VALUE = {
     "只做空": "short_only",
 }
 def _strategy_fast_line_caption(strategy_id: str) -> str:
-    if strategy_id == STRATEGY_TRIPLE_EMA_ID:
+    if is_triple_ema_strategy(strategy_id):
         return "快线 EMA"
     if strategy_id in {STRATEGY_BTC_EMA55_SLOPE_SHORT_ID, STRATEGY_EMA55_SLOPE_SHORT_ID}:
         return "信号均线（斜率开平仓）"
@@ -139,6 +139,7 @@ BACKTEST_BAR_LABEL_TO_VALUE = {
     "15分钟": "15m",
     "1小时": "1H",
     "4小时": "4H",
+    "日线": "1D",
 }
 BACKTEST_BAR_VALUE_TO_LABEL = {value: label for label, value in BACKTEST_BAR_LABEL_TO_VALUE.items()}
 DEFAULT_BACKTEST_BAR_LABEL = "15分钟"
@@ -151,12 +152,13 @@ BACKTEST_SYMBOL_OPTIONS = (
     "BNB-USDT-SWAP",
     "DOGE-USDT-SWAP",
 )
-BACKTEST_HISTORY_SYNC_BARS = ("5m", "15m", "1H", "4H")
+BACKTEST_HISTORY_SYNC_BARS = ("5m", "15m", "1H", "4H", "1D")
 DEFAULT_HISTORY_SYNC_BAR_FLAGS = {
     "5m": False,
     "15m": False,
     "1H": True,
     "4H": True,
+    "1D": True,
 }
 DEFAULT_MAKER_FEE_PERCENT = "0.015"
 DEFAULT_TAKER_FEE_PERCENT = "0.036"
@@ -973,7 +975,7 @@ def _build_backtest_param_summary(
     reference_label = config.entry_reference_line_label()
     profile = get_strategy_runtime_profile(config.strategy_id)
 
-    if config.strategy_id == STRATEGY_TRIPLE_EMA_ID:
+    if is_triple_ema_strategy(config.strategy_id):
         stop_text = (
             "慢线EMA止损"
             if config.atr_stop_multiplier <= 0
@@ -982,6 +984,7 @@ def _build_backtest_param_summary(
         return (
             f"快EMA{config.ema_period}/中EMA{config.trend_ema_period}/慢EMA{config.big_ema_period} / "
             f"ATR{config.atr_period} / {stop_text} / "
+            f"{' / '.join(_dynamic_protection_metric_parts(config))} / "
             f"方向{SIGNAL_VALUE_TO_LABEL.get(config.signal_mode, config.signal_mode)}"
         )
 
@@ -2140,7 +2143,7 @@ class BacktestWindow:
         self._last_strategy_parameter_strategy_id: str | None = None
         self.local_data_status = StringVar(value="本地数据：等待选择标的与周期。")
         self.history_sync_status = StringVar(
-            value="填 0 = 全量；填 10000 = 最新往前 10000 根。可先点“同步历史数据”下载 5 个币种的 5m / 15m / 1H / 4H 全量缓存；点“校验数据”检查连续性并尝试补洞。"
+            value="填 0 = 全量；填 10000 = 最新往前 10000 根。可先点“同步历史数据”下载 5 个币种的 5m / 15m / 1H / 4H / 1D 全量缓存；点“校验数据”检查连续性并尝试补洞。"
         )
         self.report_summary = StringVar(value="点击“开始回测”后，会在这里显示报告摘要。")
         self.manual_summary = StringVar(value="当前策略没有额外扩展统计。")
@@ -2210,7 +2213,7 @@ class BacktestWindow:
         self._update_sizing_mode_widgets()
         self._update_backtest_minimum_order_hint()
         self.history_sync_status.set(
-            "先勾选要同步的周期。默认只同步 1H / 4H；打开“纯本地回测”后只使用本地缓存，缺数据会直接提示。"
+            "先勾选要同步的周期。默认同步 1H / 4H / 1D；打开“纯本地回测”后只使用本地缓存，缺数据会直接提示。"
         )
         self._update_local_data_status()
 
@@ -2587,7 +2590,13 @@ class BacktestWindow:
             if variable is None:
                 continue
             if key in draft:
-                variable.set(draft[key])
+                draft_value = draft[key]
+                if key == "take_profit_mode":
+                    draft_value = TAKE_PROFIT_MODE_VALUE_TO_LABEL.get(
+                        str(draft_value),
+                        str(draft_value) if str(draft_value) in TAKE_PROFIT_MODE_OPTIONS else self.take_profit_mode_label.get(),
+                    )
+                variable.set(draft_value)
                 continue
             default_value = strategy_parameter_default_for_scope(strategy_id, key, self._strategy_parameter_scope)
             if default_value is None:
@@ -2629,6 +2638,8 @@ class BacktestWindow:
                     variable.set(SIGNAL_VALUE_TO_LABEL.get(str(fixed_value), resolved_definition.default_signal_label))
                 elif key == "exit_mode":
                     variable.set(BTC_EMA15_MA50_EXIT_MODE_VALUE_TO_LABEL.get(str(fixed_value), self.exit_mode_label.get()))
+                elif key == "take_profit_mode":
+                    variable.set(TAKE_PROFIT_MODE_VALUE_TO_LABEL.get(str(fixed_value), self.take_profit_mode_label.get()))
                 elif key == "mtf_reversal_mode":
                     variable.set(MTF_REVERSAL_MODE_VALUE_TO_LABEL.get(str(fixed_value), self.mtf_reversal_mode_label.get()))
                 elif key.endswith("_type"):
@@ -2651,11 +2662,11 @@ class BacktestWindow:
             "ema_period": (self.ema_period_caption, _strategy_fast_line_caption(strategy_id)),
             "trend_ema_period": (
                 self.trend_ema_period_caption,
-                "中线 EMA" if strategy_id == STRATEGY_TRIPLE_EMA_ID else "趋势均线",
+                "中线 EMA" if is_triple_ema_strategy(strategy_id) else "趋势均线",
             ),
             "big_ema_period": (
                 self.big_ema_caption,
-                "慢线 EMA" if strategy_id == STRATEGY_TRIPLE_EMA_ID else "大周期均线",
+                "慢线 EMA" if is_triple_ema_strategy(strategy_id) else "大周期均线",
             ),
         }
         for key, (widget, base_text) in label_map.items():
@@ -4202,7 +4213,7 @@ class BacktestWindow:
             pass
         batch_text = (
             "三均线策略：仅按当前参数单组回测"
-            if strategy_id == STRATEGY_TRIPLE_EMA_ID
+            if is_triple_ema_strategy(strategy_id)
             else "批量：SL×1/1.5/2，TP×1/2/3，共9组"
         )
         parts = [
@@ -5412,7 +5423,11 @@ class BacktestWindow:
                     )
                 )
         if dynamic_tp_strategy:
-            take_profit_mode = TAKE_PROFIT_MODE_OPTIONS[self.take_profit_mode_label.get()]
+            raw_take_profit_mode = str(self.take_profit_mode_label.get()).strip()
+            take_profit_mode = TAKE_PROFIT_MODE_OPTIONS.get(
+                raw_take_profit_mode,
+                raw_take_profit_mode if raw_take_profit_mode in TAKE_PROFIT_MODE_VALUE_TO_LABEL else "dynamic",
+            )
             if strategy_id in {
                 STRATEGY_BTC_DAILY_4H_LONG_SHORT_ID,
                 STRATEGY_BTC_EMA15_MA50_PULLBACK_LONG_ID,
@@ -5531,12 +5546,12 @@ class BacktestWindow:
             atr_period=self._parse_positive_int(self.atr_period.get(), "ATR 周期"),
             atr_stop_multiplier=(
                 self._parse_nonnegative_decimal(self.stop_atr.get(), "初始止损 ATR 倍数")
-                if strategy_id == STRATEGY_TRIPLE_EMA_ID
+                if is_triple_ema_strategy(strategy_id)
                 else self._parse_positive_decimal(self.stop_atr.get(), "止损 ATR 倍数")
             ),
             atr_take_multiplier=(
                 Decimal("1")
-                if strategy_id == STRATEGY_TRIPLE_EMA_ID
+                if is_triple_ema_strategy(strategy_id)
                 else self._parse_positive_decimal(self.take_atr.get(), "止盈 ATR 倍数")
             ),
             order_size=order_size,
@@ -5644,7 +5659,7 @@ class BacktestWindow:
                     widget.grid()
                 else:
                     widget.grid_remove()
-            triple_ema = strategy_id == STRATEGY_TRIPLE_EMA_ID
+            triple_ema = is_triple_ema_strategy(strategy_id)
             self.stop_atr_caption.configure(
                 text="初始止损（0=慢线EMA）" if triple_ema else "止损 ATR 倍数"
             )
@@ -8367,7 +8382,7 @@ class BacktestWindow:
             f"{identity_text} | 策略：{strategy_name} | 交易对：{config.inst_id} | "
             f"K线：{_normalize_backtest_bar_label(config.bar)} | 方向：{signal_label}"
         )
-        if config.strategy_id == STRATEGY_TRIPLE_EMA_ID:
+        if is_triple_ema_strategy(config.strategy_id):
             stop_text = (
                 "慢线 EMA"
                 if config.atr_stop_multiplier <= 0

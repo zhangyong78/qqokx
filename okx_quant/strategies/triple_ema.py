@@ -9,6 +9,7 @@ import pandas as pd
 from okx_quant.indicators import atr, ema
 from okx_quant.models import Candle, SignalDecision, StrategyConfig
 from okx_quant.pricing import format_strategy_reason_price
+from okx_quant.strategy_catalog import resolve_triple_ema_signal_mode
 
 
 TREND_UP = "UPTREND"
@@ -108,7 +109,7 @@ def generate_signal(
     allow_long: bool = True,
     allow_short: bool = True,
 ) -> TripleTrendSignal | None:
-    """按最新趋势及当前仓位生成开仓、退出或反手信号。"""
+    """按最新趋势生成开仓信号；持仓后不因趋势状态变化退出或反手。"""
     if signal_frame.empty:
         return None
 
@@ -124,22 +125,7 @@ def generate_signal(
             return TripleTrendSignal("sell", "triple_ema_downtrend", trend_state, timestamp)
         return None
 
-    if position == "long":
-        if trend_state == TREND_SIDEWAY:
-            return TripleTrendSignal("exit", "triple_ema_sideway_exit", trend_state, timestamp)
-        if trend_state == TREND_DOWN:
-            if allow_short:
-                return TripleTrendSignal("reverse_to_short", "triple_ema_reverse_to_short", trend_state, timestamp)
-            return TripleTrendSignal("exit", "triple_ema_downtrend_exit", trend_state, timestamp)
-        return None
-
-    if position == "short":
-        if trend_state == TREND_SIDEWAY:
-            return TripleTrendSignal("exit", "triple_ema_sideway_exit", trend_state, timestamp)
-        if trend_state == TREND_UP:
-            if allow_long:
-                return TripleTrendSignal("reverse_to_long", "triple_ema_reverse_to_long", trend_state, timestamp)
-            return TripleTrendSignal("exit", "triple_ema_uptrend_exit", trend_state, timestamp)
+    if position in {"long", "short"}:
         return None
 
     raise ValueError("position 只能是 None、long 或 short")
@@ -179,10 +165,11 @@ def evaluate_triple_ema_signal(
         f"中EMA{config.trend_ema_period}={px(snapshot.middle_ema)} / "
         f"慢EMA{config.big_ema_period}={px(snapshot.slow_ema)}"
     )
+    signal_mode = resolve_triple_ema_signal_mode(config.strategy_id, str(config.signal_mode or "both"))
     if (
         snapshot.trend_state == TREND_UP
         and snapshot.previous_state != TREND_UP
-        and config.signal_mode != "short_only"
+        and signal_mode != "short_only"
     ):
         return SignalDecision(
             signal="long",
@@ -197,7 +184,7 @@ def evaluate_triple_ema_signal(
     if (
         snapshot.trend_state == TREND_DOWN
         and snapshot.previous_state != TREND_DOWN
-        and config.signal_mode != "long_only"
+        and signal_mode != "long_only"
     ):
         return SignalDecision(
             signal="short",
@@ -226,16 +213,7 @@ def live_position_action(
     config: StrategyConfig,
     signal: Literal["long", "short"],
 ) -> Literal["hold", "exit", "reverse_to_long", "reverse_to_short"]:
-    """根据最新已收盘 K 线决定实盘持仓继续、退出或反手。"""
-    snapshot = latest_live_snapshot(candles, config)
-    if snapshot is None:
-        return "hold"
-    if snapshot.trend_state == TREND_SIDEWAY:
-        return "exit"
-    if signal == "long" and snapshot.trend_state == TREND_DOWN:
-        return "reverse_to_short" if config.signal_mode != "long_only" else "exit"
-    if signal == "short" and snapshot.trend_state == TREND_UP:
-        return "reverse_to_long" if config.signal_mode != "short_only" else "exit"
+    """三均线持仓只由初始止损和移动止损管理，不因趋势状态变化退出或反手。"""
     return "hold"
 
 

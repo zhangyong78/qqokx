@@ -694,8 +694,8 @@ class UiPositionsMixin:
             "side": "方向",
             "ord_type": "委托类型",
             "price": "委托价",
-            "size": "委托量",
-            "filled": "已成交",
+            "size": "委托量（币/张）",
+            "filled": "已成交（币/张）",
             "fee": "手续费",
             "tp_sl": "TP/SL",
             "order_id": "订单ID",
@@ -710,8 +710,8 @@ class UiPositionsMixin:
             ("side", 96),
             ("ord_type", 110),
             ("price", 100),
-            ("size", 100),
-            ("filled", 100),
+            ("size", 150),
+            ("filled", 150),
             ("fee", 110),
             ("tp_sl", 180),
             ("order_id", 120),
@@ -876,8 +876,8 @@ class UiPositionsMixin:
             "side": "方向",
             "ord_type": "委托类型",
             "price": "委托价",
-            "size": "委托量",
-            "filled": "已成交",
+            "size": "委托量（币/张）",
+            "filled": "已成交（币/张）",
             "fee": "手续费",
             "tp_sl": "TP/SL",
             "order_id": "订单ID",
@@ -892,8 +892,8 @@ class UiPositionsMixin:
             ("side", 96),
             ("ord_type", 110),
             ("price", 100),
-            ("size", 100),
-            ("filled", 100),
+            ("size", 150),
+            ("filled", 150),
             ("fee", 220),
             ("tp_sl", 180),
             ("order_id", 120),
@@ -1010,7 +1010,7 @@ class UiPositionsMixin:
             "inst_id": "合约",
             "side": "方向",
             "price": "成交价",
-            "size": "成交量",
+            "size": "成交量（币/张）",
             "fee": "手续费",
             "pnl": "已实现盈亏",
             "exec_type": "成交类型",
@@ -1021,7 +1021,7 @@ class UiPositionsMixin:
             ("inst_id", 240),
             ("side", 96),
             ("price", 100),
-            ("size", 100),
+            ("size", 150),
             ("fee", 220),
             ("pnl", 220),
             ("exec_type", 108),
@@ -1167,7 +1167,7 @@ class UiPositionsMixin:
             "side": "方向",
             "open_avg": "开仓均价",
             "close_avg": "平仓均价",
-            "close_size": "平仓数量",
+            "close_size": "平仓数量（币/张）",
             "fee": "手续费",
             "pnl": "盈亏",
             "realized": "已实现盈亏",
@@ -1181,7 +1181,7 @@ class UiPositionsMixin:
             ("side", 96),
             ("open_avg", 100),
             ("close_avg", 100),
-            ("close_size", 100),
+            ("close_size", 150),
             ("fee", 220),
             ("pnl", 220),
             ("realized", 240),
@@ -2883,7 +2883,9 @@ class UiPositionsMixin:
         self._pending_orders_refreshing = False
         self._mark_api_switch_refresh_step("pending_orders", "done")
         self._latest_pending_orders = list(items)
-        self._pending_order_instruments = dict(instruments)
+        cached_instruments = {item.inst_id: item for item in self.instruments if item.inst_id}
+        cached_instruments.update(instruments)
+        self._pending_order_instruments = cached_instruments
         self._pending_orders_last_refresh_at = datetime.now()
         _mark_refresh_health_success(self._pending_orders_refresh_health, at=self._pending_orders_last_refresh_at)
         self._refresh_all_refresh_badges()
@@ -2921,7 +2923,9 @@ class UiPositionsMixin:
             save_history_cache_records("orders", active_profile, active_environment, merged_records)
             self._latest_order_history = [item for record in merged_records if (item := _order_item_from_cache(record)) is not None]
             self._latest_order_history.sort(key=lambda it: (it.update_time or it.created_time or 0), reverse=True)
-            self._order_history_instruments = dict(instruments)
+            cached_instruments = {item.inst_id: item for item in self.instruments if item.inst_id}
+            cached_instruments.update(instruments)
+            self._order_history_instruments = cached_instruments
             fee_ccys: set[str] = {
                 o.fee_currency.strip().upper()
                 for o in self._latest_order_history
@@ -3039,6 +3043,43 @@ class UiPositionsMixin:
             ("_account_info_order_history_tree", "_account_info_order_history_detail"),
         )
 
+    def _format_coin_then_contract_size(self, coin_text: str, raw_size: object, inst_type: object) -> str:
+        """Keep every positions tab on the same coin-first quantity format."""
+        size_text = _format_trade_order_size(raw_size)
+        if coin_text in {"", "-", size_text}:
+            return coin_text if coin_text not in {"", "-"} else size_text
+        if str(inst_type or "").strip().upper() in {"SWAP", "FUTURES", "OPTION"}:
+            if coin_text.endswith(" 张"):
+                return coin_text
+            return f"{coin_text}（{size_text} 张）"
+        return coin_text
+
+    def _format_order_size_with_coin(self, item: object, instruments: dict[str, object], *, filled: bool) -> str:
+        coin_text = (
+            _format_trade_order_coin_filled_size_with_fallback(item, instruments)
+            if filled
+            else _format_trade_order_coin_size_with_fallback(item, instruments)
+        )
+        return self._format_coin_then_contract_size(
+            coin_text,
+            getattr(item, "filled_size" if filled else "size", None),
+            getattr(item, "inst_type", ""),
+        )
+
+    def _format_fill_size_with_contracts(self, item: object, instruments: dict[str, object]) -> str:
+        return self._format_coin_then_contract_size(
+            _format_fill_history_size_with_fallback(item, instruments),
+            getattr(item, "fill_size", None),
+            getattr(item, "inst_type", ""),
+        )
+
+    def _format_position_size_with_contracts(self, item: object, instruments: dict[str, object]) -> str:
+        return self._format_coin_then_contract_size(
+            _format_position_history_size_with_fallback(item, instruments),
+            getattr(item, "close_size", None),
+            getattr(item, "inst_type", ""),
+        )
+
     def _render_pending_orders_view(self) -> None:
         filtered_items = self._filtered_pending_order_items()
         summary = self._positions_zoom_pending_orders_base_summary
@@ -3077,8 +3118,8 @@ class UiPositionsMixin:
                             _format_history_side(item.side, item.pos_side),
                             item.ord_type or "-",
                             _format_trade_order_price(item.price, item.inst_id, item.inst_type),
-                            _format_trade_order_coin_size(item, self._pending_order_instruments),
-                            _format_trade_order_coin_filled_size(item, self._pending_order_instruments),
+                            self._format_order_size_with_coin(item, self._pending_order_instruments, filled=False),
+                            self._format_order_size_with_coin(item, self._pending_order_instruments, filled=True),
                             _format_trade_order_fee_cell(item),
                             _format_trade_order_tp_sl(item),
                             item.order_id or item.algo_id or "-",
@@ -3138,8 +3179,8 @@ class UiPositionsMixin:
                             _format_history_side(item.side, item.pos_side),
                             item.ord_type or "-",
                             _format_trade_order_price(item.price, item.inst_id, item.inst_type),
-                            _format_trade_order_coin_size(item, self._order_history_instruments),
-                            _format_trade_order_coin_filled_size(item, self._order_history_instruments),
+                            self._format_order_size_with_coin(item, self._order_history_instruments, filled=False),
+                            self._format_order_size_with_coin(item, self._order_history_instruments, filled=True),
                             _format_trade_order_fee_cell(item, self._order_history_usdt_prices),
                             _format_trade_order_tp_sl(item),
                             item.order_id or item.algo_id or "-",
@@ -3410,7 +3451,9 @@ class UiPositionsMixin:
             save_history_cache_records("fills", active_profile, active_environment, merged_records)
             self._latest_fill_history = [item for record in merged_records if (item := _fill_item_from_cache(record)) is not None]
             self._latest_fill_history.sort(key=lambda it: (it.fill_time or 0), reverse=True)
-            self._fill_history_instruments = dict(instruments)
+            cached_instruments = {item.inst_id: item for item in self.instruments if item.inst_id}
+            cached_instruments.update(instruments)
+            self._fill_history_instruments = cached_instruments
             fill_ccys: set[str] = set()
             for fill in self._latest_fill_history:
                 if fill.fill_fee is not None and fill.fee_currency and str(fill.fee_currency).strip():
@@ -3552,7 +3595,7 @@ class UiPositionsMixin:
                     item.inst_id or "-",
                     _format_history_side(item.side, item.pos_side),
                     _format_fill_history_price(item),
-                    _format_fill_history_size(item, self._fill_history_instruments),
+                    self._format_fill_size_with_contracts(item, self._fill_history_instruments),
                     _format_fill_history_fee_cell(item, self._fill_history_usdt_prices),
                     _format_fill_history_pnl(item, self._fill_history_usdt_prices),
                     _format_fill_history_exec_type(item.exec_type),
@@ -3643,7 +3686,7 @@ class UiPositionsMixin:
                     _format_position_history_trade_side(item),
                     _format_position_history_price(item.open_avg_price, item.inst_id, item.inst_type),
                     _format_position_history_price(item.close_avg_price, item.inst_id, item.inst_type),
-                    _format_position_history_size(item, self._position_history_instruments),
+                    self._format_position_size_with_contracts(item, self._position_history_instruments),
                     _format_position_history_fee_cell(item, self._position_history_usdt_prices),
                     _format_position_history_pnl(item.pnl, item, usdt_prices=self._position_history_usdt_prices),
                     _format_position_history_pnl(
