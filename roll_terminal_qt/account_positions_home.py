@@ -4281,17 +4281,10 @@ class AccountPositionsHomeWidget(QWidget):
         self._orders_table.verticalHeader().setVisible(False)
         header = self._orders_table.horizontalHeader()
         header.setStretchLastSection(False)
-        header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
-        header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(5, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(6, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(7, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(8, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(9, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(10, QHeaderView.ResizeMode.Stretch)
+        current_order_widths = (180, 280, 90, 145, 110, 130, 135, 200, 200, 135, 300)
+        for index, width in enumerate(current_order_widths):
+            header.setSectionResizeMode(index, QHeaderView.ResizeMode.Interactive)
+            self._orders_table.setColumnWidth(index, width)
         self._orders_table.itemSelectionChanged.connect(self._refresh_current_order_detail)
         layout.addWidget(self._orders_table, 1)
 
@@ -4345,10 +4338,10 @@ class AccountPositionsHomeWidget(QWidget):
         header = self._position_history_table.horizontalHeader()
         header.setStretchLastSection(False)
         self._position_history_table.setSortingEnabled(True)
-        for index in range(15):
-            header.setSectionResizeMode(index, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(3, QHeaderView.ResizeMode.Interactive)
-        header.resizeSection(3, 220)
+        position_history_widths = (180, 180, 135, 280, 120, 110, 130, 135, 135, 220, 220, 240, 240, 130, 320)
+        for index, width in enumerate(position_history_widths):
+            header.setSectionResizeMode(index, QHeaderView.ResizeMode.Interactive)
+            self._position_history_table.setColumnWidth(index, width)
         header.setSectionResizeMode(14, QHeaderView.ResizeMode.Stretch)
         self._position_history_table.itemSelectionChanged.connect(self._refresh_position_history_detail)
         layout.addWidget(self._position_history_table, 1)
@@ -6982,8 +6975,8 @@ class AccountPositionsHomeWidget(QWidget):
             ("时间", "来源", "类型", "合约", "状态", "方向", "委托类型", "委托价", "委托量（币/张）", "已成交（币/张）", "手续费", "TP/SL", "订单ID", "clOrdId"),
             stretch_columns={3, 11, 13},
         )
-        self._orders_table.setColumnWidth(8, 180)
-        self._orders_table.setColumnWidth(9, 180)
+        self._orders_table.setColumnWidth(8, 200)
+        self._orders_table.setColumnWidth(9, 200)
         layout.addWidget(self._orders_table, 1)
         return tab
 
@@ -7254,7 +7247,41 @@ class AccountPositionsHomeWidget(QWidget):
                 index,
                 QHeaderView.ResizeMode.Stretch if index in stretch_columns else QHeaderView.ResizeMode.Interactive,
             )
-        table.setColumnWidth(0, 180)
+        default_widths = {
+            "选择": 50,
+            "时间": 180,
+            "平仓时间": 180,
+            "开仓时间": 180,
+            "持仓时间": 135,
+            "来源": 120,
+            "类型": 90,
+            "合约": 280,
+            "状态": 145,
+            "方向": 110,
+            "持仓模式": 110,
+            "交易方向": 130,
+            "保证金模式": 120,
+            "委托类型": 130,
+            "委托价": 135,
+            "成交价": 135,
+            "委托量（币/张）": 200,
+            "已成交（币/张）": 200,
+            "成交量（币/张）": 200,
+            "最大持仓（币/张）": 220,
+            "已平仓（币/张）": 220,
+            "手续费": 240,
+            "TP/SL": 320,
+            "订单ID": 220,
+            "clOrdId": 300,
+            "盈亏": 240,
+            "已实现盈亏": 260,
+            "仓位状态": 130,
+            "备注": 320,
+        }
+        for index, label in enumerate(headings):
+            width = default_widths.get(label)
+            if width is not None:
+                table.setColumnWidth(index, width)
         return table
 
     def _start_private_threads(self, *, force_restart: bool = False, start_history: bool = True) -> None:

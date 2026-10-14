@@ -21,14 +21,28 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from okx_quant.okx_client import OkxPosition, OkxTradeOrderItem
+from okx_quant.okx_client import OkxFillHistoryItem, OkxPosition, OkxPositionHistoryItem, OkxTradeOrderItem
 from okx_quant.okx_client import OkxRestClient
 from okx_quant.pricing import format_decimal
 from roll_terminal_qt.account_positions_home import (
     POSITION_COLUMNS,
     _break_even_taker_fee_rate,
+    _format_fill_history_exec_type,
+    _format_fill_history_fee_cell,
+    _format_fill_history_pnl,
+    _format_fill_history_price,
+    _format_fill_history_size_with_contracts,
+    _format_history_side,
+    _format_position_history_fee_cell,
+    _format_position_history_pnl,
+    _format_position_history_price,
     _position_break_even_price,
+    _position_history_holding_time_text,
+    _position_history_open_time_text,
+    _position_history_raw_size_text,
+    _position_history_status_text,
 )
+from roll_terminal_qt.history_service import FillHistoryFeedThread, PositionHistoryFeedThread
 from okx_quant.ui_shell import (
     _augment_upl_usdt_prices_from_positions,
     _build_position_instrument_map,
@@ -37,6 +51,7 @@ from okx_quant.ui_shell import (
     _format_margin_mode,
     _format_mark_price,
     _format_option_trade_side_display,
+    _format_okx_ms_timestamp,
     _format_optional_approx_usdt,
     _format_optional_decimal,
     _format_optional_decimal_fixed,
@@ -285,7 +300,7 @@ def _order_table_values(order: object, instruments: dict[str, object] | None = N
         getattr(order, "size", ""),
         getattr(order, "filled_size", ""),
         getattr(order, "state", ""),
-        getattr(order, "update_time", None) or getattr(order, "created_time", None) or "",
+        _format_okx_ms_timestamp(getattr(order, "update_time", None) or getattr(order, "created_time", None)),
         order_display_tp_sl(order),
         order_display_ids(order)[0],
         order_display_ids(order)[1],
@@ -399,6 +414,18 @@ class KlineAccountDrawer(QWidget):
         self._refresh_data_timer.setSingleShot(True)
         self._refresh_data_timer.timeout.connect(self.refresh_data)
         self._snapshot = AccountDrawerSnapshot()
+        self._fill_history_items: tuple[OkxFillHistoryItem, ...] = ()
+        self._fill_history_instruments: dict[str, object] = {}
+        self._fill_history_usdt_prices: dict[str, Decimal] = {}
+        self._position_history_items: tuple[OkxPositionHistoryItem, ...] = ()
+        self._position_history_instruments: dict[str, object] = {}
+        self._position_history_usdt_prices: dict[str, Decimal] = {}
+        self._history_generation = 0
+        self._fill_history_loaded = False
+        self._position_history_loaded = False
+        self._fill_history_thread: FillHistoryFeedThread | None = None
+        self._position_history_thread: PositionHistoryFeedThread | None = None
+        self._retired_history_threads: list[QThread] = []
         self._visible_orders: list[object] = []
         self._load_thread: AccountDrawerLoadThread | None = None
         self._cancel_thread: AccountDrawerCancelThread | None = None
@@ -514,6 +541,27 @@ class KlineAccountDrawer(QWidget):
         history_orders_layout.addWidget(self._history_orders_table, 1)
         self._tabs.addTab(history_orders_tab, "历史委托")
 
+        self._history_fills_table = self._create_table(
+            ["成交时间", "类型", "合约", "方向", "成交价", "成交数量（币 / 张）", "手续费", "已实现盈亏", "成交类别"]
+        )
+        history_fills_tab = QWidget()
+        history_fills_layout = QVBoxLayout(history_fills_tab)
+        history_fills_layout.setContentsMargins(0, 0, 0, 0)
+        history_fills_layout.addWidget(self._history_fills_table, 1)
+        self._tabs.addTab(history_fills_tab, "历史成交")
+
+        self._history_positions_table = self._create_table(
+            [
+                "更新时间", "开仓时间", "持仓时长", "合约", "方向", "开仓均价", "平仓均价",
+                "开仓数量（币 / 张）", "平仓数量（币 / 张）", "手续费", "已实现盈亏", "状态",
+            ]
+        )
+        history_positions_tab = QWidget()
+        history_positions_layout = QVBoxLayout(history_positions_tab)
+        history_positions_layout.setContentsMargins(0, 0, 0, 0)
+        history_positions_layout.addWidget(self._history_positions_table, 1)
+        self._tabs.addTab(history_positions_tab, "历史仓位")
+
     def _create_table(
         self,
         headers: list[str],
@@ -550,12 +598,17 @@ class KlineAccountDrawer(QWidget):
         refresh_if_visible: bool = True,
     ) -> None:
         normalized_symbol = symbol.strip().upper()
-        changed = (
+        account_changed = (
             runtime is not self._runtime
             or profile_name != self._profile_name
             or environment != self._environment
+        )
+        changed = (
+            account_changed
             or normalized_symbol != self._symbol
         )
+        if account_changed:
+            self._reset_history_context()
         self._runtime = runtime
         self._profile_name = profile_name
         self._environment = environment
@@ -564,13 +617,44 @@ class KlineAccountDrawer(QWidget):
             self._load_shared_order_snapshot()
             self._refresh_tables()
         if changed and refresh_if_visible and self.isVisible():
-            self.refresh_data()
+            self.refresh_data(refresh_history=account_changed)
 
-    def refresh_data(self) -> None:
+    def _reset_history_context(self) -> None:
+        self._history_generation += 1
+        self._fill_history_loaded = False
+        self._position_history_loaded = False
+        self._fill_history_items = ()
+        self._fill_history_instruments.clear()
+        self._fill_history_usdt_prices.clear()
+        self._position_history_items = ()
+        self._position_history_instruments.clear()
+        self._position_history_usdt_prices.clear()
+        for attr_name in ("_fill_history_thread", "_position_history_thread"):
+            thread = getattr(self, attr_name)
+            if thread is None:
+                continue
+            if thread.isRunning():
+                self._retired_history_threads.append(thread)
+                thread.finished.connect(lambda finished=thread: self._forget_retired_history_thread(finished))
+                thread.stop()
+            else:
+                thread.deleteLater()
+            setattr(self, attr_name, None)
+
+    def _forget_retired_history_thread(self, thread: QThread) -> None:
+        if thread in self._retired_history_threads:
+            self._retired_history_threads.remove(thread)
+        thread.deleteLater()
+
+    def refresh_data(self, _checked: bool = False, *, refresh_history: bool = True) -> None:
         if self._runtime is None:
             self._status_label.setText("未连接账户")
             return
         self._shared_order_store.request_refresh(runtime=self._runtime, profile_name=self._profile_name)
+        if refresh_history and self._tabs.currentIndex() == 3:
+            self._ensure_fill_history_loaded(force=True)
+        elif refresh_history and self._tabs.currentIndex() == 4:
+            self._ensure_position_history_loaded(force=True)
         self._request_generation += 1
         if self._load_thread is not None and self._load_thread.isRunning():
             self._refresh_pending = True
@@ -579,11 +663,20 @@ class KlineAccountDrawer(QWidget):
         self._start_load(self._request_generation)
 
     def shutdown(self, wait_ms: int = 1500) -> bool:
+        history_threads = [
+            thread
+            for thread in (self._fill_history_thread, self._position_history_thread, *self._retired_history_threads)
+            if thread is not None and thread.isRunning()
+        ]
+        for thread in history_threads:
+            if hasattr(thread, "stop"):
+                thread.stop()
         if self._cancel_thread is not None and self._cancel_thread.isRunning():
             return self._cancel_thread.wait(wait_ms)
         if self._load_thread is not None and self._load_thread.isRunning():
-            return self._load_thread.wait(wait_ms)
-        return True
+            if not self._load_thread.wait(wait_ms):
+                return False
+        return all(thread.wait(wait_ms) for thread in history_threads)
 
     def _clear_load_thread(self) -> None:
         thread = self._load_thread
@@ -647,10 +740,21 @@ class KlineAccountDrawer(QWidget):
             )
             self._cancel_button.setEnabled(False)
             return
-        self._populate_history_orders_table(
-            filter_account_items(self._snapshot.order_history, scope=scope, symbol=self._symbol)
-        )
         self._cancel_button.setEnabled(False)
+        if current_tab == 2:
+            self._populate_history_orders_table(
+                filter_account_items(self._snapshot.order_history, scope=scope, symbol=self._symbol)
+            )
+        elif current_tab == 3:
+            self._populate_fill_history_table(
+                filter_account_items(self._fill_history_items, scope=scope, symbol=self._symbol)
+            )
+            self._ensure_fill_history_loaded()
+        elif current_tab == 4:
+            self._populate_position_history_table(
+                filter_account_items(self._position_history_items, scope=scope, symbol=self._symbol)
+            )
+            self._ensure_position_history_loaded()
 
     def _populate_orders_table(self, orders: list[object]) -> None:
         self._visible_orders = list(orders)
@@ -695,6 +799,168 @@ class KlineAccountDrawer(QWidget):
             for column, value in enumerate(values):
                 item = QTableWidgetItem(self._format_value(value))
                 self._history_orders_table.setItem(row, column, item)
+
+    def _populate_fill_history_table(self, fills: list[object]) -> None:
+        table = self._history_fills_table
+        table.setRowCount(len(fills))
+        for row, fill in enumerate(fills):
+            values = (
+                _format_okx_ms_timestamp(getattr(fill, "fill_time", None)),
+                getattr(fill, "inst_type", "-") or "-",
+                getattr(fill, "inst_id", "-") or "-",
+                _format_history_side(getattr(fill, "side", None), getattr(fill, "pos_side", None)),
+                _format_fill_history_price(fill),
+                _format_fill_history_size_with_contracts(fill, self._fill_history_instruments),
+                _format_fill_history_fee_cell(fill, self._fill_history_usdt_prices),
+                _format_fill_history_pnl(fill, self._fill_history_usdt_prices),
+                _format_fill_history_exec_type(getattr(fill, "exec_type", None)),
+            )
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(self._format_value(value))
+                if column not in {2, 5}:
+                    item.setTextAlignment(int(Qt.AlignmentFlag.AlignCenter | Qt.AlignmentFlag.AlignVCenter))
+                table.setItem(row, column, item)
+
+    def _populate_position_history_table(self, positions: list[object]) -> None:
+        table = self._history_positions_table
+        table.setRowCount(len(positions))
+        for row, position in enumerate(positions):
+            raw_direction = str(
+                getattr(position, "direction", None)
+                or (getattr(position, "pos_side", None) if getattr(position, "pos_side", None) != "net" else "")
+                or ""
+            ).strip().lower()
+            direction_text = {"long": "多头", "short": "空头", "buy": "多头", "sell": "空头"}.get(
+                raw_direction, raw_direction or "-"
+            )
+            values = (
+                _format_okx_ms_timestamp(getattr(position, "update_time", None)),
+                _position_history_open_time_text(position),
+                _position_history_holding_time_text(position),
+                getattr(position, "inst_id", "-") or "-",
+                direction_text,
+                _format_position_history_price(
+                    getattr(position, "open_avg_price", None),
+                    getattr(position, "inst_id", ""),
+                    getattr(position, "inst_type", ""),
+                    instrument=self._position_history_instruments.get(getattr(position, "inst_id", "")),
+                    usdt_prices=self._position_history_usdt_prices,
+                ),
+                _format_position_history_price(
+                    getattr(position, "close_avg_price", None),
+                    getattr(position, "inst_id", ""),
+                    getattr(position, "inst_type", ""),
+                    instrument=self._position_history_instruments.get(getattr(position, "inst_id", "")),
+                    usdt_prices=self._position_history_usdt_prices,
+                ),
+                _position_history_raw_size_text(
+                    position,
+                    self._position_history_instruments,
+                    "openMaxPos",
+                    "maxPos",
+                    "openPos",
+                ),
+                _position_history_raw_size_text(
+                    position,
+                    self._position_history_instruments,
+                    "closeTotalPos",
+                    "closePos",
+                    "closeSz",
+                ),
+                _format_position_history_fee_cell(position, self._position_history_usdt_prices),
+                _format_position_history_pnl(
+                    getattr(position, "realized_pnl", None),
+                    position,
+                    with_sign=True,
+                    usdt_prices=self._position_history_usdt_prices,
+                ),
+                _position_history_status_text(position),
+            )
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(self._format_value(value))
+                if column not in {3, 7, 8}:
+                    item.setTextAlignment(int(Qt.AlignmentFlag.AlignCenter | Qt.AlignmentFlag.AlignVCenter))
+                table.setItem(row, column, item)
+
+    def _ensure_fill_history_loaded(self, *, force: bool = False) -> None:
+        if self._runtime is None or (self._fill_history_loaded and not force):
+            return
+        if self._fill_history_thread is not None and self._fill_history_thread.isRunning():
+            if not force:
+                return
+            old_thread = self._fill_history_thread
+            self._retired_history_threads.append(old_thread)
+            old_thread.finished.connect(lambda finished=old_thread: self._forget_retired_history_thread(finished))
+            old_thread.stop()
+        generation = self._history_generation
+        thread = FillHistoryFeedThread(self._runtime, limit=100)
+        self._fill_history_thread = thread
+        thread.data_ready.connect(lambda payload, token=generation: self._apply_fill_history_payload(token, payload))
+        thread.status_changed.connect(lambda message, token=generation: self._apply_history_status(token, message))
+        thread.finished.connect(lambda finished=thread: self._clear_fill_history_thread(finished))
+        self._fill_history_loaded = False
+        thread.start()
+
+    def _ensure_position_history_loaded(self, *, force: bool = False) -> None:
+        if self._runtime is None or (self._position_history_loaded and not force):
+            return
+        if self._position_history_thread is not None and self._position_history_thread.isRunning():
+            if not force:
+                return
+            old_thread = self._position_history_thread
+            self._retired_history_threads.append(old_thread)
+            old_thread.finished.connect(lambda finished=old_thread: self._forget_retired_history_thread(finished))
+            old_thread.stop()
+        generation = self._history_generation
+        thread = PositionHistoryFeedThread(self._runtime, limit=1000)
+        self._position_history_thread = thread
+        thread.data_ready.connect(
+            lambda payload, token=generation: self._apply_position_history_payload(token, payload)
+        )
+        thread.status_changed.connect(lambda message, token=generation: self._apply_history_status(token, message))
+        thread.finished.connect(lambda finished=thread: self._clear_position_history_thread(finished))
+        self._position_history_loaded = False
+        thread.start()
+
+    def _apply_history_status(self, generation: int, message: str) -> None:
+        if generation == self._history_generation:
+            self._status_label.setText(message)
+
+    def _apply_fill_history_payload(self, generation: int, payload: object) -> None:
+        if generation != self._history_generation or not isinstance(payload, dict):
+            return
+        self._fill_history_items = tuple(payload.get("items", ()))
+        self._fill_history_instruments = dict(payload.get("instruments", {}) or {})
+        self._fill_history_usdt_prices = dict(payload.get("usdt_prices", {}) or {})
+        self._fill_history_loaded = True
+        if self._tabs.currentIndex() == 3:
+            scope = str(self._scope_combo.currentData() or "symbol")
+            self._populate_fill_history_table(
+                filter_account_items(self._fill_history_items, scope=scope, symbol=self._symbol)
+            )
+
+    def _apply_position_history_payload(self, generation: int, payload: object) -> None:
+        if generation != self._history_generation or not isinstance(payload, dict):
+            return
+        self._position_history_items = tuple(payload.get("items", ()))
+        self._position_history_instruments = dict(payload.get("instruments", {}) or {})
+        self._position_history_usdt_prices = dict(payload.get("usdt_prices", {}) or {})
+        self._position_history_loaded = True
+        if self._tabs.currentIndex() == 4:
+            scope = str(self._scope_combo.currentData() or "symbol")
+            self._populate_position_history_table(
+                filter_account_items(self._position_history_items, scope=scope, symbol=self._symbol)
+            )
+
+    def _clear_fill_history_thread(self, thread: FillHistoryFeedThread) -> None:
+        if self._fill_history_thread is thread:
+            self._fill_history_thread = None
+        thread.deleteLater()
+
+    def _clear_position_history_thread(self, thread: PositionHistoryFeedThread) -> None:
+        if self._position_history_thread is thread:
+            self._position_history_thread = None
+        thread.deleteLater()
 
     @staticmethod
     def _format_value(value: object) -> str:

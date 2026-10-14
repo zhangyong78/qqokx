@@ -4,15 +4,17 @@ from decimal import Decimal
 from types import SimpleNamespace
 from unittest import TestCase
 
-from okx_quant.okx_client import OkxPosition, OkxPositionHistoryItem
+from okx_quant.okx_client import OkxFillHistoryItem, OkxPosition, OkxPositionHistoryItem
 from roll_terminal_qt.kline_analysis_window import (
     KlineAnalysisWindow,
     _best_parameter_indicator_specs,
     _build_kline_current_position_markers,
+    _build_kline_fill_history_trade_markers,
     _build_kline_history_trade_markers,
     _filter_kline_history_trade_markers,
     _history_trade_markers_for_candles,
     _merge_kline_trade_markers,
+    _pair_kline_trade_markers,
 )
 from roll_terminal_qt.option_strategy_window import PositionPriceMarker, position_marker_action_label
 
@@ -73,6 +75,106 @@ def _current_position(*, inst_id: str, opened_at: int, price: str, pos_side: str
 
 
 class KlineHistoryTradeMarkersTest(TestCase):
+    def test_trade_marker_pairs_allocate_partial_closes_fifo_by_size(self) -> None:
+        first_open = {"event": "open", "direction": "long", "price": 100, "size": "3"}
+        second_open = {"event": "open", "direction": "long", "price": 110, "size": "2"}
+        first_close = {"event": "close", "direction": "long", "price": 120, "size": "4"}
+        second_close = {"event": "close", "direction": "long", "price": 90, "size": "1"}
+
+        segments, exit_results, pending = _pair_kline_trade_markers(
+            [first_open, second_open, first_close, second_close]
+        )
+
+        self.assertEqual(
+            [(entry, close) for entry, close, _percent in segments],
+            [
+                (first_open, first_close),
+                (second_open, first_close),
+                (second_open, second_close),
+            ],
+        )
+        self.assertAlmostEqual(exit_results[id(first_close)][0]["price"], 102.5)
+        self.assertEqual(pending["long"], [])
+        self.assertEqual(pending["short"], [])
+
+    def test_trade_marker_pairs_history_position_lifecycle_ids_directly(self) -> None:
+        first_open = {"event": "open", "direction": "long", "price": 100, "size": "1", "lifecycle_id": "pos-a"}
+        second_open = {"event": "open", "direction": "long", "price": 200, "size": "1", "lifecycle_id": "pos-b"}
+        second_close = {"event": "close", "direction": "long", "price": 210, "size": "1", "lifecycle_id": "pos-b"}
+        first_close = {"event": "close", "direction": "long", "price": 110, "size": "1", "lifecycle_id": "pos-a"}
+
+        segments, exit_results, pending = _pair_kline_trade_markers(
+            [first_open, second_open, second_close, first_close]
+        )
+
+        self.assertEqual(
+            [(entry, close) for entry, close, _percent in segments],
+            [(second_open, second_close), (first_open, first_close)],
+        )
+        self.assertAlmostEqual(exit_results[id(second_close)][1], 5.0)
+        self.assertAlmostEqual(exit_results[id(first_close)][1], 10.0)
+        self.assertEqual(pending["long"], [])
+
+    def test_fill_history_markers_use_actual_fill_times_and_combine_partial_order_fills(self) -> None:
+        fills = [
+            OkxFillHistoryItem(
+                fill_time=1_700_000_000_000,
+                inst_id="ETH-USDT-SWAP",
+                inst_type="SWAP",
+                side="buy",
+                pos_side="long",
+                fill_price=Decimal("100"),
+                fill_size=Decimal("0.5"),
+                fill_fee=None,
+                fee_currency=None,
+                pnl=Decimal("0"),
+                order_id="open-1",
+                trade_id="trade-1",
+                exec_type="T",
+                raw={"pnlCcy": "USDT"},
+            ),
+            OkxFillHistoryItem(
+                fill_time=1_700_000_001_000,
+                inst_id="ETH-USDT-SWAP",
+                inst_type="SWAP",
+                side="buy",
+                pos_side="long",
+                fill_price=Decimal("102"),
+                fill_size=Decimal("0.5"),
+                fill_fee=None,
+                fee_currency=None,
+                pnl=Decimal("0"),
+                order_id="open-1",
+                trade_id="trade-2",
+                exec_type="T",
+                raw={"pnlCcy": "USDT"},
+            ),
+            OkxFillHistoryItem(
+                fill_time=1_700_000_300_000,
+                inst_id="ETH-USDT-SWAP",
+                inst_type="SWAP",
+                side="sell",
+                pos_side="long",
+                fill_price=Decimal("105"),
+                fill_size=Decimal("1"),
+                fill_fee=None,
+                fee_currency=None,
+                pnl=Decimal("4"),
+                order_id="close-1",
+                trade_id="trade-3",
+                exec_type="T",
+                raw={"pnlCcy": "USDT"},
+            ),
+        ]
+
+        markers = _build_kline_fill_history_trade_markers(fills, symbol="ETH-USDT-SWAP")
+
+        self.assertEqual(
+            [(item.event, item.direction, item.at_seconds, item.price) for item in markers],
+            [("open", "long", 1_700_000_000, 101.0), ("close", "long", 1_700_000_300, 105.0)],
+        )
+        self.assertEqual(markers[1].realized_pnl, Decimal("4"))
+
     def test_position_marker_action_labels_distinguish_open_and_close_side(self) -> None:
         self.assertEqual(position_marker_action_label(PositionPriceMarker("entry", 1, Decimal("1"), "long")), "买入开仓")
         self.assertEqual(position_marker_action_label(PositionPriceMarker("exit", 2, Decimal("1"), "long")), "卖出平仓")

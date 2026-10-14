@@ -16,6 +16,7 @@ from okx_quant.daily_filters import (
 from okx_quant.indicators import atr, ema, moving_average
 from okx_quant.market_data_hub import MarketDataHub
 from okx_quant.models import (
+    Candle,
     Credentials,
     DynamicProtectionRule,
     Instrument,
@@ -443,6 +444,16 @@ class LocalSignalTrigger:
     candle_ts: int
     signal_candle_high: Decimal | None
     signal_candle_low: Decimal | None
+
+
+@dataclass
+class DynamicStopTriggerState:
+    favorable_price: Decimal
+
+    def observe(self, price: Decimal, direction: Literal["long", "short"]) -> None:
+        self.favorable_price = (
+            max(self.favorable_price, price) if direction == "long" else min(self.favorable_price, price)
+        )
 
 
 @dataclass(frozen=True)
@@ -4422,6 +4433,190 @@ class StrategyEngine:
     ) -> None:
         self._monitor_local_exit(credentials, config, trade_instrument, position, protection)
 
+    def _dynamic_stop_candle_page(
+        self,
+        inst_id: str,
+        trigger_type: str,
+        bar: str,
+        *,
+        before_ts: int | None = None,
+        limit: int = 300,
+    ) -> list[Candle]:
+        if trigger_type == "mark":
+            method = (
+                self._client.get_mark_price_candles
+                if before_ts is None
+                else self._client.get_mark_price_candles_history_before
+            )
+            args = (inst_id, bar, limit) if before_ts is None else (inst_id, bar, before_ts, limit)
+        elif trigger_type == "index":
+            index_inst_id = "-".join(inst_id.upper().split("-")[:2])
+            method = (
+                self._client.get_index_price_candles
+                if before_ts is None
+                else self._client.get_index_price_candles_before
+            )
+            args = (index_inst_id, bar, limit) if before_ts is None else (index_inst_id, bar, before_ts, limit)
+        elif trigger_type == "last":
+            method = self._client.get_candles if before_ts is None else self._client.get_candles_history_before
+            args = (inst_id, bar, limit) if before_ts is None else (inst_id, bar, before_ts, limit)
+        else:
+            raise ValueError(f"Unsupported trigger price type: {trigger_type}")
+        return method(*args)
+
+    @staticmethod
+    def _dynamic_stop_confirmed_minute_cursor(
+        candles: list[Candle],
+        *,
+        last_candle_ts: int | None,
+        minimum_candle_ts: int,
+        cutoff_ts: int,
+    ) -> int | None:
+        rows = {candle.ts: candle for candle in candles if minimum_candle_ts <= candle.ts < cutoff_ts}
+        if not rows:
+            return last_candle_ts
+        cursor = last_candle_ts
+        if cursor is None:
+            cursor = min(rows) - 60_000
+        cursor = max(cursor, minimum_candle_ts - 60_000)
+        # Advance only through contiguous confirmed minutes. A late/missing bar
+        # must remain eligible for the next scan even if newer bars are present.
+        while cursor + 60_000 in rows and rows[cursor + 60_000].confirmed:
+            cursor += 60_000
+        return cursor
+
+    def _restore_dynamic_stop_favorable_price(
+        self,
+        *,
+        inst_id: str,
+        trigger_type: str,
+        direction: Literal["long", "short"],
+        entry_price: Decimal,
+        entry_ts: int,
+    ) -> tuple[Decimal, int | None, int]:
+        now_ms = int(time.time() * 1000)
+        if entry_ts <= 0 or entry_ts > now_ms:
+            raise ValueError("Historical dynamic-stop recovery requires a valid position entry timestamp")
+        hour_ms = 60 * 60 * 1000
+        current_hour_ts = now_ms // hour_ms * hour_ms
+        entry_hour_ts = entry_ts // hour_ms * hour_ms
+        first_full_entry_minute_ts = (entry_ts + 59_999) // 60_000 * 60_000
+        favorable = entry_price
+        hourly_count = 0
+        page = self._dynamic_stop_candle_page(inst_id, trigger_type, "1H", limit=300)
+        while page:
+            for candle in page:
+                if candle.confirmed and entry_hour_ts < candle.ts < current_hour_ts:
+                    extreme = candle.high if direction == "long" else candle.low
+                    favorable = max(favorable, extreme) if direction == "long" else min(favorable, extreme)
+                    hourly_count += 1
+            oldest_ts = min(candle.ts for candle in page)
+            if oldest_ts <= entry_hour_ts:
+                break
+            older = self._dynamic_stop_candle_page(
+                inst_id,
+                trigger_type,
+                "1H",
+                before_ts=oldest_ts,
+                limit=300,
+            )
+            if not older or min(candle.ts for candle in older) >= oldest_ts:
+                break
+            page = older
+
+        entry_hour_end_ts = entry_hour_ts + hour_ms
+        page = self._dynamic_stop_candle_page(
+            inst_id,
+            trigger_type,
+            "1m",
+            before_ts=entry_hour_end_ts,
+            limit=300,
+        )
+        while page:
+            for candle in page:
+                if (
+                    candle.confirmed
+                    and first_full_entry_minute_ts <= candle.ts < entry_hour_end_ts
+                    and candle.ts < now_ms // 60_000 * 60_000
+                ):
+                    extreme = candle.high if direction == "long" else candle.low
+                    favorable = max(favorable, extreme) if direction == "long" else min(favorable, extreme)
+            oldest_ts = min(candle.ts for candle in page)
+            if oldest_ts <= first_full_entry_minute_ts:
+                break
+            older = self._dynamic_stop_candle_page(
+                inst_id,
+                trigger_type,
+                "1m",
+                before_ts=oldest_ts,
+                limit=300,
+            )
+            if not older or min(candle.ts for candle in older) >= oldest_ts:
+                break
+            page = older
+
+        minute_page = self._dynamic_stop_candle_page(inst_id, trigger_type, "1m", limit=300)
+        for candle in minute_page:
+            if candle.confirmed and first_full_entry_minute_ts <= candle.ts < now_ms // 60_000 * 60_000:
+                extreme = candle.high if direction == "long" else candle.low
+                favorable = max(favorable, extreme) if direction == "long" else min(favorable, extreme)
+        minute_cursor = self._dynamic_stop_confirmed_minute_cursor(
+            minute_page,
+            last_candle_ts=max(current_hour_ts, first_full_entry_minute_ts) - 60_000,
+            minimum_candle_ts=first_full_entry_minute_ts,
+            cutoff_ts=now_ms // 60_000 * 60_000,
+        )
+        return favorable, minute_cursor, hourly_count
+
+    def _scan_dynamic_stop_minute_candles(
+        self,
+        *,
+        inst_id: str,
+        trigger_type: str,
+        last_candle_ts: int | None,
+        minimum_candle_ts: int,
+        direction: Literal["long", "short"],
+    ) -> tuple[Decimal | None, int | None]:
+        page = self._dynamic_stop_candle_page(inst_id, trigger_type, "1m", limit=300)
+        collected: dict[int, Candle] = {candle.ts: candle for candle in page}
+        while last_candle_ts is not None and page:
+            oldest_ts = min(candle.ts for candle in page)
+            if oldest_ts <= last_candle_ts:
+                break
+            older = self._dynamic_stop_candle_page(
+                inst_id,
+                trigger_type,
+                "1m",
+                before_ts=oldest_ts,
+                limit=300,
+            )
+            if not older or min(candle.ts for candle in older) >= oldest_ts:
+                break
+            collected.update((candle.ts, candle) for candle in older)
+            page = older
+
+        now_minute_ts = int(time.time() * 1000) // 60_000 * 60_000
+        eligible = [
+            candle
+            for candle in collected.values()
+            if candle.confirmed
+            and candle.ts < now_minute_ts
+            and candle.ts >= minimum_candle_ts
+            and (last_candle_ts is None or candle.ts > last_candle_ts)
+        ]
+        if not eligible:
+            return None, last_candle_ts
+        eligible.sort(key=lambda candle: candle.ts)
+        prices = [candle.high if direction == "long" else candle.low for candle in eligible]
+        favorable = max(prices) if direction == "long" else min(prices)
+        cursor = self._dynamic_stop_confirmed_minute_cursor(
+            list(collected.values()),
+            last_candle_ts=last_candle_ts,
+            minimum_candle_ts=minimum_candle_ts,
+            cutoff_ts=now_minute_ts,
+        )
+        return favorable, cursor
+
     def _monitor_exchange_dynamic_stop(
         self,
         credentials: Credentials,
@@ -4508,8 +4703,75 @@ class StrategyEngine:
         missing_algo_strikes = 0
         trend_ema_close_exit_armed = False
         trend_ema_close_exit_last_candle_ts: int | None = None
+        last_minute_candle_ts: int | None = None
+        last_minute_scan_bucket: int | None = None
+        trigger_state = DynamicStopTriggerState(position.entry_price)
+        history_enabled = 0 < position.entry_ts <= int(time.time() * 1000)
+        history_restored = False
+        try:
+            favorable_price, last_minute_candle_ts, restored_hour_count = self._restore_dynamic_stop_favorable_price(
+                inst_id=trade_instrument.inst_id,
+                trigger_type=config.tp_sl_trigger_type,
+                direction=direction,
+                entry_price=position.entry_price,
+                entry_ts=position.entry_ts,
+            )
+            trigger_state.observe(favorable_price, direction)
+            self._logger(
+                " | ".join(
+                    [
+                        "OKX动态止损历史触发价回补完成",
+                        f"1小时已收盘K线={restored_hour_count}根",
+                        f"已恢复有利极值={format_decimal(favorable_price)}",
+                        f"1分钟扫描游标={last_minute_candle_ts or '-'}",
+                    ]
+                )
+            )
+            history_restored = True
+        except Exception as exc:
+            if history_enabled:
+                self._logger(f"OKX动态止损历史K线回补失败，将继续实时监控并稍后重试 | {str(exc).strip() or exc.__class__.__name__}")
+            else:
+                self._logger("OKX动态止损缺少有效入场时间，禁用历史回补并继续实时监控")
 
         while not self._stop_event.is_set():
+            scan_bucket = int(time.time()) // 60
+            if history_enabled and scan_bucket != last_minute_scan_bucket:
+                last_minute_scan_bucket = scan_bucket
+                if not history_restored:
+                    try:
+                        restored_price, restored_cursor, restored_hour_count = self._restore_dynamic_stop_favorable_price(
+                            inst_id=trade_instrument.inst_id,
+                            trigger_type=config.tp_sl_trigger_type,
+                            direction=direction,
+                            entry_price=position.entry_price,
+                            entry_ts=position.entry_ts,
+                        )
+                        trigger_state.observe(restored_price, direction)
+                        last_minute_candle_ts = restored_cursor
+                        history_restored = True
+                        self._logger(
+                            f"OKX动态止损历史触发价回补重试成功 | 1小时已收盘K线={restored_hour_count}根 | 有利极值={format_decimal(trigger_state.favorable_price)}"
+                        )
+                    except Exception as exc:
+                        self._logger(
+                            f"OKX动态止损历史K线回补仍失败，将继续实时监控 | {str(exc).strip() or exc.__class__.__name__}"
+                        )
+                try:
+                    scanned_price, scanned_ts = self._scan_dynamic_stop_minute_candles(
+                        inst_id=trade_instrument.inst_id,
+                        trigger_type=config.tp_sl_trigger_type,
+                        last_candle_ts=last_minute_candle_ts,
+                        minimum_candle_ts=(position.entry_ts + 59_999) // 60_000 * 60_000,
+                        direction=direction,
+                    )
+                    if scanned_price is not None:
+                        trigger_state.observe(scanned_price, direction)
+                    last_minute_candle_ts = scanned_ts
+                except Exception as exc:
+                    self._logger(
+                        f"OKX动态止损1分钟历史补扫失败，保留原扫描游标并下分钟重试 | {str(exc).strip() or exc.__class__.__name__}"
+                    )
             try:
                 should_continue = self._monitor_exchange_dynamic_stop_once(
                     credentials,
@@ -4522,6 +4784,7 @@ class StrategyEngine:
                     initial_stop_loss=initial_stop_loss,
                     next_trigger_r=next_trigger_r,
                     risk_per_unit=risk_per_unit,
+                    trigger_state=trigger_state,
                     amend_failures=amend_failures,
                     missing_algo_strikes=missing_algo_strikes,
                     baseline_abs_position=baseline_abs,
@@ -4658,6 +4921,8 @@ class StrategyEngine:
         next_trigger_r: int,
         risk_per_unit: Decimal,
         amend_failures: int,
+        favorable_price: Decimal | None = None,
+        trigger_state: DynamicStopTriggerState | None = None,
         missing_algo_strikes: int = 0,
         baseline_abs_position: Decimal | None = None,
         trend_ema_close_exit_armed: bool = False,
@@ -4720,6 +4985,38 @@ class StrategyEngine:
             algo_id=stop_loss_algo_id,
         )
         next_missing = 0 if pending_tracked is not None else missing_algo_strikes + 1
+        if pending_tracked is not None:
+            pending_type = (pending_tracked.stop_loss_trigger_price_type or "last").strip().lower()
+            if pending_type != config.tp_sl_trigger_type:
+                self._logger(
+                    f"OKX动态止损触发价类型不一致，暂停自动改单 | 配置={config.tp_sl_trigger_type} | 交易所={pending_type} | {algo_ref}"
+                )
+                return DynamicStopMonitorStepResult(
+                    keep_monitoring=True,
+                    current_stop_loss=current_stop_loss,
+                    next_trigger_r=next_trigger_r,
+                    amend_failures=amend_failures,
+                    seed_baseline_abs=seed_snap,
+                    trend_ema_close_exit_armed=trend_ema_close_exit_armed,
+                    trend_ema_close_exit_last_candle_ts=trend_ema_close_exit_last_candle_ts,
+                )
+            pending_stop = pending_tracked.stop_loss_trigger_price
+            if pending_stop is not None and pending_stop > 0:
+                protected_stop = (
+                    max(current_stop_loss, pending_stop)
+                    if direction == "long"
+                    else min(current_stop_loss, pending_stop)
+                )
+                if protected_stop != current_stop_loss:
+                    current_stop_loss = protected_stop
+                    next_trigger_r = _infer_dynamic_next_trigger_r_from_stop(
+                        direction=direction,
+                        entry_price=position.entry_price,
+                        current_stop_loss=current_stop_loss,
+                        risk_per_unit=risk_per_unit,
+                        tick_size=trade_instrument.tick_size,
+                        config=config,
+                    )
         live_abs = abs(live_position.position)
         # 止损算法单已从挂单消失时，必须先尝试「推断已触发 / 强制收口」，再读触发价做上移逻辑。
         # 否则 _get_trigger_price 一旦连续失败，推断分支永远走不到，界面会长期显示监控中。
@@ -4809,10 +5106,20 @@ class StrategyEngine:
             environment=config.environment,
             max_cached_age_seconds=EXCHANGE_DYNAMIC_STOP_MAX_CACHED_TICKER_AGE_SECONDS,
         )
+        evaluation_price = current_price
+        if trigger_state is not None:
+            trigger_state.observe(current_price, direction)
+            evaluation_price = trigger_state.favorable_price
+        if favorable_price is not None:
+            evaluation_price = (
+                max(evaluation_price, favorable_price)
+                if direction == "long"
+                else min(evaluation_price, favorable_price)
+            )
         holding_bars = _holding_bars_live(position.entry_ts, int(time.time() * 1000), config.bar)
         updated_stop_loss, next_trigger_price, updated_trigger_r, moved = _advance_dynamic_stop_live(
             direction=direction,
-            current_price=current_price,
+            current_price=evaluation_price,
             entry_price=position.entry_price,
             risk_per_unit=risk_per_unit,
             current_stop_loss=current_stop_loss,
@@ -4889,6 +5196,8 @@ class StrategyEngine:
             environment=config.environment,
             max_cached_age_seconds=EXCHANGE_DYNAMIC_STOP_MAX_CACHED_TICKER_AGE_SECONDS,
         )
+        if trigger_state is not None:
+            trigger_state.observe(fresh_price, direction)
         if not _is_exchange_dynamic_stop_candidate_valid(
             direction=direction,
             current_price=fresh_price,
@@ -5041,8 +5350,50 @@ class StrategyEngine:
                 )
             raise RuntimeError(f"OKX 动态止损上移失败：{detail}") from exc
 
+        confirmed_order = self._find_pending_algo_order_for_dynamic_stop(
+            credentials,
+            config,
+            trade_instrument=trade_instrument,
+            algo_cl_ord_id=amend_cl_ord,
+            algo_id=algo_order.algo_id,
+        )
+        confirmed_stop = confirmed_order.stop_loss_trigger_price if confirmed_order is not None else None
+        confirmed_type = (
+            (confirmed_order.stop_loss_trigger_price_type or "last").strip().lower()
+            if confirmed_order is not None else None
+        )
+        stop_confirmed = (
+            confirmed_stop is not None
+            and confirmed_type == config.tp_sl_trigger_type
+            and (confirmed_stop >= updated_stop_loss if direction == "long" else confirmed_stop <= updated_stop_loss)
+        )
+        if not stop_confirmed:
+            self._logger(
+                f"OKX动态止损改单已应答但回查尚未确认，保留原档位等待重查 | 候选止损={format_decimal(updated_stop_loss)} | {algo_ref}"
+            )
+            return DynamicStopMonitorStepResult(
+                keep_monitoring=True,
+                current_stop_loss=current_stop_loss,
+                next_trigger_r=next_trigger_r,
+                amend_failures=amend_failures,
+                missing_algo_strikes=next_missing,
+                seed_baseline_abs=seed_snap,
+                trend_ema_close_exit_armed=trend_ema_close_exit_armed,
+                trend_ema_close_exit_last_candle_ts=trend_ema_close_exit_last_candle_ts,
+            )
+        if confirmed_stop != updated_stop_loss:
+            updated_stop_loss = confirmed_stop
+            updated_trigger_r = _infer_dynamic_next_trigger_r_from_stop(
+                direction=direction,
+                entry_price=position.entry_price,
+                current_stop_loss=updated_stop_loss,
+                risk_per_unit=risk_per_unit,
+                tick_size=trade_instrument.tick_size,
+                config=config,
+            )
+
         self._logger(
-            f"OKX 动态止损已上移 | 当前价={format_decimal(fresh_price)} | "
+            f"OKX 动态止损已上移 | 当前价={format_decimal(fresh_price)} | 有利触发价={format_decimal(evaluation_price)} | "
             f"新止损={format_decimal(updated_stop_loss)} | 下一阶段={updated_trigger_r}R | "
             f"下一次上移触发价={_dynamic_next_trigger_price_text(direction=direction, entry_price=position.entry_price, risk_per_unit=risk_per_unit, next_trigger_r=updated_trigger_r, tick_size=trade_instrument.tick_size, dynamic_fee_offset_enabled=_live_ema55_slope_dynamic_fee_offset_enabled(config))} | "
             f"{algo_ref} | holding_bars={holding_bars}"

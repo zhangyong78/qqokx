@@ -702,20 +702,20 @@ class UiPositionsMixin:
             "cl_ord_id": "clOrdId",
         }
         for column_id, width in (
-            ("time", 150),
-            ("source", 82),
-            ("inst_type", 72),
-            ("inst_id", 240),
-            ("state", 120),
-            ("side", 96),
-            ("ord_type", 110),
-            ("price", 100),
-            ("size", 150),
-            ("filled", 150),
-            ("fee", 110),
-            ("tp_sl", 180),
-            ("order_id", 120),
-            ("cl_ord_id", 150),
+            ("time", 180),
+            ("source", 120),
+            ("inst_type", 90),
+            ("inst_id", 280),
+            ("state", 145),
+            ("side", 110),
+            ("ord_type", 130),
+            ("price", 135),
+            ("size", 200),
+            ("filled", 200),
+            ("fee", 240),
+            ("tp_sl", 320),
+            ("order_id", 220),
+            ("cl_ord_id", 300),
         ):
             tree.heading(column_id, text=headings[column_id])
             tree.column(column_id, width=width, anchor="e" if column_id in {"price", "size", "filled", "fee"} else "center")
@@ -884,20 +884,20 @@ class UiPositionsMixin:
             "cl_ord_id": "clOrdId",
         }
         for column_id, width in (
-            ("time", 150),
-            ("source", 82),
-            ("inst_type", 72),
-            ("inst_id", 240),
-            ("state", 120),
-            ("side", 96),
-            ("ord_type", 110),
-            ("price", 100),
-            ("size", 150),
-            ("filled", 150),
-            ("fee", 220),
-            ("tp_sl", 180),
-            ("order_id", 120),
-            ("cl_ord_id", 150),
+            ("time", 180),
+            ("source", 120),
+            ("inst_type", 90),
+            ("inst_id", 280),
+            ("state", 145),
+            ("side", 110),
+            ("ord_type", 130),
+            ("price", 135),
+            ("size", 200),
+            ("filled", 200),
+            ("fee", 240),
+            ("tp_sl", 320),
+            ("order_id", 220),
+            ("cl_ord_id", 300),
         ):
             tree.heading(column_id, text=headings[column_id])
             tree.column(column_id, width=width, anchor="e" if column_id in {"price", "size", "filled", "fee"} else "center")
@@ -1016,15 +1016,15 @@ class UiPositionsMixin:
             "exec_type": "成交类型",
         }
         for column_id, width in (
-            ("time", 150),
-            ("inst_type", 72),
-            ("inst_id", 240),
-            ("side", 96),
-            ("price", 100),
-            ("size", 150),
-            ("fee", 220),
-            ("pnl", 220),
-            ("exec_type", 108),
+            ("time", 180),
+            ("inst_type", 90),
+            ("inst_id", 280),
+            ("side", 110),
+            ("price", 135),
+            ("size", 200),
+            ("fee", 240),
+            ("pnl", 240),
+            ("exec_type", 135),
         ):
             tree.heading(column_id, text=headings[column_id])
             tree.column(column_id, width=width, anchor="e" if column_id in {"price", "size", "fee", "pnl"} else "center")
@@ -1174,18 +1174,18 @@ class UiPositionsMixin:
             "note": "备注",
         }
         for column_id, width in (
-            ("time", 150),
-            ("inst_type", 72),
-            ("inst_id", 240),
-            ("mgn_mode", 96),
-            ("side", 96),
-            ("open_avg", 100),
-            ("close_avg", 100),
-            ("close_size", 150),
-            ("fee", 220),
-            ("pnl", 220),
-            ("realized", 240),
-            ("note", 220),
+            ("time", 180),
+            ("inst_type", 90),
+            ("inst_id", 280),
+            ("mgn_mode", 120),
+            ("side", 110),
+            ("open_avg", 135),
+            ("close_avg", 135),
+            ("close_size", 200),
+            ("fee", 240),
+            ("pnl", 240),
+            ("realized", 260),
+            ("note", 320),
         ):
             tree.heading(column_id, text=headings[column_id])
             tree.column(
@@ -1197,7 +1197,7 @@ class UiPositionsMixin:
             )
         tree.heading("side", text="持仓模式")
         tree.heading("trade_side", text="交易方向")
-        tree.column("trade_side", width=116, anchor="center")
+        tree.column("trade_side", width=130, anchor="center")
         tree.column("inst_id", anchor="w")
         tree.column("note", anchor="w")
         tree.grid(row=0, column=0, sticky="nsew")

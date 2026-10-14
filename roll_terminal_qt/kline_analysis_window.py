@@ -86,7 +86,7 @@ from okx_quant.kline_rr_execution import RRTradeExecutionService
 from okx_quant.kline_rr_trade import RRTradeLedgerEntry, RRTradePlan, build_rr_trade_plan
 from okx_quant.kline_trade_recommendations import KlineTradeIdea, build_kline_trade_idea
 from roll_terminal_qt.kline_trade_recommendation_dialog import KlineTradeRecommendationDialog
-from okx_quant.okx_client import OkxPosition, OkxPositionHistoryItem, OkxRestClient, infer_inst_type
+from okx_quant.okx_client import OkxFillHistoryItem, OkxPosition, OkxPositionHistoryItem, OkxRestClient, infer_inst_type
 from okx_quant.engine import _dynamic_two_taker_fee_offset_live
 from okx_quant.pricing import format_decimal, format_decimal_by_increment, format_decimal_fixed, snap_to_increment
 from okx_quant.ui_shell import _format_history_size_amount, _history_display_amount
@@ -110,6 +110,7 @@ from roll_terminal_qt.line_trading_core import (
     rr_annotation_to_payload,
 )
 from roll_terminal_qt.kline_box_rules import AUTO_BOX_MAX_CANDIDATES, is_auto_box_candidate_valid
+from roll_terminal_qt.history_service import load_local_position_history, merge_position_history_cache
 from roll_terminal_qt.perf_metrics import measure_ui_step
 from roll_terminal_qt.kline_alerts import (
     build_workspace_key,
@@ -176,6 +177,11 @@ _CHART_SMA50_COLOR = "#58c66d"
 _CHART_BEST_INDICATOR_COLORS = ("#f59e0b", "#8b5cf6", "#38bdf8", "#ec4899")
 _HISTORY_TRADE_OPEN_COLOR = "#38bdf8"
 _HISTORY_TRADE_CLOSE_COLOR = "#f97316"
+_HISTORY_TRADE_LONG_COLOR = "#22d3ee"
+_HISTORY_TRADE_SHORT_COLOR = "#c084fc"
+_HISTORY_TRADE_PROFIT_COLOR = "#22c55e"
+_HISTORY_TRADE_LOSS_COLOR = "#ef4444"
+_HISTORY_TRADE_FLAT_COLOR = "#94a3b8"
 _CHART_CROSSHAIR_COLOR = "#6b7280"
 _REPLAY_SIGNAL_NEAR_MA_MAX_PCT = 0.006
 
@@ -2716,6 +2722,8 @@ class KlineHistoryTradeMarker:
     event: str
     realized_pnl: Decimal | None = None
     pnl_currency: str = ""
+    size: Decimal | None = None
+    lifecycle_id: str = ""
 
 
 def _history_position_direction(item: OkxPositionHistoryItem) -> str:
@@ -2782,7 +2790,7 @@ def _build_kline_history_trade_markers(
 
     normalized_symbol = symbol.strip().upper()
     markers: list[KlineHistoryTradeMarker] = []
-    seen_openings: set[tuple[str, str, int]] = set()
+    seen_openings: set[tuple[str, str, str]] = set()
     for item in items:
         if str(getattr(item, "inst_id", "") or "").strip().upper() != normalized_symbol:
             continue
@@ -2796,10 +2804,18 @@ def _build_kline_history_trade_markers(
             open_price = 0.0
             close_price = 0.0
         opened_at = _history_position_time(item, event="open")
+        raw = item.raw if isinstance(item.raw, dict) else {}
+        lifecycle_id = "|".join(
+            (
+                normalized_symbol,
+                str(raw.get("posId") or "").strip(),
+                str(raw.get("cTime") or opened_at or "").strip(),
+            )
+        )
         if opened_at > 0 and open_price > 0.0:
-            # One position may generate several partial-close records.  cTime is the
-            # position creation time, so render its opening only once.
-            opening_key = (normalized_symbol, direction, opened_at)
+            # Use the exchange lifecycle id so distinct positions opened close
+            # together do not collapse into one marker.
+            opening_key = (normalized_symbol, direction, lifecycle_id)
             if opening_key not in seen_openings:
                 seen_openings.add(opening_key)
                 markers.append(
@@ -2808,6 +2824,8 @@ def _build_kline_history_trade_markers(
                         price=open_price,
                         direction=direction,
                         event="open",
+                        size=getattr(item, "close_size", None),
+                        lifecycle_id=lifecycle_id,
                     )
                 )
 
@@ -2817,7 +2835,6 @@ def _build_kline_history_trade_markers(
         realized_pnl = getattr(item, "realized_pnl", None)
         if realized_pnl is None:
             realized_pnl = getattr(item, "pnl", None)
-        raw = item.raw if isinstance(item.raw, dict) else {}
         pnl_currency = str(raw.get("ccy") or raw.get("pnlCcy") or raw.get("settleCcy") or "").strip().upper()
         markers.append(
             KlineHistoryTradeMarker(
@@ -2827,9 +2844,123 @@ def _build_kline_history_trade_markers(
                 event="close",
                 realized_pnl=realized_pnl if isinstance(realized_pnl, Decimal) else None,
                 pnl_currency=pnl_currency,
+                size=getattr(item, "close_size", None),
+                lifecycle_id=lifecycle_id,
             )
         )
     markers.sort(key=lambda item: (item.at_seconds, item.direction, item.event, item.price))
+    return markers
+
+
+def _build_kline_fill_history_trade_markers(
+    items: list[OkxFillHistoryItem] | tuple[OkxFillHistoryItem, ...],
+    *,
+    symbol: str,
+) -> list[KlineHistoryTradeMarker]:
+    """Map actual fills to chart events, combining partial fills from one order."""
+
+    normalized_symbol = symbol.strip().upper()
+    fills: list[tuple[int, OkxFillHistoryItem, Decimal, Decimal, str, str]] = []
+    for item in items:
+        if str(getattr(item, "inst_id", "") or "").strip().upper() != normalized_symbol:
+            continue
+        timestamp = _history_time_to_seconds(getattr(item, "fill_time", None))
+        side = str(getattr(item, "side", "") or "").strip().lower()
+        try:
+            price = Decimal(str(getattr(item, "fill_price", None)))
+            size = Decimal(str(getattr(item, "fill_size", None)))
+        except Exception:
+            continue
+        if timestamp <= 0 or price <= 0 or size <= 0 or side not in {"buy", "sell"}:
+            continue
+        raw = item.raw if isinstance(item.raw, dict) else {}
+        pnl_currency = str(raw.get("pnlCcy") or raw.get("settleCcy") or raw.get("ccy") or "").strip().upper()
+        fills.append((timestamp, item, price, size, side, pnl_currency))
+    fills.sort(key=lambda row: (row[0], str(getattr(row[1], "trade_id", "") or "")))
+
+    # Net-mode accounts do not identify each fill as open or close. Track the
+    # observed signed position, and use non-zero realized fill PnL to recognize
+    # closes when the locally cached window starts mid-position.
+    net_position = Decimal("0")
+    grouped: dict[tuple[str, str, str], dict[str, Any]] = {}
+    for timestamp, item, price, size, side, pnl_currency in fills:
+        pos_side = str(getattr(item, "pos_side", "") or "").strip().lower()
+        pnl = getattr(item, "pnl", None)
+        try:
+            pnl_value = Decimal(str(pnl)) if pnl is not None else None
+        except Exception:
+            pnl_value = None
+        if pos_side in {"long", "short"}:
+            direction = pos_side
+            is_open = (direction == "long" and side == "buy") or (direction == "short" and side == "sell")
+            parts = [("open" if is_open else "close", direction, size)]
+        else:
+            parts: list[tuple[str, str, Decimal]] = []
+            remaining = size
+            if side == "buy":
+                if net_position < 0:
+                    closed = min(remaining, -net_position)
+                    parts.append(("close", "short", closed))
+                    net_position += closed
+                    remaining -= closed
+                if remaining > 0:
+                    parts.append(("open", "long", remaining))
+                    net_position += remaining
+                elif not parts and pnl_value not in (None, Decimal("0")):
+                    parts.append(("close", "short", size))
+            else:
+                if net_position > 0:
+                    closed = min(remaining, net_position)
+                    parts.append(("close", "long", closed))
+                    net_position -= closed
+                    remaining -= closed
+                if remaining > 0:
+                    parts.append(("open", "short", remaining))
+                    net_position -= remaining
+                elif not parts and pnl_value not in (None, Decimal("0")):
+                    parts.append(("close", "long", size))
+
+        order_id = str(getattr(item, "order_id", "") or getattr(item, "trade_id", "") or timestamp)
+        for event, direction, part_size in parts:
+            key = (order_id, event, direction)
+            aggregate = grouped.setdefault(
+                key,
+                {
+                    "first_time": timestamp,
+                    "last_time": timestamp,
+                    "size": Decimal("0"),
+                    "price_value": Decimal("0"),
+                    "pnl": Decimal("0"),
+                    "has_pnl": False,
+                    "pnl_currency": pnl_currency,
+                },
+            )
+            aggregate["first_time"] = min(aggregate["first_time"], timestamp)
+            aggregate["last_time"] = max(aggregate["last_time"], timestamp)
+            aggregate["size"] += part_size
+            aggregate["price_value"] += price * part_size
+            if event == "close" and pnl_value is not None:
+                aggregate["pnl"] += pnl_value
+                aggregate["has_pnl"] = True
+
+    markers: list[KlineHistoryTradeMarker] = []
+    for (_order_id, event, direction), aggregate in grouped.items():
+        total_size = aggregate["size"]
+        if total_size <= 0:
+            continue
+        at_seconds = aggregate["first_time"] if event == "open" else aggregate["last_time"]
+        markers.append(
+            KlineHistoryTradeMarker(
+                at_seconds=at_seconds,
+                price=float(aggregate["price_value"] / total_size),
+                direction=direction,
+                event=event,
+                realized_pnl=aggregate["pnl"] if aggregate["has_pnl"] else None,
+                pnl_currency=aggregate["pnl_currency"],
+                size=total_size,
+            )
+        )
+    markers.sort(key=lambda marker: (marker.at_seconds, marker.direction, marker.event, marker.price))
     return markers
 
 
@@ -2869,6 +3000,14 @@ def _build_kline_current_position_markers(
                 price=open_price,
                 direction=direction,
                 event="open",
+                size=abs(item.position) if isinstance(item.position, Decimal) else None,
+                lifecycle_id="|".join(
+                    (
+                        normalized_symbol,
+                        str(raw.get("posId") or "").strip(),
+                        str(raw.get("cTime") or opened_at or "").strip(),
+                    )
+                ),
             )
         )
     markers.sort(key=lambda item: (item.at_seconds, item.direction, item.price))
@@ -2883,12 +3022,12 @@ def _merge_kline_trade_markers(
 
     merged = list(history_markers)
     existing_openings = {
-        (item.direction, item.at_seconds)
+        (item.direction, item.lifecycle_id or str(item.at_seconds))
         for item in merged
         if item.event == "open"
     }
     for item in current_markers:
-        key = (item.direction, item.at_seconds)
+        key = (item.direction, item.lifecycle_id or str(item.at_seconds))
         if item.event == "open" and key in existing_openings:
             continue
         merged.append(item)
@@ -2937,11 +3076,125 @@ def _history_trade_markers_for_candles(
                 "timestamp": marker.at_seconds,
                 "realized_pnl": marker.realized_pnl,
                 "pnl_currency": marker.pnl_currency,
+                "size": marker.size,
+                "lifecycle_id": marker.lifecycle_id,
                 "label": f"{'开' if is_open else '平'}{'多' if is_long else '空'}{pnl_text}",
                 "color": _HISTORY_TRADE_OPEN_COLOR if is_open else _HISTORY_TRADE_CLOSE_COLOR,
             }
         )
     return result
+
+
+def _pair_kline_trade_markers(
+    markers: list[dict[str, Any]] | tuple[dict[str, Any], ...],
+) -> tuple[
+    list[tuple[dict[str, Any], dict[str, Any], float]],
+    dict[int, tuple[dict[str, Any], float]],
+    dict[str, list[dict[str, Any]]],
+]:
+    """Match closes to opening quantities in FIFO order, preserving partial positions."""
+
+    def marker_size(marker: dict[str, Any]) -> Decimal | None:
+        try:
+            size = Decimal(str(marker.get("size")))
+        except Exception:
+            return None
+        return size if size > 0 else None
+
+    def result_percent(entry: dict[str, Any], close: dict[str, Any]) -> float:
+        try:
+            entry_price = float(entry.get("logical_price", entry.get("price", 0.0)) or 0.0)
+            close_price = float(close.get("logical_price", close.get("price", 0.0)) or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+        if entry_price <= 0.0:
+            return 0.0
+        change = close_price - entry_price
+        if str(entry.get("direction", "") or "").strip().lower() == "short":
+            change = -change
+        return change / entry_price * 100.0
+
+    pending: dict[str, list[dict[str, Any]]] = {"long": [], "short": []}
+    remaining: dict[int, Decimal | None] = {}
+    segments: list[tuple[dict[str, Any], dict[str, Any], float]] = []
+    exit_results: dict[int, tuple[dict[str, Any], float]] = {}
+    lifecycle_entries = {
+        str(marker.get("lifecycle_id") or "").strip(): marker
+        for marker in markers
+        if str(marker.get("event", "") or "").strip().lower() == "open"
+        and str(marker.get("lifecycle_id") or "").strip()
+    }
+    for marker in markers:
+        direction = str(marker.get("direction", "") or "").strip().lower()
+        event = str(marker.get("event", "") or "").strip().lower()
+        if direction not in pending:
+            continue
+        if event == "open":
+            pending[direction].append(marker)
+            remaining[id(marker)] = marker_size(marker)
+            continue
+        if event != "close" or not pending[direction]:
+            continue
+
+        lifecycle_id = str(marker.get("lifecycle_id") or "").strip()
+        direct_entry = lifecycle_entries.get(lifecycle_id) if lifecycle_id else None
+        if direct_entry is not None and str(direct_entry.get("direction", "") or "").strip().lower() == direction:
+            segments.append((direct_entry, marker, result_percent(direct_entry, marker)))
+            exit_results[id(marker)] = (direct_entry, result_percent(direct_entry, marker))
+            pending[direction] = [entry for entry in pending[direction] if entry is not direct_entry]
+            remaining.pop(id(direct_entry), None)
+            lifecycle_entries.pop(lifecycle_id, None)
+            continue
+
+        close_remaining = marker_size(marker)
+        allocations: list[tuple[dict[str, Any], Decimal | None]] = []
+        while pending[direction]:
+            entry = pending[direction][0]
+            entry_remaining = remaining.get(id(entry))
+            if close_remaining is None or entry_remaining is None:
+                pending[direction].pop(0)
+                remaining.pop(id(entry), None)
+                allocations.append((entry, None))
+                break
+
+            allocated = min(close_remaining, entry_remaining)
+            if allocated <= 0:
+                pending[direction].pop(0)
+                remaining.pop(id(entry), None)
+                continue
+            allocations.append((entry, allocated))
+            close_remaining -= allocated
+            entry_remaining -= allocated
+            if entry_remaining <= 0:
+                pending[direction].pop(0)
+                remaining.pop(id(entry), None)
+            else:
+                remaining[id(entry)] = entry_remaining
+            if close_remaining <= 0:
+                break
+
+        if not allocations:
+            continue
+        weighted_entry = 0.0
+        weighted_size = Decimal("0")
+        for entry, allocated in allocations:
+            percent = result_percent(entry, marker)
+            segments.append((entry, marker, percent))
+            if allocated is None:
+                weighted_entry = float(entry.get("logical_price", entry.get("price", 0.0)) or 0.0)
+                weighted_size = Decimal("0")
+                break
+            weighted_entry += float(entry.get("logical_price", entry.get("price", 0.0)) or 0.0) * float(allocated)
+            weighted_size += allocated
+        if weighted_size > 0:
+            representative = dict(allocations[0][0])
+            representative["price"] = weighted_entry / float(weighted_size)
+            representative.pop("logical_price", None)
+            exit_results[id(marker)] = (representative, result_percent(representative, marker))
+        else:
+            entry = allocations[0][0]
+            exit_results[id(marker)] = (entry, result_percent(entry, marker))
+    return segments, exit_results, pending
 
 
 def _best_parameter_indicator_specs(
@@ -4224,18 +4477,30 @@ if QChartView is not None:
                 except (TypeError, ValueError):
                     return 0
 
-            def marker_result_percent(entry: dict[str, Any], exit_marker: dict[str, Any]) -> float:
+            def direction_color(direction: str) -> QColor:
+                """Keep both legs of a trade pair in the same direction colour."""
+
+                return QColor(_HISTORY_TRADE_SHORT_COLOR if direction == "short" else _HISTORY_TRADE_LONG_COLOR)
+
+            def outcome_color(marker: dict[str, Any], result: tuple[dict[str, Any], float] | None) -> QColor:
+                """Return the close result colour without changing the pair colour."""
+
+                if result is not None:
+                    result_percent = result[1]
+                    if result_percent > 0.0:
+                        return QColor(_HISTORY_TRADE_PROFIT_COLOR)
+                    if result_percent < 0.0:
+                        return QColor(_HISTORY_TRADE_LOSS_COLOR)
+                    return QColor(_HISTORY_TRADE_FLAT_COLOR)
                 try:
-                    entry_price = float(entry.get("logical_price", entry.get("price", 0.0)) or 0.0)
-                    exit_price = float(exit_marker.get("logical_price", exit_marker.get("price", 0.0)) or 0.0)
+                    realized_pnl = float(marker.get("realized_pnl"))
                 except (TypeError, ValueError):
-                    return 0.0
-                if entry_price <= 0.0:
-                    return 0.0
-                change = exit_price - entry_price
-                if str(entry.get("direction", "") or "").strip().lower() == "short":
-                    change = -change
-                return (change / entry_price) * 100.0
+                    return QColor(_HISTORY_TRADE_FLAT_COLOR)
+                if realized_pnl > 0.0:
+                    return QColor(_HISTORY_TRADE_PROFIT_COLOR)
+                if realized_pnl < 0.0:
+                    return QColor(_HISTORY_TRADE_LOSS_COLOR)
+                return QColor(_HISTORY_TRADE_FLAT_COLOR)
 
             ordered_markers = sorted(
                 (item for item in self._history_trade_markers if isinstance(item, dict)),
@@ -4244,20 +4509,7 @@ if QChartView is not None:
                     str(item.get("event", "") or "").strip().lower() != "open",
                 ),
             )
-            pending_entries: dict[str, list[dict[str, Any]]] = {"long": [], "short": []}
-            exit_results: dict[int, tuple[dict[str, Any], float]] = {}
-            for marker in ordered_markers:
-                direction = str(marker.get("direction", "") or "").strip().lower()
-                event = str(marker.get("event", "") or "").strip().lower()
-                if direction not in pending_entries:
-                    continue
-                if event == "open":
-                    pending_entries[direction].append(marker)
-                    continue
-                if event != "close" or not pending_entries[direction]:
-                    continue
-                entry = pending_entries[direction].pop(0)
-                exit_results[id(marker)] = (entry, marker_result_percent(entry, marker))
+            pair_segments, exit_results, pending_entries = _pair_kline_trade_markers(ordered_markers)
 
             visible_markers: list[tuple[int, float, dict[str, Any]]] = []
             for marker in ordered_markers:
@@ -4272,10 +4524,7 @@ if QChartView is not None:
                     visible_markers.append((index, price, marker))
 
             # Connect each matched opening and closing trade with profit/loss colour.
-            for exit_id, (entry, result_percent) in exit_results.items():
-                exit_marker = next((item for item in ordered_markers if id(item) == exit_id), None)
-                if exit_marker is None:
-                    continue
+            for entry, exit_marker, result_percent in pair_segments:
                 entry_index = int(entry.get("index", -1))
                 exit_index = int(exit_marker.get("index", -1))
                 if not (left_index <= entry_index <= right_index and left_index <= exit_index <= right_index):
@@ -4317,7 +4566,7 @@ if QChartView is not None:
                         continue
                     if price <= 0.0:
                         continue
-                    guide_color = QColor("#38bdf8")
+                    guide_color = direction_color(direction)
                     guide_color.setAlpha(155)
                     guide_pen = QPen(guide_color, 1)
                     guide_pen.setStyle(Qt.PenStyle.DashLine)
@@ -4335,7 +4584,9 @@ if QChartView is not None:
                 event = str(marker.get("event", "") or "").strip().lower()
                 direction = str(marker.get("direction", "") or "").strip().lower()
                 is_sell = (event == "open" and direction == "short") or (event == "close" and direction == "long")
-                color = QColor("#ef4444" if is_sell else "#22c55e")
+                result = exit_results.get(id(marker))
+                color = direction_color(direction)
+                result_color = outcome_color(marker, result) if event == "close" else None
                 candle = self._candles[index]
                 candle_top = self._y_for_value(float(candle["high"]), plot_area)
                 candle_bottom = self._y_for_value(float(candle["low"]), plot_area)
@@ -4348,9 +4599,11 @@ if QChartView is not None:
                     "平空"
                 )
                 label_lines = [trade_label, self._format_hover_value(price)]
-                result = exit_results.get(id(marker))
+                outcome_line_indices: set[int] = set()
                 if event == "close" and result is not None:
-                    label_lines.append(f"{result[1]:+.2f}%")
+                    outcome_text = "盈利" if result[1] > 0.0 else "亏损" if result[1] < 0.0 else "持平"
+                    label_lines.append(f"{outcome_text} {result[1]:+.2f}%")
+                    outcome_line_indices.add(len(label_lines) - 1)
                     pnl = marker.get("realized_pnl")
                     try:
                         pnl_value = float(pnl) if pnl is not None else None
@@ -4359,6 +4612,7 @@ if QChartView is not None:
                     if pnl_value is not None:
                         currency = str(marker.get("pnl_currency", "") or "").strip().upper()
                         label_lines.append(f"盈亏 {pnl_value:+.2f}{(' ' + currency) if currency else ''}")
+                        outcome_line_indices.add(len(label_lines) - 1)
                 label_lines.append(time_text)
                 label_width = max(float(metrics.horizontalAdvance(line)) for line in label_lines) + (padding_x * 2.0)
                 label_height = (text_height * len(label_lines)) + (padding_y * 2.0)
@@ -4419,8 +4673,21 @@ if QChartView is not None:
                 painter.setPen(QPen(color, 1))
                 painter.setBrush(background)
                 painter.drawRoundedRect(label_rect, 3.0, 3.0)
-                painter.setPen(color)
+                if result_color is not None:
+                    # A narrow outcome stripe keeps the long/short pair colour
+                    # intact while making close profit/loss immediately visible.
+                    painter.setPen(Qt.PenStyle.NoPen)
+                    painter.setBrush(result_color)
+                    painter.drawRoundedRect(
+                        QRectF(label_rect.left(), label_rect.top(), 4.0, label_rect.height()),
+                        2.0,
+                        2.0,
+                    )
                 for line_index, line in enumerate(label_lines):
+                    line_color = color
+                    if result_color is not None and line_index in outcome_line_indices:
+                        line_color = result_color
+                    painter.setPen(line_color)
                     painter.drawText(
                         QPointF(text_x, float(label_rect.top()) + padding_y + text_ascent + (line_index * text_height)),
                         line,
@@ -5307,7 +5574,7 @@ class WeeklyCacheBackfillLoader(QThread):
 
 
 class KlineHistoryTradeLoader(QThread):
-    """Fetch history and current account positions once without blocking the chart."""
+    """Fetch position lifecycles and current positions without blocking the chart."""
 
     loaded = Signal(int, object)
     failed = Signal(int, str)
@@ -5330,17 +5597,26 @@ class KlineHistoryTradeLoader(QThread):
                 self.loaded.emit(self._request_id, ())
                 return
             client = OkxRestClient()
+            profile_name = str(getattr(credentials, "profile_name", "") or "").strip()
+            cached_history: list[OkxPositionHistoryItem] = []
+            cache_error: Exception | None = None
+            if profile_name:
+                try:
+                    cached_history = load_local_position_history(profile_name, environment, limit=1000)
+                except Exception as exc:  # noqa: BLE001
+                    cache_error = exc
             history_error: Exception | None = None
             current_error: Exception | None = None
             try:
-                records = client.get_positions_history(
+                remote_history = client.get_positions_history(
                     credentials,
                     environment=environment,
                     inst_types=(inst_type,),
                     limit=100,
+                    fetch_all=True,
                 )
             except Exception as exc:  # noqa: BLE001
-                records = []
+                remote_history = []
                 history_error = exc
             try:
                 current_positions = client.get_positions(
@@ -5352,9 +5628,21 @@ class KlineHistoryTradeLoader(QThread):
             except Exception as exc:  # noqa: BLE001
                 current_positions = []
                 current_error = exc
-            if history_error is not None and current_error is not None:
+            if history_error is not None and not cached_history and current_error is not None:
                 raise history_error
-            history_markers = _build_kline_history_trade_markers(records, symbol=self._symbol)
+            if cache_error is not None and history_error is not None and current_error is not None:
+                raise cache_error
+            history_items = cached_history
+            if profile_name and remote_history:
+                history_items = merge_position_history_cache(
+                    profile_name=profile_name,
+                    environment=environment,
+                    remote_items=remote_history,
+                    limit=1000,
+                )
+            elif remote_history:
+                history_items = remote_history
+            history_markers = _build_kline_history_trade_markers(history_items, symbol=self._symbol)
             current_markers = _build_kline_current_position_markers(current_positions, symbol=self._symbol)
             self.loaded.emit(self._request_id, _merge_kline_trade_markers(history_markers, current_markers))
         except Exception as exc:  # noqa: BLE001

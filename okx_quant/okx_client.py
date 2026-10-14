@@ -1127,6 +1127,54 @@ class OkxRestClient:
             after=str(before_ts),
         )
 
+    def get_mark_price_candles_history_before(self, inst_id: str, bar: str, before_ts: int, limit: int = 100) -> list[Candle]:
+        """Load older mark candles outside the recent endpoint's retention window."""
+        if before_ts <= 0:
+            return []
+        params = {
+            "instId": inst_id,
+            "bar": bar,
+            "limit": str(min(max(1, limit), 100)),
+            "after": str(before_ts),
+        }
+        payload = self._request("GET", "/api/v5/market/history-mark-price-candles", params=params)
+        return self._parse_mark_price_candles_payload(payload)
+
+    def get_index_price_candles(self, inst_id: str, bar: str, limit: int = 200) -> list[Candle]:
+        params = {"instId": inst_id, "bar": bar, "limit": str(max(1, min(limit, 100)))}
+        payload = self._request("GET", "/api/v5/market/index-candles", params=params)
+        return self._parse_index_price_candles_payload(payload)
+
+    def get_index_price_candles_before(self, inst_id: str, bar: str, before_ts: int, limit: int = 240) -> list[Candle]:
+        """Load one older index-price candle page whose timestamps precede ``before_ts``."""
+        if before_ts <= 0:
+            return []
+        params = {
+            "instId": inst_id,
+            "bar": bar,
+            "limit": str(min(max(1, limit), 100)),
+            "after": str(before_ts),
+        }
+        payload = self._request("GET", "/api/v5/market/history-index-candles", params=params)
+        return self._parse_index_price_candles_payload(payload)
+
+    def _parse_index_price_candles_payload(self, payload: dict[str, Any]) -> list[Candle]:
+        candles: list[Candle] = []
+        for row in payload["data"]:
+            candles.append(
+                Candle(
+                    ts=int(row[0]),
+                    open=Decimal(row[1]),
+                    high=Decimal(row[2]),
+                    low=Decimal(row[3]),
+                    close=Decimal(row[4]),
+                    volume=Decimal("0"),
+                    confirmed=(row[5] == "1") if len(row) > 5 else True,
+                )
+            )
+        candles.sort(key=lambda candle: candle.ts)
+        return candles
+
     def _fetch_mark_price_candles_page(
         self,
         inst_id: str,

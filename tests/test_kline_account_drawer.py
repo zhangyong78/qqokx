@@ -8,6 +8,7 @@ from unittest import TestCase
 from PySide6.QtWidgets import QAbstractItemView, QMessageBox
 from PySide6.QtCore import Qt
 
+from okx_quant.okx_client import OkxPositionHistoryItem
 from roll_terminal_qt.kline_account_drawer import (
     AccountDrawerCancelThread,
     AccountDrawerLoadThread,
@@ -171,11 +172,88 @@ class KlineAccountDrawerWidgetTests(QtWidgetTestCase):
             self.assertEqual(drawer._tabs.tabText(0), "当前委托")
             self.assertEqual(drawer._tabs.tabText(1), "当前持仓")
             self.assertEqual(drawer._tabs.tabText(2), "历史委托")
+            self.assertEqual(drawer._tabs.tabText(3), "历史成交")
+            self.assertEqual(drawer._tabs.tabText(4), "历史仓位")
+            self.assertEqual(drawer._history_fills_table.columnCount(), 9)
+            self.assertEqual(drawer._history_positions_table.columnCount(), 12)
             self.assertEqual(
                 drawer._positions_table.editTriggers(),
                 QAbstractItemView.EditTrigger.NoEditTriggers,
             )
             self.assertFalse(hasattr(drawer, "_flatten_button"))
+        finally:
+            self.dispose_widget(drawer)
+
+    @patch("roll_terminal_qt.kline_account_drawer.FillHistoryFeedThread")
+    def test_history_fills_are_loaded_lazily_and_rendered(self, feed_type: Mock) -> None:
+        drawer = KlineAccountDrawer()
+        try:
+            drawer._runtime = SimpleNamespace(credentials=object(), environment="demo")
+            drawer._symbol = "BTC-USDT-SWAP"
+            fill = SimpleNamespace(
+                fill_time=1_700_000_000_000,
+                inst_type="SWAP",
+                inst_id="BTC-USDT-SWAP",
+                side="buy",
+                pos_side="long",
+                fill_price=Decimal("60000"),
+                fill_size=Decimal("1"),
+                fill_fee=None,
+                fee_currency=None,
+                pnl=Decimal("0"),
+                exec_type="T",
+                raw={},
+            )
+            feed_type.return_value = Mock()
+            drawer._ensure_fill_history_loaded()
+            feed_type.assert_called_once_with(drawer._runtime, limit=100)
+            drawer._tabs.setCurrentIndex(3)
+            drawer._apply_fill_history_payload(drawer._history_generation, {
+                "items": [fill],
+                "instruments": {},
+                "usdt_prices": {},
+            })
+
+            self.assertEqual(drawer._history_fills_table.rowCount(), 1)
+            self.assertEqual(drawer._history_fills_table.item(0, 2).text(), "BTC-USDT-SWAP")
+        finally:
+            self.dispose_widget(drawer)
+
+    def test_history_positions_render_coin_and_contract_size_columns(self) -> None:
+        drawer = KlineAccountDrawer()
+        try:
+            drawer._symbol = "BTC-USDT-SWAP"
+            drawer._tabs.setCurrentIndex(4)
+            position = OkxPositionHistoryItem(
+                update_time=1_700_000_300_000,
+                inst_id="BTC-USDT-SWAP",
+                inst_type="SWAP",
+                mgn_mode="cross",
+                pos_side="net",
+                direction="long",
+                open_avg_price=Decimal("60000"),
+                close_avg_price=Decimal("61000"),
+                close_size=Decimal("2"),
+                pnl=Decimal("20"),
+                realized_pnl=Decimal("20"),
+                settle_pnl=None,
+                raw={
+                    "posId": "p1",
+                    "cTime": "1700000000000",
+                    "closeTime": "1700000300000",
+                    "openMaxPos": "2",
+                    "closeTotalPos": "2",
+                },
+            )
+
+            drawer._apply_position_history_payload(
+                drawer._history_generation,
+                {"items": [position], "instruments": {}, "usdt_prices": {}},
+            )
+
+            self.assertEqual(drawer._history_positions_table.rowCount(), 1)
+            self.assertIn("2", drawer._history_positions_table.item(0, 7).text())
+            self.assertIn("2", drawer._history_positions_table.item(0, 8).text())
         finally:
             self.dispose_widget(drawer)
 

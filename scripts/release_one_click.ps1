@@ -109,7 +109,11 @@ function Update-TextFile([string]$Path, [scriptblock]$Updater) {
     $text = [System.IO.File]::ReadAllText($Path)
     $newText = & $Updater $text
     if ($newText -ne $text) {
-        [System.IO.File]::WriteAllText($Path, $newText, $utf8Bom)
+        $fileEncoding = $utf8Bom
+        if ([System.IO.Path]::GetExtension($Path) -ieq '.toml') {
+            $fileEncoding = $utf8NoBom
+        }
+        [System.IO.File]::WriteAllText($Path, $newText, $fileEncoding)
     }
 }
 
