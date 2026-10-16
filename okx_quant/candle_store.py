@@ -148,6 +148,33 @@ def upsert_candles(
         conn.commit()
 
 
+def replace_candles(
+    inst_id: str,
+    bar: str,
+    candles: list[Candle],
+    *,
+    base_dir: Path | str | None = None,
+) -> None:
+    """Replace one instrument/timeframe cache atomically."""
+    normalized_inst_id = _normalize_inst_id(inst_id)
+    normalized_bar = _normalize_bar(bar)
+    with _connection(base_dir) as conn:
+        with conn:
+            conn.execute(
+                "DELETE FROM candles WHERE inst_id = ? AND bar = ?",
+                (normalized_inst_id, normalized_bar),
+            )
+            if candles:
+                conn.executemany(
+                    """
+                    INSERT INTO candles
+                        (inst_id, bar, ts, open, high, low, close, volume, confirmed)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    [_candle_to_row(normalized_inst_id, normalized_bar, candle) for candle in candles],
+                )
+
+
 def get_candles(
     inst_id: str,
     bar: str,

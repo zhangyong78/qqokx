@@ -30,8 +30,8 @@ class OkxPublicWsConnectionUnavailable(RuntimeError):
 
 
 class OkxPublicWsConnection:
-    _PUBLIC_URL = "wss://ws.okx.com:8443/ws/v5/public"
-    _DEMO_PUBLIC_URL = "wss://wspap.okx.com:8443/ws/v5/public"
+    _PUBLIC_URL = "wss://ws.okx.com/ws/v5/public"
+    _DEMO_PUBLIC_URL = "wss://wspap.okx.com/ws/v5/public"
 
     def __init__(
         self,

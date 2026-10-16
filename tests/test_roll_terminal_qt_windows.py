@@ -14,7 +14,8 @@ from pathlib import Path
 from unittest.mock import MagicMock, call, patch
 
 from PySide6.QtCharts import QCandlestickSeries, QCandlestickSet, QChart, QLineSeries, QValueAxis
-from PySide6.QtCore import QPointF, QThread, Qt
+from PySide6.QtCore import QEvent, QPointF, QThread, Qt
+from PySide6.QtGui import QKeyEvent
 from PySide6.QtWidgets import QDoubleSpinBox, QLabel, QMessageBox, QPushButton, QSizePolicy, QSplitter, QTabWidget, QWidget
 from okx_quant.analysis import ChannelDetectionConfig
 from okx_quant.models import Candle, Instrument
@@ -110,6 +111,7 @@ from roll_terminal_qt.kline_analysis_window import (
     _slice_chart_payload_tail,
     _to_sma,
     _bar_to_ms,
+    _ensure_local_weekly_cache,
     _is_local_cache_stale,
     _volatility_currency_for_symbol,
 )
@@ -120,6 +122,42 @@ from roll_terminal_qt.workspace_shell import LocalTaskCount
 
 
 class RollTerminalQtWindowHelperTests(QtWidgetTestCase):
+
+    def test_delete_key_removes_selected_rr_drawing_through_safe_delete_flow(self) -> None:
+        rr_payload = {
+            "rr_id": "rr-delete-key",
+            "side": "long",
+            "bar_entry": 12,
+            "bar_stop": 12,
+            "price_entry": "60000",
+            "price_stop": "59000",
+            "price_tp": "62000",
+            "r_multiple": "2",
+        }
+        workspace_key = f"BTC-USDT-SWAP|{_DEFAULT_SINGLE_CHART_PERIOD}"
+        with (
+            patch("roll_terminal_qt.kline_analysis_window.QTimer.singleShot", return_value=None),
+            patch(
+                "roll_terminal_qt.kline_analysis_window.load_kline_analysis_workspace_entries",
+                return_value={workspace_key: {"rr": [rr_payload]}},
+            ),
+            patch("roll_terminal_qt.kline_analysis_window.load_kline_rr_trade_ledger_snapshot", return_value={"entries": []}),
+            patch("roll_terminal_qt.kline_analysis_window.save_kline_analysis_workspace_entries", return_value=None),
+        ):
+            window = KlineAnalysisWindow()
+            try:
+                window._populate_rr_table(selected_index=0)
+                event = QKeyEvent(
+                    QEvent.Type.KeyPress,
+                    Qt.Key.Key_Delete,
+                    Qt.KeyboardModifier.NoModifier,
+                )
+                window.keyPressEvent(event)
+
+                self.assertEqual(window._workspace_entry()["rr"], [])
+                self.assertTrue(event.isAccepted())
+            finally:
+                self.dispose_widget(window)
 
     def test_candlestick_chart_can_request_older_data_with_64_bit_timestamp(self) -> None:
         chart = CandlestickChartView()
@@ -6060,6 +6098,33 @@ class RollTerminalQtWindowHelperTests(QtWidgetTestCase):
         now_ms = 1_600_000_000_000
         candle = SimpleNamespace(ts=1_600_000_000_000 - 61_000, confirmed=True)
         self.assertTrue(_is_local_cache_stale([candle], "1m", now_ms=now_ms))
+
+    def test_local_weekly_cache_rebuild_discards_misaligned_stale_rows(self) -> None:
+        week_ms = 7 * 86_400_000
+        anchor_ms = (3 * 86_400_000) + (16 * 3_600_000)
+        source = [
+            Candle(anchor_ms + 86_400_000, Decimal("10"), Decimal("12"), Decimal("9"), Decimal("11"), Decimal("2"), True),
+            Candle(anchor_ms + 2 * 86_400_000, Decimal("11"), Decimal("13"), Decimal("10"), Decimal("12"), Decimal("3"), True),
+            Candle(anchor_ms + week_ms + 86_400_000, Decimal("12"), Decimal("14"), Decimal("11"), Decimal("13"), Decimal("4"), True),
+        ]
+        stale_weekly = [Candle(anchor_ms + 123_456, Decimal("1"), Decimal("1"), Decimal("1"), Decimal("1"), Decimal("0"), True)]
+
+        def fake_load(_symbol: str, bar: str, *, limit: int | None = None) -> list[Candle]:
+            if bar == "1W":
+                return stale_weekly
+            return source if bar == "1D" else []
+
+        with (
+            patch.object(kline_analysis_module, "load_candle_cache", side_effect=fake_load),
+            patch.object(kline_analysis_module, "replace_candle_cache") as replace_cache,
+        ):
+            rebuilt, changed, source_bar = _ensure_local_weekly_cache("SOL-USDT-SWAP")
+
+        self.assertTrue(changed)
+        self.assertEqual(source_bar, "1D")
+        self.assertEqual([candle.ts for candle in rebuilt], [anchor_ms, anchor_ms + week_ms])
+        self.assertEqual(rebuilt[0].high, Decimal("13"))
+        replace_cache.assert_called_once_with("SOL-USDT-SWAP", "1W", rebuilt)
 
     def test_is_local_cache_stale_by_gap(self) -> None:
         now_ms = 1_600_000_000_000

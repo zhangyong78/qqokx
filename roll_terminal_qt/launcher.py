@@ -51,6 +51,8 @@ from roll_terminal_qt.profile_access import ensure_profile_unlocked, load_profil
 from roll_terminal_qt.runtime import load_runtime
 from roll_terminal_qt.smart_order_window import SmartOrderQtWindow
 from okx_quant.shape_signal_monitor import ShapeSignalMonitor
+from okx_quant.area_shape_monitor import AreaShapeMonitor
+from okx_quant.area_shape_execution_monitor import AreaShapeDemoExecutionMonitor
 from okx_quant.shape_signal_store import load_events, mark_events_read
 from roll_terminal_qt.style import APP_STYLE, apply_global_font_mode, normalize_global_font_mode
 from roll_terminal_qt.ui import RollTerminalWindow
@@ -516,6 +518,8 @@ class LauncherWindow(QMainWindow):
         self._shape_signal_monitor = ShapeSignalMonitor(self)
         self._shape_signal_monitor.status_changed.connect(self._on_shape_monitor_status)
         self._shape_signal_monitor.signal_detected.connect(self._on_shape_signal_detected)
+        self._area_shape_monitor = AreaShapeMonitor(self)
+        self._area_shape_execution_monitor = AreaShapeDemoExecutionMonitor(self)
         self._shape_popup_boxes: list[QMessageBox] = []
         self._shape_popup_box: QMessageBox | None = None
         self._shape_popup_display_events: list[dict[str, object]] = []
@@ -554,6 +558,8 @@ class LauncherWindow(QMainWindow):
         self._build_menu()
         self._refresh_shape_message_badge()
         self._shape_signal_monitor.start()
+        self._area_shape_monitor.start()
+        self._area_shape_execution_monitor.start()
         self._initialize_workspace_profiles()
         QTimer.singleShot(1500, self._start_background_history_sync)
         with measure_ui_step("launcher_first_show"):
@@ -681,6 +687,12 @@ class LauncherWindow(QMainWindow):
             set_monitor = getattr(page, "set_shape_signal_monitor", None)
             if callable(set_monitor):
                 set_monitor(self._shape_signal_monitor)
+            set_area_monitor = getattr(page, "set_area_shape_monitor", None)
+            if callable(set_area_monitor):
+                set_area_monitor(self._area_shape_monitor)
+            set_demo_monitor = getattr(page, "set_area_shape_execution_monitor", None)
+            if callable(set_demo_monitor):
+                set_demo_monitor(self._area_shape_execution_monitor)
             return page
         if page_key == "account":
             page = AccountPositionsHomeWidget(self)
@@ -760,13 +772,13 @@ class LauncherWindow(QMainWindow):
         if any(summary.values()):
             message = "检测到本地任务仍在运行：" + " | ".join(
                 f"{label} {count}"
-                for label, count in (("RR", summary["rr"]), ("条件单", summary["line_conditions"]), ("套利", summary["arbitrage"]))
+                for label, count in (("RR", summary["rr"]), ("条件单", summary["line_conditions"]), ("套利", summary["arbitrage"]), ("区域demo执行", summary["area_demo"]))
                 if count
             )
             answer = QMessageBox.question(
                 self,
                 "确认关闭",
-                f"{message}\n\n关闭将停止本机监控任务，交易所已挂出的订单不会被撤销。是否继续？",
+                f"{message}\n\n关闭将停止本机新入场与保护管理；交易所已有保护单不会被撤销。区域形态模拟盘会话重启后只读，需人工核对后继续保护。是否继续？",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 QMessageBox.StandardButton.No,
             )
@@ -782,7 +794,7 @@ class LauncherWindow(QMainWindow):
         QTimer.singleShot(0, self._begin_shutdown)
 
     def _local_task_summary(self) -> dict[str, int]:
-        summary = {"rr": 0, "line_conditions": 0, "arbitrage": 0}
+        summary = {"rr": 0, "line_conditions": 0, "arbitrage": 0, "area_demo": 0}
         for page in self._pages.values():
             getter = getattr(page, "local_task_summary", None)
             if not callable(getter):
@@ -795,6 +807,12 @@ class LauncherWindow(QMainWindow):
                 continue
             for key in summary:
                 summary[key] += max(0, int(payload.get(key, 0) or 0))
+        demo_getter = getattr(self._area_shape_execution_monitor, "sessions", None)
+        if callable(demo_getter):
+            try:
+                summary["area_demo"] = sum(1 for item in demo_getter() if item.get("status") in {"arming", "armed", "signal_pending", "entry_intent", "position_unprotected", "tp_pending", "protected", "manual_control", "needs_manual_rearm", "manual_review", "paused"})
+            except Exception:
+                pass
         return summary
 
     @Slot()
@@ -828,6 +846,9 @@ class LauncherWindow(QMainWindow):
         legacy_text = " | ".join(part for part in legacy_parts if part)
         if legacy_text:
             text = f"{text}｜{legacy_text}" if text else legacy_text
+        demo_count = sum(1 for item in self._area_shape_execution_monitor.sessions() if item.get("status") in {"arming", "armed", "signal_pending", "entry_intent", "position_unprotected", "tp_pending", "protected", "manual_control", "needs_manual_rearm", "manual_review", "paused"})
+        if demo_count:
+            text = f"{text}｜区域demo {demo_count}" if text else f"区域demo {demo_count}"
         self._workspace_header.set_task_text(text)
         self._local_task_status.setText(text)
 
@@ -933,6 +954,8 @@ class LauncherWindow(QMainWindow):
         except Exception:
             pass
         self._shape_signal_monitor.stop()
+        self._area_shape_monitor.stop()
+        self._area_shape_execution_monitor.stop()
         self._history_sync_manager.shutdown()
         self.deleteLater()
         app = QApplication.instance()

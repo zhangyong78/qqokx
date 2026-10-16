@@ -1530,6 +1530,281 @@ class OkxRestClient:
         first = data[0]
         return first if isinstance(first, dict) else None
 
+    def get_area_shape_instrument(self, inst_id: str) -> Instrument:
+        """Force a fresh public instrument lookup for the guarded area executor."""
+        return self.get_instrument(inst_id, prefer_cached=False)
+
+    def get_area_shape_fee_rate(self, credentials: Credentials, *, environment: str, inst_family: str) -> Decimal:
+        """Return conservative taker cost for a unique OKX feeGroup.
+
+        OKX currently reports feeGroup entries per family. If the response does
+        not identify one unambiguous group, the caller must not guess a fee.
+        Positive values are rebates; risk sizing only credits no more than zero.
+        """
+        if environment != "demo":
+            raise PermissionError("区域形态费用查询只允许demo环境")
+        payload = self._request(
+            "GET", "/api/v5/account/trade-fee",
+            params={"instType": "SWAP", "instFamily": str(inst_family).upper()},
+            auth=True, credentials=credentials, simulated=True,
+        )
+        rows = payload.get("data")
+        if not isinstance(rows, list) or len(rows) != 1 or not isinstance(rows[0], dict):
+            raise OkxApiError("OKX未返回唯一的区域形态合约手续费组")
+        groups = rows[0].get("feeGroup")
+        if not isinstance(groups, list) or len(groups) != 1 or not isinstance(groups[0], dict):
+            raise OkxApiError("手续费组无法唯一映射到该合约；拒绝使用估算默认费率")
+        taker = _to_decimal(groups[0].get("taker"))
+        if taker is None or not taker.is_finite():
+            raise OkxApiError("OKX未返回有效taker费率")
+        return max(Decimal("0"), -taker)
+
+    def get_area_shape_pending_orders(
+        self, credentials: Credentials, *, environment: str, inst_id: str,
+    ) -> list[OkxTradeOrderItem]:
+        """Strict contract-targeted normal and all entry-capable algo orders.
+
+        This does not alter the legacy aggregate pending-order method. Any
+        endpoint/shape error propagates, so callers cannot interpret a partial
+        view as proof of no conflict. A non-empty first page already blocks the
+        new entry; a saturated response is therefore safely a conflict too.
+        """
+        if environment != "demo":
+            raise PermissionError("区域形态委托冲突查询只允许demo环境")
+        normalized = str(inst_id).strip().upper()
+        rows: list[OkxTradeOrderItem] = []
+        normal = self._request(
+            "GET", "/api/v5/trade/orders-pending",
+            params={"instType": "SWAP", "instId": normalized, "limit": "100"},
+            auth=True, credentials=credentials, simulated=True,
+        ).get("data")
+        if not isinstance(normal, list):
+            raise OkxApiError("合约定向普通委托响应结构无效")
+        for raw in normal:
+            if not isinstance(raw, dict):
+                raise OkxApiError("合约定向普通委托记录结构无效")
+            if str(raw.get("instId") or "").upper() != normalized:
+                raise OkxApiError("普通委托端点未按instId严格过滤；冲突视图不可信")
+            if str(raw.get("state") or "").lower() not in {"live", "partially_filled"}:
+                raise OkxApiError("普通委托端点返回非活动状态；冲突视图不可信")
+            rows.append(self._parse_normal_order_item(raw, default_inst_type="SWAP"))
+        # Query every documented pending algo kind because iceberg/TWAP/smart
+        # iceberg can place/open exposure too. Old helper intentionally has a
+        # narrower, best-effort list and is not used for this safety decision.
+        for ord_type in ("conditional", "oco", "chase", "trigger", "move_order_stop", "iceberg", "twap", "smart_iceberg"):
+            payload = self._request(
+                "GET", "/api/v5/trade/orders-algo-pending",
+                params={"ordType": ord_type, "instId": normalized, "instType": "SWAP", "limit": "100"},
+                auth=True, credentials=credentials, simulated=True,
+            )
+            data = payload.get("data")
+            if not isinstance(data, list):
+                raise OkxApiError(f"合约定向{ord_type}算法委托响应结构无效")
+            for raw in data:
+                if not isinstance(raw, dict):
+                    raise OkxApiError(f"合约定向{ord_type}算法委托记录结构无效")
+                if str(raw.get("instId") or "").upper() != normalized:
+                    raise OkxApiError(f"{ord_type}算法委托端点未按instId严格过滤；冲突视图不可信")
+                if str(raw.get("state") or "").lower() not in {"live", "effective", "partially_effective"}:
+                    raise OkxApiError(f"{ord_type}算法委托端点返回非活动状态；冲突视图不可信")
+                rows.append(self._parse_algo_order_item(raw, default_inst_type="SWAP"))
+        return rows
+
+    def place_area_shape_demo_fok_entry(
+        self, credentials: Credentials, config: StrategyConfig, *, inst_id: str,
+        side: str, size: Decimal, limit_price: Decimal, stop_price: Decimal,
+        client_order_id: str, stop_algo_client_order_id: str,
+    ) -> OkxOrderResult:
+        """Demo-only FOK entry with an attached last-price initial stop.
+
+        The attachment is NOT considered active protection on acknowledgement;
+        callers must query the child algo after actual fill and fail closed.
+        """
+        if config.environment != "demo":
+            raise PermissionError("区域形态订单写入仅允许OKX模拟盘")
+        if side not in {"buy", "sell"} or not client_order_id or not stop_algo_client_order_id:
+            raise ValueError("区域形态demo FOK订单参数无效")
+        instrument = self.get_area_shape_instrument(inst_id)
+        tick, lot, minimum, _ = _area_shape_validate_contract(instrument)
+        if size < minimum or size % lot != 0:
+            raise ValueError("区域形态demo订单数量不符合minSz/lotSz")
+        # Never widen a caller's frozen price cap. A non-marketable rounded
+        # FOK is allowed to expire; the executor must not pay beyond its cap.
+        px = snap_to_increment(limit_price, tick, "down" if side == "buy" else "up")
+        stop = snap_to_increment(stop_price, tick, "nearest")
+        if stop != stop_price:
+            raise ValueError("初始止损价必须已按tickSz精确规范；拒绝扩大风险距离")
+        self._enforce_order_size_safety_limit(instrument=instrument, size=size, reference_price=px)
+        order: dict[str, Any] = {
+            "instId": instrument.inst_id, "tdMode": config.trade_mode, "side": side,
+            "ordType": "fok", "px": format_decimal(px), "sz": _format_exchange_contract_sz(instrument, size),
+            "tag": OKX_BROKER_TAG,
+            "attachAlgoOrds": [{
+                "attachAlgoClOrdId": stop_algo_client_order_id,
+                "slTriggerPx": format_decimal(stop), "slOrdPx": "-1", "slTriggerPxType": "last",
+            }],
+            "clOrdId": client_order_id,
+        }
+        pos_side = self._derivative_order_pos_side(credentials, config, instrument, side)
+        if pos_side:
+            order["posSide"] = pos_side
+        self._maybe_isolated_margin_ccy(order, instrument=instrument, config=config)
+        try:
+            payload = self._request(
+                "POST", "/api/v5/trade/order", body=order, auth=True,
+                credentials=credentials, simulated=True,
+            )
+            return self._parse_order_result(payload, empty_message="OKX未返回区域demo入场订单", fallback_cl_ord_id=client_order_id)
+        except OkxApiError as exc:
+            _raise_order_error_with_request(exc, order)
+
+    def place_area_shape_demo_limit_entry(
+        self, credentials: Credentials, config: StrategyConfig, *, inst_id: str,
+        side: str, size: Decimal, limit_price: Decimal, stop_price: Decimal,
+        client_order_id: str, stop_algo_client_order_id: str,
+    ) -> OkxOrderResult:
+        """Place a demo-only GTC limit at the exact user-drawn entry line.
+
+        The entry price is never rounded or improved. The attached last-price
+        stop is only a requested child order; callers must verify it after fill.
+        """
+        if config.environment != "demo":
+            raise PermissionError("区域形态限价委托只允许OKX模拟盘")
+        valid_id = lambda value: bool(re.fullmatch(r"[A-Za-z0-9]{1,32}", str(value or "")))
+        if side not in {"buy", "sell"}:
+            raise ValueError("区域形态demo限价委托方向无效")
+        if not valid_id(client_order_id) or not valid_id(stop_algo_client_order_id) or client_order_id == stop_algo_client_order_id:
+            raise ValueError("区域形态demo限价委托客户端ID无效")
+        if any(not isinstance(value, Decimal) or not value.is_finite() or value <= 0
+               for value in (size, limit_price, stop_price)):
+            raise ValueError("区域形态demo限价委托数量或价格无效")
+        instrument = self.get_area_shape_instrument(inst_id)
+        tick, lot, minimum, _ = _area_shape_validate_contract(instrument)
+        if size < minimum or size % lot != 0:
+            raise ValueError("区域形态demo限价委托数量不符合minSz/lotSz")
+        if limit_price % tick != 0:
+            raise ValueError("用户入场线价格必须符合tickSz；拒绝改价")
+        if stop_price % tick != 0:
+            raise ValueError("初始止损价必须符合tickSz；拒绝扩大风险距离")
+        if (side == "buy" and stop_price >= limit_price) or (side == "sell" and stop_price <= limit_price):
+            raise ValueError("初始止损价必须位于入场价的亏损方向")
+        self._enforce_order_size_safety_limit(instrument=instrument, size=size, reference_price=limit_price)
+        order: dict[str, Any] = {
+            "instId": instrument.inst_id, "tdMode": config.trade_mode, "side": side,
+            "ordType": "limit", "px": format_decimal(limit_price),
+            "sz": _format_exchange_contract_sz(instrument, size), "tag": OKX_BROKER_TAG,
+            "attachAlgoOrds": [{
+                "attachAlgoClOrdId": stop_algo_client_order_id,
+                "slTriggerPx": format_decimal(stop_price), "slOrdPx": "-1", "slTriggerPxType": "last",
+            }],
+            "clOrdId": client_order_id,
+        }
+        pos_side = self._derivative_order_pos_side(credentials, config, instrument, side)
+        if pos_side:
+            order["posSide"] = pos_side
+        self._maybe_isolated_margin_ccy(order, instrument=instrument, config=config)
+        try:
+            payload = self._request(
+                "POST", "/api/v5/trade/order", body=order, auth=True,
+                credentials=credentials, simulated=True,
+            )
+            return self._parse_order_result(
+                payload, empty_message="OKX未返回区域demo限价入场订单", fallback_cl_ord_id=client_order_id,
+            )
+        except OkxApiError as exc:
+            _raise_order_error_with_request(exc, order)
+
+    def place_area_shape_demo_trigger_entry(
+        self, credentials: Credentials, config: StrategyConfig, *, inst_id: str,
+        side: str, size: Decimal, trigger_price: Decimal, limit_price: Decimal,
+        stop_price: Decimal, client_order_id: str, stop_algo_client_order_id: str,
+    ) -> OkxOrderResult:
+        """Submit a demo-only exchange-hosted trigger entry with a bounded FOK and attached SL."""
+        if config.environment != "demo":
+            raise PermissionError("区域形态触发委托仅允许OKX模拟盘")
+        if side not in {"buy", "sell"} or not client_order_id or not stop_algo_client_order_id:
+            raise ValueError("区域形态demo触发委托参数无效")
+        instrument = self.get_area_shape_instrument(inst_id)
+        tick, lot, minimum, _ = _area_shape_validate_contract(instrument)
+        if size < minimum or size % lot != 0:
+            raise ValueError("区域形态demo触发委托数量不符合minSz/lotSz")
+        trigger = snap_to_increment(trigger_price, tick, "up" if side == "buy" else "down")
+        limit = snap_to_increment(limit_price, tick, "down" if side == "buy" else "up")
+        stop = snap_to_increment(stop_price, tick, "nearest")
+        if trigger != trigger_price or limit != limit_price or stop != stop_price:
+            raise ValueError("触发、限价和初始止损必须符合tickSz；拒绝扩大风险")
+        if (side == "buy" and not stop < trigger <= limit) or (side == "sell" and not limit <= trigger < stop):
+            raise ValueError("触发价/成交上限/止损关系无效")
+        self._enforce_order_size_safety_limit(instrument=instrument, size=size, reference_price=limit)
+        order: dict[str, Any] = {
+            "instId": instrument.inst_id, "tdMode": config.trade_mode, "side": side,
+            "ordType": "trigger", "sz": _format_exchange_contract_sz(instrument, size),
+            "triggerPx": format_decimal(trigger), "triggerPxType": "last",
+            "orderPx": format_decimal(limit), "advanceOrdType": "fok",
+            "algoClOrdId": client_order_id, "tag": OKX_BROKER_TAG,
+            "attachAlgoOrds": [{
+                "attachAlgoClOrdId": stop_algo_client_order_id,
+                "slTriggerPx": format_decimal(stop), "slOrdPx": "-1", "slTriggerPxType": "last",
+            }],
+        }
+        pos_side = self._derivative_order_pos_side(credentials, config, instrument, side)
+        if pos_side:
+            order["posSide"] = pos_side
+        self._maybe_isolated_margin_ccy(order, instrument=instrument, config=config)
+        try:
+            payload = self._request("POST", "/api/v5/trade/order-algo", body=order,
+                                    auth=True, credentials=credentials, simulated=True)
+            return self._parse_algo_order_result(
+                payload, empty_message="OKX未返回区域demo触发委托", fallback_algo_cl_ord_id=client_order_id,
+            )
+        except OkxApiError as exc:
+            _raise_order_error_with_request(exc, order)
+
+    def place_area_shape_demo_protection_algo(
+        self, credentials: Credentials, config: StrategyConfig, *, inst_id: str, side: str,
+        size: Decimal, pos_side: str | None, trigger_price: Decimal, client_order_id: str,
+        protection_kind: str,
+    ) -> OkxOrderResult:
+        """Submit one reduce-only last-price demo TP or SL algorithm order."""
+        if config.environment != "demo":
+            raise PermissionError("区域形态保护单只允许OKX模拟盘")
+        if protection_kind not in {"sl", "tp"} or side not in {"buy", "sell"}:
+            raise ValueError("区域形态保护单参数无效")
+        instrument = self.get_area_shape_instrument(inst_id)
+        tick, lot, minimum, _multiplier = _area_shape_validate_contract(instrument)
+        if size < minimum or size % lot != 0:
+            raise ValueError("保护单数量不符合minSz/lotSz")
+        rounding = "down" if protection_kind == "sl" and side == "sell" else "up"
+        if protection_kind == "tp":
+            rounding = "up" if side == "sell" else "down"
+        price = snap_to_increment(trigger_price, tick, rounding)
+        if price != trigger_price:
+            raise ValueError("保护触发价必须已按tickSz精确规范；拒绝改变冻结止损/止盈")
+        order: dict[str, Any] = {
+            "instId": instrument.inst_id, "tdMode": config.trade_mode,
+            "side": side, "ordType": "conditional", "sz": _format_exchange_contract_sz(instrument, size),
+            "tag": OKX_BROKER_TAG,
+            "algoClOrdId": client_order_id,
+        }
+        resolved_pos = self._reduce_only_order_pos_side(credentials, config, instrument, side, plan_pos_side=pos_side)
+        if config.position_mode == "net":
+            order["reduceOnly"] = True
+        if protection_kind == "sl":
+            order.update({"slTriggerPx": format_decimal(price), "slOrdPx": "-1", "slTriggerPxType": "last"})
+        else:
+            order.update({"tpTriggerPx": format_decimal(price), "tpOrdPx": "-1", "tpTriggerPxType": "last"})
+        if config.position_mode == "net":
+            order["cxlOnClosePos"] = True
+        if resolved_pos:
+            order["posSide"] = resolved_pos
+        self._maybe_isolated_margin_ccy(order, instrument=instrument, config=config)
+        try:
+            payload = self._request("POST", "/api/v5/trade/order-algo", body=order,
+                                    auth=True, credentials=credentials, simulated=True)
+            return self._parse_algo_order_result(payload, empty_message="OKX未返回区域demo保护单", fallback_algo_cl_ord_id=client_order_id)
+        except OkxApiError as exc:
+            _raise_order_error_with_request(exc, order)
+
     def get_mark_price(self, inst_id: str) -> Decimal:
         mark_price, _ = self.get_mark_price_snapshot(inst_id)
         return mark_price
@@ -3622,6 +3897,22 @@ def infer_inst_type(inst_id: str) -> str:
     if FUTURES_ID_PATTERN.match(normalized):
         return "FUTURES"
     return "SPOT"
+
+
+def _area_shape_validate_contract(instrument: Instrument) -> tuple[Decimal, Decimal, Decimal, Decimal]:
+    inst_id = str(instrument.inst_id or "").upper()
+    if not re.fullmatch(r"[A-Z0-9]+-USDT-SWAP", inst_id):
+        raise ValueError("区域形态demo仅支持USDT线性永续合约")
+    base = inst_id.removesuffix("-USDT-SWAP")
+    if str(instrument.inst_type).upper() != "SWAP" or str(instrument.state).lower() != "live":
+        raise ValueError("区域形态demo合约类型或交易状态不支持")
+    if str(instrument.settle_ccy or "").upper() != "USDT" or str(instrument.ct_val_ccy or "").upper() != base:
+        raise ValueError("区域形态demo仅支持ctVal币种与USDT结算匹配的线性永续")
+    values = (instrument.tick_size, instrument.lot_size, instrument.min_size, instrument.ct_val, instrument.ct_mult)
+    if any(value is None or not value.is_finite() or value <= 0 for value in values):
+        raise ValueError("区域形态demo合约规格不完整，禁止猜测")
+    tick, lot, minimum, ct_val, ct_mult = values
+    return tick, lot, minimum, ct_val * ct_mult
 
 
 def infer_option_family(inst_id: str) -> str | None:

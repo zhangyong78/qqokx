@@ -63,8 +63,8 @@ class OkxPrivateWsConnectionUnavailable(RuntimeError):
 
 
 class OkxPrivateWsConnection:
-    _PRIVATE_URL = "wss://ws.okx.com:8443/ws/v5/private"
-    _DEMO_PRIVATE_URL = "wss://wspap.okx.com:8443/ws/v5/private"
+    _PRIVATE_URL = "wss://ws.okx.com/ws/v5/private"
+    _DEMO_PRIVATE_URL = "wss://wspap.okx.com/ws/v5/private"
 
     def __init__(
         self,

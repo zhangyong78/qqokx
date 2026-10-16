@@ -8,6 +8,7 @@ from okx_quant.candle_store import (
     get_candles_before,
     migrate_json_cache_file,
     promote_stale_unconfirmed_candles,
+    replace_candles,
     upsert_candles,
 )
 from okx_quant.models import Candle
@@ -93,6 +94,20 @@ def save_candle_cache(
     target.parent.mkdir(parents=True, exist_ok=True)
     merged = merge_candles(candles, max_records=max_records)
     upsert_candles(inst_id, bar, merged, base_dir=base_dir)
+    return target
+
+
+def replace_candle_cache(
+    inst_id: str,
+    bar: str,
+    candles: list[Candle],
+    *,
+    base_dir: Path | None = None,
+) -> Path:
+    """Replace a complete instrument/timeframe cache without retaining stale rows."""
+    target = candle_cache_file_path(inst_id, bar, base_dir)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    replace_candles(inst_id, bar, candles, base_dir=base_dir)
     return target
 
 

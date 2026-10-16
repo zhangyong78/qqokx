@@ -60,8 +60,8 @@ class OkxAlgoWsConnectionUnavailable(RuntimeError):
 
 
 class OkxAlgoWsConnection:
-    _BUSINESS_URL = "wss://ws.okx.com:8443/ws/v5/business"
-    _DEMO_BUSINESS_URL = "wss://wspap.okx.com:8443/ws/v5/business"
+    _BUSINESS_URL = "wss://ws.okx.com/ws/v5/business"
+    _DEMO_BUSINESS_URL = "wss://wspap.okx.com/ws/v5/business"
 
     def __init__(
         self,

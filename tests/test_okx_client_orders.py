@@ -1822,3 +1822,77 @@ class OkxClientOrderRequestTest(TestCase):
         self.assertEqual(items[0].bill_sub_type, "173")
         self.assertEqual(items[0].amount, Decimal("-0.01"))
         self.assertEqual(items[0].currency, "USDT")
+
+    def test_area_shape_demo_limit_entry_uses_exact_line_price_and_attaches_last_stop(self) -> None:
+        client = OkxRestClient()
+        inst_id = "BTC-USDT-SWAP"
+        instrument = Instrument(
+            inst_id=inst_id, inst_type="SWAP", tick_size=Decimal("0.1"),
+            lot_size=Decimal("0.01"), min_size=Decimal("0.01"), state="live",
+            settle_ccy="USDT", ct_val=Decimal("0.01"), ct_mult=Decimal("1"), ct_val_ccy="BTC",
+        )
+        client.get_area_shape_instrument = lambda requested: instrument  # type: ignore[method-assign]
+        client._derivative_order_pos_side = lambda *args, **kwargs: "long"  # type: ignore[method-assign]
+        client._enforce_order_size_safety_limit = MagicMock()  # type: ignore[method-assign]
+        captured: dict[str, object] = {}
+
+        def _stub_request(method: str, path: str, params=None, body=None, **kwargs):
+            captured.update(method=method, path=path, body=body, kwargs=kwargs)
+            return {"data": [{"ordId": "limit-1", "clOrdId": "entry1", "sCode": "0", "sMsg": ""}]}
+
+        client._request = _stub_request  # type: ignore[method-assign]
+        config = self._strategy_config(inst_id)
+        config = StrategyConfig(**{**config.__dict__, "trade_mode": "isolated"})
+
+        result = client.place_area_shape_demo_limit_entry(
+            Credentials(api_key="key", secret_key="secret", passphrase="pass"), config,
+            inst_id=inst_id, side="buy", size=Decimal("0.02"),
+            limit_price=Decimal("75000.1"), stop_price=Decimal("74000.1"),
+            client_order_id="entry1", stop_algo_client_order_id="stop1",
+        )
+
+        self.assertEqual(result.ord_id, "limit-1")
+        self.assertEqual(captured["method"], "POST")
+        self.assertEqual(captured["path"], "/api/v5/trade/order")
+        body = captured["body"]
+        assert isinstance(body, dict)
+        self.assertEqual(body["ordType"], "limit")
+        self.assertEqual(body["px"], "75000.1")
+        self.assertEqual(body["sz"], "0.02")
+        self.assertEqual(body["posSide"], "long")
+        self.assertEqual(body["ccy"], "USDT")
+        self.assertEqual(body["attachAlgoOrds"], [{
+            "attachAlgoClOrdId": "stop1", "slTriggerPx": "74000.1",
+            "slOrdPx": "-1", "slTriggerPxType": "last",
+        }])
+        self.assertTrue(captured["kwargs"]["simulated"])
+        client._enforce_order_size_safety_limit.assert_called_once()
+
+    def test_area_shape_demo_limit_entry_rejects_live_and_off_tick_prices(self) -> None:
+        client = OkxRestClient()
+        instrument = Instrument(
+            inst_id="BTC-USDT-SWAP", inst_type="SWAP", tick_size=Decimal("0.1"),
+            lot_size=Decimal("0.01"), min_size=Decimal("0.01"), state="live",
+            settle_ccy="USDT", ct_val=Decimal("0.01"), ct_mult=Decimal("1"), ct_val_ccy="BTC",
+        )
+        client.get_area_shape_instrument = lambda requested: instrument  # type: ignore[method-assign]
+        client._derivative_order_pos_side = lambda *args, **kwargs: "long"  # type: ignore[method-assign]
+        client._enforce_order_size_safety_limit = MagicMock()  # type: ignore[method-assign]
+        client._request = MagicMock(return_value={"data": []})  # type: ignore[method-assign]
+        credentials = Credentials(api_key="key", secret_key="secret", passphrase="pass")
+        config = self._strategy_config(instrument.inst_id)
+        kwargs = dict(
+            inst_id=instrument.inst_id, side="buy", size=Decimal("0.01"),
+            limit_price=Decimal("75000"), stop_price=Decimal("74000"),
+            client_order_id="entry1", stop_algo_client_order_id="stop1",
+        )
+
+        with self.assertRaises(PermissionError):
+            client.place_area_shape_demo_limit_entry(credentials, StrategyConfig(
+                **{**config.__dict__, "environment": "live"}
+            ), **kwargs)
+        with self.assertRaisesRegex(ValueError, "tickSz"):
+            client.place_area_shape_demo_limit_entry(credentials, config, **{
+                **kwargs, "limit_price": Decimal("75000.05"),
+            })
+        client._request.assert_not_called()

@@ -4490,8 +4490,6 @@ class BacktestWindow:
             return
         try:
             config, candle_limit, maker_fee_rate, taker_fee_rate, start_ts, end_ts, local_only = self._build_backtest_request()
-            if local_only:
-                self._preflight_pure_local_backtest(config, candle_limit, start_ts, end_ts)
             raw_batch_count = len(build_parameter_batch_configs(config))
         except Exception as exc:
             messagebox.showerror("回测参数错误", str(exc), parent=self.window)
@@ -4535,8 +4533,6 @@ class BacktestWindow:
             return
         try:
             config, candle_limit, maker_fee_rate, taker_fee_rate, start_ts, end_ts, local_only = self._build_backtest_request()
-            if local_only:
-                self._preflight_pure_local_backtest(config, candle_limit, start_ts, end_ts)
         except Exception as exc:
             messagebox.showerror("回测参数错误", str(exc), parent=self.window)
             return
@@ -5033,6 +5029,8 @@ class BacktestWindow:
         local_only: bool,
     ) -> None:
         try:
+            if local_only:
+                self._preflight_pure_local_backtest(config, candle_limit, start_ts, end_ts)
             results = run_backtest_batch(
                 self.client,
                 config,
@@ -5067,6 +5065,8 @@ class BacktestWindow:
         local_only: bool,
     ) -> None:
         try:
+            if local_only:
+                self._preflight_pure_local_backtest(config, candle_limit, start_ts, end_ts)
             result = run_backtest(
                 self.client,
                 config,

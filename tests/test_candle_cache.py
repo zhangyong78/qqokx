@@ -10,6 +10,7 @@ from okx_quant.candle_cache import (
     load_candle_cache,
     load_candle_cache_range,
     merge_candles,
+    replace_candle_cache,
     save_candle_cache,
 )
 from okx_quant.models import Candle
@@ -60,6 +61,27 @@ class DummyHistoryClient(OkxRestClient):
 
 
 class CandleCacheTest(TestCase):
+    def test_replace_candle_cache_removes_stale_rows_only_for_target_series(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            save_candle_cache(
+                "SOL-USDT-SWAP",
+                "1W",
+                [_build_candle(1, "100"), _build_candle(2, "101")],
+                base_dir=temp_dir,
+            )
+            save_candle_cache("SOL-USDT-SWAP", "1D", [_build_candle(1, "200")], base_dir=temp_dir)
+            save_candle_cache("BTC-USDT-SWAP", "1W", [_build_candle(1, "300")], base_dir=temp_dir)
+
+            replace_candle_cache("SOL-USDT-SWAP", "1W", [_build_candle(3, "103")], base_dir=temp_dir)
+
+            sol_weekly = load_candle_cache("SOL-USDT-SWAP", "1W", base_dir=temp_dir)
+            sol_daily = load_candle_cache("SOL-USDT-SWAP", "1D", base_dir=temp_dir)
+            btc_weekly = load_candle_cache("BTC-USDT-SWAP", "1W", base_dir=temp_dir)
+
+        self.assertEqual([candle.ts for candle in sol_weekly], [3])
+        self.assertEqual(sol_daily[0].close, Decimal("200"))
+        self.assertEqual(btc_weekly[0].close, Decimal("300"))
+
     def test_save_and_load_round_trip(self) -> None:
         candles = [_build_candle(1, "100"), _build_candle(2, "101")]
 

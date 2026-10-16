@@ -60,7 +60,7 @@ from PySide6.QtWidgets import (
     QWidgetAction,
 )
 
-from okx_quant.candle_cache import load_candle_cache, merge_candles, save_candle_cache
+from okx_quant.candle_cache import load_candle_cache, merge_candles, replace_candle_cache, save_candle_cache
 from okx_quant.analysis import ChannelDetectionConfig
 from okx_quant.analysis.box_detector import BoxDetectionConfig, detect_boxes
 from okx_quant.strategy_live_chart import build_auto_channel_live_chart_snapshot
@@ -84,7 +84,9 @@ from okx_quant.deribit_volatility_ui import (
 )
 from okx_quant.kline_rr_execution import RRTradeExecutionService
 from okx_quant.kline_rr_trade import RRTradeLedgerEntry, RRTradePlan, build_rr_trade_plan
+from okx_quant.area_shape_trade import AreaShapeConfig, AreaShapePlan
 from okx_quant.kline_trade_recommendations import KlineTradeIdea, build_kline_trade_idea
+from roll_terminal_qt.area_shape_dialog import AreaShapeConfigDialog
 from roll_terminal_qt.kline_trade_recommendation_dialog import KlineTradeRecommendationDialog
 from okx_quant.okx_client import OkxFillHistoryItem, OkxPosition, OkxPositionHistoryItem, OkxRestClient, infer_inst_type
 from okx_quant.engine import _dynamic_two_taker_fee_offset_live
@@ -669,11 +671,13 @@ def _ensure_local_weekly_cache(symbol: str) -> tuple[list[Candle], bool, str | N
         7 * 86_400_000,
         anchor_offset_ms=_UTC8_WEEK_ANCHOR_MS,
     )
-    merged_weekly = merge_candles(existing_weekly, generated_weekly)
-    changed = merged_weekly != existing_weekly
+    # Weekly cache rows can be polluted by bars from a different boundary or
+    # timeframe. Rebuild it from the local source instead of preserving stale
+    # timestamps via an append-only merge.
+    changed = generated_weekly != existing_weekly
     if changed:
-        save_candle_cache(normalized_symbol, "1W", merged_weekly)
-    return merged_weekly, changed, source_bar
+        replace_candle_cache(normalized_symbol, "1W", generated_weekly)
+    return generated_weekly, changed, source_bar
 
 
 def _clamp(value: float, lower: float, upper: float) -> float:
@@ -5895,6 +5899,21 @@ class RRTradeExecutionThread(QThread):
             self.failed.emit(str(exc))
 
 
+class AreaShapeDemoActionThread(QThread):
+    completed = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, action: Callable[[], object], parent: QObject | None = None) -> None:
+        super().__init__(parent)
+        self._action = action
+
+    def run(self) -> None:
+        try:
+            self.completed.emit(self._action())
+        except Exception as exc:  # noqa: BLE001
+            self.failed.emit(str(exc))
+
+
 class KlineAnalysisWindow(QMainWindow):
     _realtime_candle_received = Signal(object)
 
@@ -6048,6 +6067,12 @@ class KlineAnalysisWindow(QMainWindow):
         self._realtime_candle_key: CandleStreamKey | None = None
         self._realtime_candle_unsubscribe: Callable[[], None] | None = None
         self._shape_signal_monitor: object | None = None
+        self._area_shape_monitor: object | None = None
+        self._area_shape_execution_monitor: object | None = None
+        self._area_shape_demo_workers: set[AreaShapeDemoActionThread] = set()
+        self._area_shape_demo_action_pending = False
+        self._area_shape_demo_arm_pending = False
+        self._area_shape_demo_ui_error = ""
         self._realtime_candle_received.connect(self._apply_realtime_candle)
         self._instrument_cache: dict[str, object | None] = {}
         self._rr_trade_ledger_snapshot = load_kline_rr_trade_ledger_snapshot()
@@ -6209,6 +6234,24 @@ class KlineAnalysisWindow(QMainWindow):
     def set_shape_signal_monitor(self, monitor: object | None) -> None:
         self._shape_signal_monitor = monitor
 
+    def set_area_shape_monitor(self, monitor: object | None) -> None:
+        self._area_shape_monitor = monitor
+        if monitor is not None:
+            monitor.plan_updated.connect(self._on_area_plan_updated)
+            monitor.status_changed.connect(self._on_area_monitor_status)
+            self._refresh_area_shape_status()
+
+    def set_area_shape_execution_monitor(self, monitor: object | None) -> None:
+        self._area_shape_execution_monitor = monitor
+        if monitor is not None:
+            monitor.session_updated.connect(self._on_area_demo_session_updated)
+            monitor.status_changed.connect(self._on_area_demo_monitor_status)
+            self._area_shape_demo_refresh_timer = QTimer(self)
+            self._area_shape_demo_refresh_timer.setInterval(2000)
+            self._area_shape_demo_refresh_timer.timeout.connect(self._refresh_area_shape_execution_status)
+            self._area_shape_demo_refresh_timer.start()
+        self._refresh_area_shape_execution_status()
+
     def configure_shape_signal_preview(
         self,
         *,
@@ -6319,6 +6362,7 @@ class KlineAnalysisWindow(QMainWindow):
             "_deferred_chart_render_timer",
             "_layout_refresh_timer",
             "_account_prefetch_timer",
+            "_area_shape_demo_refresh_timer",
         ):
             timer = getattr(self, name, None)
             if timer is not None:
@@ -6337,6 +6381,7 @@ class KlineAnalysisWindow(QMainWindow):
             getattr(self, "_secondary_volatility_loader", None),
             getattr(self, "_history_trade_loader", None),
             getattr(self, "_weekly_cache_backfill_loader", None),
+            *tuple(getattr(self, "_area_shape_demo_workers", ())),
         )
         for loader in (*active_loaders, *tuple(self._retired_loaders)):
             if loader is not None and loader.isRunning():
@@ -6978,6 +7023,7 @@ class KlineAnalysisWindow(QMainWindow):
         self._control_tabs = control_tabs
         control_tabs.setDocumentMode(True)
         control_tabs.setTabPosition(QTabWidget.TabPosition.North)
+        control_tabs.tabBar().setUsesScrollButtons(True)
         control_layout.addWidget(control_tabs)
 
         analysis_page = QWidget()
@@ -6997,6 +7043,90 @@ class KlineAnalysisWindow(QMainWindow):
         rr_layout.setContentsMargins(4, 6, 4, 4)
         rr_layout.setSpacing(6)
         control_tabs.addTab(rr_page, "RR交易")
+
+        area_page = QWidget()
+        area_layout = QVBoxLayout(area_page)
+        area_layout.setContentsMargins(4, 6, 4, 4)
+        area_layout.setSpacing(6)
+        control_tabs.addTab(area_page, "区域形态")
+
+        self._area_shape_status = QLabel("区域形态：尚未创建计划")
+        self._area_shape_status.setObjectName("Subtle")
+        self._area_shape_status.setWordWrap(True)
+        self._area_shape_status.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        area_layout.addWidget(self._area_shape_status)
+        self._area_shape_lines = QLabel("下方支撑：待生成\n上方压力：待生成")
+        self._area_shape_lines.setWordWrap(True)
+        self._area_shape_lines.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        area_layout.addWidget(self._area_shape_lines)
+        area_layout.addWidget(QLabel("执行模式"))
+        self._area_shape_mode_combo = QComboBox()
+        self._area_shape_mode_combo.addItem("纸面演练", "paper")
+        self._area_shape_mode_combo.addItem("OKX模拟盘", "demo")
+        self._area_shape_mode_combo.setToolTip("纸面只推演；模拟盘默认同时在入场线挂GTC限价单，并在触线+1H形态确认后尝试价格受限FOK。任一路径成交后撤销另一入场并保护真实成交。")
+        self._area_shape_mode_combo.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+        self._area_shape_mode_combo.setMinimumContentsLength(8)
+        self._area_shape_mode_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        self._area_shape_mode_combo.currentIndexChanged.connect(self._on_area_shape_mode_changed)
+        area_layout.addWidget(self._area_shape_mode_combo)
+        self._area_shape_create_button = QPushButton("一键两线")
+        self._area_shape_create_button.setToolTip("在当前1H SWAP图表生成支撑线和压力线；初始取可见价格范围三等分，可拖动校准。")
+        self._area_shape_create_button.clicked.connect(self._create_area_shape_plan)
+        self._area_shape_create_button.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+        area_layout.addWidget(self._area_shape_create_button)
+        self._area_shape_edit_button = QPushButton("调整参数")
+        self._area_shape_edit_button.setToolTip("设置方向、单笔风险、最低可用空间、离场模板及高级ATR/成本参数。监控启动后参数冻结。")
+        self._area_shape_edit_button.clicked.connect(self._edit_area_shape_plan)
+        self._area_shape_edit_button.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+        area_layout.addWidget(self._area_shape_edit_button)
+        self._area_shape_start_button = QPushButton("开始监控")
+        self._area_shape_start_button.setToolTip("纸面模式启动小时级推演；模拟盘先核验账户/合约，再按参数挂GTC线价单并监控触线形态FOK。GTC可在形态确认前成交。")
+        self._area_shape_start_button.clicked.connect(self._start_area_shape_monitoring)
+        self._area_shape_start_button.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+        area_layout.addWidget(self._area_shape_start_button)
+        self._area_shape_pause_button = QPushButton("暂停计划")
+        self._area_shape_pause_button.setToolTip("暂停新信号；先撤销并核实GTC/活动入场单。已有成交仓位的交易所保护继续由后台维护。")
+        self._area_shape_pause_button.clicked.connect(self._pause_area_shape_monitoring)
+        self._area_shape_pause_button.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+        area_layout.addWidget(self._area_shape_pause_button)
+        self._area_shape_cancel_button = QPushButton("取消计划")
+        self._area_shape_cancel_button.setToolTip("取消当前计划；若OKX仍有活动入场委托，会先请求撤单并等待交易所确认。")
+        self._area_shape_cancel_button.clicked.connect(self._cancel_area_shape_plan)
+        self._area_shape_cancel_button.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+        area_layout.addWidget(self._area_shape_cancel_button)
+        demo_actions = QHBoxLayout()
+        self._area_shape_reconcile_button = QPushButton("只读对账")
+        self._area_shape_reconcile_button.setEnabled(False)
+        self._area_shape_reconcile_button.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+        self._area_shape_reconcile_button.clicked.connect(self._reconcile_area_shape_demo_session)
+        demo_actions.addWidget(self._area_shape_reconcile_button)
+        self._area_shape_rearm_button = QPushButton("继续保护")
+        self._area_shape_rearm_button.setEnabled(False)
+        self._area_shape_rearm_button.setToolTip("只读对账成功后，显式恢复原持仓保护管理；不会复制旧信号或新开仓。")
+        self._area_shape_rearm_button.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+        self._area_shape_rearm_button.clicked.connect(self._rearm_area_shape_demo_session)
+        demo_actions.addWidget(self._area_shape_rearm_button)
+        area_layout.addLayout(demo_actions)
+        self._area_shape_demo_status = QLabel("模拟盘执行：未启用")
+        self._area_shape_demo_status.setObjectName("Subtle")
+        self._area_shape_demo_status.setWordWrap(True)
+        self._area_shape_demo_status.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        area_layout.addWidget(self._area_shape_demo_status)
+        self._area_shape_summary = QLabel("纸面按下一根1H开盘价假设入场；模拟盘可在入场线挂GTC，并在触线+形态确认后提交FOK。GTC先成交时按实际成交管理并取消后续入场。")
+        self._area_shape_summary.setObjectName("Subtle")
+        self._area_shape_summary.setWordWrap(True)
+        self._area_shape_summary.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        self._area_shape_summary.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        area_layout.addWidget(self._area_shape_summary)
+        area_layout.addStretch(1)
+
+        self._control_area_tab_index = control_tabs.indexOf(area_page)
+        self._control_width_policy_snapshot = (
+            control.sizePolicy(), control.minimumWidth(),
+            control_tabs.sizePolicy(), control_tabs.minimumWidth(),
+        )
+        control_tabs.currentChanged.connect(self._on_control_tab_changed)
+        self._on_control_tab_changed(control_tabs.currentIndex())
 
         self._backend_hint = QLabel("")
         self._backend_hint.setObjectName("Subtle")
@@ -7367,6 +7497,28 @@ class KlineAnalysisWindow(QMainWindow):
 
         self._refresh_timer = QTimer(self)
         self._refresh_timer.timeout.connect(self._load_data)
+
+    def _on_control_tab_changed(self, index: int) -> None:
+        panel = getattr(self, "_control_panel", None)
+        tabs = getattr(self, "_control_tabs", None)
+        snapshot = getattr(self, "_control_width_policy_snapshot", None)
+        if panel is None or tabs is None or snapshot is None:
+            return
+        if int(index) == int(getattr(self, "_control_area_tab_index", -1)):
+            panel_policy = panel.sizePolicy()
+            panel_policy.setHorizontalPolicy(QSizePolicy.Policy.Ignored)
+            panel.setSizePolicy(panel_policy)
+            panel.setMinimumWidth(0)
+            tabs_policy = tabs.sizePolicy()
+            tabs_policy.setHorizontalPolicy(QSizePolicy.Policy.Ignored)
+            tabs.setSizePolicy(tabs_policy)
+            tabs.setMinimumWidth(0)
+            return
+        panel_policy, panel_minimum, tabs_policy, tabs_minimum = snapshot
+        panel.setSizePolicy(panel_policy)
+        panel.setMinimumWidth(panel_minimum)
+        tabs.setSizePolicy(tabs_policy)
+        tabs.setMinimumWidth(tabs_minimum)
 
     @staticmethod
     def _auto_refresh_interval_ms(period: str) -> int:
@@ -8599,10 +8751,15 @@ class KlineAnalysisWindow(QMainWindow):
             self._set_draw_tool("none")
             event.accept()
             return
-        if event.key() in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace) and self._selected_line_index >= 0:
-            self._delete_selected_line()
-            event.accept()
-            return
+        if event.key() in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace):
+            if self._selected_line_index >= 0:
+                self._delete_selected_line()
+                event.accept()
+                return
+            if self._selected_rr_index >= 0:
+                self._remove_rr_item()
+                event.accept()
+                return
         super().keyPressEvent(event)
 
     def _has_active_loaders(self) -> bool:
@@ -11133,6 +11290,556 @@ class KlineAnalysisWindow(QMainWindow):
     def _save_workspace_snapshot(self) -> None:
         save_kline_analysis_workspace_entries(self._workspace_entries)
 
+    def _area_shape_plans(self) -> list[AreaShapePlan]:
+        monitor = getattr(self, "_area_shape_monitor", None)
+        getter = getattr(monitor, "plans", None)
+        if not callable(getter):
+            return []
+        try:
+            return list(getter())
+        except Exception:
+            return []
+
+    def _current_area_plan(self, *, draft_only: bool = False) -> AreaShapePlan | None:
+        symbol = self._selected_symbol().strip().upper()
+        profile = self._active_profile_name().strip()
+        environment = self._active_environment().strip().lower()
+        candidates = [
+            plan for plan in self._area_shape_plans()
+            if plan.symbol == symbol and plan.period == "1H" and plan.profile_name == profile and plan.environment == environment
+            and (not draft_only or plan.status == "draft")
+        ]
+        return candidates[-1] if candidates else None
+
+    def _area_line_is_frozen(self, line_id: str) -> bool:
+        return any(
+            line_id in {plan.support_line_id, plan.pressure_line_id}
+            and plan.status in {"monitoring", "touched", "paper_pending", "paper_position", "paper_break_even", "paper_locked", "paused", "manual_review"}
+            for plan in self._area_shape_plans()
+        )
+
+    def _area_line_price(self, line_id: str) -> Decimal:
+        entry = self._workspace_entry(symbol=self._selected_symbol(), period="1H")
+        for item in entry.get("lines", []) if isinstance(entry.get("lines"), list) else []:
+            if isinstance(item, dict) and str(item.get("id", "")) == line_id:
+                return Decimal(str(item.get("price_a", "0")))
+        raise ValueError("区域计划关联线已丢失，请重新创建两线草稿")
+
+    def _create_area_shape_plan(self) -> None:
+        if self._pending_payload is None or not self._pending_payload.candles:
+            self._set_area_shape_status("请先加载1H K线，再创建区域计划。")
+            return
+        if self._period_combo.currentText().strip().upper() != "1H" or not self._selected_symbol().strip().upper().endswith("-SWAP"):
+            self._set_area_shape_status("区域计划仅开放在1H SWAP合约图上。")
+            return
+        monitor = getattr(self, "_area_shape_monitor", None)
+        if monitor is None:
+            self._set_area_shape_status("区域形态后台服务未连接；计划创建已禁用。")
+            return
+        prior = self._current_area_plan(draft_only=True)
+        context_plans = [
+            item for item in self._area_shape_plans()
+            if item.symbol == self._selected_symbol().strip().upper()
+            and item.period == "1H"
+            and item.profile_name == self._active_profile_name().strip()
+            and item.environment == self._active_environment().strip().lower()
+        ]
+        try:
+            config = prior.config if prior is not None else (context_plans[-1].config if context_plans else AreaShapeConfig())
+            config.validate()
+            candles = self._pending_payload.candles
+            lows = [Decimal(str(item["low"])) for item in candles]
+            highs = [Decimal(str(item["high"])) for item in candles]
+            low, high = min(lows), max(highs)
+            if low <= 0 or high <= low:
+                raise ValueError("当前可见K线范围无效")
+            support = low + (high - low) / Decimal("3")
+            pressure = low + (high - low) * Decimal("2") / Decimal("3")
+            workspace = self._workspace_entry(symbol=self._selected_symbol(), period="1H")
+            lines = workspace.get("lines")
+            if not isinstance(lines, list):
+                lines = []
+                workspace["lines"] = lines
+            now_time = int(candles[-1].get("time", 0) or 0)
+            if prior is not None:
+                support_id, pressure_id = prior.support_line_id, prior.pressure_line_id
+                found_support = found_pressure = False
+                for item in lines:
+                    if not isinstance(item, dict):
+                        continue
+                    if item.get("id") == support_id:
+                        support = Decimal(str(item.get("price_a", support)))
+                        found_support = True
+                    elif item.get("id") == pressure_id:
+                        pressure = Decimal(str(item.get("price_a", pressure)))
+                        found_pressure = True
+                if not found_support or not found_pressure:
+                    raise ValueError("草稿关联线缺失；请先取消损坏草稿，再重新生成两线")
+                if support <= 0 or pressure <= support:
+                    raise ValueError("草稿支撑/压力线顺序无效，请先校准两线")
+                prior.support_price, prior.pressure_price, prior.config = support, pressure, config
+                plan = prior
+            else:
+                support_id, pressure_id = uuid4().hex[:10], uuid4().hex[:10]
+                plan = AreaShapePlan.create(
+                    profile_name=self._active_profile_name(), environment=self._active_environment(),
+                    symbol=self._selected_symbol(), support_price=support, pressure_price=pressure,
+                    config=config, support_line_id=support_id, pressure_line_id=pressure_id,
+                )
+                lines.extend([
+                    {"id": support_id, "kind": "horizontal", "label": f"区域支撑 · {plan.profile_name}/{plan.environment} · {plan.plan_id[:6]}", "trigger": "touch", "action": "notify", "time_a": now_time, "price_a": float(support), "time_b": now_time, "price_b": float(support), "enabled": False, "color": "#2563eb"},
+                    {"id": pressure_id, "kind": "horizontal", "label": f"区域压力 · {plan.profile_name}/{plan.environment} · {plan.plan_id[:6]}", "trigger": "touch", "action": "notify", "time_a": now_time, "price_a": float(pressure), "time_b": now_time, "price_b": float(pressure), "enabled": False, "color": "#ea580c"},
+                ])
+            monitor.save_draft(plan)
+            self._save_workspace_snapshot()
+            self._populate_line_table()
+            self._render_to_chart(self._pending_payload)
+            self._refresh_area_shape_status()
+            if prior is not None:
+                self._set_status("已定位当前账户草稿的两根区域线；保留原位置，可继续拖动校准。")
+            else:
+                self._set_status("已生成一组成对区域线；初始位置取当前可见价格范围三等分，请拖动支撑与压力线校准。")
+        except Exception as exc:
+            self._set_area_shape_status(f"无法创建区域计划：{exc}")
+
+    def _edit_area_shape_plan(self) -> None:
+        plan = self._current_area_plan()
+        if plan is None:
+            self._set_area_shape_status("请先一键生成两线草稿。")
+            return
+        if plan.status != "draft":
+            self._set_area_shape_status("计划参数已随监控冻结；请结束此计划后新建草稿。")
+            return
+        dialog = AreaShapeConfigDialog(plan.config, self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        try:
+            plan.config = dialog.config()
+            plan.support_price = self._area_line_price(plan.support_line_id)
+            plan.pressure_price = self._area_line_price(plan.pressure_line_id)
+            self._area_shape_monitor.save_draft(plan)
+            self._refresh_area_shape_status()
+        except Exception as exc:
+            self._set_area_shape_status(f"无法保存区域参数：{exc}")
+
+    def _start_area_shape_monitoring(self) -> None:
+        mode = str(self._area_shape_mode_combo.currentData() or "paper")
+        plan = self._current_area_plan(draft_only=True)
+        if plan is None:
+            candidate = self._current_area_plan()
+            if candidate is not None and (
+                candidate.status == "paused"
+                or (mode == "demo" and candidate.execution_mode == "demo_exchange" and candidate.status in {"monitoring", "touched"})
+            ):
+                plan = candidate
+        if plan is None or self._area_shape_monitor is None:
+            self._set_area_shape_status("当前账户和合约没有可启动的区域草稿。")
+            return
+        try:
+            if self._period_combo.currentText().strip().upper() != "1H":
+                raise ValueError("请切换到1H图启动监控")
+            retry_demo_arm = mode == "demo" and plan.execution_mode == "demo_exchange" and plan.status in {"monitoring", "touched"}
+            if plan.status not in {"draft", "paused"} and not retry_demo_arm:
+                paused = [
+                    item for item in self._area_shape_plans()
+                    if item.status == "paused" and item.symbol == self._selected_symbol().strip().upper()
+                    and item.profile_name == self._active_profile_name().strip()
+                    and item.environment == self._active_environment().strip().lower()
+                ]
+                if not paused:
+                    raise ValueError("当前计划状态不能启动或恢复")
+                plan = paused[-1]
+            confirmed = [item for item in self._pending_payload.raw_candles if isinstance(item, Candle) and item.confirmed] if self._pending_payload is not None else []
+            if not confirmed:
+                raise ValueError("缺少已收盘1H K线")
+            support = self._area_line_price(plan.support_line_id)
+            pressure = self._area_line_price(plan.pressure_line_id)
+            plan.config.validate()
+            if plan.status == "draft":
+                plan.support_price, plan.pressure_price = support, pressure
+                self._area_shape_monitor.save_draft(plan)
+            last_closed_ts = int(confirmed[-1].ts)
+            if mode == "demo":
+                runtime, profile_name = self._require_area_shape_demo_access()
+                execution_monitor = self._area_shape_execution_monitor
+                if execution_monitor is None:
+                    raise RuntimeError("模拟盘执行服务未连接")
+                session = self._area_shape_demo_session_for_plan(plan)
+                if session is not None:
+                    if session.get("status") == "paused":
+                        self._run_area_shape_demo_action(
+                            "恢复模拟盘监控",
+                            lambda: execution_monitor.resume_session(
+                                str(session["session_id"]), runtime=runtime, unlocked=True,
+                            ),
+                        )
+                        return
+                    if session.get("status") in {"needs_manual_rearm", "manual_review"}:
+                        raise RuntimeError("此会话重启后处于只读状态；请先执行只读对账，再显式继续保护")
+                    raise RuntimeError(f"该计划已有模拟盘会话（{session.get('status', 'unknown')}），请使用现有会话操作")
+            started_plan = plan if retry_demo_arm else self._area_shape_monitor.start_plan(
+                plan.plan_id, last_closed_candle_ts=last_closed_ts,
+                profile_name=self._active_profile_name(), environment=self._active_environment(),
+                execution_mode="demo_exchange" if mode == "demo" else "paper",
+            )
+            self._refresh_area_shape_status()
+            if mode == "demo":
+                self._area_shape_demo_arm_pending = True
+                execution_monitor.request_arm(
+                    plan=started_plan, runtime=runtime, unlocked=True, paper_monitor=self._area_shape_monitor,
+                )
+                self._set_area_shape_status("模拟盘启用预检中：纸面基线已启动；完成账户UID、合约与保护条件核对后才会启用新信号执行。")
+                self._set_status("区域形态模拟盘启用预检中；默认等待线触碰和1H形态确认，再提交OKX价格受限FOK。")
+            else:
+                self._set_status("区域形态纸面监控已启动；next_open按下一根已确认1H K线开盘价假设入场，不发送订单。")
+            self._refresh_area_shape_execution_status()
+        except Exception as exc:
+            self._area_shape_demo_arm_pending = False
+            self._set_area_shape_status(f"未启动区域监控：{exc}")
+            if str(self._area_shape_mode_combo.currentData() or "paper") == "demo":
+                self._set_area_shape_demo_error(f"模拟盘未启用：{exc}")
+                self._sync_area_shape_demo_actions()
+
+    def _pause_area_shape_monitoring(self) -> None:
+        plan = self._current_area_plan()
+        if plan is None or self._area_shape_monitor is None:
+            self._set_area_shape_status("当前没有区域形态计划。")
+            return
+        try:
+            if str(self._area_shape_mode_combo.currentData() or "paper") == "demo":
+                session = self._area_shape_demo_session_for_plan(plan)
+                if session is not None:
+                    self._area_shape_execution_monitor.pause_session(str(session["session_id"]))
+                    self._area_shape_monitor.pause_plan(plan.plan_id)
+                    self._refresh_area_shape_execution_status(session)
+                    self._set_area_shape_status("已暂停模拟盘新入场；已有仓位的交易所保护继续由后台维护。")
+                    return
+            self._area_shape_monitor.pause_plan(plan.plan_id)
+            self._refresh_area_shape_status()
+        except Exception as exc:
+            self._set_area_shape_status(f"暂停失败：{exc}")
+
+    def _cancel_area_shape_plan(self) -> None:
+        plan = self._current_area_plan()
+        if plan is None or self._area_shape_monitor is None:
+            self._set_area_shape_status("当前没有区域形态计划。")
+            return
+        try:
+            if str(self._area_shape_mode_combo.currentData() or "paper") == "demo":
+                session = self._area_shape_demo_session_for_plan(plan)
+                if session is not None:
+                    self._area_shape_execution_monitor.cancel_session(str(session["session_id"]))
+            self._area_shape_monitor.cancel_plan(plan.plan_id)
+            self._refresh_area_shape_status()
+            self._refresh_area_shape_execution_status()
+        except Exception as exc:
+            self._set_area_shape_status(f"取消失败：{exc}")
+
+    @Slot(object)
+    def _on_area_plan_updated(self, payload: object) -> None:
+        if not isinstance(payload, dict):
+            return
+        try:
+            plan = AreaShapePlan.from_dict(payload)
+        except (TypeError, ValueError, KeyError):
+            return
+        if plan.symbol == self._selected_symbol().strip().upper() and plan.profile_name == self._active_profile_name() and plan.environment == self._active_environment():
+            self._refresh_area_shape_status(plan)
+
+    @Slot(str)
+    def _on_area_monitor_status(self, status: str) -> None:
+        if status:
+            if self._area_shape_mode_combo.currentData() == "demo":
+                self._area_shape_summary.setText(f"后台：{status}。默认形态触发由本地识别并提交价格受限FOK；本地对账成交与管理仓位保护。")
+            else:
+                self._area_shape_summary.setText(f"后台：{status}。纸面按下一根1H开盘价假设入场，不发送订单。")
+
+    def _refresh_area_shape_status(self, plan: AreaShapePlan | None = None) -> None:
+        target = plan or self._current_area_plan()
+        if target is None:
+            self._set_area_shape_status("区域形态：尚未创建计划")
+            lines = getattr(self, "_area_shape_lines", None)
+            if lines is not None:
+                lines.setText("下方支撑：待生成\n上方压力：待生成")
+            self._refresh_area_shape_execution_status()
+            return
+        latest = target.events[0] if target.events else {}
+        message = str(latest.get("message", "等待监控")) if isinstance(latest, dict) else "等待监控"
+        self._set_area_shape_status(f"{target.symbol} | {target.profile_name}/{target.environment} | {target.config.direction} | {target.status}\n{message}")
+        lines = getattr(self, "_area_shape_lines", None)
+        if lines is not None:
+            lines.setText(f"下方支撑：{target.support_price}\n上方压力：{target.pressure_price}")
+        self._refresh_area_shape_execution_status()
+
+    def _set_area_shape_status(self, message: str) -> None:
+        label = getattr(self, "_area_shape_status", None)
+        if label is not None:
+            label.setText(message)
+
+    def _area_shape_demo_sessions(self) -> list[dict[str, object]]:
+        monitor = getattr(self, "_area_shape_execution_monitor", None)
+        getter = getattr(monitor, "sessions", None)
+        if not callable(getter):
+            return []
+        try:
+            profile = self._active_profile_name().strip()
+            environment = self._active_environment().strip().lower()
+            symbol = self._selected_symbol().strip().upper()
+            return [
+                item for item in getter()
+                if isinstance(item, dict)
+                and str(item.get("profile_name", "")).strip() == profile
+                and str(item.get("environment", "")).strip().lower() == environment
+                and str(item.get("symbol", "")).strip().upper() == symbol
+            ]
+        except Exception as exc:
+            self._set_area_shape_demo_error(f"读取模拟盘会话失败：{exc}")
+            return []
+
+    def _area_shape_demo_session_for_plan(self, plan: AreaShapePlan) -> dict[str, object] | None:
+        matches = [item for item in self._area_shape_demo_sessions() if str(item.get("plan_id", "")) == plan.plan_id]
+        return matches[-1] if matches else None
+
+    def _require_area_shape_demo_access(self):
+        profile_name = self._active_profile_name().strip()
+        environment = self._active_environment().strip().lower()
+        runtime = self._runtime
+        runtime_profile = str(getattr(runtime, "credential_profile_name", "") or "").strip() if runtime is not None else ""
+        if not runtime_profile and runtime is not None:
+            runtime_profile = str(getattr(getattr(runtime, "credentials", None), "profile_name", "") or "").strip()
+        if not profile_name or runtime is None or runtime_profile != profile_name:
+            raise RuntimeError("当前API profile与运行时不一致；请重新选择并解锁目标账户")
+        selected_profile = self._api_profile_combo.currentText().strip() if hasattr(self, "_api_profile_combo") else profile_name
+        if selected_profile and selected_profile != profile_name:
+            raise RuntimeError("顶部选择的API profile尚未切换完成；请等待账户状态更新后重试")
+        if environment != "demo" or str(getattr(runtime, "environment", "") or "").strip().lower() != "demo":
+            raise RuntimeError("区域形态订单只允许OKX模拟盘；当前环境不是demo")
+        if not self._ensure_profile_access(profile_name):
+            raise PermissionError("当前API profile尚未解锁")
+        return runtime, profile_name
+
+    def _run_area_shape_demo_action(self, label: str, action: Callable[[], object]) -> None:
+        if self._area_shape_demo_action_pending:
+            self._set_area_shape_demo_error("模拟盘对账/恢复仍在处理中，请等待完成。")
+            return
+        self._area_shape_demo_action_pending = True
+        self._sync_area_shape_demo_actions()
+        self._set_area_shape_demo_error(f"{label}进行中…")
+        worker = AreaShapeDemoActionThread(action, self)
+        self._area_shape_demo_workers.add(worker)
+        worker.completed.connect(self._on_area_shape_demo_action_completed)
+        worker.failed.connect(self._on_area_shape_demo_action_failed)
+
+        def _finished() -> None:
+            self._area_shape_demo_workers.discard(worker)
+            worker.deleteLater()
+
+        worker.finished.connect(_finished)
+        worker.start()
+
+    @Slot(object)
+    def _on_area_shape_demo_action_completed(self, session: object) -> None:
+        self._area_shape_demo_action_pending = False
+        self._area_shape_demo_ui_error = ""
+        if isinstance(session, dict):
+            self._refresh_area_shape_execution_status(session)
+        else:
+            self._refresh_area_shape_execution_status()
+        self._sync_area_shape_demo_actions()
+
+    @Slot(str)
+    def _on_area_shape_demo_action_failed(self, message: str) -> None:
+        self._area_shape_demo_action_pending = False
+        self._refresh_area_shape_execution_status()
+        self._set_area_shape_demo_error(f"模拟盘操作失败：{message}")
+        self._sync_area_shape_demo_actions()
+
+    @Slot(object)
+    def _on_area_demo_session_updated(self, payload: object) -> None:
+        if isinstance(payload, dict):
+            symbol = str(payload.get("symbol", "")).strip().upper()
+            profile = str(payload.get("profile_name", "")).strip()
+            environment = str(payload.get("environment", "")).strip().lower()
+            if (symbol, profile, environment) == (
+                self._selected_symbol().strip().upper(), self._active_profile_name().strip(),
+                self._active_environment().strip().lower(),
+            ):
+                self._area_shape_demo_arm_pending = False
+                self._area_shape_demo_ui_error = ""
+                self._refresh_area_shape_execution_status(payload)
+        self._sync_area_shape_demo_actions()
+
+    @Slot(str)
+    def _on_area_demo_monitor_status(self, status: str) -> None:
+        if not status:
+            return
+        symbol = self._selected_symbol().strip().upper()
+        is_arm_error = self._area_shape_demo_arm_pending and status.startswith("demo启用失败")
+        if symbol not in status.upper() and not is_arm_error:
+            return
+        if symbol in status.upper() or is_arm_error:
+            self._area_shape_demo_arm_pending = False
+        self._set_area_shape_demo_error(status)
+        self._sync_area_shape_demo_actions()
+
+    @Slot(int)
+    def _on_area_shape_mode_changed(self, _index: int) -> None:
+        if not hasattr(self, "_area_shape_mode_combo"):
+            return
+        self._area_shape_summary.setText(
+            "纸面按下一根已确认1H K线开盘价假设入场；不会发送订单。"
+            if self._area_shape_mode_combo.currentData() == "paper"
+            else "OKX模拟盘默认同时挂入场线GTC限价单，并由本地触线+1H形态确认后提交价格受限FOK；任一路径成交后取消另一入场。"
+        )
+        self._refresh_area_shape_execution_status()
+
+    def _set_area_shape_demo_error(self, message: str) -> None:
+        self._area_shape_demo_ui_error = str(message)
+        label = getattr(self, "_area_shape_demo_status", None)
+        if label is not None:
+            label.setText(str(message))
+
+    def _refresh_area_shape_execution_status(self, session: dict[str, object] | None = None) -> None:
+        label = getattr(self, "_area_shape_demo_status", None)
+        if label is None:
+            return
+        sessions = self._area_shape_demo_sessions()
+        target = session if isinstance(session, dict) else (sessions[-1] if sessions else None)
+        if target is None:
+            label.setText(self._area_shape_demo_ui_error or "模拟盘执行：未启用")
+            self._sync_area_shape_demo_actions()
+            return
+        mode_combo = getattr(self, "_area_shape_mode_combo", None)
+        if mode_combo is not None and str(target.get("status", "")) not in {"closed", "cancelled", "expired"}:
+            demo_index = mode_combo.findData("demo")
+            if demo_index >= 0 and mode_combo.currentIndex() != demo_index:
+                mode_combo.blockSignals(True)
+                mode_combo.setCurrentIndex(demo_index)
+                mode_combo.blockSignals(False)
+                self._area_shape_summary.setText("OKX模拟盘默认同时挂入场线GTC限价单，并由本地触线+1H形态确认后提交价格受限FOK；任一路径成交后取消另一入场。")
+        intent = target.get("pending_intent") if isinstance(target.get("pending_intent"), dict) else {}
+        position = target.get("position") if isinstance(target.get("position"), dict) else {}
+        resting = target.get("resting_entry_intent") if isinstance(target.get("resting_entry_intent"), dict) else {}
+        entry = (f"OKX GTC线价单 {resting.get('price', resting.get('cl_ord_id', '待核对'))}"
+                 if resting else "等待新信号") if not intent else (
+            f"OKX FOK委托上限 {intent.get('price', intent.get('cl_ord_id', '待核对'))}"
+            if str(intent.get("entry_kind") or "trigger") == "fok"
+            else f"OKX条件委托 {intent.get('trigger_px', intent.get('cl_ord_id', '待核对'))}"
+        )
+        if position:
+            entry = f"仓位 {position.get('size', '-')} @ {position.get('entry', '-')}"
+        currently_protected = str(target.get("status", "")) == "protected"
+        stop_verified = int(position.get("stop_verified_at_ms", 0) or 0) if position else 0
+        tp_verified = int(position.get("take_profit_verified_at_ms", 0) or 0) if position else 0
+        stop_state = (
+            f"最近核验 {datetime.fromtimestamp(stop_verified / 1000).strftime('%H:%M:%S')}"
+            if currently_protected and stop_verified else "当前未确认/需对账"
+        )
+        tp_state = (
+            f"最近核验 {datetime.fromtimestamp(tp_verified / 1000).strftime('%H:%M:%S')}"
+            if currently_protected and tp_verified else (
+                "请求待核验" if position and position.get("take_profit_intent") else "未设置/当前未确认"
+            )
+        )
+        stop = f"{position.get('stop', '-')}（{stop_state}）" if position else f"-（{stop_state}）"
+        take_profit = f"{position.get('take_profit', '-')}（{tp_state}）" if position else f"-（{tp_state}）"
+        event_message = ""
+        events = target.get("events")
+        if isinstance(events, list) and events and isinstance(events[-1], dict):
+            event_message = str(events[-1].get("message", "") or "")
+        error = str(target.get("last_error", "") or "")
+        pieces = [
+            f"模拟盘 {target.get('status', 'unknown')} | {target.get('profile_name', '-')}/{target.get('environment', '-')} | UID {target.get('account_uid', '-')}",
+            f"{entry} | SL {stop} | TP {take_profit}",
+        ]
+        if error:
+            pieces.append(f"预检/执行错误：{error}")
+        if event_message:
+            pieces.append(event_message)
+        report = target.get("readonly_reconciliation")
+        if isinstance(report, dict):
+            pieces.append(f"只读对账：entry={report.get('entry')} GTC={report.get('resting_entry')} position={report.get('position')} SL={report.get('stop')} TP={report.get('take_profit')}")
+        label.setText("\n".join(pieces))
+        self._sync_area_shape_demo_actions(target)
+
+    def _sync_area_shape_demo_actions(self, session: dict[str, object] | None = None) -> None:
+        reconcile = getattr(self, "_area_shape_reconcile_button", None)
+        rearm = getattr(self, "_area_shape_rearm_button", None)
+        if reconcile is None or rearm is None:
+            return
+        target = session
+        if target is None:
+            sessions = self._area_shape_demo_sessions()
+            target = sessions[-1] if sessions else None
+        status = str(target.get("status", "")) if isinstance(target, dict) else ""
+        selected_demo = getattr(self, "_area_shape_mode_combo", None) is not None and self._area_shape_mode_combo.currentData() == "demo"
+        available = selected_demo and not self._area_shape_demo_action_pending
+        combo = getattr(self, "_area_shape_mode_combo", None)
+        if combo is not None:
+            busy_statuses = {"arming", "armed", "signal_pending", "entry_intent", "position_unprotected", "tp_pending", "protected", "manual_control", "needs_manual_rearm", "manual_review", "paused"}
+            combo.setEnabled(not self._area_shape_demo_arm_pending and status not in busy_statuses)
+        start_button = getattr(self, "_area_shape_start_button", None)
+        if start_button is not None:
+            start_button.setEnabled(
+                not self._area_shape_demo_arm_pending
+                and not self._area_shape_demo_action_pending
+                and status not in {"arming", "armed", "signal_pending", "entry_intent", "position_unprotected", "tp_pending", "protected", "manual_control", "needs_manual_rearm", "manual_review"}
+            )
+        reconcile.setEnabled(available and status in {"needs_manual_rearm", "manual_review"})
+        has_reconciliation = isinstance(target, dict) and bool(target.get("readonly_reconciled_at_ms"))
+        rearm.setEnabled(available and status in {"needs_manual_rearm", "manual_review"} and has_reconciliation)
+
+    def _reconcile_area_shape_demo_session(self) -> None:
+        session = self._area_shape_demo_session_for_current_context()
+        if session is None:
+            self._set_area_shape_demo_error("当前账户/合约没有待对账模拟盘会话。")
+            return
+        try:
+            runtime, _profile = self._require_area_shape_demo_access()
+            monitor = self._area_shape_execution_monitor
+            self._run_area_shape_demo_action(
+                "只读交易所对账",
+                lambda: monitor.reconcile_readonly(str(session["session_id"]), runtime=runtime, unlocked=True),
+            )
+        except Exception as exc:
+            self._set_area_shape_demo_error(f"不能开始只读对账：{exc}")
+
+    def _rearm_area_shape_demo_session(self) -> None:
+        session = self._area_shape_demo_session_for_current_context()
+        if session is None:
+            self._set_area_shape_demo_error("当前账户/合约没有可继续的模拟盘会话。")
+            return
+        try:
+            runtime, _profile = self._require_area_shape_demo_access()
+            monitor = self._area_shape_execution_monitor
+            self._run_area_shape_demo_action(
+                "恢复模拟盘保护",
+                lambda: monitor.rearm_session(str(session["session_id"]), runtime=runtime, unlocked=True),
+            )
+        except Exception as exc:
+            self._set_area_shape_demo_error(f"不能恢复模拟盘保护：{exc}")
+
+    def _area_shape_demo_session_for_current_context(self) -> dict[str, object] | None:
+        sessions = self._area_shape_demo_sessions()
+        if not sessions:
+            return None
+        return sessions[-1]
+
+    def _sync_area_shape_draft_lines(self) -> None:
+        if self._area_shape_monitor is None:
+            return
+        profile = self._active_profile_name().strip()
+        environment = self._active_environment().strip().lower()
+        for plan in self._area_shape_plans():
+            if plan.status != "draft" or plan.symbol != self._selected_symbol().strip().upper() or plan.period != self._period_combo.currentText().strip().upper() or plan.profile_name != profile or plan.environment != environment:
+                continue
+            try:
+                plan.support_price = self._area_line_price(plan.support_line_id)
+                plan.pressure_price = self._area_line_price(plan.pressure_line_id)
+                self._area_shape_monitor.save_draft(plan)
+            except Exception:
+                continue
+
     def _reload_workspace_view(self, symbol: str | None = None, period: str | None = None) -> None:
         entry = self._workspace_entry(symbol=symbol, period=period)
         alerts = entry.get("alerts", {})
@@ -12443,6 +13150,8 @@ class KlineAnalysisWindow(QMainWindow):
                 self._apply_rr_drag_update(candle_time=candle_time, price=price)
         if line_drag_in_progress or rr_drag_active:
             self._save_workspace_snapshot()
+            if line_drag_in_progress:
+                self._sync_area_shape_draft_lines()
             if self._pending_payload is not None:
                 self._render_to_chart(self._pending_payload)
         entry = self._workspace_entry()
@@ -12614,6 +13323,8 @@ class KlineAnalysisWindow(QMainWindow):
             item = records[index]
             if not isinstance(item, dict):
                 continue
+            if self._area_line_is_frozen(str(item.get("id", ""))):
+                continue
             kind = str(item.get("kind", "horizontal") or "horizontal").strip().lower()
             if kind == "trend":
                 endpoint_candidates = (
@@ -12651,6 +13362,10 @@ class KlineAnalysisWindow(QMainWindow):
         lines = entry.get("lines")
         index = int(state.get("index", -1))
         if not isinstance(lines, list) or index < 0 or index >= len(lines) or not isinstance(lines[index], dict):
+            return False
+        if self._area_line_is_frozen(str(lines[index].get("id", ""))):
+            self._line_drag_state = None
+            self._set_area_shape_status("监控中的区域线与冻结参数不能修改。")
             return False
         updated = _apply_drag_to_line_rule(
             lines[index],
@@ -13078,6 +13793,9 @@ class KlineAnalysisWindow(QMainWindow):
         if not isinstance(lines, list) or self._selected_line_index >= len(lines):
             return
         item = dict(lines[self._selected_line_index])
+        if self._area_line_is_frozen(str(item.get("id", ""))):
+            self._set_area_shape_status("监控中的区域线与冻结参数不能修改。")
+            return
         item["label"] = self._line_label_edit.text().strip() or str(item.get("label", "") or "")
         price_a = _parse_rr_optional_decimal(self._line_price_a_edit.text())
         kind = str(item.get("kind", "horizontal") or "horizontal").strip().lower()
@@ -13121,6 +13839,7 @@ class KlineAnalysisWindow(QMainWindow):
         lines[self._selected_line_index] = item
         selected_index = self._selected_line_index
         self._save_workspace_snapshot()
+        self._sync_area_shape_draft_lines()
         self._populate_line_table(selected_index=selected_index)
         if self._pending_payload is not None:
             self._render_to_chart(self._pending_payload)
@@ -13133,6 +13852,10 @@ class KlineAnalysisWindow(QMainWindow):
         entry = self._workspace_entry()
         lines = entry.get("lines")
         if not isinstance(lines, list) or self._selected_line_index >= len(lines):
+            return
+        selected_line = lines[self._selected_line_index]
+        if isinstance(selected_line, dict) and self._area_line_is_frozen(str(selected_line.get("id", ""))):
+            self._set_area_shape_status("监控中的区域线不能删除。")
             return
         deleted_index = self._selected_line_index
         del lines[deleted_index]

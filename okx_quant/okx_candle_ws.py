@@ -68,8 +68,8 @@ class OkxCandleWsConnectionUnavailable(RuntimeError):
 
 
 class OkxCandleWsConnection:
-    _BUSINESS_URL = "wss://ws.okx.com:8443/ws/v5/business"
-    _DEMO_BUSINESS_URL = "wss://wspap.okx.com:8443/ws/v5/business"
+    _BUSINESS_URL = "wss://ws.okx.com/ws/v5/business"
+    _DEMO_BUSINESS_URL = "wss://wspap.okx.com/ws/v5/business"
 
     def __init__(self, *, environment: str, logger: Callable[[str], None] | None = None) -> None:
         self._environment = environment.strip().lower() or "demo"
