@@ -51,6 +51,7 @@ def build_package(version: str) -> tuple[Path, Path]:
 
     for file_name in (
         "main.py",
+        "run_main_bootstrap.py",
         "pyproject.toml",
         "requirements.txt",
         "roll_terminal_qt_requirements.txt",
@@ -90,15 +91,15 @@ def build_package(version: str) -> tuple[Path, Path]:
         stage_dir / "RUN.bat",
         (
             "@echo off\r\n"
-            "cd /d %~dp0\r\n"
+            "cd /d \"%~dp0\"\r\n"
             "where py >nul 2>&1\r\n"
             "if %errorlevel%==0 (\r\n"
-            "    py -3 main.py\r\n"
+            "    py -3 run_main_bootstrap.py %*\r\n"
             "    goto :end\r\n"
             ")\r\n"
             "where python >nul 2>&1\r\n"
             "if %errorlevel%==0 (\r\n"
-            "    python main.py\r\n"
+            "    python run_main_bootstrap.py %*\r\n"
             "    goto :end\r\n"
             ")\r\n"
             "echo Python 3.11+ not found in PATH.\r\n"
@@ -179,9 +180,9 @@ def build_package(version: str) -> tuple[Path, Path]:
         (
             "Set-Location -LiteralPath $PSScriptRoot\n"
             "if (Get-Command py -ErrorAction SilentlyContinue) {\n"
-            "    py -3 .\\main.py\n"
+            "    py -3 .\\run_main_bootstrap.py @args\n"
             "} elseif (Get-Command python -ErrorAction SilentlyContinue) {\n"
-            "    python .\\main.py\n"
+            "    python .\\run_main_bootstrap.py @args\n"
             "} else {\n"
             "    Write-Host 'Python 3.11+ not found in PATH.'\n"
             "    Write-Host 'Install Python and enable Add Python to PATH, then run again.'\n"
@@ -195,7 +196,7 @@ def build_package(version: str) -> tuple[Path, Path]:
             "#!/usr/bin/env bash\n"
             "set -euo pipefail\n"
             "cd \"$(dirname \"$0\")\"\n"
-            "python3 main.py\n"
+            "python3 run_main_bootstrap.py \"$@\"\n"
         ),
         encoding="utf-8",
     )
@@ -206,6 +207,7 @@ def build_package(version: str) -> tuple[Path, Path]:
             "1. Runtime\n"
             "- Python 3.11+\n"
             "- Windows: run RUN.bat for the workbench, RUN_QT.bat for Roll Terminal QT\n"
+            "- RUN.bat / RUN.ps1 automatically install missing numpy, pandas and websockets using the same Python\n"
             "- RUN_QT.bat automatically installs missing Qt runtime dependencies using the detected Python\n"
             "- Linux server: this GUI app requires a desktop environment\n"
             "- Linux Tk install example: sudo apt-get install -y python3-tk\n"
@@ -213,6 +215,7 @@ def build_package(version: str) -> tuple[Path, Path]:
             "- Optional environment override: `QQOKX_DATA_DIR=D:\\qqokx_data`\n\n"
             "2. Included\n"
             "- main.py\n"
+            "- run_main_bootstrap.py\n"
             "- run_roll_terminal_qt.py\n"
             "- run_roll_terminal_qt_bootstrap.py\n"
             "- start_roll_terminal_qt.bat\n"

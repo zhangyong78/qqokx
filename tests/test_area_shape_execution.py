@@ -8,6 +8,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from okx_quant.area_shape_execution import (
+    AREA_SHAPE_EXECUTION_RULE_VERSION,
     build_demo_execution_session,
     check_demo_execution_conflicts,
     create_persisted_entry_intent,
@@ -122,7 +123,7 @@ class AreaShapeExecutionCoreTests(unittest.TestCase):
             )
 
     def test_restart_disables_writes_and_intent_id_is_stable(self):
-        session = {"version": 1, "mode": "demo_exchange", "status": "armed", "events": [], "plan_id": "p"}
+        session = {"version": AREA_SHAPE_EXECUTION_RULE_VERSION, "mode": "demo_exchange", "status": "armed", "events": [], "plan_id": "p"}
         restored = restore_execution_session_for_readonly(session)
         self.assertEqual(restored["status"], "needs_manual_rearm")
         self.assertTrue(restored["write_disabled"])
@@ -195,7 +196,7 @@ class AreaShapeExecutionCoreTests(unittest.TestCase):
         client = OkxRestClient()
         instrument = _instrument()
         client.get_area_shape_instrument = lambda _inst_id: instrument
-        client._derivative_order_pos_side = lambda *args, **kwargs: None
+        client._derivative_order_pos_side = lambda *args, plan_pos_side: None
         client._maybe_isolated_margin_ccy = lambda *_args, **_kwargs: None
         client._enforce_order_size_safety_limit = lambda **_kwargs: None
         captured = {}
@@ -217,7 +218,7 @@ class AreaShapeExecutionCoreTests(unittest.TestCase):
             Credentials(api_key="key", secret_key="secret", passphrase="pass"), config,
             inst_id=instrument.inst_id, side="buy", size=Decimal("1"), trigger_price=Decimal("101"),
             limit_price=Decimal("101.1"), stop_price=Decimal("99"), client_order_id="entry-1",
-            stop_algo_client_order_id="stop-1",
+            stop_algo_client_order_id="stop-1", take_profit_price=Decimal("110"),
         )
         self.assertEqual(result.ord_id, "algo-1")
         self.assertEqual(captured["path"], "/api/v5/trade/order-algo")
@@ -227,6 +228,7 @@ class AreaShapeExecutionCoreTests(unittest.TestCase):
         self.assertEqual(captured["body"]["advanceOrdType"], "fok")
         self.assertEqual(captured["body"]["orderPx"], "101.1")
         self.assertEqual(captured["body"]["attachAlgoOrds"][0]["slTriggerPx"], "99")
+        self.assertEqual(captured["body"]["attachAlgoOrds"][0]["tpTriggerPx"], "110")
 
         live_config = replace(config, environment="live")
         with self.assertRaises(PermissionError):
@@ -241,7 +243,7 @@ class AreaShapeExecutionCoreTests(unittest.TestCase):
         client = OkxRestClient()
         instrument = _instrument()
         client.get_area_shape_instrument = lambda _inst_id: instrument
-        client._derivative_order_pos_side = lambda *args, **kwargs: None
+        client._derivative_order_pos_side = lambda *args, plan_pos_side: None
         client._maybe_isolated_margin_ccy = lambda *_args, **kwargs: None
         client._enforce_order_size_safety_limit = lambda **_kwargs: None
         captured = {}
@@ -262,7 +264,7 @@ class AreaShapeExecutionCoreTests(unittest.TestCase):
         result = client.place_area_shape_demo_fok_entry(
             Credentials(api_key="key", secret_key="secret", passphrase="pass"), config,
             inst_id=instrument.inst_id, side="buy", size=Decimal("1"), limit_price=Decimal("101.1"),
-            stop_price=Decimal("99"), client_order_id="entry-1", stop_algo_client_order_id="stop-1",
+            stop_price=Decimal("99"), client_order_id="entry-1", stop_algo_client_order_id="stop-1", take_profit_price=Decimal("110"),
         )
         self.assertEqual(result.ord_id, "order-1")
         self.assertEqual(captured["path"], "/api/v5/trade/order")
@@ -271,6 +273,7 @@ class AreaShapeExecutionCoreTests(unittest.TestCase):
         self.assertEqual(captured["body"]["px"], "101.1")
         self.assertEqual(captured["body"]["clOrdId"], "entry-1")
         self.assertEqual(captured["body"]["attachAlgoOrds"][0]["slTriggerPx"], "99")
+        self.assertEqual(captured["body"]["attachAlgoOrds"][0]["tpTriggerPx"], "110")
 
 
 if __name__ == "__main__":

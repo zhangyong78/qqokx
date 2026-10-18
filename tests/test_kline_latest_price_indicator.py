@@ -45,3 +45,19 @@ class LatestPriceIndicatorTest(QtWidgetTestCase):
         self.view.set_latest_price(float("nan"))
         self.assertIsNone(self.view._latest_price)
         self.assertEqual((self.axis_y.min(), self.axis_y.max()), before)
+
+    def test_one_hour_right_padding_survives_chart_data_refresh(self):
+        self.view._right_padding_bars = 75
+        state = self.view.capture_view_state()
+        self.view.set_chart_context(
+            axis_x=self.axis_x,
+            axis_y=self.axis_y,
+            candles=self.view._candles,
+            overlay_values=[],
+            display_times_ms=[0, 3_600_000],
+            period="1H",
+            symbol="ETH-USDT-SWAP",
+            restore_state=state,
+        )
+        self.assertEqual(self.view._right_padding_bars, 75)
+        self.assertEqual(self.view._full_x_max, 3_600_000 + 75 * 3_600_000)

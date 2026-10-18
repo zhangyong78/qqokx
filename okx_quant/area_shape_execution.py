@@ -17,7 +17,7 @@ from okx_quant.pricing import snap_to_increment
 from okx_quant.client_order_id import with_custom_order_id_prefix
 
 
-AREA_SHAPE_EXECUTION_RULE_VERSION = 1
+AREA_SHAPE_EXECUTION_RULE_VERSION = 2
 _CL_ORD_ID_RE = re.compile(r"^[A-Za-z0-9-]{1,32}$")
 
 

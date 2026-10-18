@@ -65,6 +65,10 @@ def _order_view_source_label(order: OrderStatusView) -> str:
     raw = order.raw if isinstance(order.raw, dict) else {}
     feed_source = str(raw.get("_feed_source") or "").strip().lower()
     source_kind = _order_view_source_kind(order)
+    if feed_source == "submit_ack":
+        return "下单回执"
+    if feed_source == "rest_order":
+        return "REST 单笔确认"
     if feed_source == "rest_pending" and source_kind == "algo":
         return "REST 算法"
     if feed_source == "rest_pending":

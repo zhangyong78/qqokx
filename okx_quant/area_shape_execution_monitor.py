@@ -23,7 +23,10 @@ from okx_quant.area_shape_execution import (
     validate_usdt_linear_swap,
 )
 from okx_quant.area_shape_execution_store import load_area_shape_execution_records, save_area_shape_execution_records
-from okx_quant.area_shape_trade import AreaShapePlan
+from okx_quant.area_shape_trade import (
+    AREA_DYNAMIC_TAKE_PROFIT_R, AreaShapePlan, area_shape_lock_profit_r,
+    area_shape_net_progress_r, calculate_initial_stop,
+)
 from okx_quant.engine import StrategyEngine
 from okx_quant.indicators import atr
 from okx_quant.models import StrategyConfig
@@ -258,7 +261,7 @@ class AreaShapeDemoExecutionMonitor(QObject):
                 current["signal_cursor_ts"] = baseline
                 current["baseline_candle_ts"] = baseline
                 plan = AreaShapePlan.from_dict(current["plan_snapshot"])
-                if plan.config.resting_entry_enabled:
+                if plan.config.resting_entry_enabled or plan.config.entry_trigger_mode == "direct_touch":
                     current["resting_entry_intent"], reason = self._prepare_resting_entry(current, plan, baseline_candles)
                     if reason:
                         current.setdefault("events", []).append({"kind": "resting_entry_skipped", "ts": int(time.time() * 1000),
@@ -351,22 +354,39 @@ class AreaShapeDemoExecutionMonitor(QObject):
             # After this marker the public paper worker will not mutate this plan.
             paper_monitor.mark_demo_execution(plan.plan_id)
             resting_reason = ""
-            if plan.config.resting_entry_enabled:
+            place_line_order = plan.config.entry_trigger_mode == "direct_touch" or plan.config.resting_entry_enabled
+            if place_line_order:
                 session["resting_entry_intent"], resting_reason = self._prepare_resting_entry(session, plan, candles)
+                if plan.config.entry_trigger_mode == "direct_touch" and not session["resting_entry_intent"]:
+                    raise RuntimeError(resting_reason or "直接入场线GTC挂单未能准备")
             with self._lock:
                 session["status"] = "armed"
                 if resting_reason:
                     session["events"].append({"kind": "resting_entry_skipped", "ts": int(time.time() * 1000),
                                               "message": resting_reason})
+                armed_message = (
+                    "直接价格触发已启用；正在向OKX提交入场线GTC限价单，成交后转入仓位保护"
+                    if plan.config.entry_trigger_mode == "direct_touch"
+                    else "demo执行已启用；GTC入场线挂单与形态确认入场并行，成交互斥"
+                )
                 session["events"].append({"kind": "armed", "ts": int(time.time() * 1000),
-                                          "message": "demo执行已启用；GTC入场线挂单与形态确认入场并行，成交互斥"})
+                                          "message": armed_message})
                 self._runtimes[session_id] = runtime
                 self._clients[session_id] = client
                 self._persist_locked()
             if session.get("resting_entry_intent"):
                 self._submit_resting_entry(session_id)
             self.session_updated.emit(copy.deepcopy(session))
-            self.status_changed.emit(f"{plan.symbol} demo执行已启用，账户uid已绑定；等待新信号")
+            current = self._sessions[session_id]
+            if plan.config.entry_trigger_mode == "direct_touch":
+                status_message = (
+                    f"{plan.symbol}直接入场已启用；OKX入场线GTC已提交，等待委托成交"
+                    if current.get("status") == "armed" and current.get("resting_entry_intent")
+                    else f"{plan.symbol}直接入场状态：{current.get('status')}；请核对区域交易事件"
+                )
+            else:
+                status_message = f"{plan.symbol} demo执行已启用，账户uid已绑定；等待新信号"
+            self.status_changed.emit(status_message)
             return dict(session)
         except Exception:
             with self._lock:
@@ -385,21 +405,31 @@ class AreaShapeDemoExecutionMonitor(QObject):
     def _prepare_resting_entry(
         self, session: dict[str, Any], plan: AreaShapePlan, candles: list[Any],
     ) -> tuple[dict[str, Any] | None, str]:
-        if plan.config.entry_mode != "next_open":
+        if (plan.config.entry_trigger_mode != "direct_touch"
+                and plan.config.entry_mode != "next_open"):
             return None, "普通GTC与旧版OKX条件触发模式不并行；本次保留条件触发路径"
-        values = atr(candles, plan.config.atr_period)
-        current_atr = values[-1] if values else None
-        if current_atr is None or current_atr <= 0:
-            return None, "最新已收盘1H ATR不可用；未挂GTC，形态确认FOK仍可运行"
-        if plan.config.stop_offset_atr <= 0:
-            return None, "止损ATR偏移必须大于0才能为GTC预置保护；本次未挂GTC"
+        needs_atr = (plan.config.stop_basis != "fixed_distance" and plan.config.stop_offset_atr > 0) or plan.config.target_buffer_atr > 0
+        current_atr = Decimal("0")
+        if needs_atr:
+            values = atr(candles, plan.config.atr_period)
+            current_atr = values[-1] if values else None
+            if current_atr is None or current_atr <= 0:
+                return None, "最新已收盘1H ATR不可用；无法计算入场保护止损或目标缓冲"
+        if plan.config.stop_basis != "fixed_distance" and plan.config.stop_offset_atr <= 0:
+            return None, "止损ATR偏移必须大于0才能计算入场保护止损"
         instrument = session["instrument"]
         tick = Decimal(str(instrument["tick_size"]))
         side = "buy" if plan.config.direction == "long" else "sell"
         raw_entry = plan.support_price if side == "buy" else plan.pressure_price
         entry = snap_to_increment(raw_entry, tick, "down" if side == "buy" else "up")
-        stop_delta = current_atr * plan.config.stop_offset_atr
-        raw_stop = entry - stop_delta if side == "buy" else entry + stop_delta
+        if not candles:
+            return None, "缺少已收盘K线，无法计算入场保护止损"
+        if plan.config.stop_basis == "three_candle" and len(candles) < 3:
+            return None, "最近三根已收盘K线不足；无法计算入场保护止损"
+        raw_stop = calculate_initial_stop(
+            plan.config, plan.config.direction, entry_reference=entry,
+            signal_candle=candles[-1], recent_candles=candles[-3:], atr_value=current_atr,
+        )
         stop = snap_to_increment(raw_stop, tick, "up" if side == "buy" else "down")
         if entry <= 0 or stop <= 0 or (side == "buy" and stop >= entry) or (side == "sell" and stop <= entry):
             return None, "GTC线价/ATR止损关系无效；本次未挂GTC"
@@ -421,10 +451,24 @@ class AreaShapeDemoExecutionMonitor(QObject):
         except ValueError as exc:
             return None, f"GTC风险定仓不可用（{exc}）；本次未挂GTC"
         signal_key = f"resting:{session['baseline_candle_ts']}:{session.get('last_signal_key') or 'initial'}"
+        stop_algo_cl_ord_id = new_execution_client_order_id(session["plan_id"], signal_key, "stop")
+        try:
+            take_profit_price = price_for_net_r(
+                entry=entry, stop=stop, direction=plan.config.direction,
+                target_r=_take_profit_r(plan), fee_rate=Decimal(session["fee_rate"]),
+                slippage_rate=Decimal(session["slippage_rate"]), contract_multiplier=multiplier,
+                tick_size=tick,
+            )
+        except ValueError as exc:
+            return None, f"止盈保护价不可用；本次未挂GTC：{exc}"
+        take_profit_algo_cl_ord_id = stop_algo_cl_ord_id
         return ({
             "entry_kind": "gtc", "signal_key": signal_key,
             "cl_ord_id": new_execution_client_order_id(session["plan_id"], signal_key, "gtc"),
-            "stop_algo_cl_ord_id": new_execution_client_order_id(session["plan_id"], signal_key, "stop"),
+            "stop_algo_cl_ord_id": stop_algo_cl_ord_id,
+            "take_profit_algo_cl_ord_id": take_profit_algo_cl_ord_id,
+            "take_profit_price": "" if take_profit_price is None else str(take_profit_price),
+            "take_profit_target_r": str(_take_profit_r(plan)), "entry_reference": str(entry),
             "side": side, "size": str(size), "price": str(entry), "stop": str(stop),
             "state": "prepared", "created_at_ms": int(time.time() * 1000),
             "expires_at_ms": int(session["expires_at_candle_ts"]) + 3_600_000,
@@ -445,6 +489,8 @@ class AreaShapeDemoExecutionMonitor(QObject):
                 side=intent["side"], size=Decimal(intent["size"]), limit_price=Decimal(intent["price"]),
                 stop_price=Decimal(intent["stop"]), client_order_id=intent["cl_ord_id"],
                 stop_algo_client_order_id=intent["stop_algo_cl_ord_id"],
+                take_profit_price=(Decimal(intent["take_profit_price"])
+                                   if intent.get("take_profit_price") else None),
             )
         except Exception:
             # The POST may have succeeded; only query this original clOrdId.
@@ -832,29 +878,28 @@ class AreaShapeDemoExecutionMonitor(QObject):
                     session.setdefault("events", []).append({"kind": "recovered_partial_fill_protected",
                                                                "ts": int(time.time() * 1000),
                                                                "message": "恢复到原订单部分成交；已核验已成交数量止损保护，余量/账户竞态需人工接管"})
-                elif plan.config.exit_template == "fixed_1r":
+                else:
                     tp_id = str(position.get("take_profit_algo_cl_ord_id") or "")
                     if not tp_id:
-                        raise RuntimeError("固定止盈编号缺失；活动仓位保持只读，不能恢复为受保护")
+                        raise RuntimeError("止盈保护编号缺失；活动仓位保持只读，不能恢复为受保护")
                     tp_raw = client.get_order_algo(runtime.credentials, environment="demo",
                                                    inst_id=session["symbol"], algo_cl_ord_id=tp_id)
                     if str((tp_raw or {}).get("state", "")).lower() == "effective":
-                        raise RuntimeError("固定止盈已触发/终态但账户仍有活动仓位；保持只读并人工核对成交")
+                        raise RuntimeError("止盈保护已触发/终态但账户仍有活动仓位；保持只读并人工核对成交")
                     instrument = session.get("instrument") or {}
                     multiplier = Decimal(str(instrument.get("ct_val", "0"))) * Decimal(str(instrument.get("ct_mult", "0")))
-                    target = price_for_net_r(
-                        entry=Decimal(position["entry"]), stop=Decimal(position["initial_stop"]),
-                        direction=plan.config.direction, target_r=plan.config.fixed_tp_r,
-                        fee_rate=Decimal(session["fee_rate"]), slippage_rate=Decimal(session["slippage_rate"]),
-                        contract_multiplier=multiplier, tick_size=Decimal(str(instrument.get("tick_size", "0"))),
-                    )
+                    frozen_tp = (position.get("take_profit") or (position.get("take_profit_intent") or {}).get("trigger")
+                                 or intent.get("take_profit_price"))
+                    if not frozen_tp:
+                        raise RuntimeError("恢复缺少原始冻结止盈价；保持只读，禁止套用新规则")
+                    target = Decimal(str(frozen_tp))
                     if not _verified_protection(
                         tp_raw, inst_id=session["symbol"],
                         side="sell" if plan.config.direction == "long" else "buy",
                         size=Decimal(position["size"]), trigger=target, kind="tp",
                         pos_side=position.get("pos_side"), position_mode=runtime.position_mode,
                     ):
-                        raise RuntimeError("固定止盈未回读为live且参数一致；活动仓位保持只读")
+                        raise RuntimeError("止盈保护未回读为live且参数一致；活动仓位保持只读")
                     position["take_profit"] = str(target)
                     position["take_profit_verified_at_ms"] = int(time.time() * 1000)
                 if not reconstructed_partial:
@@ -888,7 +933,7 @@ class AreaShapeDemoExecutionMonitor(QObject):
                 session["pending_intent"] = None
                 session["signal_pending"] = None
                 plan = AreaShapePlan.from_dict(session["plan_snapshot"])
-                if plan.config.resting_entry_enabled:
+                if plan.config.resting_entry_enabled or plan.config.entry_trigger_mode == "direct_touch":
                     session["resting_entry_intent"], reason = self._prepare_resting_entry(session, plan, candles)
                     if reason:
                         session.setdefault("events", []).append({"kind": "resting_entry_skipped", "ts": int(time.time() * 1000),
@@ -973,7 +1018,7 @@ class AreaShapeDemoExecutionMonitor(QObject):
         elif status == "position_unprotected":
             self._retry_initial_protection(session_id)
         elif status == "tp_pending":
-            self._place_fixed_target(session_id)
+            self._ensure_take_profit(session_id)
         elif status == "protected":
             self._manage_filled_position(session_id)
 
@@ -1005,6 +1050,9 @@ class AreaShapeDemoExecutionMonitor(QObject):
                 position["stop_algo_cl_ord_id"] = stop_id
                 position["stop_algo_id"] = str(raw.get("algoId") or "")
                 position["stop_verified_at_ms"] = int(time.time() * 1000)
+                self._ensure_take_profit(session_id)
+                if session.get("status") in {"tp_pending", "manual_review", "manual_control", "closed"}:
+                    return
                 if position.get("partial_fill_requires_review") or position.get("account_position_mismatch"):
                     self._set_status(session_id, "manual_control", "已保护已知成交量，但部分成交/账户聚合不一致需人工接管；停止后续自动交易管理")
                     return
@@ -1049,6 +1097,9 @@ class AreaShapeDemoExecutionMonitor(QObject):
         position["stop_algo_cl_ord_id"] = stop_id
         position["stop_algo_id"] = str(existing.get("algoId") or "")
         position["stop_verified_at_ms"] = int(time.time() * 1000)
+        self._ensure_take_profit(session_id)
+        if session.get("status") in {"tp_pending", "manual_review", "closed"}:
+            return
         if position.get("partial_fill_requires_review") or position.get("account_position_mismatch"):
             with self._lock:
                 session.pop("cancel_requested", None)
@@ -1073,6 +1124,10 @@ class AreaShapeDemoExecutionMonitor(QObject):
         snapshot = AreaShapePlan.from_dict(session["plan_snapshot"])
         candles = sorted((item for item in client.get_candles_history(session["symbol"], "1H", limit=240) if item.confirmed), key=lambda item: item.ts)
         cursor = int(session.get("signal_cursor_ts", 0))
+        if snapshot.config.entry_trigger_mode == "direct_touch":
+            # Direct-touch plans use the exchange-hosted GTC order submitted
+            # at arm time. Do not create a second local FOK entry.
+            return
         if not candles or candles[-1].ts <= cursor:
             return
         fresh = [item for item in candles if item.ts > cursor]
@@ -1094,6 +1149,7 @@ class AreaShapeDemoExecutionMonitor(QObject):
         snapshot.paper_position = None
         snapshot.status = "monitoring"
         snapshot.last_candle_ts = cursor
+        snapshot.activation_candle_ts = int(session["baseline_candle_ts"])
         event = snapshot.observe(candles)
         with self._lock:
             current = self._sessions[session_id]
@@ -1224,6 +1280,19 @@ class AreaShapeDemoExecutionMonitor(QObject):
             intent["trigger_px"] = str(snap_to_increment(trigger, tick, "up" if side == "buy" else "down"))
             intent["trigger_expires_at_ms"] = signal_ts + 2 * 3_600_000
         intent["stop_algo_cl_ord_id"] = new_execution_client_order_id(session["plan_id"], str(signal["signal_key"]), "stop")
+        try:
+            frozen_tp = price_for_net_r(
+                entry=limit, stop=stop, direction=plan.config.direction,
+                target_r=_take_profit_r(plan), fee_rate=Decimal(session["fee_rate"]),
+                slippage_rate=Decimal(session["slippage_rate"]),
+                contract_multiplier=multiplier, tick_size=tick,
+            )
+        except ValueError as exc:
+            self._consume_signal(session_id, f"附带止盈保护价无效；未提交入场：{exc}")
+            return
+        intent.update({"take_profit_price": str(frozen_tp),
+                       "take_profit_algo_cl_ord_id": intent["stop_algo_cl_ord_id"],
+                       "take_profit_target_r": str(_take_profit_r(plan)), "entry_reference": str(limit)})
         with self._lock:
             current = self._sessions[session_id]
             if (self._stop.is_set() or current.get("status") != "signal_pending"
@@ -1248,12 +1317,14 @@ class AreaShapeDemoExecutionMonitor(QObject):
                     size=Decimal(intent["size"]), limit_price=Decimal(intent["price"]),
                     stop_price=Decimal(intent["stop"]), client_order_id=intent["cl_ord_id"],
                     stop_algo_client_order_id=intent["stop_algo_cl_ord_id"],
+                    take_profit_price=Decimal(intent["take_profit_price"]) if intent.get("take_profit_price") else None,
                 )
             else:
                 client.place_area_shape_demo_trigger_entry(
                     runtime.credentials, config, inst_id=session["symbol"], side=intent["side"],
                     size=Decimal(intent["size"]), trigger_price=Decimal(intent["trigger_px"]),
                     limit_price=Decimal(intent["price"]), stop_price=Decimal(intent["stop"]),
+                    take_profit_price=Decimal(intent["take_profit_price"]) if intent.get("take_profit_price") else None,
                     client_order_id=intent["cl_ord_id"], stop_algo_client_order_id=intent["stop_algo_cl_ord_id"],
                 )
         except Exception:
@@ -1286,6 +1357,15 @@ class AreaShapeDemoExecutionMonitor(QObject):
             "fee_rate": session["fee_rate"], "slippage_rate": session["slippage_rate"],
             "partial_fill_requires_review": size != Decimal(intent["size"]),
         }
+        if intent.get("take_profit_price") and intent.get("take_profit_algo_cl_ord_id"):
+            position["take_profit_algo_cl_ord_id"] = str(intent["take_profit_algo_cl_ord_id"])
+            position["take_profit_intent"] = {
+                "trigger": str(intent["take_profit_price"]), "size": str(size),
+                "side": "sell" if plan.config.direction == "long" else "buy",
+                "rule_version": session["rule_version"],
+            }
+            position["take_profit_target_r"] = str(intent.get("take_profit_target_r") or _take_profit_r(plan))
+            position["entry_reference"] = str(intent.get("entry_reference") or intent["price"])
         with self._lock:
             current = self._sessions[session_id]
             current["position"] = position
@@ -1377,8 +1457,9 @@ class AreaShapeDemoExecutionMonitor(QObject):
         if not fill_time:
             self._set_status(session_id, "manual_review", "成交事实与初始保护已保存，但交易所成交时间未能核实；保护保留，停止阶段管理需人工核对")
             return
-        if plan.config.exit_template == "fixed_1r":
-            self._place_fixed_target(session_id)
+        self._ensure_take_profit(session_id)
+        if session.get("status") in {"tp_pending", "manual_review", "closed"}:
+            return
         if size != Decimal(intent["size"]):
             self._set_status(session_id, "manual_control", "入场单出现部分成交；已先保护已知成交数量，余量/竞态需人工核对")
             return
@@ -1389,7 +1470,7 @@ class AreaShapeDemoExecutionMonitor(QObject):
             self._set_status(session_id, "manual_control", f"实际成交含费用风险{actual_risk}超过预算{plan.config.risk_amount}；保护单保留，需人工减仓/接管")
         self.session_updated.emit(copy.deepcopy(self._sessions[session_id]))
 
-    def _place_fixed_target(self, session_id: str) -> None:
+    def _ensure_take_profit(self, session_id: str) -> None:
         session = self._sessions[session_id]
         runtime, client = self._runtime_client(session_id)
         plan = AreaShapePlan.from_dict(session["plan_snapshot"])
@@ -1402,12 +1483,16 @@ class AreaShapeDemoExecutionMonitor(QObject):
         if intent:
             if (Decimal(str(intent.get("size", "0"))) != Decimal(position["size"])
                     or str(intent.get("side", "")) != ("sell" if plan.config.direction == "long" else "buy")):
-                self._set_status(session_id, "manual_review", "固定止盈持久化意图与仓位不一致；禁止更换请求参数")
+                self._set_status(session_id, "manual_review", "止盈保护持久化意图与仓位不一致；禁止更换请求参数")
                 return
             target = Decimal(str(intent.get("trigger", "0")))
+        elif position.get("take_profit"):
+            # Reconciliation must retain the original frozen target even when
+            # the actual fill improved on the entry reference.
+            target = Decimal(str(position["take_profit"]))
         else:
             target = price_for_net_r(entry=entry, stop=stop, direction=plan.config.direction,
-                                     target_r=plan.config.fixed_tp_r, fee_rate=Decimal(session["fee_rate"]),
+                                     target_r=_take_profit_r(plan), fee_rate=Decimal(session["fee_rate"]),
                                      slippage_rate=Decimal(session["slippage_rate"]), contract_multiplier=multiplier,
                                      tick_size=tick)
         if target <= 0:
@@ -1429,6 +1514,19 @@ class AreaShapeDemoExecutionMonitor(QObject):
                     return
                 self._set_status(session_id, "manual_control", "止盈单已触发但成交/平仓证据不完整；停止写入并需人工核对")
                 return
+            if (str((existing or {}).get("state", "")).lower() == "live"
+                    and position.get("stop_algo_cl_ord_id") == tp_id
+                    and not _verified_protection(existing, inst_id=session["symbol"], side=closing_side,
+                                                 size=Decimal(position["size"]), trigger=target, kind="tp",
+                                                 pos_side=position.get("pos_side"), position_mode=runtime.position_mode)):
+                # A partially filled parent may expose only its SL child. Keep
+                # that protection and give the standalone TP its own stable ID.
+                tp_id = new_execution_client_order_id(session["plan_id"], tp_id, "tpfallback")
+                with self._lock:
+                    position["take_profit_algo_cl_ord_id"] = tp_id
+                    self._persist_locked()
+                existing = client.get_order_algo(runtime.credentials, environment="demo",
+                                                 inst_id=session["symbol"], algo_cl_ord_id=tp_id)
             if not _verified_protection(existing, inst_id=session["symbol"], side=closing_side,
                                         size=Decimal(position["size"]), trigger=target, kind="tp",
                                         pos_side=position.get("pos_side"), position_mode=runtime.position_mode):
@@ -1441,19 +1539,25 @@ class AreaShapeDemoExecutionMonitor(QObject):
                     )
             algo = client.get_order_algo(runtime.credentials, environment="demo", inst_id=session["symbol"], algo_cl_ord_id=tp_id)
         except Exception as exc:
-            self._set_status(session_id, "tp_pending", f"固定止盈请求/回读暂未确认；已保留止损，将按原ID核对：{exc}")
+            self._set_status(session_id, "tp_pending", f"止盈保护请求/回读暂未确认；已保留止损，将按原ID核对：{exc}")
             return
         if not _verified_protection(algo, inst_id=session["symbol"], side=closing_side,
                                     size=Decimal(position["size"]), trigger=target, kind="tp",
                                     pos_side=position.get("pos_side"), position_mode=runtime.position_mode):
-            self._set_status(session_id, "tp_pending", "固定止盈单未回读到live/精确参数；已保留止损，将继续按原ID核对")
+            self._set_status(session_id, "tp_pending", "止盈保护单未回读到live/精确参数；已保留止损，将继续按原ID核对")
             return
         position["take_profit"] = str(target)
         position["take_profit_algo_cl_ord_id"] = tp_id
         position["take_profit_verified_at_ms"] = int(time.time() * 1000)
         position.pop("take_profit_intent", None)
         with self._lock:
-            self._sessions[session_id]["status"] = "protected"
+            needs_review = (position.get("partial_fill_requires_review") or position.get("account_position_mismatch")
+                            or position.get("risk_budget_exceeded"))
+            self._sessions[session_id]["status"] = "manual_control" if needs_review else "protected"
+            session.setdefault("events", []).append({"kind": "take_profit_verified", "ts": int(time.time() * 1000),
+                "trigger": str(target), "algo_cl_ord_id": tp_id, "source": "last",
+                "target_r": str(position.get("take_profit_target_r") or _take_profit_r(plan)),
+                "entry_reference": str(position.get("entry_reference") or entry), "actual_entry": str(entry)})
         self._persist_session(session_id)
 
     def _manage_filled_position(self, session_id: str) -> None:
@@ -1487,21 +1591,23 @@ class AreaShapeDemoExecutionMonitor(QObject):
                 position.pop("pending_stop_price", None)
                 position.pop("pending_stage", None)
                 position.pop("pending_amend_intent", None)
+                session.setdefault("events", []).append({"kind": "stop_amend_reconciled", "ts": int(time.time()*1000),
+                    "stop": str(pending_price), "stage": position["stage"], "source": "last"})
                 self._persist_session(session_id)
             else:
                 self._set_status(session_id, "manual_control", "交易所止损价与本会话最近核验值不同；视为人工接管，停止覆盖")
                 return
-        if plan.config.exit_template == "fixed_1r":
-            tp_id = position.get("take_profit_algo_cl_ord_id")
-            if not tp_id or not position.get("take_profit_verified_at_ms"):
-                self._set_status(session_id, "tp_pending", "止盈保护尚未完成回读核验；保留止损并按原ID恢复")
-                return
-            tp = client.get_order_algo(runtime.credentials, environment="demo", inst_id=session["symbol"], algo_cl_ord_id=tp_id)
-            if not _verified_protection(tp, inst_id=session["symbol"], side="sell" if plan.config.direction == "long" else "buy",
-                                        size=Decimal(position["size"]), trigger=Decimal(position["take_profit"]), kind="tp",
-                                        pos_side=position.get("pos_side"), position_mode=runtime.position_mode):
-                self._set_status(session_id, "manual_control", "已核验止盈单发生变化/终态；视为手动接管，保留现有止损")
-                return
+        tp_id = position.get("take_profit_algo_cl_ord_id")
+        if not tp_id or not position.get("take_profit_verified_at_ms"):
+            self._set_status(session_id, "tp_pending", "止盈保护尚未完成回读核验；保留止损并按原ID恢复")
+            return
+        tp = client.get_order_algo(runtime.credentials, environment="demo", inst_id=session["symbol"], algo_cl_ord_id=tp_id)
+        if not _verified_protection(tp, inst_id=session["symbol"], side="sell" if plan.config.direction == "long" else "buy",
+                                    size=Decimal(position["size"]), trigger=Decimal(position["take_profit"]), kind="tp",
+                                    pos_side=position.get("pos_side"), position_mode=runtime.position_mode):
+            self._set_status(session_id, "manual_control", "已核验止盈单发生变化/终态；视为手动接管，保留现有止损")
+            return
+        if plan.config.exit_template == "fixed_1r" and not plan.config.break_even_enabled:
             return
         price = client.get_trigger_price(session["symbol"], "last", environment="demo", max_cached_age_seconds=5)
         engine = StrategyEngine(client, lambda _message: None)
@@ -1532,19 +1638,34 @@ class AreaShapeDemoExecutionMonitor(QObject):
         if not scan_error:
             position["last_minute_cursor_ts"] = int(new_cursor or cursor or 0)
         entry, stop0 = Decimal(position["entry"]), Decimal(position["initial_stop"])
-        r = abs(entry - stop0)
-        progress = (prior_favorable - entry) / r if plan.config.direction == "long" else (entry - prior_favorable) / r
+        protection_fee = Decimal(session["fee_rate"]) if plan.config.fee_offset_enabled else Decimal("0")
+        progress = area_shape_net_progress_r(
+            plan.config, direction=plan.config.direction, entry=entry, initial_stop=stop0,
+            price=prior_favorable, fee_rate=protection_fee,
+        )
+        elapsed_bars = max(0, (int(time.time() * 1000) - int(position["entry_ts"])) // 3_600_000)
+        current_net_progress = area_shape_net_progress_r(
+            plan.config, direction=plan.config.direction, entry=entry, initial_stop=stop0,
+            price=price, fee_rate=protection_fee,
+        )
+        time_be_ready = (
+            plan.config.break_even_enabled and plan.config.time_break_even_enabled
+            and elapsed_bars >= plan.config.time_break_even_bars and current_net_progress >= 0
+        )
         pending_stage = str(position.get("pending_stage", ""))
-        if progress >= plan.config.lock_trigger_r or position.get("stage") == "locked" or pending_stage == "locked":
-            stage, locked_r = "locked", plan.config.lock_profit_r
-        elif progress >= plan.config.be_trigger_r or position.get("stage") == "break_even" or pending_stage == "break_even":
+        if (plan.config.exit_template != "fixed_1r" and
+                (progress >= plan.config.lock_trigger_r or position.get("stage") == "locked" or pending_stage == "locked")):
+            stage, locked_r = "locked", area_shape_lock_profit_r(plan.config, progress)
+        elif plan.config.break_even_enabled and (
+                progress >= plan.config.be_trigger_r or position.get("stage") == "break_even"
+                or pending_stage == "break_even" or time_be_ready):
             stage, locked_r = "break_even", Decimal("0")
         else:
             self._persist_session(session_id)
             return
         candidate = price_for_net_r(entry=entry, stop=stop0, direction=plan.config.direction,
-                                    target_r=locked_r, fee_rate=Decimal(session["fee_rate"]),
-                                    slippage_rate=Decimal(session["slippage_rate"]),
+                                    target_r=locked_r, fee_rate=protection_fee,
+                                    slippage_rate=Decimal("0"),
                                     contract_multiplier=Decimal(position["contract_multiplier"]),
                                     tick_size=Decimal(session["instrument"]["tick_size"]))
         old_stop = Decimal(position["stop"])
@@ -1593,12 +1714,25 @@ class AreaShapeDemoExecutionMonitor(QObject):
             self._persist_session(session_id)
             return
         self._assert_write_enabled(session_id)
-        client.amend_algo_order(
-            runtime.credentials, environment="demo", inst_id=session["symbol"],
-            algo_id=position.get("stop_algo_id") or None, algo_cl_ord_id=position.get("stop_algo_cl_ord_id") or None,
-            new_stop_loss_trigger_price=candidate, new_stop_loss_order_price=Decimal("-1"),
-            new_stop_loss_trigger_price_type="last",
-        )
+        event = {"kind": "stop_amend_requested", "ts": int(time.time() * 1000), "source": "last",
+                 "favorable_price": str(prior_favorable), "current_price": str(latest),
+                 "progress_r": str(progress), "locked_r": str(locked_r), "old_stop": str(old_stop),
+                 "new_stop": str(candidate), "frozen_tp": position.get("take_profit"),
+                 "rule_version": session["rule_version"]}
+        session.setdefault("events", []).append(event)
+        self._persist_session(session_id)
+        try:
+            client.amend_algo_order(
+                runtime.credentials, environment="demo", inst_id=session["symbol"],
+                algo_id=position.get("stop_algo_id") or None, algo_cl_ord_id=position.get("stop_algo_cl_ord_id") or None,
+                new_stop_loss_trigger_price=candidate, new_stop_loss_order_price=Decimal("-1"),
+                new_stop_loss_trigger_price_type="last",
+            )
+        except Exception as exc:
+            session.setdefault("events", []).append({"kind": "stop_amend_unconfirmed", "ts": int(time.time()*1000),
+                                                      "new_stop": str(candidate), "error": str(exc)})
+            self._persist_session(session_id)
+            raise
         updated = client.get_order_algo(runtime.credentials, environment="demo", inst_id=session["symbol"],
                                         algo_id=position.get("stop_algo_id") or None,
                                         algo_cl_ord_id=position.get("stop_algo_cl_ord_id") or None)
@@ -1612,6 +1746,17 @@ class AreaShapeDemoExecutionMonitor(QObject):
         position.pop("pending_stop_price", None)
         position.pop("pending_stage", None)
         position.pop("pending_amend_intent", None)
+        self._persist_session(session_id)
+        if position.get("stop_algo_cl_ord_id") == position.get("take_profit_algo_cl_ord_id"):
+            if not _verified_protection(updated, inst_id=session["symbol"],
+                                        side="sell" if plan.config.direction == "long" else "buy",
+                                        size=Decimal(position["size"]), trigger=Decimal(position["take_profit"]),
+                                        kind="tp", pos_side=position.get("pos_side"), position_mode=runtime.position_mode):
+                self._set_status(session_id, "manual_control", "止损已收紧，但共用附单的冻结止盈回读不符；停止覆盖并需人工核对")
+                return
+        session.setdefault("events", []).append({"kind": "stop_amend_verified", "ts": int(time.time()*1000),
+                                                  "stop": str(candidate), "unchanged_tp": position.get("take_profit"),
+                                                  "stage": stage, "source": "last"})
         self._persist_session(session_id)
         if scan_error:
             self.status_changed.emit(f"分钟补查失败，已按实时last记录有利档位；游标不前移并将重试：{scan_error}")
@@ -1849,7 +1994,8 @@ class AreaShapeDemoExecutionMonitor(QObject):
     def _maybe_rearm_resting_entry(self, session_id: str) -> None:
         session = self._sessions[session_id]
         plan = AreaShapePlan.from_dict(session["plan_snapshot"])
-        if (not plan.config.resting_entry_enabled or session.get("status") != "armed"
+        if (not (plan.config.resting_entry_enabled or plan.config.entry_trigger_mode == "direct_touch")
+                or session.get("status") != "armed"
                 or session.get("paused") or session.get("position") or session.get("resting_entry_intent")):
             return
         if int(time.time() * 1000) >= int(session.get("expires_at_candle_ts", 0)) + 3_600_000:
@@ -1899,6 +2045,8 @@ class AreaShapeDemoExecutionMonitor(QObject):
             raise RuntimeError("本进程没有显式启用的demo runtime；只读恢复状态禁止写入")
         session = self._sessions[session_id]
         self._verify_runtime_identity(session, runtime, True)
+        if int(session.get("rule_version") or 0) != AREA_SHAPE_EXECUTION_RULE_VERSION:
+            raise PermissionError("执行规则版本已变化；旧会话保持只读，禁止套用新保护规则")
         if str(getattr(runtime, "environment", "")).lower() != "demo":
             raise PermissionError("运行时环境已变化；live写入硬拒绝")
         blocked = {"closed", "cancelled", "expired"}
@@ -1914,6 +2062,10 @@ class AreaShapeDemoExecutionMonitor(QObject):
         session = self._sessions[session_id]
         if session.get("write_disabled") or session.get("status") in {"needs_manual_rearm", "manual_review", "closed", "cancelled", "expired", "paused"}:
             raise PermissionError("会话只读/终止，禁止交易写入")
+
+
+def _take_profit_r(plan: AreaShapePlan) -> Decimal:
+    return plan.config.fixed_tp_r if plan.config.exit_template == "fixed_1r" else AREA_DYNAMIC_TAKE_PROFIT_R
 
 
 def _strategy_config(session: dict[str, Any], runtime: Any) -> StrategyConfig:

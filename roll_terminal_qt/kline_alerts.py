@@ -9,7 +9,7 @@ from okx_quant.analysis.box_detector import BoxDetectionConfig, detect_boxes
 from roll_terminal_qt.kline_box_rules import AUTO_BOX_MAX_CANDIDATES, is_auto_box_candidate_valid
 
 
-_LINE_KINDS = {"horizontal", "trend"}
+_LINE_KINDS = {"horizontal", "trend", "ray"}
 _LINE_TRIGGERS = {"cross_above", "cross_below", "touch"}
 _LINE_ACTIONS = {"notify", "long", "short"}
 _LINE_EMAIL_DELIVERY_MODES = {"once", "repeat"}
@@ -35,6 +35,7 @@ def normalize_workspace_entry(payload: dict[str, object] | None) -> dict[str, ob
     box_breakout = alerts.get("box_breakout") if isinstance(alerts, dict) and isinstance(alerts.get("box_breakout"), dict) else {}
     visuals = raw.get("visuals") if isinstance(raw.get("visuals"), dict) else {}
     auto_channel = raw.get("auto_channel") if isinstance(raw.get("auto_channel"), dict) else {}
+    area_replays = raw.get("area_replays") if isinstance(raw.get("area_replays"), dict) else {}
     return {
         "lines": [_normalize_line_rule(item) for item in _safe_list(raw.get("lines"))],
         "rr": [dict(item) for item in _safe_list(raw.get("rr")) if isinstance(item, dict)],
@@ -57,6 +58,10 @@ def normalize_workspace_entry(payload: dict[str, object] | None) -> dict[str, ob
             "anchor_distance": _safe_int_at_least(auto_channel.get("anchor_distance"), default=8, minimum=1),
             "min_bars": _safe_int_at_least(auto_channel.get("min_bars"), default=18, minimum=2),
             "max_violations": _safe_int_at_least(auto_channel.get("max_violations"), default=8, minimum=0),
+        },
+        "area_replays": {
+            str(key): dict(value) for key, value in area_replays.items()
+            if str(key).strip() and isinstance(value, dict)
         },
         "events": _normalize_events(_safe_list(raw.get("events"))),
     }
@@ -279,6 +284,8 @@ def _evaluate_line_alert(candles: list[dict[str, Any]], line: dict[str, object])
     prev_candle = candles[-2]
     curr_candle = candles[-1]
     candle_time = _safe_int(curr_candle.get("time"))
+    if str(line.get("kind", "horizontal") or "horizontal").strip().lower() == "ray" and candle_time < _safe_int(line.get("time_a")):
+        return None
     if candle_time <= _safe_int(line.get("last_event_candle_time")):
         return None
     prev_time = _safe_int(prev_candle.get("time"))
@@ -312,7 +319,7 @@ def _normalize_line_rule(item: object) -> dict[str, object]:
     return {
         "id": _safe_text(raw.get("id")) or uuid4().hex[:10],
         "kind": kind,
-        "label": _safe_text(raw.get("label")) or ("趋势线" if kind == "trend" else "水平线"),
+        "label": _safe_text(raw.get("label")) or ("趋势线" if kind == "trend" else ("射线" if kind == "ray" else "水平线")),
         "trigger": _safe_choice(raw.get("trigger"), _LINE_TRIGGERS, default="cross_above"),
         "action": _safe_choice(raw.get("action"), _LINE_ACTIONS, default="notify"),
         "time_a": time_a,

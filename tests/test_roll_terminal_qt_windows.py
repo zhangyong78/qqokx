@@ -99,7 +99,9 @@ from roll_terminal_qt.kline_analysis_window import (
     _default_native_x_range_with_right_padding,
     _prefer_native_chart_backend,
     _default_native_visible_range,
+    _ema_chart_points,
     _native_right_padding_ms,
+    _right_padding_after_drag,
     _format_chart_time,
     _ordered_trend_endpoints,
     _reverse_kline_chart_payload,
@@ -1230,6 +1232,26 @@ class RollTerminalQtWindowHelperTests(QtWidgetTestCase):
             self.assertEqual(window._shape_settings_button.text(), "形态：开")
         finally:
             self.__class__.dispose_widget(window)
+
+    def test_kline_account_drawer_has_one_outer_toolbar_button(self) -> None:
+        with (
+            patch("roll_terminal_qt.kline_analysis_window.QTimer.singleShot", return_value=None),
+            patch("roll_terminal_qt.kline_analysis_window.load_kline_analysis_workspace_entries", return_value={}),
+        ):
+            window = KlineAnalysisWindow()
+            try:
+                account_buttons = [
+                    button.text()
+                    for button in window.findChildren(QPushButton)
+                    if button.text() in {"委托/持仓", "委托", "持仓"}
+                ]
+                self.assertEqual(account_buttons, ["委托/持仓"])
+                self.assertEqual(
+                    [window._account_drawer._tabs.tabText(index) for index in range(window._account_drawer._tabs.count())][:2],
+                    ["当前委托", "当前持仓"],
+                )
+            finally:
+                self.__class__.dispose_widget(window)
 
     def test_kline_embedded_accepts_workspace_profile_without_changing_symbol_or_period(self) -> None:
         runtime_api1 = SimpleNamespace(
@@ -3754,6 +3776,7 @@ class RollTerminalQtWindowHelperTests(QtWidgetTestCase):
                 window._rr_table.setCurrentCell(0, 0)
                 with (
                     patch.object(window, "_build_selected_rr_trade_plan", side_effect=AssertionError("cancel should not rebuild plan")),
+                    patch.object(window, "_runtime_for_task_profile", return_value=window._runtime),
                     patch.object(window, "_start_rr_execution_action") as start_execution,
                 ):
                     window._cancel_selected_rr_trade()
@@ -3957,9 +3980,12 @@ class RollTerminalQtWindowHelperTests(QtWidgetTestCase):
                     patch("roll_terminal_qt.kline_analysis_window.QMessageBox.question", return_value=QMessageBox.StandardButton.Yes),
                 ):
                     window._enable_selected_rr_trade()
+                    self.assertIn("已排队", window._status.text())
+                    window._enable_selected_rr_trade()
 
                 self.assertEqual(len(window._pending_rr_execution_requests), 1)
-                self.assertIn("已排队", window._status.text())
+                self.assertIn("重复提交", window._status.text())
+                self.assertFalse(window._rr_enable_trade_btn.isEnabled())
             finally:
                 self.__class__.dispose_widget(window)
 
@@ -4255,6 +4281,105 @@ class RollTerminalQtWindowHelperTests(QtWidgetTestCase):
             finally:
                 self.__class__.dispose_widget(window)
 
+    def test_kline_rr_user_queue_drains_serially_before_line_trade_queue(self) -> None:
+        with (
+            patch("roll_terminal_qt.kline_analysis_window.QTimer.singleShot", return_value=None),
+            patch("roll_terminal_qt.kline_analysis_window.load_kline_analysis_workspace_entries", return_value={}),
+        ):
+            window = KlineAnalysisWindow(preview_mode=True)
+            try:
+                first = RRTradeLedgerEntry(entry_id="first", status="entry_working", plan=SimpleNamespace(plan_id="first"))
+                second = RRTradeLedgerEntry(entry_id="second", status="entry_working", plan=SimpleNamespace(plan_id="second"))
+                completed = []
+                with (
+                    patch.object(window, "_find_rr_trade_ledger_entry", return_value=None),
+                    patch.object(window, "_save_rr_trade_ledger_entry"),
+                    patch.object(window, "_start_next_line_trade_execution") as line_queue,
+                ):
+                    window._start_rr_execution_action(action=lambda: first, on_success=lambda entry: completed.append(entry.entry_id))
+                    window._start_rr_execution_action(action=lambda: second, on_success=lambda entry: completed.append(entry.entry_id), queue_if_busy=True)
+                    deadline = time.monotonic() + 2
+                    while (len(completed) < 2 or window._rr_execution_thread is not None) and time.monotonic() < deadline:
+                        self._app.processEvents()
+                        time.sleep(0.005)
+                    self.assertEqual(completed, ["first", "second"])
+                    self.assertFalse(window._rr_execution_in_flight)
+                    line_queue.assert_called_once()
+            finally:
+                self.__class__.dispose_widget(window)
+
+    def test_kline_rr_execution_clients_are_reused_only_with_same_credentials_and_environment(self) -> None:
+        with (
+            patch("roll_terminal_qt.kline_analysis_window.QTimer.singleShot", return_value=None),
+            patch("roll_terminal_qt.kline_analysis_window.load_kline_analysis_workspace_entries", return_value={}),
+        ):
+            window = KlineAnalysisWindow(preview_mode=True)
+            try:
+                credentials = SimpleNamespace(profile_name="moni", api_key="test-key-a")
+                demo = SimpleNamespace(credentials=credentials, environment="demo")
+                live = SimpleNamespace(credentials=credentials, environment="live")
+                replacement = SimpleNamespace(credentials=SimpleNamespace(profile_name="moni", api_key="test-key-b"), environment="demo")
+                with patch("roll_terminal_qt.kline_analysis_window.OkxRestClient", side_effect=[MagicMock(), MagicMock(), MagicMock()]) as client_type:
+                    first = window._rr_client(demo)
+                    self.assertIs(window._rr_client(demo), first)
+                    self.assertIsNot(window._rr_client(live), first)
+                    self.assertIsNot(window._rr_client(replacement), first)
+                    self.assertEqual(client_type.call_count, 3)
+            finally:
+                self.__class__.dispose_widget(window)
+
+    def test_kline_rr_ack_is_visible_before_exchange_confirmation_and_history_refresh(self) -> None:
+        from roll_terminal_qt.shared_order_store import SharedOrderStore
+
+        instrument = Instrument(
+            inst_id="BTC-USDT-SWAP", inst_type="SWAP", tick_size=Decimal("0.1"),
+            lot_size=Decimal("1"), min_size=Decimal("1"), state="live", settle_ccy="USDT",
+            ct_val=Decimal("0.01"), ct_mult=Decimal("1"), ct_val_ccy="BTC",
+        )
+        plan = build_rr_trade_plan(
+            plan_id="moni:BTC-USDT-SWAP:ack", profile_name="moni", environment="demo",
+            instrument=instrument, direction="long", entry_execution_mode="limit",
+            management_mode="fixed_tp", trigger_price_type="last", risk_amount=Decimal("100"),
+            entry_price=Decimal("60000"), stop_loss_price=Decimal("59000"),
+            direct_take_profit_r=Decimal("2"), round_trip_fee_rate=Decimal("0"),
+        )
+        entry = RRTradeLedgerEntry(
+            entry_id=plan.plan_id, plan=plan, status="entry_working",
+            entry_order=RRTradeOrderLink(role="entry", channel="order", order_id="ack-order", client_id="ack-client", price=plan.entry_price, size=plan.sizing.contract_size),
+        )
+        with (
+            patch("roll_terminal_qt.kline_analysis_window.QTimer.singleShot", return_value=None),
+            patch("roll_terminal_qt.kline_analysis_window.load_kline_analysis_workspace_entries", return_value={}),
+        ):
+            window = KlineAnalysisWindow(preview_mode=True)
+            try:
+                store = SharedOrderStore()
+                drawer = window._account_drawer
+                drawer._runtime = None
+                drawer._profile_name, drawer._environment = "moni", "demo"
+                drawer._symbol = "BTC-USDT-SWAP"
+                drawer._shared_order_store = store
+                store.snapshot_changed.connect(drawer._apply_shared_order_snapshot)
+                window._pending_rr_activation_plan_ids.add(plan.plan_id)
+                with (
+                    patch("roll_terminal_qt.kline_analysis_window.get_shared_order_store", return_value=store),
+                    patch.object(store, "confirm_submitted_order") as confirm,
+                ):
+                    window._handle_rr_activation_success(entry, SimpleNamespace(trade_mode="cross", environment="demo"), time.perf_counter())
+                    confirm.assert_called_once()
+                self.assertEqual(len(drawer._snapshot.orders), 1)
+                self.assertEqual(drawer._snapshot.orders[0].order_id, "ack-order")
+                self.assertEqual(drawer._snapshot.orders[0].state, "pending_confirmation")
+                drawer._refresh_tables()
+                self.assertEqual(drawer._orders_table.rowCount(), 1)
+                self.assertIn("待交易所确认", drawer._orders_table.item(0, 8).text())
+                self.assertEqual(window._pending_rr_activation_plan_ids, set())
+                self.assertTrue(window._rr_enable_trade_btn.isEnabled())
+                store.publish_current_orders(profile_name="moni", environment="demo", orders=[], started_revision=0)
+                self.assertEqual(len(drawer._snapshot.orders), 1)
+            finally:
+                self.__class__.dispose_widget(window)
+
     def test_kline_rr_execution_success_callback_runs_on_gui_thread(self) -> None:
         with (
             patch("roll_terminal_qt.kline_analysis_window.QTimer.singleShot", return_value=None),
@@ -4314,16 +4439,81 @@ class RollTerminalQtWindowHelperTests(QtWidgetTestCase):
             finally:
                 self.__class__.dispose_widget(window)
 
-    def test_kline_rr_status_rows_keep_fixed_height_when_trade_state_changes(self) -> None:
+    def test_kline_rr_cancel_button_shows_validation_queue_failure_and_result(self) -> None:
         with (
             patch("roll_terminal_qt.kline_analysis_window.QTimer.singleShot", return_value=None),
             patch("roll_terminal_qt.kline_analysis_window.load_kline_analysis_workspace_entries", return_value={}),
         ):
-            window = KlineAnalysisWindow()
+            window = KlineAnalysisWindow(preview_mode=True)
             try:
-                self.assertEqual(window._rr_tracking_summary.minimumHeight(), window._rr_tracking_summary.maximumHeight())
-                self.assertEqual(window._rr_condition_status.minimumHeight(), window._rr_condition_status.maximumHeight())
-                self.assertFalse(window._rr_condition_status.wordWrap())
+                button = window._rr_cancel_trade_btn
+                self.assertTrue(button.text().endswith("撤销入场挂单"))
+                button.click()
+                self.assertFalse(window._rr_action_status.isHidden())
+                self.assertIn("请先选中", window._rr_action_status.text())
+                self.assertTrue(button.isEnabled())
+
+                entry = SimpleNamespace(plan=SimpleNamespace(inst_id="BTC-USDT-SWAP"))
+                runtime = SimpleNamespace(credentials=object())
+                with patch.object(window, "_start_rr_execution_action", return_value=False) as start:
+                    window._submit_rr_trade_cancel(
+                        entry=entry, runtime=runtime, confirmed_for_filled=False, delete_after_cancel=False,
+                    )
+                    self.assertIn("排队", window._rr_action_status.text())
+                    self.assertFalse(button.isEnabled())
+                    button.click()
+                    start.assert_called_once()
+                    callbacks = start.call_args.kwargs
+                    callbacks["on_failure"]("接口超时")
+                    self.assertIn("接口超时", window._rr_action_status.text())
+                    self.assertTrue(button.isEnabled())
+
+                    callbacks["on_success"](SimpleNamespace(status="cancelled"))
+                    self.assertIn("最终订单状态", window._rr_action_status.text())
+                    callbacks["on_success"](SimpleNamespace(status="protected_cancelled_remainder"))
+                    self.assertIn("已成交仓位和止盈止损保护保留", window._rr_action_status.text())
+                    with patch("roll_terminal_qt.kline_analysis_window.QMessageBox.question", return_value=QMessageBox.StandardButton.No):
+                        callbacks["on_success"](SimpleNamespace(status="cancel_confirmation_required"))
+                    self.assertIn("已取消撤单确认", window._rr_action_status.text())
+                    self.assertTrue(button.isEnabled())
+            finally:
+                self.__class__.dispose_widget(window)
+
+    def test_kline_rr_status_rows_show_wrapped_trade_state_at_narrow_width(self) -> None:
+        with (
+            patch("roll_terminal_qt.kline_analysis_window.QTimer.singleShot", return_value=None),
+            patch("roll_terminal_qt.kline_analysis_window.load_kline_analysis_workspace_entries", return_value={}),
+        ):
+            window = KlineAnalysisWindow(preview_mode=True)
+            try:
+                window._control_tabs.setCurrentIndex(2)
+                window._control_scroll.setFixedWidth(440)
+                window.resize(1200, 650)
+                window._rr_tracking_summary.setText(
+                    "rr-1 | 空头 | 入场 82542.5 | 止损 83723.4 | 止盈 80180.7 | 风险金 100 U | 固定止盈 | R 1:2\n"
+                    "状态：未锁定 | 手续费偏移：关闭\n"
+                    "交易：追单中 | 成交 0.0846 BTC（8.46 张） | 剩余 0.0846 BTC（8.46 张） | 当前止损 83723.4"
+                )
+                window._rr_condition_status.setText("止损条件单：等待 OKX 回传 | 止盈条件单：等待 OKX 回传")
+                window.show()
+                window._toggle_left_panel(False)
+                for _ in range(3):
+                    self._app.processEvents()
+                for label in (window._rr_tracking_summary, window._rr_condition_status):
+                    self.assertTrue(label.wordWrap())
+                    self.assertGreaterEqual(label.height(), label.heightForWidth(label.width()))
+                self.assertGreater(window._rr_tracking_summary.height(), 60)
+                self.assertEqual(window._rr_table.horizontalScrollBarPolicy(), Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+                narrow_height = window._rr_tracking_summary.minimumHeight()
+                window._control_scroll.setFixedWidth(620)
+                for _ in range(3):
+                    self._app.processEvents()
+                for label in (window._rr_tracking_summary, window._rr_condition_status):
+                    self.assertGreaterEqual(label.height(), label.heightForWidth(label.width()))
+                self.assertLess(window._rr_tracking_summary.minimumHeight(), narrow_height)
+                window._rr_tracking_summary.setText("交易：未启用")
+                self._app.processEvents()
+                self.assertLess(window._rr_tracking_summary.minimumHeight(), 60)
             finally:
                 self.__class__.dispose_widget(window)
 
@@ -4352,10 +4542,17 @@ class RollTerminalQtWindowHelperTests(QtWidgetTestCase):
             try:
                 tabs = window._control_tabs
                 self.assertIsNotNone(tabs)
-                self.assertEqual([tabs.tabText(index) for index in range(tabs.count())], ["分析", "画线告警", "RR交易"])
+                self.assertEqual([tabs.tabText(index) for index in range(tabs.count())], ["分析", "画线告警", "RR交易", "智能辅助交易"])
                 self.assertTrue(tabs.widget(0).isAncestorOf(window._backend_hint))
                 self.assertTrue(tabs.widget(1).isAncestorOf(window._line_table))
                 self.assertTrue(tabs.widget(2).isAncestorOf(window._rr_table))
+                self.assertTrue(tabs.widget(3).isAncestorOf(window._area_shape_start_button))
+                self.assertEqual(tabs.count(), 4)
+                self.assertEqual(
+                    [window._rr_workspace_mode_combo.itemData(index) for index in range(window._rr_workspace_mode_combo.count())],
+                    ["direct", "area"],
+                )
+                self.assertTrue(window._rr_workspace_mode_combo.isHidden())
             finally:
                 self.__class__.dispose_widget(window)
 
@@ -4707,6 +4904,34 @@ class RollTerminalQtWindowHelperTests(QtWidgetTestCase):
             finally:
                 self.__class__.dispose_widget(window)
 
+    def test_kline_rr_workspace_status_uses_matching_ledger_without_graphic(self) -> None:
+        with (
+            patch("roll_terminal_qt.kline_analysis_window.QTimer.singleShot", return_value=None),
+            patch("roll_terminal_qt.kline_analysis_window.load_kline_analysis_workspace_entries", return_value={}),
+        ):
+            window = KlineAnalysisWindow()
+            try:
+                ledger_entry = SimpleNamespace(status="entry_submitted")
+                with patch.object(window, "_matching_rr_trade_ledger_entries", return_value=[ledger_entry]) as matching:
+                    window._refresh_rr_workspace_other_status("area")
+                matching.assert_called_once_with()
+                self.assertIn("RR 交易状态：entry_submitted", window._area_workspace_other_status.text())
+            finally:
+                self.__class__.dispose_widget(window)
+
+    def test_kline_rr_tracking_summary_clear_refreshes_other_mode_status(self) -> None:
+        with (
+            patch("roll_terminal_qt.kline_analysis_window.QTimer.singleShot", return_value=None),
+            patch("roll_terminal_qt.kline_analysis_window.load_kline_analysis_workspace_entries", return_value={}),
+        ):
+            window = KlineAnalysisWindow()
+            try:
+                with patch.object(window, "_refresh_rr_workspace_other_status") as refresh:
+                    window._refresh_rr_tracking_summary(None)
+                refresh.assert_called_once_with()
+            finally:
+                self.__class__.dispose_widget(window)
+
     def test_kline_window_layout_refresh_rerenders_loaded_chart(self) -> None:
         payload = KlineChartPayload(
             candles=[{"time": 1, "open": 1.0, "high": 2.0, "low": 0.5, "close": 1.5, "volume": 10.0}],
@@ -4765,6 +4990,47 @@ class RollTerminalQtWindowHelperTests(QtWidgetTestCase):
                     window._rr_table.cellDoubleClicked.emit(0, 0)
                 open_card.assert_called_once()
                 self.assertEqual(window._selected_rr_index, 0)
+                self.assertEqual(window._rr_workspace_mode_combo.currentData(), "direct")
+                parameter_button = next(
+                    button for button in window._control_tabs.widget(2).findChildren(QPushButton)
+                    if button.text() == "交易参数"
+                )
+                with patch("roll_terminal_qt.kline_analysis_window.RRCardDialog") as card:
+                    card.return_value.exec.return_value = 0
+                    parameter_button.click()
+                    card.assert_called_once()
+            finally:
+                self.__class__.dispose_widget(window)
+
+    def test_rr_card_execution_mode_is_saved_and_reflected_in_trade_form(self) -> None:
+        rr_payload = {
+            "rr_id": "rr-mode-roundtrip", "side": "long", "bar_entry": 1,
+            "price_entry": "60000", "price_stop": "59000", "price_tp": "62000",
+            "r_multiple": "2", "entry_execution_mode": "limit",
+        }
+        with (
+            patch("roll_terminal_qt.kline_analysis_window.QTimer.singleShot", return_value=None),
+            patch(
+                "roll_terminal_qt.kline_analysis_window.load_kline_analysis_workspace_entries",
+                return_value={f"BTC-USDT-SWAP|{_DEFAULT_SINGLE_CHART_PERIOD}": {"rr": [dict(rr_payload)]}},
+            ),
+            patch("roll_terminal_qt.kline_analysis_window.save_kline_analysis_workspace_entries"),
+        ):
+            window = KlineAnalysisWindow()
+            try:
+                window._selected_rr_index = 0
+                window._rr_workspace_mode_combo.setCurrentIndex(window._rr_workspace_mode_combo.findData("area"))
+                window._populate_rr_table(selected_index=0)
+                self.assertEqual(window._rr_workspace_mode_combo.currentData(), "area")
+                edited = {**rr_payload, "entry_execution_mode": "chase_best_quote"}
+                dialog = MagicMock()
+                dialog.exec.return_value = 1
+                dialog.result_payload.return_value = edited
+                with patch("roll_terminal_qt.kline_analysis_window.RRCardDialog", return_value=dialog):
+                    window._open_rr_card_for_selected()
+                saved = window._workspace_entry()["rr"][0]
+                self.assertEqual(saved["entry_execution_mode"], "chase_best_quote")
+                self.assertEqual(window._rr_execution_mode_combo.currentData(), "chase_best_quote")
             finally:
                 self.__class__.dispose_widget(window)
 
@@ -4908,10 +5174,25 @@ class RollTerminalQtWindowHelperTests(QtWidgetTestCase):
         try:
             label_texts = {label.text() for label in dialog.findChildren(QLabel)}
             self.assertNotIn("账户规模", label_texts)
+            self.assertIn("最优盘口限价（单次）", [
+                dialog._entry_execution_mode_combo.itemText(index)
+                for index in range(dialog._entry_execution_mode_combo.count())
+            ])
+            self.assertIn("固定止盈", dialog._management_hint.text())
+            self.assertNotIn("移至保本", dialog._management_hint.text())
+            dialog._management_mode_combo.setCurrentIndex(
+                dialog._management_mode_combo.findData("trail_after_1r")
+            )
+            self.assertIn("保本", dialog._management_hint.text())
+            self.assertIn("整数 R", dialog._management_hint.text())
+            dialog._entry_execution_mode_combo.setCurrentIndex(
+                dialog._entry_execution_mode_combo.findData("chase_best_quote")
+            )
             dialog.accept()
             payload = dialog.result_payload()
             self.assertIsInstance(payload, dict)
             self.assertNotIn("account_size", payload)
+            self.assertEqual(payload["entry_execution_mode"], "chase_best_quote")
         finally:
             self.__class__.dispose_widget(dialog)
 
@@ -6098,6 +6379,18 @@ class RollTerminalQtWindowHelperTests(QtWidgetTestCase):
         now_ms = 1_600_000_000_000
         candle = SimpleNamespace(ts=1_600_000_000_000 - 61_000, confirmed=True)
         self.assertTrue(_is_local_cache_stale([candle], "1m", now_ms=now_ms))
+
+    def test_ema_chart_points_uses_candle_times_and_period(self) -> None:
+        candles = [
+            {"time": index, "close": close}
+            for index, close in enumerate((10.0, 12.0, 14.0), start=1)
+        ]
+        points = _ema_chart_points(candles, 2)
+
+        self.assertEqual([point["time"] for point in points], [1, 2, 3])
+        self.assertAlmostEqual(points[0]["value"], 10.0)
+        self.assertAlmostEqual(points[1]["value"], 11.3333333333)
+        self.assertAlmostEqual(points[2]["value"], 13.1111111111)
 
     def test_local_weekly_cache_rebuild_discards_misaligned_stale_rows(self) -> None:
         week_ms = 7 * 86_400_000
@@ -7409,6 +7702,29 @@ class RollTerminalQtWindowHelperTests(QtWidgetTestCase):
         start_x, end_x = _default_native_x_range_with_right_padding(display_times, display_step_ms=3_600_000)
         self.assertEqual(start_x, float(display_times[0]))
         self.assertEqual(end_x, float(display_times[0]) + _native_right_padding_ms(3_600_000))
+
+    def test_right_padding_drag_adjusts_by_bar_spacing_and_stays_bounded(self) -> None:
+        self.assertEqual(
+            _right_padding_after_drag(
+                start_padding_bars=32, delta_px=50, plot_width=1_000,
+                visible_span_ms=100 * 3_600_000, display_step_ms=3_600_000,
+            ),
+            27,
+        )
+        self.assertEqual(
+            _right_padding_after_drag(
+                start_padding_bars=32, delta_px=-500, plot_width=1_000,
+                visible_span_ms=100 * 3_600_000, display_step_ms=3_600_000,
+            ),
+            82,
+        )
+        self.assertEqual(
+            _right_padding_after_drag(
+                start_padding_bars=4990, delta_px=-500, plot_width=1_000,
+                visible_span_ms=100 * 3_600_000, display_step_ms=3_600_000,
+            ),
+            5000,
+        )
 
     def test_hover_overlay_layout_moves_tooltip_above_volume_reserved_band(self) -> None:
         layout = _compute_hover_overlay_layout(

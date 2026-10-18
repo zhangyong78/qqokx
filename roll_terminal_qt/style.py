@@ -27,6 +27,12 @@ QWidget {
     font-size: 11px;
     background: #eef3f8;
 }
+QToolTip {
+    color: #f8fafc;
+    background-color: #111827;
+    border: 1px solid #64748b;
+    padding: 5px 7px;
+}
 QLabel {
     background: transparent;
 }

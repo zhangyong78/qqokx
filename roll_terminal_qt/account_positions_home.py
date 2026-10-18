@@ -2051,6 +2051,7 @@ class InstrumentKlineDialog(QDialog):
         self._linked_requested = linked_requested
         self._auto_refresh_timer = QTimer(self)
         self._auto_refresh_timer.timeout.connect(self._load_current_bar)
+        self._ema21_ema55_enabled = False
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(12, 12, 12, 12)
@@ -2084,6 +2085,11 @@ class InstrumentKlineDialog(QDialog):
         self._linked_button.clicked.connect(self._request_linked_kline)
         self._linked_button.setVisible(False)
         bar_row.addWidget(self._linked_button)
+        self._moving_average_button = QPushButton("均线: EMA15/SMA50")
+        self._moving_average_button.setCheckable(True)
+        self._moving_average_button.setToolTip("切换持仓 K 线显示 EMA15/SMA50 或 EMA21/EMA55。")
+        self._moving_average_button.toggled.connect(self._toggle_moving_average_mode)
+        bar_row.addWidget(self._moving_average_button)
         self._auto_refresh_button = QPushButton("自动刷新:开")
         self._auto_refresh_button.setCheckable(True)
         self._auto_refresh_button.setChecked(True)
@@ -2158,6 +2164,12 @@ class InstrumentKlineDialog(QDialog):
         self._sync_auto_refresh_timer()
         if enabled and self._inst_id:
             self._load_current_bar()
+
+    @Slot(bool)
+    def _toggle_moving_average_mode(self, enabled: bool) -> None:
+        self._ema21_ema55_enabled = enabled
+        self._moving_average_button.setText("均线: EMA21/EMA55" if enabled else "均线: EMA15/SMA50")
+        self._chart.set_moving_average_mode("ema21_ema55" if enabled else "ema15_sma50")
 
     @Slot()
     def _copy_chart_screenshot_to_clipboard(self) -> None:
@@ -2284,6 +2296,7 @@ class InstrumentKlineDialog(QDialog):
                 title=f"{inst_id} {source_label}K线 | {bar}",
                 candles=candles,
                 show_moving_averages=True,
+                moving_average_mode="ema21_ema55" if self._ema21_ema55_enabled else "ema15_sma50",
                 tooltip_close_usdt_rate=self._underlying_usdt_price if inst_type == "OPTION" else None,
                 tooltip_close_usdt_basis=self._underlying_usdt_basis if inst_type == "OPTION" else "",
                 tooltip_entry_price=self._option_entry_price if inst_type == "OPTION" else None,

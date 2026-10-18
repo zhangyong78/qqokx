@@ -1823,7 +1823,7 @@ class OkxClientOrderRequestTest(TestCase):
         self.assertEqual(items[0].amount, Decimal("-0.01"))
         self.assertEqual(items[0].currency, "USDT")
 
-    def test_area_shape_demo_limit_entry_uses_exact_line_price_and_attaches_last_stop(self) -> None:
+    def test_area_shape_demo_limit_entry_attaches_last_stop_and_fixed_take_profit(self) -> None:
         client = OkxRestClient()
         inst_id = "BTC-USDT-SWAP"
         instrument = Instrument(
@@ -1832,7 +1832,7 @@ class OkxClientOrderRequestTest(TestCase):
             settle_ccy="USDT", ct_val=Decimal("0.01"), ct_mult=Decimal("1"), ct_val_ccy="BTC",
         )
         client.get_area_shape_instrument = lambda requested: instrument  # type: ignore[method-assign]
-        client._derivative_order_pos_side = lambda *args, **kwargs: "long"  # type: ignore[method-assign]
+        client._derivative_order_pos_side = lambda *args, plan_pos_side: "long"  # type: ignore[method-assign]
         client._enforce_order_size_safety_limit = MagicMock()  # type: ignore[method-assign]
         captured: dict[str, object] = {}
 
@@ -1849,6 +1849,7 @@ class OkxClientOrderRequestTest(TestCase):
             inst_id=inst_id, side="buy", size=Decimal("0.02"),
             limit_price=Decimal("75000.1"), stop_price=Decimal("74000.1"),
             client_order_id="entry1", stop_algo_client_order_id="stop1",
+            take_profit_price=Decimal("76000.1"),
         )
 
         self.assertEqual(result.ord_id, "limit-1")
@@ -1864,6 +1865,7 @@ class OkxClientOrderRequestTest(TestCase):
         self.assertEqual(body["attachAlgoOrds"], [{
             "attachAlgoClOrdId": "stop1", "slTriggerPx": "74000.1",
             "slOrdPx": "-1", "slTriggerPxType": "last",
+            "tpTriggerPx": "76000.1", "tpOrdPx": "-1", "tpTriggerPxType": "last",
         }])
         self.assertTrue(captured["kwargs"]["simulated"])
         client._enforce_order_size_safety_limit.assert_called_once()
@@ -1876,7 +1878,7 @@ class OkxClientOrderRequestTest(TestCase):
             settle_ccy="USDT", ct_val=Decimal("0.01"), ct_mult=Decimal("1"), ct_val_ccy="BTC",
         )
         client.get_area_shape_instrument = lambda requested: instrument  # type: ignore[method-assign]
-        client._derivative_order_pos_side = lambda *args, **kwargs: "long"  # type: ignore[method-assign]
+        client._derivative_order_pos_side = lambda *args, plan_pos_side: "long"  # type: ignore[method-assign]
         client._enforce_order_size_safety_limit = MagicMock()  # type: ignore[method-assign]
         client._request = MagicMock(return_value={"data": []})  # type: ignore[method-assign]
         credentials = Credentials(api_key="key", secret_key="secret", passphrase="pass")

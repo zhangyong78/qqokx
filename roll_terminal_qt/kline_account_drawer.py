@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from time import perf_counter
+
 from dataclasses import dataclass, replace
 from decimal import Decimal
 from typing import Iterable
@@ -78,6 +80,7 @@ from okx_quant.ui_shell import (
     _position_unrealized_pnl_usdt,
 )
 from roll_terminal_qt.shared_order_store import SharedOrderSnapshot, get_shared_order_store
+from okx_quant.log_utils import append_log_line
 from roll_terminal_qt.realtime_account_store import (
     AccountRealtimeSnapshot,
     get_shared_realtime_account_store,
@@ -299,7 +302,7 @@ def _order_table_values(order: object, instruments: dict[str, object] | None = N
         order_display_coin_size(order, instruments),
         getattr(order, "size", ""),
         getattr(order, "filled_size", ""),
-        getattr(order, "state", ""),
+        "待交易所确认" if getattr(order, "state", "") == "pending_confirmation" else getattr(order, "state", ""),
         _format_okx_ms_timestamp(getattr(order, "update_time", None) or getattr(order, "created_time", None)),
         order_display_tp_sl(order),
         order_display_ids(order)[0],
@@ -427,6 +430,7 @@ class KlineAccountDrawer(QWidget):
         self._position_history_thread: PositionHistoryFeedThread | None = None
         self._retired_history_threads: list[QThread] = []
         self._visible_orders: list[object] = []
+        self._rendered_submission_ids: set[str] = set()
         self._load_thread: AccountDrawerLoadThread | None = None
         self._cancel_thread: AccountDrawerCancelThread | None = None
         self._cancel_in_flight = False
@@ -765,6 +769,16 @@ class KlineAccountDrawer(QWidget):
             for column, value in enumerate(values):
                 item = QTableWidgetItem(self._format_value(value))
                 self._orders_table.setItem(row, column, item)
+        pending_ids: set[str] = set()
+        for order in orders:
+            raw = getattr(order, "raw", {})
+            received_at = raw.get("_ack_received_at") if isinstance(raw, dict) else None
+            order_id = str(getattr(order, "order_id", "") or "")
+            if received_at is not None and order_id:
+                pending_ids.add(order_id)
+                if order_id not in self._rendered_submission_ids:
+                    append_log_line(f"[rr_latency] table_ready profile={self._profile_name} environment={self._environment} order={order_id} ack_to_table_ms={(perf_counter() - received_at) * 1000:.1f}")
+        self._rendered_submission_ids = pending_ids
 
     def _populate_positions_table(self, positions: list[object]) -> None:
         self._positions_table.setRowCount(len(positions))
@@ -1093,14 +1107,12 @@ def _shared_refresh_data(self: KlineAccountDrawer) -> None:
     # any table construction or network reconciliation.
     self._schedule_active_table_refresh()
     self._orders_refresh_deferred_timer.stop()
-    self._orders_refresh_waiting_for_realtime = True
-    self._orders_refresh_started_after_realtime = False
-    # Keep a bounded fallback for an unavailable REST endpoint.  This preserves
-    # the priority while avoiding an indefinitely waiting drawer.
-    self._orders_refresh_deferred_timer.start(15_000)
+    self._orders_refresh_waiting_for_realtime = False
+    self._orders_refresh_started_after_realtime = True
+    self._shared_order_store.request_refresh(runtime=self._runtime, profile_name=self._profile_name)
     self._realtime_store.start_if_needed(self._runtime)
     self._realtime_store.request_reconcile("drawer")
-    self._status_label.setText("正在检查现有持仓...")
+    self._status_label.setText("正在同步当前委托和持仓…")
 
 
 def _start_deferred_order_refresh(self: KlineAccountDrawer) -> None:
@@ -1192,6 +1204,11 @@ def _shared_apply_realtime_snapshot(self: KlineAccountDrawer, snapshot: object) 
         position_instruments=dict(snapshot.position_instruments),
         position_tickers=dict(snapshot.position_tickers),
         upl_usdt_prices=dict(snapshot.upl_usdt_prices),
+    )
+    # These are incremental observations (including terminal orders), not an
+    # authoritative replacement for all current orders.
+    self._shared_order_store.publish_order_updates(
+        profile_name=snapshot.profile_name, environment=snapshot.environment, orders=list(snapshot.orders),
     )
     self._status_label.setText(f"委托 {len(self._snapshot.orders)} | 持仓 {len(self._snapshot.positions)}")
     # Avoid constructing any wide tables while the drawer is collapsed; when

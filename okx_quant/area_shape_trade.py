@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation, ROUND_FLOOR
 from typing import Any
 from uuid import uuid4
 
@@ -17,6 +17,8 @@ from okx_quant.models import Candle
 
 
 AREA_PLAN_VERSION = 1
+AREA_TAKER_FEE_RATE = Decimal("0.00036")
+AREA_DYNAMIC_TAKE_PROFIT_R = Decimal("15")
 AREA_PLAN_STATUSES = {
     "draft", "monitoring", "touched", "paper_pending", "paper_position", "paper_break_even",
     "paper_locked", "paper_closed", "paused", "expired", "cancelled", "manual_review",
@@ -59,14 +61,23 @@ class AreaShapeConfig:
     entry_offset_atr: Decimal = Decimal("0")
     stop_offset_atr: Decimal = Decimal("0.2")
     target_buffer_atr: Decimal = Decimal("0")
-    round_trip_fee_rate: Decimal = Decimal("0")
+    round_trip_fee_rate: Decimal = AREA_TAKER_FEE_RATE
     slippage_rate: Decimal = Decimal("0")
     fixed_tp_r: Decimal = Decimal("1")
+    break_even_enabled: bool = True
     be_trigger_r: Decimal = Decimal("2")
+    time_break_even_enabled: bool = False
+    time_break_even_bars: int = 0
     lock_trigger_r: Decimal = Decimal("3")
     lock_profit_r: Decimal = Decimal("2")
+    lock_trail_every_r: Decimal = Decimal("1")
+    lock_trail_add_r: Decimal = Decimal("1")
     entry_mode: str = "next_open"
-    resting_entry_enabled: bool = True
+    entry_trigger_mode: str = "pattern"
+    stop_basis: str = "signal_candle"
+    fixed_stop_distance: Decimal = Decimal("1000")
+    fee_offset_enabled: bool = True
+    resting_entry_enabled: bool = False
     exit_template: str = "fixed_1r"
     trigger_price_type: str = "last"
     valid_for_bars: int = 240
@@ -74,6 +85,14 @@ class AreaShapeConfig:
         "double_reversal_up", "double_reversal_down", "long_lower_shadow", "long_upper_shadow",
         "top_fractal", "bottom_fractal",
     )
+
+    def requires_atr(self) -> bool:
+        return (
+            (self.stop_basis != "fixed_distance" and self.stop_offset_atr > 0)
+            or self.target_buffer_atr > 0
+            or (self.entry_trigger_mode == "pattern" and self.entry_mode == "breakout"
+                and self.entry_offset_atr > 0)
+        )
 
     def validate(self) -> None:
         if self.direction not in {"long", "short"}:
@@ -85,19 +104,37 @@ class AreaShapeConfig:
         if any(not value.is_finite() or value < 0 for value in (
             self.area_half_width_atr, self.entry_offset_atr, self.stop_offset_atr,
             self.target_buffer_atr, self.round_trip_fee_rate, self.slippage_rate,
+            self.fixed_stop_distance,
         )):
             raise ValueError("ATR offsets and costs must be finite and non-negative")
         if self.exit_template not in EXIT_TEMPLATES:
             raise ValueError("unsupported exit template")
-        if not all(item.is_finite() for item in (self.fixed_tp_r, self.be_trigger_r, self.lock_trigger_r, self.lock_profit_r)):
+        if self.time_break_even_bars < 0 or (self.time_break_even_enabled and self.time_break_even_bars < 1):
+            raise ValueError("time break-even bars must be positive when enabled")
+        if not all(item.is_finite() for item in (
+            self.fixed_tp_r, self.be_trigger_r, self.lock_trigger_r, self.lock_profit_r,
+            self.lock_trail_every_r, self.lock_trail_add_r,
+        )):
             raise ValueError("exit R thresholds must be finite")
-        if self.fixed_tp_r <= 0 or self.be_trigger_r <= 0 or self.lock_trigger_r <= self.be_trigger_r or self.lock_profit_r < 0 or self.lock_profit_r >= self.lock_trigger_r:
+        dynamic_exit = self.exit_template != "fixed_1r"
+        if (self.fixed_tp_r <= 0 or self.be_trigger_r <= 0
+                or (dynamic_exit and self.break_even_enabled and self.lock_trigger_r <= self.be_trigger_r)
+                or self.lock_profit_r < 0 or (dynamic_exit and self.lock_profit_r >= self.lock_trigger_r)
+                or self.lock_trail_every_r <= 0 or self.lock_trail_add_r <= 0):
             raise ValueError("exit R thresholds are invalid")
         if self.entry_mode not in {"next_open", "breakout"}:
             raise ValueError("unsupported paper entry mode")
+        if self.entry_trigger_mode not in {"pattern", "direct_touch"}:
+            raise ValueError("unsupported entry trigger mode")
+        if self.stop_basis not in {"signal_candle", "three_candle", "fixed_distance"}:
+            raise ValueError("unsupported stop basis")
+        if self.stop_basis == "fixed_distance" and self.fixed_stop_distance <= 0:
+            raise ValueError("fixed stop distance must be positive")
         if self.trigger_price_type != "last":
             raise ValueError("area monitoring currently uses confirmed last-price candles only")
-        if not self.signal_patterns or any(item not in SUPPORTED_SIGNALS for item in self.signal_patterns):
+        if self.entry_trigger_mode == "pattern" and not self.signal_patterns:
+            raise ValueError("at least one chart pattern must be selected")
+        if any(item not in SUPPORTED_SIGNALS for item in self.signal_patterns):
             raise ValueError("signal pattern list is unsupported")
 
     def to_dict(self) -> dict[str, object]:
@@ -111,6 +148,7 @@ class AreaShapeConfig:
     @classmethod
     def from_dict(cls, payload: dict[str, object] | None) -> "AreaShapeConfig":
         raw = payload if isinstance(payload, dict) else {}
+        exit_template = str(raw.get("exit_template", "fixed_1r"))
         return cls(
             direction=str(raw.get("direction", "long")),
             risk_amount=_required_decimal(raw, "risk_amount"),
@@ -123,16 +161,80 @@ class AreaShapeConfig:
             round_trip_fee_rate=_required_decimal(raw, "round_trip_fee_rate"),
             slippage_rate=_required_decimal(raw, "slippage_rate"),
             fixed_tp_r=_required_decimal(raw, "fixed_tp_r"),
+            # Older fixed-target plans had no break-even protection; preserve that behavior.
+            break_even_enabled=bool(raw.get("break_even_enabled", exit_template != "fixed_1r")),
             be_trigger_r=_required_decimal(raw, "be_trigger_r"),
+            time_break_even_enabled=bool(raw.get("time_break_even_enabled", False)),
+            time_break_even_bars=max(0, int(raw.get("time_break_even_bars", 0) or 0)),
             lock_trigger_r=_required_decimal(raw, "lock_trigger_r"),
             lock_profit_r=_required_decimal(raw, "lock_profit_r"),
+            lock_trail_every_r=_decimal(raw.get("lock_trail_every_r", "1"), "1"),
+            lock_trail_add_r=_decimal(raw.get("lock_trail_add_r", "1"), "1"),
             entry_mode=str(raw.get("entry_mode", "next_open")),
+            entry_trigger_mode=str(raw.get("entry_trigger_mode", "pattern")),
+            stop_basis=str(raw.get("stop_basis", "signal_candle")),
+            fixed_stop_distance=_required_decimal(raw, "fixed_stop_distance") if "fixed_stop_distance" in raw else Decimal("1000"),
+            # Older plans did not expose a fee-offset switch; preserve their behavior.
+            fee_offset_enabled=bool(raw.get("fee_offset_enabled", False)),
             resting_entry_enabled=bool(raw.get("resting_entry_enabled", True)),
-            exit_template=str(raw.get("exit_template", "fixed_1r")),
+            exit_template=exit_template,
             trigger_price_type=str(raw.get("trigger_price_type", "last")),
             valid_for_bars=max(1, int(raw.get("valid_for_bars", 240) or 240)),
             signal_patterns=tuple(str(item) for item in raw.get("signal_patterns", cls.signal_patterns) if str(item)),
         )
+
+
+def calculate_initial_stop(
+    config: AreaShapeConfig, direction: str, *, entry_reference: Decimal,
+    signal_candle: Candle, recent_candles: list[Candle], atr_value: Decimal,
+) -> Decimal:
+    """Return the configured initial stop relative to the entry line or signal candles."""
+    if config.stop_basis == "fixed_distance":
+        return entry_reference - config.fixed_stop_distance if direction == "long" else entry_reference + config.fixed_stop_distance
+    candles = recent_candles if config.stop_basis == "three_candle" else [signal_candle]
+    low = min(item.low for item in candles)
+    high = max(item.high for item in candles)
+    return low - atr_value * config.stop_offset_atr if direction == "long" else high + atr_value * config.stop_offset_atr
+
+
+def area_shape_lock_profit_r(config: AreaShapeConfig, progress_r: Decimal) -> Decimal:
+    """Return the stepped stop lock level once the configured lock trigger is reached."""
+    if progress_r < config.lock_trigger_r:
+        return config.lock_profit_r
+    steps = ((progress_r - config.lock_trigger_r) / config.lock_trail_every_r).to_integral_value(rounding=ROUND_FLOOR)
+    return config.lock_profit_r + steps * config.lock_trail_add_r
+
+
+def area_shape_net_progress_r(
+    config: AreaShapeConfig, *, direction: str, entry: Decimal, initial_stop: Decimal,
+    price: Decimal, fee_rate: Decimal | None = None,
+) -> Decimal:
+    """Measure favorable progress after entry and exit taker fees, in initial-stop R units."""
+    rate = fee_rate if fee_rate is not None else AREA_TAKER_FEE_RATE
+    if not config.fee_offset_enabled:
+        rate = Decimal("0")
+    risk = abs(entry - initial_stop)
+    if risk <= 0:
+        raise ValueError("initial R must be positive")
+    gross = price - entry if direction == "long" else entry - price
+    round_trip_fee = (entry + price) * rate
+    return (gross - round_trip_fee) / risk
+
+
+def area_shape_price_for_net_r(
+    *, entry: Decimal, initial_stop: Decimal, direction: str, target_r: Decimal,
+    fee_rate: Decimal,
+) -> Decimal:
+    """Calculate the stop price that retains target R after fees on entry and exit."""
+    risk = abs(entry - initial_stop)
+    total_cost_rate = fee_rate
+    if risk <= 0 or total_cost_rate < 0 or total_cost_rate >= 1:
+        raise ValueError("net R price inputs are invalid")
+    if direction == "long":
+        return (entry * (Decimal("1") + total_cost_rate) + target_r * risk) / (Decimal("1") - total_cost_rate)
+    if direction == "short":
+        return (entry * (Decimal("1") - total_cost_rate) - target_r * risk) / (Decimal("1") + total_cost_rate)
+    raise ValueError("direction must be long or short")
 
 
 @dataclass
@@ -150,6 +252,7 @@ class AreaShapePlan:
     status: str = "draft"
     created_at: str = ""
     activated_at: str = ""
+    activation_candle_ts: int = 0
     expires_at_candle_ts: int = 0
     last_signal_key: str = ""
     last_candle_ts: int = 0
@@ -190,6 +293,7 @@ class AreaShapePlan:
             created_at=_now(),
         )
 
+
     def to_dict(self) -> dict[str, object]:
         return {
             "version": self.version, "plan_id": self.plan_id, "profile_name": self.profile_name,
@@ -198,6 +302,7 @@ class AreaShapePlan:
             "support_price": str(self.support_price), "pressure_price": str(self.pressure_price),
             "config": self.config.to_dict(), "status": self.status, "created_at": self.created_at,
             "activated_at": self.activated_at, "expires_at_candle_ts": self.expires_at_candle_ts,
+            "activation_candle_ts": self.activation_candle_ts,
             "last_signal_key": self.last_signal_key, "last_candle_ts": self.last_candle_ts,
             "events": list(self.events), "paper_position": self.paper_position,
             "execution_enabled": False,
@@ -218,6 +323,7 @@ class AreaShapePlan:
             config=AreaShapeConfig.from_dict(payload.get("config") if isinstance(payload.get("config"), dict) else None),
             status=str(payload.get("status", "draft")), created_at=str(payload.get("created_at", "")),
             activated_at=str(payload.get("activated_at", "")), expires_at_candle_ts=int(payload.get("expires_at_candle_ts", 0) or 0),
+            activation_candle_ts=int(payload.get("activation_candle_ts", 0) or 0),
             last_signal_key=str(payload.get("last_signal_key", "")), last_candle_ts=int(payload.get("last_candle_ts", 0) or 0),
             events=[dict(item) for item in payload.get("events", []) if isinstance(item, dict)],
             paper_position=dict(payload["paper_position"]) if isinstance(payload.get("paper_position"), dict) else None,
@@ -231,6 +337,7 @@ class AreaShapePlan:
         if profile_name.strip() != self.profile_name or environment.strip().lower() != self.environment:
             raise ValueError("plan account context does not match the selected account")
         self.activated_at = _now()
+        self.activation_candle_ts = last_closed_candle_ts
         self.expires_at_candle_ts = last_closed_candle_ts + self.config.valid_for_bars * 3_600_000
         self.last_candle_ts = max(self.last_candle_ts, last_closed_candle_ts)
         self.status = "monitoring"
@@ -255,14 +362,18 @@ class AreaShapePlan:
         if self.status not in {"monitoring", "touched", "paper_pending"} or not candles:
             return None
         confirmed = [item for item in candles if item.confirmed]
-        if len(confirmed) < self.config.atr_period + 1:
+        needs_atr = self.config.requires_atr()
+        minimum_history = 3 if self.config.stop_basis == "three_candle" or self.config.entry_trigger_mode == "pattern" else 1
+        if needs_atr:
+            minimum_history = max(minimum_history, self.config.atr_period + 1)
+        if len(confirmed) < minimum_history:
             return None
         if self.pressure_price <= self.support_price:
             self.status = "manual_review"
             return self._event("invalid_region", "支撑价必须低于压力价；监控已停止")
-        values = atr(confirmed, self.config.atr_period)
+        values = atr(confirmed, self.config.atr_period) if needs_atr else []
         patterns = set(self.config.signal_patterns)
-        chart_patterns_by_ts = _chart_patterns_by_candle_ts(confirmed)
+        chart_patterns_by_ts = _chart_patterns_by_candle_ts(confirmed) if self.config.entry_trigger_mode == "pattern" else {}
         for index, candle in enumerate(confirmed):
             if candle.ts <= self.last_candle_ts:
                 continue
@@ -275,26 +386,36 @@ class AreaShapePlan:
                 if pending_event is not None:
                     return pending_event
                 continue
-            current_atr = values[index] if index < len(values) else None
-            if current_atr is None or current_atr <= 0:
+            current_atr = values[index] if needs_atr and index < len(values) else Decimal("0")
+            if needs_atr and (current_atr is None or current_atr <= 0):
                 continue
             entry_line = self.support_price if self.config.direction == "long" else self.pressure_price
-            touched = candle.low <= entry_line <= candle.high
-            if not touched:
-                continue
-            self.status = "touched"
             expected_direction = self.config.direction
-            matching_pattern = _matching_chart_pattern(
+            matching_pattern = "direct_touch" if self.config.entry_trigger_mode == "direct_touch" else _matching_chart_pattern(
                 chart_patterns_by_ts, candle_ts=candle.ts,
                 expected_direction=expected_direction, selected=patterns,
             )
             # Old persisted drafts retain their original single-candle signal semantics.
-            if matching_pattern is None and patterns.intersection({
+            if self.config.entry_trigger_mode != "direct_touch" and matching_pattern is None and patterns.intersection({
                 "hammer", "inverted_hammer", "dragonfly_doji", "shooting_star", "hanging_man", "gravestone_doji",
             }):
                 matching_pattern = _matching_legacy_single_candle_pattern(
                     confirmed[: index + 1], expected_direction=expected_direction, selected=patterns,
                 )
+            # Multi-candle patterns may touch the line before their confirmation
+            # candle. Limit the touch to this pattern's own confirmed window and
+            # to candles after activation; never retain an unrelated old touch.
+            span = 3 if matching_pattern in {"bottom_fractal", "top_fractal"} else (
+                2 if matching_pattern in {"double_reversal_up", "double_reversal_down", "inside_bar"} else 1
+            )
+            activation_baseline = self.activation_candle_ts or (self.expires_at_candle_ts - self.config.valid_for_bars * 3_600_000)
+            touched = any(
+                item.ts > activation_baseline and item.low <= entry_line <= item.high
+                for item in confirmed[max(0, index - span + 1): index + 1]
+            )
+            if not touched:
+                continue
+            self.status = "touched"
             signal_key = f"{self.profile_name}|{self.environment}|{self.symbol}|{candle.ts}|{matching_pattern or 'no-pattern'}"
             if signal_key == self.last_signal_key:
                 continue
@@ -302,7 +423,12 @@ class AreaShapePlan:
                 self.last_signal_key = signal_key
                 self._event("touch_without_signal", f"触及区域但没有有效的{'看涨' if self.config.direction == 'long' else '看跌'}反转形态")
                 continue
-            event = self._build_paper_entry(candle, current_atr, matching_pattern, signal_key)
+            stop_candles = confirmed[max(0, index - 2): index + 1]
+            stop_price = calculate_initial_stop(
+                self.config, self.config.direction, entry_reference=entry_line,
+                signal_candle=candle, recent_candles=stop_candles, atr_value=current_atr,
+            )
+            event = self._build_paper_entry(candle, current_atr, matching_pattern, signal_key, stop_price=stop_price)
             self.last_signal_key = signal_key
             self._event(str(event["kind"]), str(event["message"]), **{k: v for k, v in event.items() if k not in {"kind", "message"}})
             if event["kind"] == "paper_pending":
@@ -311,9 +437,14 @@ class AreaShapePlan:
             return event
         return None
 
-    def _build_paper_entry(self, candle: Candle, current_atr: Decimal, pattern: str, key: str) -> dict[str, object]:
+    def _build_paper_entry(
+        self, candle: Candle, current_atr: Decimal, pattern: str, key: str, *, stop_price: Decimal | None = None,
+    ) -> dict[str, object]:
         side = self.config.direction
-        stop = (candle.low - current_atr * self.config.stop_offset_atr) if side == "long" else (candle.high + current_atr * self.config.stop_offset_atr)
+        stop = stop_price if stop_price is not None else calculate_initial_stop(
+            self.config, side, entry_reference=(self.support_price if side == "long" else self.pressure_price),
+            signal_candle=candle, recent_candles=[candle], atr_value=current_atr,
+        )
         trigger = (candle.high + current_atr * self.config.entry_offset_atr) if side == "long" else (candle.low - current_atr * self.config.entry_offset_atr)
         if stop <= 0 or (side == "long" and stop >= candle.close) or (side == "short" and stop <= candle.close):
             return {"kind": "signal_skipped", "message": "形态止损关系无效，跳过本次信号", "candle_ts": candle.ts}
@@ -323,7 +454,8 @@ class AreaShapePlan:
             # next-open simulation still ignores it; the demo executor submits
             # this threshold as an exchange-hosted trigger order.
             "entry_trigger": str(trigger),
-            "entry_mode": self.config.entry_mode, "stage": "pending_entry", "pattern": pattern,
+            "entry_mode": self.config.entry_mode, "entry_trigger_mode": self.config.entry_trigger_mode,
+            "stop_basis": self.config.stop_basis, "stage": "pending_entry", "pattern": pattern,
             "risk_amount": str(self.config.risk_amount), "rule_version": self.version,
             "target_buffer_atr": str(current_atr * self.config.target_buffer_atr),
         }
@@ -338,7 +470,6 @@ class AreaShapePlan:
         if not pending or candle.ts <= int(pending.get("signal_candle_ts", 0) or 0):
             return None
         side = str(pending["side"])
-        sign = Decimal("1") if side == "long" else Decimal("-1")
         stop = _decimal(pending["stop"])
         if str(pending.get("entry_mode")) == "breakout":
             trigger = _decimal(pending.get("entry_trigger"))
@@ -362,18 +493,32 @@ class AreaShapePlan:
             self.status = "monitoring"
             self.paper_position = None
             return self._event("signal_skipped", f"未来入场价目标空间 {space_r:.2f}R 低于最低要求，未模拟成交", candle_ts=candle.ts, space_r=str(space_r))
-        cost_offset = entry * (self.config.round_trip_fee_rate + self.config.slippage_rate)
         fixed = self.config.exit_template == "fixed_1r"
-        take_profit = entry + sign * (risk * self.config.fixed_tp_r + cost_offset) if fixed else Decimal("0")
+        target_r = self.config.fixed_tp_r if fixed else AREA_DYNAMIC_TAKE_PROFIT_R
+        try:
+            take_profit = area_shape_price_for_net_r(
+                entry=entry, initial_stop=stop, direction=side, target_r=target_r,
+                fee_rate=self.config.round_trip_fee_rate + self.config.slippage_rate,
+            )
+            if take_profit <= 0:
+                raise ValueError("止盈目标价非正")
+        except ValueError as exc:
+            self.status = "monitoring"
+            self.paper_position = None
+            return self._event("signal_skipped", f"纸面止盈保护价不可用：{exc}", candle_ts=candle.ts)
         self.paper_position = {
             **pending, "entry": str(entry), "initial_stop": str(stop), "risk_distance": str(risk),
-            "target": str(target), "take_profit": str(take_profit) if fixed else "",
+            "target": str(target), "take_profit": str(take_profit),
             "entry_ts": candle.ts, "entry_time": datetime.fromtimestamp(candle.ts / 1000, tz=timezone.utc).isoformat(),
             "last_checked_ts": candle.ts - 1, "stage": "initial", "space_r": str(space_r),
             "contracts": None, "sizing_status": "未计算：未核验合约张值、手续费与滑点规格",
         }
         self.status = "paper_position"
-        result = self._event("paper_entry", f"纸面模拟按未来1H行情在 {entry} 成交；成交K线不参与止损/止盈回放", candle_ts=candle.ts, entry=str(entry), space_r=str(space_r), entry_mode=self.config.entry_mode)
+        result = self._event(
+            "paper_entry", f"纸面模拟按未来1H行情在 {entry} 成交；成交K线不参与止损/止盈回放",
+            candle_ts=candle.ts, entry=str(entry), stop=str(stop), risk_distance=str(risk),
+            pattern=str(pending.get("pattern", "")), space_r=str(space_r), entry_mode=self.config.entry_mode,
+        )
         if self.config.entry_mode == "breakout":
             # Entry and stop can both be crossed in this bar; OHLC does not reveal
             # their order, so the simulation conservatively applies the stop first.
@@ -399,7 +544,8 @@ class AreaShapePlan:
         self.last_candle_ts = max(self.last_candle_ts, candle.ts)
         side = str(position["side"])
         entry = _decimal(position["entry"])
-        risk = _decimal(position["risk_distance"])
+        initial_stop = _decimal(position["initial_stop"])
+        risk = abs(entry - initial_stop)
         stop = _decimal(position["stop"])
         favorable = candle.high if side == "long" else candle.low
         adverse = candle.low if side == "long" else candle.high
@@ -408,7 +554,6 @@ class AreaShapePlan:
         tp = _decimal(tp_raw)
         tp_hit = bool(tp_raw) and (favorable >= tp if side == "long" else favorable <= tp)
         position["last_checked_ts"] = candle.ts
-        sign = Decimal("1") if side == "long" else Decimal("-1")
         if stop_hit:
             self.status = "paper_closed"
             ambiguous = tp_hit
@@ -417,16 +562,43 @@ class AreaShapePlan:
             return result
         if tp_hit:
             self.status = "paper_closed"
-            result = self._event("paper_take_profit", f"纸面固定 {self.config.fixed_tp_r}R 止盈触发于 {tp}", candle_ts=candle.ts, exit_price=str(tp))
+            target_r = self.config.fixed_tp_r if self.config.exit_template == "fixed_1r" else AREA_DYNAMIC_TAKE_PROFIT_R
+            result = self._event("paper_take_profit", f"纸面 {target_r}R 止盈触发于 {tp}", candle_ts=candle.ts, exit_price=str(tp))
             self.paper_position = None
             return result
-        progress_r = ((favorable - entry) / risk) if side == "long" else ((entry - favorable) / risk)
+        fee_rate = AREA_TAKER_FEE_RATE if self.config.fee_offset_enabled else Decimal("0")
+        progress_r = area_shape_net_progress_r(
+            self.config, direction=side, entry=entry, initial_stop=initial_stop,
+            price=favorable, fee_rate=fee_rate,
+        )
         target_stop: Decimal | None = None
         pending_stage = str(position.get("pending_stage", ""))
-        if self.config.exit_template != "fixed_1r" and (progress_r >= self.config.lock_trigger_r or pending_stage == "locked"):
-            target_stop = entry + sign * (risk * self.config.lock_profit_r + entry * (self.config.round_trip_fee_rate + self.config.slippage_rate))
-        elif self.config.exit_template != "fixed_1r" and (progress_r >= self.config.be_trigger_r or pending_stage == "break_even"):
-            target_stop = entry + sign * entry * (self.config.round_trip_fee_rate + self.config.slippage_rate)
+        dynamic_exit = self.config.exit_template != "fixed_1r"
+        elapsed_bars = max(0, (candle.ts - int(position.get("entry_ts", candle.ts))) // 3_600_000)
+        current_progress_r = area_shape_net_progress_r(
+            self.config, direction=side, entry=entry, initial_stop=initial_stop,
+            price=candle.close, fee_rate=fee_rate,
+        )
+        time_be_ready = (
+            self.config.break_even_enabled and self.config.time_break_even_enabled
+            and elapsed_bars >= self.config.time_break_even_bars and current_progress_r >= 0
+        )
+        if dynamic_exit and (progress_r >= self.config.lock_trigger_r or pending_stage == "locked"):
+            locked_r = area_shape_lock_profit_r(self.config, progress_r)
+            if pending_stage == "locked":
+                locked_r = max(locked_r, _decimal(position.get("pending_lock_r", "0")))
+            target_r = locked_r
+            target_stop = area_shape_price_for_net_r(
+                entry=entry, initial_stop=initial_stop, direction=side,
+                target_r=target_r, fee_rate=fee_rate,
+            )
+        elif self.config.break_even_enabled and (
+            progress_r >= self.config.be_trigger_r or pending_stage == "break_even" or time_be_ready
+        ):
+            target_stop = area_shape_price_for_net_r(
+                entry=entry, initial_stop=initial_stop, direction=side,
+                target_r=Decimal("0"), fee_rate=fee_rate,
+            )
         if target_stop is not None:
             old_stop = _decimal(position["stop"])
             tightens = target_stop > old_stop if side == "long" else target_stop < old_stop
@@ -436,11 +608,14 @@ class AreaShapePlan:
                 if not close_allows or candidate_already_crossed:
                     position["pending_stop_price"] = str(target_stop)
                     position["pending_stage"] = "locked" if pending_stage == "locked" or progress_r >= self.config.lock_trigger_r else "break_even"
+                    if position["pending_stage"] == "locked":
+                        position["pending_lock_r"] = str(locked_r)
                     return self._event("paper_stop_pending", "K线触发保护档位，但收盘价或bar内路径不能证明候选止损安全；保留待处理档位", candle_ts=candle.ts, candidate_stop=str(target_stop), progress_r=str(progress_r), ambiguous_bar=True)
                 position["stop"] = str(target_stop)
                 updated_stage = "locked" if pending_stage == "locked" or progress_r >= self.config.lock_trigger_r else "break_even"
                 position.pop("pending_stop_price", None)
                 position.pop("pending_stage", None)
+                position.pop("pending_lock_r", None)
                 position["stage"] = updated_stage
                 self.status = "paper_locked" if updated_stage == "locked" else "paper_break_even"
                 return self._event("paper_stop_tightened", f"纸面保护档位已在当前收盘价校验后更新至 {target_stop}", candle_ts=candle.ts, stop=str(target_stop), progress_r=str(progress_r), stage=updated_stage)

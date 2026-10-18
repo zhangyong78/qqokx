@@ -6,6 +6,7 @@ import os
 import re
 import sys
 import time
+import copy
 from bisect import bisect_right
 from dataclasses import dataclass, field, replace
 from datetime import datetime
@@ -84,7 +85,8 @@ from okx_quant.deribit_volatility_ui import (
 )
 from okx_quant.kline_rr_execution import RRTradeExecutionService
 from okx_quant.kline_rr_trade import RRTradeLedgerEntry, RRTradePlan, build_rr_trade_plan
-from okx_quant.area_shape_trade import AreaShapeConfig, AreaShapePlan
+from okx_quant.area_shape_trade import AREA_DYNAMIC_TAKE_PROFIT_R, AreaShapeConfig, AreaShapePlan
+from okx_quant.analysis.auto_zones import find_auto_zone_pair
 from okx_quant.kline_trade_recommendations import KlineTradeIdea, build_kline_trade_idea
 from roll_terminal_qt.area_shape_dialog import AreaShapeConfigDialog
 from roll_terminal_qt.kline_trade_recommendation_dialog import KlineTradeRecommendationDialog
@@ -114,6 +116,7 @@ from roll_terminal_qt.line_trading_core import (
 from roll_terminal_qt.kline_box_rules import AUTO_BOX_MAX_CANDIDATES, is_auto_box_candidate_valid
 from roll_terminal_qt.history_service import load_local_position_history, merge_position_history_cache
 from roll_terminal_qt.perf_metrics import measure_ui_step
+from okx_quant.log_utils import append_log_line
 from roll_terminal_qt.kline_alerts import (
     build_workspace_key,
     evaluate_workspace_alerts,
@@ -122,6 +125,8 @@ from roll_terminal_qt.kline_alerts import (
     normalize_workspace_entry,
 )
 from roll_terminal_qt.kline_account_drawer import KlineAccountDrawer
+from roll_terminal_qt.order_service import OrderStatusView
+from roll_terminal_qt.shared_order_store import get_shared_order_store
 from roll_terminal_qt.profile_access import ensure_profile_unlocked, load_profile_snapshots
 from roll_terminal_qt.runtime import load_runtime, profile_names
 from roll_terminal_qt.workspace_shell import LocalTaskCount, merge_local_task_counts
@@ -134,6 +139,7 @@ _AUTO_REFRESH_DEFAULT_ENABLED = True
 # Keep a visible tail after the latest candle.  Four-chart layouts make the
 # previous 24-bar gap look cramped, especially on the 1W/1D panels.
 _NATIVE_RIGHT_PADDING_BARS = 32
+_NATIVE_MAX_RIGHT_PADDING_BARS = 5_000
 # Recent view keeps the 1H chart at about 250 candles.  Higher timeframes
 # need fewer candles to keep their structure readable in linked layouts.
 _RECENT_VIEW_BARS = 250
@@ -176,6 +182,8 @@ _CHART_UP_COLOR = "#22c55e"
 _CHART_DOWN_COLOR = "#e04f84"
 _CHART_EMA15_COLOR = "#ff4d6d"
 _CHART_SMA50_COLOR = "#58c66d"
+_CHART_EMA21_COLOR = "#38bdf8"
+_CHART_EMA55_COLOR = "#a78bfa"
 _CHART_BEST_INDICATOR_COLORS = ("#f59e0b", "#8b5cf6", "#38bdf8", "#ec4899")
 _HISTORY_TRADE_OPEN_COLOR = "#38bdf8"
 _HISTORY_TRADE_CLOSE_COLOR = "#f97316"
@@ -461,6 +469,14 @@ def _to_ema(values: list[float], period: int) -> list[float]:
     return result
 
 
+def _ema_chart_points(candles: list[dict[str, Any]], period: int) -> list[dict[str, float | int]]:
+    values = _to_ema([float(item["close"]) for item in candles], period)
+    return [
+        {"time": int(candle["time"]), "value": value}
+        for candle, value in zip(candles, values)
+    ]
+
+
 def _to_sma(values: list[float], period: int) -> list[float]:
     if period <= 0:
         return []
@@ -470,6 +486,22 @@ def _to_sma(values: list[float], period: int) -> list[float]:
         window = values[window_start:index]
         result.append(sum(window) / len(window))
     return result
+
+
+def _future_moving_average_points(
+    candles: list[dict[str, Any]], bars: list[dict[str, Any]], period: int, *, exponential: bool,
+) -> list[tuple[float, float]]:
+    """Continue a chart moving average through projected candle closes."""
+    closes = [float(item["close"]) for item in candles]
+    future_bars = [item for item in bars if isinstance(item, dict)]
+    if not closes or not future_bars or period <= 0:
+        return []
+    closes.extend(float(item["close"]) for item in future_bars)
+    values = _to_ema(closes, period) if exponential else _to_sma(closes, period)
+    return [
+        (float(item["time_ms"]), float(values[len(candles) + index]))
+        for index, item in enumerate(future_bars)
+    ]
 
 
 def _candle_body_pen_width(open_price: float, close_price: float, *, price_span: float) -> int:
@@ -566,7 +598,10 @@ def _apply_drag_to_line_rule(
 ) -> dict[str, object]:
     updated = dict(line)
     kind = str(updated.get("kind", "horizontal") or "horizontal").strip().lower()
-    if kind == "horizontal":
+    if kind in {"horizontal", "ray"}:
+        if kind == "ray" and drag_mode == "endpoint_a":
+            updated["time_a"] = int(candle_time)
+            updated["time_b"] = int(candle_time)
         updated["price_a"] = float(price)
         updated["price_b"] = float(price)
         if "time_a" not in updated:
@@ -805,6 +840,23 @@ def _default_native_visible_range(total_bars: int, *, target_visible_bars: int =
 
 def _native_right_padding_ms(display_step_ms: int, *, padding_bars: int = _NATIVE_RIGHT_PADDING_BARS) -> float:
     return float(max(0, padding_bars) * max(1, display_step_ms))
+
+
+def _right_padding_after_drag(
+    *, start_padding_bars: int, delta_px: float, plot_width: float,
+    visible_span_ms: float, display_step_ms: int,
+) -> int:
+    step = max(1, int(display_step_ms))
+    bars_visible = max(float(visible_span_ms) / step, 1.0)
+    pixels_per_bar = max(float(plot_width), 1.0) / bars_visible
+    delta_bars = int(round(float(delta_px) / max(pixels_per_bar, 1e-6)))
+    return int(_clamp(float(start_padding_bars - delta_bars), 0.0, float(_NATIVE_MAX_RIGHT_PADDING_BARS)))
+
+
+def _one_hour_right_padding_bars(total_bars: int, *, full: bool = False) -> int:
+    # Recent view has a fixed total span; full view adds padding to all history.
+    span = max(1, total_bars - 1)
+    return min(_NATIVE_MAX_RIGHT_PADDING_BARS, math.ceil(span / 2 if full else min(span, _RECENT_VIEW_BARS - 1) / 3))
 
 
 def _default_native_x_range_with_right_padding(
@@ -1163,6 +1215,30 @@ def _compute_rr_multiple_from_take_profit(
     raise ValueError(f"unsupported side: {side!r}")
 
 
+class _WrappedStatusLabel(QLabel):
+    """Keep wrapped status text readable inside the scrollable tab panel."""
+
+    def __init__(self, text: str) -> None:
+        super().__init__(text)
+        self.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Minimum)
+        self.setWordWrap(True)
+        self.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+
+    def setText(self, text: str) -> None:
+        super().setText(text)
+        self._fit_text_height()
+
+    def resizeEvent(self, event) -> None:  # noqa: ANN001
+        super().resizeEvent(event)
+        self._fit_text_height()
+
+    def _fit_text_height(self) -> None:
+        # QLabel clamps heightForWidth to its current minimum; clear it so
+        # shorter text and wider panels can shrink again.
+        self.setMinimumHeight(0)
+        self.setMinimumHeight(max(0, self.heightForWidth(self.width())))
+
+
 class RMultipleSpinBox(QDoubleSpinBox):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -1434,6 +1510,17 @@ class RRCardDialog(QDialog):
         self._management_mode_combo.setCurrentIndex(
             max(0, self._management_mode_combo.findData(_normalize_rr_management_mode(item.get("management_mode"))))
         )
+        self._entry_execution_mode_combo = QComboBox()
+        self._entry_execution_mode_combo.addItem("限价", "limit")
+        self._entry_execution_mode_combo.addItem("市价", "market")
+        self._entry_execution_mode_combo.addItem("最优盘口限价（单次）", "chase_best_quote")
+        self._entry_execution_mode_combo.setToolTip("提交时读取一次最优盘口并按限价提交，不会持续追价。")
+        self._management_hint = QLabel("")
+        self._management_hint.setWordWrap(True)
+        self._management_hint.setObjectName("CardSubtle")
+        self._entry_execution_mode_combo.setCurrentIndex(
+            max(0, self._entry_execution_mode_combo.findData(str(item.get("entry_execution_mode", "limit") or "limit")))
+        )
         self._risk_edit = QLineEdit(str(item.get("risk_amount", "100") or "100"))
         self._entry_edit = QLineEdit(_format_rr_table_price(item.get("price_entry", ""), price_increment))
         self._stop_edit = QLineEdit(_format_rr_table_price(item.get("price_stop", ""), price_increment))
@@ -1449,6 +1536,7 @@ class RRCardDialog(QDialog):
         self._summary_label.setObjectName("Subtle")
         parameter_layout.addRow("方向", self._side_combo)
         parameter_layout.addRow("管理方式", self._management_mode_combo)
+        parameter_layout.addRow("入场方式", self._entry_execution_mode_combo)
         parameter_layout.addRow("风险金(U)", self._risk_edit)
         parameter_layout.addRow("入场价", self._entry_edit)
         parameter_layout.addRow("止损价", self._stop_edit)
@@ -1456,6 +1544,7 @@ class RRCardDialog(QDialog):
         parameter_layout.addRow("杠杆", self._leverage_edit)
         parameter_layout.addRow(self._fee_offset_check)
         parameter_layout.addRow(self._locked_check)
+        parameter_layout.addRow("成交后管理", self._management_hint)
         parameter_layout.addRow("计算结果", self._summary_label)
         tabs.addTab(parameter_tab, "参数")
 
@@ -1490,7 +1579,7 @@ class RRCardDialog(QDialog):
         buttons.rejected.connect(self.reject)
         root.addWidget(buttons)
 
-        for widget in (self._side_combo, self._management_mode_combo, self._risk_edit, self._entry_edit, self._stop_edit, self._r_edit, self._leverage_edit):
+        for widget in (self._side_combo, self._management_mode_combo, self._entry_execution_mode_combo, self._risk_edit, self._entry_edit, self._stop_edit, self._r_edit, self._leverage_edit):
             if isinstance(widget, QComboBox):
                 widget.currentIndexChanged.connect(self._refresh_summary)
             elif isinstance(widget, QDoubleSpinBox):
@@ -1502,9 +1591,15 @@ class RRCardDialog(QDialog):
         self._refresh_summary()
 
     def _refresh_summary(self) -> None:
+        management_mode = str(self._management_mode_combo.currentData() or "fixed_tp")
+        if management_mode == "fixed_tp":
+            management_hint = "固定止盈：到达 RR 目标止盈后退出；不执行保本或阶梯锁盈。"
+        else:
+            management_hint = "监控观察到所选 R 档后移至保本；之后每跨整数 R 锁入前一整数 R，RR 目标止盈保留。"
+        self._management_hint.setText(management_hint)
+        self._management_mode_combo.setToolTip(management_hint)
         try:
             side = str(self._side_combo.currentData() or "long")
-            management_mode = str(self._management_mode_combo.currentData() or "fixed_tp")
             entry_price = Decimal(self._entry_edit.text().strip())
             stop_price = Decimal(self._stop_edit.text().strip())
             r_multiple = Decimal(self._r_edit.text())
@@ -1569,6 +1664,7 @@ class RRCardDialog(QDialog):
             "price_tp": decimal_to_text(take_profit),
             "r_multiple": decimal_to_text(_normalize_rr_multiple_step(r_multiple)),
             "management_mode": management_mode,
+            "entry_execution_mode": str(self._entry_execution_mode_combo.currentData() or "limit"),
             "direct_take_profit_r": decimal_to_text(_normalize_rr_multiple_step(r_multiple)),
             "risk_amount": self._risk_edit.text().strip() or "100",
             "leverage": self._leverage_edit.text().strip() or "1",
@@ -1637,6 +1733,7 @@ def _prefer_native_chart_backend() -> bool:
 def _line_kind_text(kind: str) -> str:
     mapping = {
         "horizontal": "水平线",
+        "ray": "射线",
         "trend": "趋势线",
     }
     return mapping.get(str(kind or "").strip().lower(), str(kind or "-") or "-")
@@ -3468,6 +3565,7 @@ if QChartView is not None:
             self.setRenderHint(QPainter.RenderHint.Antialiasing, False)
             self.setMouseTracking(True)
             self.viewport().setMouseTracking(True)
+            self.setToolTip("1H图表中，左键拖动最后一根K线右侧的空白区可调整留白；双击图表可恢复近期视图。")
             self.setFrameShape(QFrame.Shape.NoFrame)
             self._draw_mode_enabled = False
             self._axis_x: QDateTimeAxis | None = None
@@ -3478,6 +3576,8 @@ if QChartView is not None:
             self._display_times_ms: list[int] = []
             self._display_step_ms = 60_000
             self._period = "15m"
+            self._right_padding_bars = _NATIVE_RIGHT_PADDING_BARS
+            self._right_padding_drag: tuple[float, int, float] | None = None
             self._symbol = ""
             self._venue_label = "OKX"
             # Latest market price is a paint-only annotation.  It is deliberately
@@ -3489,8 +3589,11 @@ if QChartView is not None:
             self._workspace_rr_items: list[dict[str, object]] = []
             self._signal_markers: list[dict[str, Any]] = []
             self._history_trade_markers: list[dict[str, Any]] = []
+            self._area_shape_replay_trades: list[dict[str, Any]] = []
             self._box_overlays: list[dict[str, Any]] = []
             self._channel_overlays: list[dict[str, Any]] = []
+            self._future_projection: dict[str, Any] | None = None
+            self._future_ma_specs: list[tuple[str, int, str, int]] = []
             self._selected_workspace_line_index = -1
             self._selected_workspace_rr_index = -1
             self._hovered_workspace_line_index = -1
@@ -3518,6 +3621,7 @@ if QChartView is not None:
         def set_draw_mode_enabled(self, enabled: bool) -> None:
             self._draw_mode_enabled = enabled
             self._pan_anchor_x = None
+            self._right_padding_drag = None
             self._press_pos = None
             self._dragging = False
             self._apply_cursor_mode("crosshair" if enabled else "default")
@@ -3526,6 +3630,7 @@ if QChartView is not None:
             self._interaction_locked = bool(locked)
             if locked:
                 self._pan_anchor_x = None
+                self._right_padding_drag = None
                 self._press_pos = None
                 self._dragging = False
             else:
@@ -3595,6 +3700,7 @@ if QChartView is not None:
                 "start_x": start_x,
                 "end_x": end_x,
                 "stick_to_right": abs(self._full_x_max - end_x) <= 2.0,
+                "right_padding_bars": float(self._right_padding_bars),
             }
 
         def current_x_range(self) -> tuple[float, float]:
@@ -3638,6 +3744,14 @@ if QChartView is not None:
             self._overlay_values = [list(item) for item in overlay_values]
             self._display_times_ms = list(display_times_ms)
             self._period = period.strip() or "15m"
+            if self._period.strip().upper() == "1H" and restore_state is None:
+                self._right_padding_bars = _one_hour_right_padding_bars(len(candles))
+            elif self._period.strip().upper() == "1H" and restore_state is not None:
+                try:
+                    restored_padding = int(restore_state.get("right_padding_bars", self._right_padding_bars))
+                except (TypeError, ValueError):
+                    restored_padding = self._right_padding_bars
+                self._right_padding_bars = int(_clamp(float(restored_padding), 0.0, float(_NATIVE_MAX_RIGHT_PADDING_BARS)))
             self._symbol = symbol.strip().upper()
             self._venue_label = venue_label.strip().upper() or "OKX"
             try:
@@ -3667,10 +3781,15 @@ if QChartView is not None:
                 self._display_step_ms = max(1, self._display_times_ms[1] - self._display_times_ms[0])
             if self._display_times_ms:
                 self._full_x_min = float(self._display_times_ms[0])
-                self._full_x_max = float(self._display_times_ms[-1]) + _native_right_padding_ms(self._display_step_ms)
+                self._full_x_max = float(self._display_times_ms[-1]) + _native_right_padding_ms(
+                    self._display_step_ms, padding_bars=self._active_right_padding_bars(),
+                )
             else:
                 self._full_x_min = 0.0
-                self._full_x_max = max(float(self._display_step_ms), _native_right_padding_ms(self._display_step_ms))
+                self._full_x_max = max(
+                    float(self._display_step_ms),
+                    _native_right_padding_ms(self._display_step_ms, padding_bars=self._active_right_padding_bars()),
+                )
             if candles:
                 self._full_y_min = min(float(item["low"]) for item in candles)
                 self._full_y_max = max(float(item["high"]) for item in candles)
@@ -3692,6 +3811,64 @@ if QChartView is not None:
             self._hide_hover_overlays()
             self.viewport().update()
 
+        def set_future_projection(self, projection: dict[str, Any] | None) -> None:
+            self._future_projection = dict(projection) if isinstance(projection, dict) else None
+            if self._future_projection and self._axis_x is not None and self._display_times_ms:
+                bars = self._future_projection.get("bars", [])
+                if isinstance(bars, list) and bars:
+                    future_end = max(float(item.get("time_ms", 0) or 0) for item in bars if isinstance(item, dict))
+                    old_min, old_max = self.current_x_range()
+                    self._full_x_max = max(self._full_x_max, future_end + self._display_step_ms)
+                    span = max(old_max - old_min, self._display_step_ms * 30)
+                    new_max = self._full_x_max
+                    self._apply_x_range(max(self._full_x_min, new_max - span), new_max, emit_signal=True)
+                    prices = [float(item[key]) for item in bars if isinstance(item, dict) for key in ("low", "high")]
+                    prices.extend(float(self._future_projection[key]) for key in ("entry", "stop", "target") if self._future_projection.get(key))
+                    if prices and self._axis_y is not None:
+                        current_low, current_high = float(self._axis_y.min()), float(self._axis_y.max())
+                        padding = max((max(prices) - min(prices)) * 0.08, 0.01)
+                        self._axis_y.setRange(min(current_low, min(prices) - padding), max(current_high, max(prices) + padding))
+            elif self._axis_x is not None and self._display_times_ms:
+                self._full_x_max = float(self._display_times_ms[-1]) + _native_right_padding_ms(
+                    self._display_step_ms, padding_bars=self._active_right_padding_bars(),
+                )
+                self.reset_view()
+                self._fit_y_axis_to_visible_range()
+            self.viewport().update()
+
+        def set_area_shape_replay_trades(
+            self, rows: list[dict[str, Any]] | None, *, focus: bool = False,
+        ) -> None:
+            self._area_shape_replay_trades = [dict(item) for item in (rows or []) if isinstance(item, dict)]
+            if focus and self._area_shape_replay_trades and self._display_times_ms:
+                indices: list[int] = []
+                for item in self._area_shape_replay_trades:
+                    for key in ("signal_ts", "entry_ts", "exit_ts"):
+                        try:
+                            timestamp = int(item.get(key, 0) or 0)
+                        except (TypeError, ValueError):
+                            continue
+                        if timestamp > 0:
+                            indices.append(self._index_for_candle_time(timestamp // 1000))
+                if indices:
+                    left = max(0, min(indices) - 5)
+                    right = min(len(self._display_times_ms) - 1, max(indices) + 7)
+                    self._apply_x_range(
+                        float(self._display_times_ms[left]),
+                        float(self._display_times_ms[right]) + self._display_step_ms,
+                        emit_signal=True,
+                    )
+                    self._fit_y_axis_to_visible_range()
+            self.viewport().update()
+
+        def set_future_ma_specs(self, specs: list[tuple[str, int, str, int]]) -> None:
+            self._future_ma_specs = [
+                (str(ma_type), int(period), str(color), int(width))
+                for ma_type, period, color, width in specs
+                if str(ma_type).strip().lower() in {"ema", "ma", "sma"} and int(period) > 0
+            ]
+            self.viewport().update()
+
         def clear_chart_context(self) -> None:
             self._axis_x = None
             self._axis_y = None
@@ -3708,20 +3885,35 @@ if QChartView is not None:
             self._history_trade_markers = []
             self._box_overlays = []
             self._channel_overlays = []
+            self._future_projection = None
             self._selected_workspace_rr_index = -1
             self._preview_rr_item = None
             self._hover_pos = None
             self._press_pos = None
             self._last_pointer_pos = None
             self._pan_anchor_x = None
+            self._right_padding_drag = None
             self._dragging = False
             self._external_hover_time = None
             self._hide_hover_overlays()
             self.viewport().update()
 
+        def set_workspace_lines(
+            self,
+            workspace_lines: list[dict[str, object]],
+            *,
+            selected_index: int = -1,
+        ) -> None:
+            """Update drawing overlays without rebuilding the candle chart."""
+            self._workspace_lines = [dict(item) for item in workspace_lines if isinstance(item, dict)]
+            self._selected_workspace_line_index = int(selected_index)
+            self.viewport().update()
+
         def reset_view(self) -> None:
             if self._axis_x is None:
                 return
+            if self._period.strip().upper() == "1H":
+                self._set_right_padding_bars(_one_hour_right_padding_bars(len(self._candles)))
             start_x, end_x = self._default_x_range()
             self._apply_x_range(start_x, end_x, emit_signal=True)
             self._fit_y_axis_to_visible_range()
@@ -3735,6 +3927,8 @@ if QChartView is not None:
         def set_full_view_range(self) -> None:
             if self._axis_x is None:
                 return
+            if self._period.strip().upper() == "1H":
+                self._set_right_padding_bars(_one_hour_right_padding_bars(len(self._candles), full=True))
             start_x, end_x = self._full_x_min, self._full_x_max
             self._apply_x_range(start_x, end_x, emit_signal=True)
             self._fit_y_axis_to_visible_range()
@@ -3745,6 +3939,12 @@ if QChartView is not None:
         def set_external_x_range(self, start_x: float, end_x: float) -> None:
             if self._axis_x is None or not self._candles:
                 return
+            if self._period.strip().upper() == "1H" and self._display_times_ms and end_x > self._full_x_max:
+                required_padding = math.ceil((float(end_x) - float(self._display_times_ms[-1])) / max(self._display_step_ms, 1))
+                self._right_padding_bars = int(_clamp(float(required_padding), 0.0, float(_NATIVE_MAX_RIGHT_PADDING_BARS)))
+                self._full_x_max = float(self._display_times_ms[-1]) + _native_right_padding_ms(
+                    self._display_step_ms, padding_bars=self._right_padding_bars,
+                )
             bounded_start, bounded_end = self._bounded_x_range(float(start_x), float(end_x))
             self._apply_x_range(bounded_start, bounded_end, emit_signal=False)
             self._fit_y_axis_to_visible_range()
@@ -3790,15 +3990,24 @@ if QChartView is not None:
                 self.chartActivated.emit()
                 self._press_pos = QPointF(event.position())
                 self._last_pointer_pos = QPointF(event.position())
-                self._pan_anchor_x = float(event.position().x())
+                if self._is_right_padding_position(float(event.position().x()), plot_area):
+                    self._right_padding_drag = (
+                        float(event.position().x()), self._right_padding_bars,
+                        max(self.current_x_range()[1] - self.current_x_range()[0], 1.0),
+                    )
+                    self._pan_anchor_x = None
+                else:
+                    self._right_padding_drag = None
+                    self._pan_anchor_x = float(event.position().x())
                 self._dragging = False
-                point = self.chart().mapToValue(event.position())
-                self.chartPointerPressed.emit(float(point.x()), float(point.y()))
+                if self._right_padding_drag is None:
+                    point = self.chart().mapToValue(event.position())
+                    self.chartPointerPressed.emit(float(point.x()), float(point.y()))
             super().mousePressEvent(event)
 
         def mouseMoveEvent(self, event) -> None:  # noqa: ANN001
             plot_area = self.chart().plotArea()
-            if plot_area.contains(event.position()):
+            if plot_area.contains(event.position()) and self._right_padding_drag is None:
                 self._last_pointer_pos = QPointF(event.position())
                 point = self.chart().mapToValue(event.position())
                 self.chartPointerMoved.emit(float(point.x()), float(point.y()))
@@ -3807,6 +4016,41 @@ if QChartView is not None:
                 self.viewport().update()
                 event.accept()
                 return
+            if (
+                not self._draw_mode_enabled
+                and not self._interaction_locked
+                and self._right_padding_drag is not None
+                and event.buttons() & Qt.MouseButton.LeftButton
+            ):
+                start_x, start_padding, visible_span = self._right_padding_drag
+                if abs(float(event.position().x()) - start_x) >= 4.0:
+                    self._dragging = True
+                if self._dragging:
+                    padding = _right_padding_after_drag(
+                        start_padding_bars=start_padding,
+                        delta_px=float(event.position().x()) - start_x,
+                        plot_width=max(float(plot_area.width()), 1.0),
+                        visible_span_ms=visible_span,
+                        display_step_ms=self._display_step_ms,
+                    )
+                    old_max = self._full_x_max
+                    self._right_padding_bars = padding
+                    self._full_x_max = float(self._display_times_ms[-1]) + _native_right_padding_ms(
+                        self._display_step_ms, padding_bars=self._active_right_padding_bars(),
+                    )
+                    if self._future_projection:
+                        future_bars = self._future_projection.get("bars", [])
+                        future_end = max((float(item.get("time_ms", 0) or 0) for item in future_bars if isinstance(item, dict)), default=0.0)
+                        self._full_x_max = max(self._full_x_max, future_end + self._display_step_ms)
+                    current_min, current_max = self.current_x_range()
+                    shift = self._full_x_max - old_max
+                    new_min, new_max = self._bounded_x_range(current_min + shift, current_max + shift)
+                    self._apply_x_range(new_min, new_max, emit_signal=True)
+                    self._fit_y_axis_to_visible_range()
+                    self._hover_pos = QPointF(event.position())
+                    self.viewport().update()
+                    event.accept()
+                    return
             if (
                 not self._draw_mode_enabled
                 and not self._interaction_locked
@@ -3833,16 +4077,20 @@ if QChartView is not None:
 
         def mouseReleaseEvent(self, event) -> None:  # noqa: ANN001
             plot_area = self.chart().plotArea()
+            was_padding_drag = self._right_padding_drag is not None
             if event.button() == Qt.MouseButton.LeftButton:
                 self._last_pointer_pos = QPointF(event.position())
-                point = self.chart().mapToValue(event.position())
-                self.chartPointerReleased.emit(float(point.x()), float(point.y()))
-                if plot_area.contains(event.position()) and not self._dragging and not self._interaction_locked:
+                if not was_padding_drag:
+                    point = self.chart().mapToValue(event.position())
+                    self.chartPointerReleased.emit(float(point.x()), float(point.y()))
+                if (plot_area.contains(event.position()) and not self._dragging and not self._interaction_locked
+                        and not was_padding_drag):
                     self.chartPointClicked.emit(float(point.x()), float(point.y()))
                 if plot_area.contains(event.position()):
                     event.accept()
             self._press_pos = None
             self._pan_anchor_x = None
+            self._right_padding_drag = None
             self._dragging = False
             super().mouseReleaseEvent(event)
 
@@ -3885,10 +4133,13 @@ if QChartView is not None:
                 self._draw_volume_overlay(painter, plot_area)
                 self._draw_channel_overlays(painter, plot_area)
                 self._draw_box_overlays(painter, plot_area)
+                self._draw_workspace_ray_extensions(painter, plot_area)
                 self._draw_workspace_rr_items(painter, plot_area)
                 self._draw_preview_rr_item(painter, plot_area)
                 self._draw_signal_markers(painter, plot_area)
                 self._draw_history_trade_markers(painter, plot_area)
+                self._draw_area_shape_replay_trades(painter, plot_area)
+                self._draw_future_projection(painter, plot_area)
                 self._draw_selected_line_handles(painter, plot_area)
                 self._draw_preview_line(painter, plot_area)
                 hover_context = self._resolve_hover_context()
@@ -4697,6 +4948,139 @@ if QChartView is not None:
                         line,
                     )
 
+        def _draw_area_shape_replay_trades(self, painter: QPainter, plot_area: QRectF) -> None:
+            if not self._area_shape_replay_trades or not self._candles:
+                return
+            start_x, end_x = self.current_x_range()
+            replay_colors = {
+                ("trade", "long"): QColor("#4ade80"),
+                ("trade", "short"): QColor("#f87171"),
+                ("opportunity", "long"): QColor("#38bdf8"),
+                ("opportunity", "short"): QColor("#c4b5fd"),
+            }
+            font = painter.font()
+            font.setPointSize(8)
+            font.setBold(True)
+            painter.setFont(font)
+            metrics = painter.fontMetrics()
+
+            for trade in self._area_shape_replay_trades:
+                try:
+                    record_type = str(trade.get("record_type", "trade") or "trade").strip().lower()
+                    signal_ts = int(trade.get("signal_ts", 0) or 0)
+                    entry_ts = int(trade.get("entry_ts", 0) or 0)
+                    exit_ts = int(trade.get("exit_ts", 0) or 0)
+                    entry_price = float(trade.get("entry", 0) or 0)
+                    exit_price = float(trade.get("exit", 0) or 0)
+                    net_r = float(trade.get("r", 0) or 0)
+                    space_r = float(trade.get("space_r", 0) or 0)
+                except (TypeError, ValueError):
+                    continue
+                if entry_ts <= 0 or entry_price <= 0:
+                    continue
+                is_opportunity = record_type == "opportunity"
+                marker_ts = signal_ts if is_opportunity and signal_ts > 0 else entry_ts
+                if not is_opportunity and (exit_ts <= 0 or exit_price <= 0):
+                    continue
+                marker_index = self._index_for_candle_time(marker_ts // 1000)
+                entry_index = self._index_for_candle_time(entry_ts // 1000)
+                if not (0 <= entry_index < len(self._candles) and 0 <= marker_index < len(self._candles)):
+                    continue
+
+                side = str(trade.get("side", "long")).strip().lower()
+                side_label = "多" if side == "long" else "空"
+                replay_color = replay_colors.get(
+                    ("opportunity" if is_opportunity else "trade", side),
+                    QColor("#eab308"),
+                )
+                if is_opportunity:
+                    marker_display_x = self._display_times_ms[marker_index]
+                    if marker_display_x < start_x or marker_display_x > end_x:
+                        continue
+                    x_pos = self._x_for_index(marker_index, plot_area)
+                    y_pos = self._y_for_value(entry_price, plot_area)
+                    if side == "long":
+                        marker = QPolygonF((
+                            QPointF(x_pos, y_pos - 7), QPointF(x_pos + 7, y_pos + 6),
+                            QPointF(x_pos - 7, y_pos + 6),
+                        ))
+                    else:
+                        marker = QPolygonF((
+                            QPointF(x_pos, y_pos + 7), QPointF(x_pos + 7, y_pos - 6),
+                            QPointF(x_pos - 7, y_pos - 6),
+                        ))
+                    painter.setPen(QPen(replay_color, 2))
+                    painter.setBrush(QColor("#111827"))
+                    painter.drawPolygon(marker)
+                    label = f"潜在{side_label} · 空间 {space_r:.2f}R"
+                    label_width = float(metrics.horizontalAdvance(label)) + 10.0
+                    label_height = float(metrics.height()) + 6.0
+                    label_x = _clamp(
+                        x_pos + 9.0, float(plot_area.left()) + 2.0,
+                        float(plot_area.right()) - label_width - 2.0,
+                    )
+                    label_y = _clamp(
+                        y_pos - label_height - 8.0 if side == "short" else y_pos + 8.0,
+                        float(plot_area.top()) + 2.0,
+                        float(plot_area.bottom()) - label_height - 2.0,
+                    )
+                    rect = QRectF(label_x, label_y, label_width, label_height)
+                    painter.setPen(QPen(replay_color, 1))
+                    painter.setBrush(QColor("#111827"))
+                    painter.drawRoundedRect(rect, 3.0, 3.0)
+                    painter.setPen(replay_color.lighter(145))
+                    painter.drawText(QPointF(rect.left() + 5.0, rect.top() + metrics.ascent() + 3.0), label)
+                    continue
+
+                exit_index = self._index_for_candle_time(exit_ts // 1000)
+                if not (0 <= exit_index < len(self._candles)):
+                    continue
+                entry_display_x = self._display_times_ms[entry_index]
+                exit_display_x = self._display_times_ms[exit_index]
+                if exit_display_x < start_x or entry_display_x > end_x:
+                    continue
+                entry_x = self._x_for_index(entry_index, plot_area)
+                exit_x = self._x_for_index(exit_index, plot_area)
+                entry_y = self._y_for_value(entry_price, plot_area)
+                exit_y = self._y_for_value(exit_price, plot_area)
+                replay_pen = QPen(replay_color, 2)
+                replay_pen.setStyle(Qt.PenStyle.DashLine)
+                painter.setPen(replay_pen)
+                painter.drawLine(QPointF(entry_x, entry_y), QPointF(exit_x, exit_y))
+
+                for x_pos, price, label, above in (
+                    (entry_x, entry_price, f"回测{side_label}入场", side == "short"),
+                    (exit_x, exit_price, f"回测{side_label}出场 {net_r:+.2f}R", side == "long"),
+                ):
+                    y_pos = self._y_for_value(price, plot_area)
+                    diamond = QPolygonF((
+                        QPointF(x_pos, y_pos - 6), QPointF(x_pos + 6, y_pos),
+                        QPointF(x_pos, y_pos + 6), QPointF(x_pos - 6, y_pos),
+                    ))
+                    painter.setPen(QPen(replay_color, 1.5))
+                    painter.setBrush(QColor("#111827"))
+                    painter.drawPolygon(diamond)
+                    label_width = float(metrics.horizontalAdvance(label)) + 10.0
+                    label_height = float(metrics.height()) + 6.0
+                    label_x = _clamp(
+                        x_pos + 8.0, float(plot_area.left()) + 2.0,
+                        float(plot_area.right()) - label_width - 2.0,
+                    )
+                    label_y = y_pos - label_height - 8.0 if above else y_pos + 8.0
+                    label_y = _clamp(
+                        label_y, float(plot_area.top()) + 2.0,
+                        float(plot_area.bottom()) - label_height - 2.0,
+                    )
+                    label_rect = QRectF(label_x, label_y, label_width, label_height)
+                    painter.setPen(QPen(replay_color, 1))
+                    painter.setBrush(QColor("#111827"))
+                    painter.drawRoundedRect(label_rect, 3.0, 3.0)
+                    painter.setPen(replay_color.lighter(145))
+                    painter.drawText(
+                        QPointF(label_rect.left() + 5.0, label_rect.top() + metrics.ascent() + 3.0),
+                        label,
+                    )
+
         def _draw_channel_overlays(self, painter: QPainter, plot_area: QRectF) -> None:
             if not self._channel_overlays or not self._candles:
                 return
@@ -4794,6 +5178,83 @@ if QChartView is not None:
                 score = int(marker.get("score", 0) or 0)
                 lines.append(f"信号 {label} | 均线距离 {distance:.2f}% | 评分 {score}")
             return tuple(lines)
+
+        def _draw_future_projection(self, painter: QPainter, plot_area: QRectF) -> None:
+            projection = self._future_projection
+            bars = projection.get("bars", []) if isinstance(projection, dict) else []
+            if not isinstance(bars, list) or not bars:
+                return
+            ordered = [item for item in bars if isinstance(item, dict)]
+            if not ordered:
+                return
+            step_width = float(plot_area.width()) * self._display_step_ms / max(self.current_x_range()[1] - self.current_x_range()[0], 1.0)
+            body_width = max(2.0, min(18.0, step_width * 0.68))
+            first_x = self._x_for_display_value(float(ordered[0].get("time_ms", 0) or 0), plot_area)
+            last_x = self._x_for_display_value(float(ordered[-1].get("time_ms", 0) or 0), plot_area)
+            boundary_x = first_x - step_width * 0.5
+            painter.save()
+            painter.setClipRect(plot_area)
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            region_color = QColor("#a78bfa")
+            region_color.setAlpha(14)
+            painter.fillRect(QRectF(boundary_x, plot_area.top(), last_x - boundary_x + step_width * 0.5, plot_area.height()), region_color)
+            boundary_pen = QPen(QColor("#a78bfa"), 1.0, Qt.PenStyle.DashLine)
+            painter.setPen(boundary_pen)
+            painter.drawLine(QPointF(boundary_x, plot_area.top()), QPointF(boundary_x, plot_area.bottom()))
+            outline_color = QColor("#c4b5fd")
+            outline_color.setAlpha(170)
+            for bar in ordered:
+                x = self._x_for_display_value(float(bar.get("time_ms", 0) or 0), plot_area)
+                open_y = self._y_for_value(float(bar.get("open", 0) or 0), plot_area)
+                close_y = self._y_for_value(float(bar.get("close", 0) or 0), plot_area)
+                high_y = self._y_for_value(float(bar.get("high", 0) or 0), plot_area)
+                low_y = self._y_for_value(float(bar.get("low", 0) or 0), plot_area)
+                candle_color = QColor(_CHART_UP_COLOR if float(bar.get("close", 0) or 0) >= float(bar.get("open", 0) or 0) else _CHART_DOWN_COLOR)
+                candle_color.setAlpha(220)
+                painter.setPen(QPen(candle_color, 1.2))
+                painter.drawLine(QPointF(x, high_y), QPointF(x, low_y))
+                body = QRectF(x - body_width / 2, min(open_y, close_y), body_width, max(2.0, abs(close_y - open_y)))
+                candle_color.setAlpha(140)
+                painter.fillRect(body, candle_color)
+                painter.setPen(QPen(outline_color, 1.0))
+                painter.drawRect(body)
+            for ma_type, period, color, width in self._future_ma_specs:
+                if not self._candles:
+                    continue
+                points = _future_moving_average_points(
+                    self._candles, ordered, period, exponential=ma_type == "ema",
+                )
+                if not points:
+                    continue
+                pen = QPen(QColor(color), width)
+                pen.setCosmetic(True)
+                pen.setStyle(Qt.PenStyle.DashLine)
+                painter.setPen(pen)
+                # Keep a visible empty interval between historical and future MAs.
+                previous: QPointF | None = None
+                for time_ms, value in points:
+                    current = QPointF(self._x_for_display_value(time_ms, plot_area), self._y_for_value(value, plot_area))
+                    if previous is not None:
+                        painter.drawLine(previous, current)
+                    previous = current
+            painter.restore()
+            for key, color, label, width, style in (
+                ("entry", "#38bdf8", "入场关键线", 2.2, Qt.PenStyle.SolidLine),
+                ("target", "#34d399", "目标关键线", 1.8, Qt.PenStyle.DashLine),
+                ("stop", "#f87171", "止损参考", 1.2, Qt.PenStyle.DotLine),
+            ):
+                try:
+                    value = float(projection[key])
+                except (KeyError, TypeError, ValueError):
+                    continue
+                y = self._y_for_value(value, plot_area)
+                pen = QPen(QColor(color), width)
+                pen.setStyle(style)
+                painter.setPen(pen)
+                painter.drawLine(QPointF(first_x, y), QPointF(last_x + body_width, y))
+                painter.drawText(QPointF(last_x + body_width + 4, y - 3), f"{label} {value:.2f}")
+            painter.setPen(QColor("#c4b5fd"))
+            painter.drawText(QPointF(first_x, float(plot_area.top()) + 18), f"未来推演 · {projection.get('label', '')}（示意）")
 
         def _draw_workspace_rr_items(self, painter: QPainter, plot_area: QRectF) -> None:
             if not self._workspace_rr_items or not self._candles:
@@ -4961,6 +5422,33 @@ if QChartView is not None:
                 text,
             )
 
+        def _draw_workspace_ray_extensions(self, painter: QPainter, plot_area: QRectF) -> None:
+            if not self._display_times_ms:
+                return
+            painter.save()
+            painter.setClipRect(plot_area)
+            for index, line in enumerate(self._workspace_lines):
+                if line.get("kind") != "ray":
+                    continue
+                start = max(float(self._display_times_ms[-1]), _display_x_for_candle_time(
+                    self._candles, self._display_times_ms, candle_time=int(line.get("time_a", 0) or 0),
+                    display_step_ms=self._display_step_ms,
+                ))
+                x = self._x_for_display_value(start, plot_area)
+                if x >= plot_area.right():
+                    continue
+                color = str(line.get("color", "#1d4ed8")) if line.get("enabled", True) else "#94a3b8"
+                selected = index == self._selected_workspace_line_index
+                pen = QPen(QColor("#38bdf8" if selected else color), 4 if selected else 2)
+                pen.setCosmetic(True)
+                painter.setPen(pen)
+                price = float(line.get("price_a", 0) or 0)
+                if self._axis_y is not None and not self._axis_y.min() <= price <= self._axis_y.max():
+                    continue
+                y = self._y_for_value(price, plot_area)
+                painter.drawLine(QPointF(max(x, plot_area.left()), y), QPointF(plot_area.right(), y))
+            painter.restore()
+
         def _draw_selected_line_handles(self, painter: QPainter, plot_area: QRectF) -> None:
             if not (0 <= self._selected_workspace_line_index < len(self._workspace_lines)):
                 return
@@ -4970,7 +5458,7 @@ if QChartView is not None:
             handle_pen.setCosmetic(True)
             painter.setPen(handle_pen)
             hovered_mode = self._hovered_workspace_drag_mode if self._hovered_workspace_line_index == self._selected_workspace_line_index else None
-            if kind == "horizontal":
+            if kind in {"horizontal", "ray"}:
                 body_visual = _line_handle_visual("move", hovered_drag_mode=hovered_mode)
                 y_pos = self._y_for_value(float(line.get("price_a", 0.0) or 0.0), plot_area)
                 x_pos = float(plot_area.right()) - 18.0
@@ -4978,6 +5466,15 @@ if QChartView is not None:
                 painter.drawEllipse(QPointF(x_pos, y_pos), float(body_visual["radius"]), float(body_visual["radius"]))
                 painter.setBrush(QColor(str(body_visual["inner_fill"])))
                 painter.drawEllipse(QPointF(x_pos, y_pos), 2.2, 2.2)
+                if kind == "ray":
+                    start_time = int(line.get("time_a", 0) or 0)
+                    start_x = self._x_for_display_value(
+                        _display_x_for_candle_time(self._candles, self._display_times_ms, candle_time=start_time, display_step_ms=self._display_step_ms),
+                        plot_area,
+                    )
+                    visual = _line_handle_visual("endpoint_a", hovered_drag_mode=hovered_mode)
+                    painter.setBrush(QColor(str(visual["fill"])))
+                    painter.drawEllipse(QPointF(start_x, y_pos), float(visual["radius"]), float(visual["radius"]))
                 return
             endpoint_points = (
                 ("endpoint_a", int(line.get("time_a", 0) or 0), float(line.get("price_a", 0.0) or 0.0)),
@@ -5010,6 +5507,14 @@ if QChartView is not None:
             if kind == "horizontal":
                 y_pos = self._y_for_value(float(preview_line.get("price_a", 0.0) or 0.0), plot_area)
                 painter.drawLine(QPointF(plot_area.left(), y_pos), QPointF(plot_area.right(), y_pos))
+                return
+            if kind == "ray":
+                y_pos = self._y_for_value(float(preview_line.get("price_a", 0.0) or 0.0), plot_area)
+                start_x = self._x_for_display_value(
+                    _display_x_for_candle_time(self._candles, self._display_times_ms, candle_time=int(preview_line.get("time_a", 0) or 0), display_step_ms=self._display_step_ms),
+                    plot_area,
+                )
+                painter.drawLine(QPointF(start_x, y_pos), QPointF(plot_area.right(), y_pos))
                 return
             endpoint_points = (
                 (int(preview_line.get("time_a", 0) or 0), float(preview_line.get("price_a", 0.0) or 0.0)),
@@ -5075,6 +5580,9 @@ if QChartView is not None:
             shift_x = (float(delta_px) / max(float(plot_width), 1.0)) * current_x_span
             new_x_min = current_x_min - shift_x
             new_x_max = current_x_max - shift_x
+            if self._period.strip().upper() == "1H" and new_x_max > self._full_x_max:
+                padding = math.ceil((new_x_max - float(self._display_times_ms[-1])) / self._display_step_ms)
+                self._set_right_padding_bars(padding)
             new_x_min, new_x_max = self._bounded_x_range(new_x_min, new_x_max)
             self._apply_x_range(new_x_min, new_x_max, emit_signal=True)
             self._fit_y_axis_to_visible_range()
@@ -5099,7 +5607,36 @@ if QChartView is not None:
                     self._period.strip().upper(),
                     _RECENT_VIEW_BARS,
                 ),
+                right_padding_bars=self._active_right_padding_bars(),
             )
+
+        def _active_right_padding_bars(self) -> int:
+            return self._right_padding_bars if self._period.strip().upper() == "1H" else _NATIVE_RIGHT_PADDING_BARS
+
+        def _set_right_padding_bars(self, bars: int) -> None:
+            self._right_padding_bars = int(_clamp(float(bars), 0.0, float(_NATIVE_MAX_RIGHT_PADDING_BARS)))
+            if not self._display_times_ms:
+                return
+            self._full_x_max = float(self._display_times_ms[-1]) + _native_right_padding_ms(
+                self._display_step_ms, padding_bars=self._active_right_padding_bars(),
+            )
+            if self._future_projection:
+                future_bars = self._future_projection.get("bars", [])
+                self._full_x_max = max(self._full_x_max, max(
+                    (float(item.get("time_ms", 0) or 0) + self._display_step_ms for item in future_bars if isinstance(item, dict)),
+                    default=self._full_x_max,
+                ))
+
+        def _is_right_padding_position(self, x: float, plot_area: QRectF) -> bool:
+            if (self._period.strip().upper() != "1H" or self._draw_mode_enabled or self._interaction_locked
+                    or not self._display_times_ms or self._axis_x is None):
+                return False
+            start_x, end_x = self.current_x_range()
+            span = max(end_x - start_x, 1.0)
+            latest_x = float(plot_area.left()) + (
+                (float(self._display_times_ms[-1]) - start_x) / span
+            ) * float(plot_area.width())
+            return float(plot_area.left()) <= latest_x < float(plot_area.right()) and x >= latest_x + 3.0
 
         def _index_for_display_x(self, x_value: float, *, mode: str) -> int:
             if not self._candles or len(self._display_times_ms) <= 1:
@@ -5934,6 +6471,9 @@ class KlineAnalysisWindow(QMainWindow):
         self._loaded_primary_request_key: tuple[Any, ...] | None = None
         self._loader: KlineDataLoader | None = None
         self._retired_loaders: set[QThread] = set()
+        self._area_shape_replay_thread: QThread | None = None
+        self._area_shape_replay_context: tuple[AreaShapePlan, int, tuple[str, ...], str, dict[str, int]] | None = None
+        self._area_shape_replay_overlay: dict[str, Any] | None = None
         self._weekly_cache_backfill_loader: WeeklyCacheBackfillLoader | None = None
         self._history_trade_request_id = 0
         self._active_history_trade_request_id = 0
@@ -5983,6 +6523,7 @@ class KlineAnalysisWindow(QMainWindow):
         self._web = None
         self._native_chart = None
         self._native_chart_view = None
+        self._area_shape_projection: dict[str, Any] | None = None
         self._primary_chart_frame = None
         self._secondary_native_chart = None
         self._secondary_native_chart_view = None
@@ -6033,8 +6574,6 @@ class KlineAnalysisWindow(QMainWindow):
         self._control_tabs: QTabWidget | None = None
         self._layout_context_panel: QFrame | None = None
         self._account_drawer: KlineAccountDrawer | None = None
-        self._orders_drawer_button: QPushButton | None = None
-        self._positions_drawer_button: QPushButton | None = None
         self._chart_fullscreen_button: QPushButton | None = None
         self._chart_fullscreen_enabled = False
         self._chart_fullscreen_restore_body_sizes: list[int] = []
@@ -6081,6 +6620,8 @@ class KlineAnalysisWindow(QMainWindow):
         self._rr_execution_in_flight = False
         self._rr_monitor_cursor = 0
         self._pending_rr_execution_requests: list[dict[str, object]] = []
+        self._pending_rr_activation_plan_ids: set[str] = set()
+        self._rr_execution_clients: dict[tuple[str, str, str], OkxRestClient] = {}
         self._line_trade_execution_queue: list[RRTradePlan] = []
         self._suppress_api_profile_change = False
         self._profile_snapshots: dict[str, dict[str, str]] = {}
@@ -6240,6 +6781,11 @@ class KlineAnalysisWindow(QMainWindow):
             monitor.plan_updated.connect(self._on_area_plan_updated)
             monitor.status_changed.connect(self._on_area_monitor_status)
             self._refresh_area_shape_status()
+            if self._pending_payload is not None and self._native_chart_view is not None:
+                self._restore_area_shape_replay(
+                    self._native_chart_view, symbol=self._selected_symbol(),
+                    period=self._period_combo.currentText(),
+                )
 
     def set_area_shape_execution_monitor(self, monitor: object | None) -> None:
         self._area_shape_execution_monitor = monitor
@@ -6457,6 +7003,9 @@ class KlineAnalysisWindow(QMainWindow):
             QTimer.singleShot(50, lambda: KlineAnalysisWindow._poll_shutdown_loaders(self))
             return
         self._shutdown_complete = True
+        for rr_client in getattr(self, "_rr_execution_clients", {}).values():
+            rr_client.close()
+        self._rr_execution_clients = {}
         callbacks = list(getattr(self, "_shutdown_callbacks", []))
         self._shutdown_callbacks = []
         for callback in callbacks:
@@ -6603,9 +7152,14 @@ class KlineAnalysisWindow(QMainWindow):
         self._ema21.toggled.connect(self._sync_chart_options)
         ma_group_layout.addWidget(self._ema21)
 
+        self._ema21_55_check = QCheckBox("EMA 21/55")
+        self._ema21_55_check.setToolTip("同时显示或隐藏 EMA 21 与 EMA 55。")
+        self._ema21_55_check.toggled.connect(self._sync_chart_options)
+        ma_group_layout.addWidget(self._ema21_55_check)
+
         self._best_parameter_indicators_check = QCheckBox("最佳参数指标")
         self._best_parameter_indicators_check.setToolTip(
-            "显示当前品种已固化的最佳参数均线；会按当前 K 线周期重新计算，开启时隐藏原 EMA 15 / SMA 50。"
+            "显示当前品种已固化的最佳参数均线；会按当前 K 线周期重新计算，开启时隐藏手动选择的均线。"
         )
         self._best_parameter_indicators_check.toggled.connect(self._on_best_parameter_indicators_changed)
 
@@ -6921,13 +7475,6 @@ class KlineAnalysisWindow(QMainWindow):
         self._chart_screenshot_button.clicked.connect(self._copy_chart_screenshot_to_clipboard)
         chart_options_row.addWidget(self._chart_screenshot_button)
 
-        self._orders_drawer_button = QPushButton("委托")
-        self._orders_drawer_button.clicked.connect(lambda: self._show_account_drawer("orders"))
-        chart_options_row.addWidget(self._orders_drawer_button)
-
-        self._positions_drawer_button = QPushButton("持仓")
-        self._positions_drawer_button.clicked.connect(lambda: self._show_account_drawer("positions"))
-        chart_options_row.addWidget(self._positions_drawer_button)
         chart_options_row.addStretch(1)
         view_options_layout.addLayout(chart_options_row)
         view_options_action = QWidgetAction(view_options_menu)
@@ -6968,6 +7515,10 @@ class KlineAnalysisWindow(QMainWindow):
             workspace_row.addWidget(chart_check, 0)
         workspace_row.addStretch(1)
         workspace_row.addWidget(self._trade_recommendation_button, 0)
+        self._account_drawer_button = QPushButton("委托/持仓")
+        self._account_drawer_button.setToolTip("打开下方委托和持仓面板")
+        self._account_drawer_button.clicked.connect(self._toggle_account_drawer)
+        workspace_row.addWidget(self._account_drawer_button, 0)
         workspace_row.addWidget(view_options_button, 0)
         workspace_row.addWidget(load_btn, 0)
         workspace_row.addWidget(self._auto_refresh_btn, 0)
@@ -7043,13 +7594,36 @@ class KlineAnalysisWindow(QMainWindow):
         rr_layout.setContentsMargins(4, 6, 4, 4)
         rr_layout.setSpacing(6)
         control_tabs.addTab(rr_page, "RR交易")
+        self._control_rr_tab_index = control_tabs.indexOf(rr_page)
+
+        # Keep an internal mode value for existing workflow actions; users now
+        # choose the workspace directly with the top-level tabs.
+        self._rr_workspace_mode_combo = QComboBox(self)
+        self._rr_workspace_mode_combo.addItem("直接入场", "direct")
+        self._rr_workspace_mode_combo.addItem("区域形态入场", "area")
+        self._rr_workspace_mode_combo.currentIndexChanged.connect(self._on_rr_workspace_mode_changed)
+        self._rr_workspace_mode_combo.hide()
+        self._rr_workspace_other_status = _WrappedStatusLabel("")
+        self._rr_workspace_other_status.setObjectName("Subtle")
+        self._rr_workspace_other_status.hide()
+        rr_layout.addWidget(self._rr_workspace_other_status)
 
         area_page = QWidget()
         area_layout = QVBoxLayout(area_page)
         area_layout.setContentsMargins(4, 6, 4, 4)
         area_layout.setSpacing(6)
-        control_tabs.addTab(area_page, "区域形态")
+        control_tabs.addTab(area_page, "智能辅助交易")
+        self._control_area_tab_index = control_tabs.indexOf(area_page)
+        self._area_workspace_other_status = _WrappedStatusLabel("")
+        self._area_workspace_other_status.setObjectName("Subtle")
+        self._area_workspace_other_status.hide()
+        area_layout.addWidget(self._area_workspace_other_status)
 
+        area_notice = QLabel("支持纸面演练和 OKX 模拟盘。")
+        area_notice.setObjectName("Subtle")
+        area_notice.setWordWrap(True)
+        area_notice.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        area_layout.addWidget(area_notice)
         self._area_shape_status = QLabel("区域形态：尚未创建计划")
         self._area_shape_status.setObjectName("Subtle")
         self._area_shape_status.setWordWrap(True)
@@ -7070,27 +7644,45 @@ class KlineAnalysisWindow(QMainWindow):
         self._area_shape_mode_combo.currentIndexChanged.connect(self._on_area_shape_mode_changed)
         area_layout.addWidget(self._area_shape_mode_combo)
         self._area_shape_create_button = QPushButton("一键两线")
-        self._area_shape_create_button.setToolTip("在当前1H SWAP图表生成支撑线和压力线；初始取可见价格范围三等分，可拖动校准。")
+        self._area_shape_create_button.setToolTip("快速取最近120根1H K线的最低点和最高点生成两条线；生成后可在图上手工调整。")
         self._area_shape_create_button.clicked.connect(self._create_area_shape_plan)
         self._area_shape_create_button.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
         area_layout.addWidget(self._area_shape_create_button)
+        self._area_shape_auto_button = QPushButton("自动找区域")
+        self._area_shape_auto_button.setToolTip("从最近240根已收盘1H K线中，聚合至少2个确认摆动点识别当前价格下方支撑、上方压力，生成可手调的两条射线；不自动下单，不随行情移动。已有两线时不会覆盖，请先删除草稿和两线。")
+        self._area_shape_auto_button.clicked.connect(self._auto_create_area_shape_plan)
+        self._area_shape_auto_button.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+        area_layout.addWidget(self._area_shape_auto_button)
         self._area_shape_edit_button = QPushButton("调整参数")
         self._area_shape_edit_button.setToolTip("设置方向、单笔风险、最低可用空间、离场模板及高级ATR/成本参数。监控启动后参数冻结。")
         self._area_shape_edit_button.clicked.connect(self._edit_area_shape_plan)
         self._area_shape_edit_button.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
         area_layout.addWidget(self._area_shape_edit_button)
-        self._area_shape_start_button = QPushButton("开始监控")
-        self._area_shape_start_button.setToolTip("纸面模式启动小时级推演；模拟盘先核验账户/合约，再按参数挂GTC线价单并监控触线形态FOK。GTC可在形态确认前成交。")
+        self._area_shape_replay_button = QPushButton("复盘交易")
+        self._area_shape_replay_button.setToolTip(
+            "一次回放多空两侧，列出模拟交易及持仓期间出现的潜在机会。"
+            "计划参数和射线未变时，点击直接打开已保存结果；要更新行情结果，请在窗口中点‘重新复盘’。"
+        )
+        self._area_shape_replay_button.clicked.connect(self._run_area_shape_replay)
+        self._area_shape_replay_button.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+        area_layout.addWidget(self._area_shape_replay_button)
+        self._area_shape_projection_button = QPushButton("未来推演")
+        self._area_shape_projection_button.setToolTip("选择一种1H形态，在图表右侧绘制未来情景K线以及入场、止损和目标线；只作示意，不会下单。")
+        self._area_shape_projection_button.clicked.connect(self._toggle_area_shape_future_projection)
+        self._area_shape_projection_button.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+        area_layout.addWidget(self._area_shape_projection_button)
+        self._area_shape_start_button = QPushButton("启用计划")
+        self._area_shape_start_button.setToolTip("核对方向、入场线和另一条线的盈亏比后启用。每个计划只运行一个方向；模拟盘启用前会显示订单风险确认。")
         self._area_shape_start_button.clicked.connect(self._start_area_shape_monitoring)
         self._area_shape_start_button.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
         area_layout.addWidget(self._area_shape_start_button)
-        self._area_shape_pause_button = QPushButton("暂停计划")
-        self._area_shape_pause_button.setToolTip("暂停新信号；先撤销并核实GTC/活动入场单。已有成交仓位的交易所保护继续由后台维护。")
+        self._area_shape_pause_button = QPushButton("暂停新入场")
+        self._area_shape_pause_button.setToolTip("停止新入场；模拟盘会请求撤销未成交入场单，已有仓位的交易所保护继续运行。")
         self._area_shape_pause_button.clicked.connect(self._pause_area_shape_monitoring)
         self._area_shape_pause_button.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
         area_layout.addWidget(self._area_shape_pause_button)
         self._area_shape_cancel_button = QPushButton("取消计划")
-        self._area_shape_cancel_button.setToolTip("取消当前计划；若OKX仍有活动入场委托，会先请求撤单并等待交易所确认。")
+        self._area_shape_cancel_button.setToolTip("结束当前方向的计划。不会平掉已有仓位，也不会撤销其交易所止盈止损保护。")
         self._area_shape_cancel_button.clicked.connect(self._cancel_area_shape_plan)
         self._area_shape_cancel_button.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
         area_layout.addWidget(self._area_shape_cancel_button)
@@ -7118,15 +7710,21 @@ class KlineAnalysisWindow(QMainWindow):
         self._area_shape_summary.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         self._area_shape_summary.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         area_layout.addWidget(self._area_shape_summary)
+        self._area_shape_plan_details = QLabel("计划参数：请先创建计划并保存参数。")
+        self._area_shape_plan_details.setObjectName("Subtle")
+        self._area_shape_plan_details.setWordWrap(True)
+        self._area_shape_plan_details.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self._area_shape_plan_details.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        area_layout.addWidget(self._area_shape_plan_details)
         area_layout.addStretch(1)
 
-        self._control_area_tab_index = control_tabs.indexOf(area_page)
         self._control_width_policy_snapshot = (
             control.sizePolicy(), control.minimumWidth(),
             control_tabs.sizePolicy(), control_tabs.minimumWidth(),
         )
         control_tabs.currentChanged.connect(self._on_control_tab_changed)
         self._on_control_tab_changed(control_tabs.currentIndex())
+        self._refresh_rr_workspace_other_status("direct")
 
         self._backend_hint = QLabel("")
         self._backend_hint.setObjectName("Subtle")
@@ -7306,16 +7904,36 @@ class KlineAnalysisWindow(QMainWindow):
         drawing_layout.addWidget(self._line_table)
 
         rr_layout.addWidget(QLabel("RR 工作区"))
-        rr_manage_row = QHBoxLayout()
-        save_rr_btn = QPushButton("新增/保存 RR")
+        rr_draw_row = QHBoxLayout()
+        for text, tool in (("RR多", "rr_long"), ("RR空", "rr_short"), ("光标", "none")):
+            button = QPushButton(text)
+            button.clicked.connect(lambda _checked=False, tool=tool: self._set_draw_tool(tool))
+            rr_draw_row.addWidget(button)
+        rr_layout.addLayout(rr_draw_row)
+        rr_workflow_hint = _WrappedStatusLabel("先选 RR多/空，在图上确定入场和止损；选中 RR 后点“交易参数”，保存后再启用交易。")
+        rr_workflow_hint.setObjectName("Subtle")
+        rr_layout.addWidget(rr_workflow_hint)
+        rr_manage_row = QVBoxLayout()
+        rr_manage_top = QHBoxLayout()
+        save_rr_btn = QPushButton("保存 RR")
         save_rr_btn.clicked.connect(self._save_rr_item)
-        rr_manage_row.addWidget(save_rr_btn)
-        remove_rr_btn = QPushButton("删除 RR")
+        rr_manage_top.addWidget(save_rr_btn)
+        edit_rr_btn = QPushButton("交易参数")
+        edit_rr_btn.clicked.connect(self._open_rr_card_for_selected)
+        rr_manage_top.addWidget(edit_rr_btn)
+        rr_manage_row.addLayout(rr_manage_top)
+        rr_manage_bottom = QHBoxLayout()
+        remove_rr_btn = QPushButton("删除 RR 方案")
+        remove_rr_btn.setToolTip(
+            "删除本地 RR 图形和方案；若入场挂单仍未成交，会先撤单。"
+            "已成交仓位不会平仓，已有止盈止损保护会保留。"
+        )
         remove_rr_btn.clicked.connect(self._remove_rr_item)
-        rr_manage_row.addWidget(remove_rr_btn)
+        rr_manage_bottom.addWidget(remove_rr_btn)
         monitor_rr_btn = QPushButton("RR 监控")
         monitor_rr_btn.clicked.connect(self.open_rr_monitor_dialog)
-        rr_manage_row.addWidget(monitor_rr_btn)
+        rr_manage_bottom.addWidget(monitor_rr_btn)
+        rr_manage_row.addLayout(rr_manage_bottom)
         rr_layout.addLayout(rr_manage_row)
 
         rr_risk_row = QHBoxLayout()
@@ -7326,8 +7944,10 @@ class KlineAnalysisWindow(QMainWindow):
             "每笔交易最多按此金额承担止损风险。实际下单风险会受合约最小张数取整影响。"
         )
         rr_risk_row.addWidget(self._rr_risk_edit, 1)
-        rr_risk_row.addWidget(QLabel("默认 100 U；保存 RR 后生效"))
         rr_layout.addLayout(rr_risk_row)
+        rr_risk_note = _WrappedStatusLabel("默认 100 U；保存 RR 后生效。")
+        rr_risk_note.setObjectName("Subtle")
+        rr_layout.addWidget(rr_risk_note)
 
         self._rr_table = QTableWidget(0, 9)
         self._rr_table.setHorizontalHeaderLabels(["方向", "入场", "止损", "止盈", "管理", "R", "K线", "锁定", "风险金"])
@@ -7337,12 +7957,12 @@ class KlineAnalysisWindow(QMainWindow):
         self._rr_table.cellClicked.connect(self._on_rr_table_cell_clicked)
         self._rr_table.cellDoubleClicked.connect(self._on_rr_table_cell_double_clicked)
         self._rr_table.setWordWrap(False)
-        self._rr_table.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._rr_table.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         rr_header = self._rr_table.horizontalHeader()
         rr_header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
-        rr_header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
-        rr_header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
-        rr_header.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
+        rr_header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        rr_header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        rr_header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
         rr_header.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
         rr_header.setSectionResizeMode(5, QHeaderView.ResizeMode.ResizeToContents)
         rr_header.setSectionResizeMode(6, QHeaderView.ResizeMode.ResizeToContents)
@@ -7379,7 +7999,9 @@ class KlineAnalysisWindow(QMainWindow):
         self._rr_execution_mode_combo = QComboBox()
         self._rr_execution_mode_combo.addItem("限价", "limit")
         self._rr_execution_mode_combo.addItem("市价", "market")
-        self._rr_execution_mode_combo.addItem("盘口追单", "chase_best_quote")
+        self._rr_execution_mode_combo.addItem("最优盘口限价（单次）", "chase_best_quote")
+        self._rr_execution_mode_combo.setToolTip("提交时读取一次最优盘口并按限价提交，不会持续追价。")
+        self._rr_management_mode_combo.setToolTip("监控观察到所选 R 档后先移至保本；之后每跨整数 R 锁入前一整数 R，RR 目标止盈保留。")
         self._rr_preview = QLabel("止盈会按入场、止损和 R 倍数自动计算。")
         self._rr_preview.setObjectName("Subtle")
         self._rr_preview.setWordWrap(True)
@@ -7397,24 +8019,28 @@ class KlineAnalysisWindow(QMainWindow):
         rr_form.hide()
 
         rr_layout.addWidget(QLabel("RR 跟踪"))
-        self._rr_tracking_summary = QLabel("选中 RR 后显示入场、止损、止盈和跟踪状态。")
+        self._rr_tracking_summary = _WrappedStatusLabel("选中 RR 后显示入场、止损、止盈和跟踪状态。")
         self._rr_tracking_summary.setObjectName("Subtle")
-        self._rr_tracking_summary.setWordWrap(True)
-        self._rr_tracking_summary.setFixedHeight(60)
         rr_layout.addWidget(self._rr_tracking_summary)
         rr_execution_row = QHBoxLayout()
         self._rr_enable_trade_btn = QPushButton("启用交易")
         self._rr_enable_trade_btn.setObjectName("Primary")
         self._rr_enable_trade_btn.clicked.connect(self._enable_selected_rr_trade)
         rr_execution_row.addWidget(self._rr_enable_trade_btn)
-        self._rr_cancel_trade_btn = QPushButton("取消交易")
+        self._rr_cancel_trade_btn = QPushButton("仅撤销入场挂单")
+        self._rr_cancel_trade_btn.setToolTip(
+            "只撤销此 RR 未成交的入场部分，RR 图形和方案保留；"
+            "不会平仓，已成交仓位和止盈止损保护保留。"
+        )
         self._rr_cancel_trade_btn.clicked.connect(self._cancel_selected_rr_trade)
         rr_execution_row.addWidget(self._rr_cancel_trade_btn)
         rr_layout.addLayout(rr_execution_row)
-        self._rr_condition_status = QLabel("条件单：未启用交易")
+        self._rr_action_status = _WrappedStatusLabel("")
+        self._rr_action_status.setObjectName("Subtle")
+        self._rr_action_status.hide()
+        rr_layout.addWidget(self._rr_action_status)
+        self._rr_condition_status = _WrappedStatusLabel("条件单：未启用交易")
         self._rr_condition_status.setObjectName("Subtle")
-        self._rr_condition_status.setWordWrap(False)
-        self._rr_condition_status.setFixedHeight(24)
         rr_layout.addWidget(self._rr_condition_status)
 
         rr_layout.addWidget(QLabel("事件日志"))
@@ -7504,7 +8130,18 @@ class KlineAnalysisWindow(QMainWindow):
         snapshot = getattr(self, "_control_width_policy_snapshot", None)
         if panel is None or tabs is None or snapshot is None:
             return
-        if int(index) == int(getattr(self, "_control_area_tab_index", -1)):
+        rr_tab_index = int(getattr(self, "_control_rr_tab_index", -1))
+        area_tab_index = int(getattr(self, "_control_area_tab_index", -1))
+        if int(index) in {rr_tab_index, area_tab_index}:
+            mode = "area" if int(index) == area_tab_index else "direct"
+            combo = getattr(self, "_rr_workspace_mode_combo", None)
+            if combo is not None and str(combo.currentData() or "direct") != mode:
+                target = combo.findData(mode)
+                if target >= 0:
+                    combo.blockSignals(True)
+                    combo.setCurrentIndex(target)
+                    combo.blockSignals(False)
+            self._refresh_rr_workspace_other_status(mode)
             panel_policy = panel.sizePolicy()
             panel_policy.setHorizontalPolicy(QSizePolicy.Policy.Ignored)
             panel.setSizePolicy(panel_policy)
@@ -7519,6 +8156,67 @@ class KlineAnalysisWindow(QMainWindow):
         panel.setMinimumWidth(panel_minimum)
         tabs.setSizePolicy(tabs_policy)
         tabs.setMinimumWidth(tabs_minimum)
+
+    def _select_rr_workspace_mode(self, mode: str) -> None:
+        combo = getattr(self, "_rr_workspace_mode_combo", None)
+        if combo is None:
+            return
+        target = combo.findData(str(mode))
+        if target >= 0:
+            if combo.currentIndex() == target:
+                self._on_rr_workspace_mode_changed(target)
+            else:
+                combo.setCurrentIndex(target)
+
+    @Slot(int)
+    def _on_rr_workspace_mode_changed(self, index: int) -> None:
+        combo = getattr(self, "_rr_workspace_mode_combo", None)
+        tabs = getattr(self, "_control_tabs", None)
+        if tabs is None or combo is None:
+            return
+        mode = str(combo.itemData(index) or "direct")
+        target_tab = int(getattr(self, "_control_area_tab_index", -1)) if mode == "area" else int(getattr(self, "_control_rr_tab_index", -1))
+        if target_tab >= 0 and tabs.currentIndex() != target_tab:
+            tabs.setCurrentIndex(target_tab)
+        self._refresh_rr_workspace_other_status(mode)
+
+    def _refresh_rr_workspace_other_status(self, mode: str | None = None) -> None:
+        direct_label = getattr(self, "_rr_workspace_other_status", None)
+        area_label = getattr(self, "_area_workspace_other_status", None)
+        if direct_label is None or area_label is None:
+            return
+        selected_mode = mode or str(self._rr_workspace_mode_combo.currentData() or "direct")
+        label = area_label if selected_mode == "area" else direct_label
+        other_label = direct_label if selected_mode == "area" else area_label
+        other_label.hide()
+        message = ""
+        if selected_mode == "direct":
+            plan = self._current_area_plan()
+            plan_status = str(getattr(plan, "status", "") or "") if plan is not None else ""
+            if plan_status and plan_status not in {"draft", "closed", "cancelled", "expired", "paper_closed"}:
+                message = f"区域形态计划：{plan.status}（切换只改变显示）。"
+            terminal_session_statuses = {"closed", "cancelled", "expired"}
+            sessions = self._area_shape_demo_sessions()
+            active_sessions = [
+                status
+                for item in sessions
+                if (status := str(item.get("status", "") or "")) and status not in terminal_session_statuses
+            ]
+            if active_sessions:
+                session_text = ", ".join(active_sessions[-2:])
+                message = f"{message} {('；' if message else '')}区域模拟盘会话：{session_text}（切换只改变显示）。"
+        else:
+            terminal_rr_statuses = {"closed", "cancelled", "expired"}
+            active_entries = [
+                entry
+                for entry in self._matching_rr_trade_ledger_entries()
+                if str(getattr(entry, "status", "") or "")
+                and str(getattr(entry, "status", "") or "") not in terminal_rr_statuses
+            ]
+            if active_entries:
+                message = f"RR 交易状态：{active_entries[-1].status}（切换只改变显示）。"
+        label.setText(message)
+        label.setVisible(bool(message))
 
     @staticmethod
     def _auto_refresh_interval_ms(period: str) -> int:
@@ -8962,6 +9660,7 @@ class KlineAnalysisWindow(QMainWindow):
     def _on_best_parameter_indicators_changed(self, enabled: bool) -> None:
         self._ema9.setEnabled(not enabled)
         self._ema21.setEnabled(not enabled)
+        self._ema21_55_check.setEnabled(not enabled)
         self._sync_chart_options()
 
     def _runtime_for_task_profile(self, profile_name: str):
@@ -9867,6 +10566,14 @@ class KlineAnalysisWindow(QMainWindow):
         self._account_drawer._schedule_active_table_refresh()
         self._account_drawer.schedule_refresh_data()
 
+    def _toggle_account_drawer(self) -> None:
+        if self._account_drawer is None:
+            return
+        if not self._account_drawer.isHidden():
+            self._collapse_account_drawer()
+            return
+        self._show_account_drawer("orders")
+
     def _collapse_account_drawer(self) -> None:
         if self._account_drawer is None or self._chart_account_splitter is None:
             return
@@ -10073,7 +10780,19 @@ class KlineAnalysisWindow(QMainWindow):
         latest = payload.candles[-1]
         ema9 = payload.ema_9[-1] if payload.ema_9 else None
         ema21 = payload.ema_21[-1] if payload.ema_21 else None
-        self._run_js(f"window.updateRealtimeCandle({json.dumps({'candle': latest, 'ema9': ema9, 'ema21': ema21})});")
+        display_candles = self._display_payload_for_chart(payload, is_secondary=False).candles
+        ema21_fast_points = _ema_chart_points(display_candles, 21)
+        ema55_points = _ema_chart_points(display_candles, 55)
+        realtime_payload = {
+            "candle": latest,
+            "ema9": ema9,
+            "ema21": ema21,
+            "ema21Fast": ema21_fast_points[-1] if ema21_fast_points else None,
+            "ema55": ema55_points[-1] if ema55_points else None,
+        }
+        self._run_js(
+            f"window.updateRealtimeCandle({json.dumps(realtime_payload)});"
+        )
 
     def _apply_realtime_candle_to_native_chart(self, payload: KlineChartPayload) -> None:
         if self._native_chart is None or not payload.candles or QCandlestickSeries is None or QCandlestickSet is None:
@@ -10455,10 +11174,13 @@ class KlineAnalysisWindow(QMainWindow):
             "ema": {
                 "ema9": display_payload.ema_9,
                 "ema21": display_payload.ema_21,
+                "ema21Fast": _ema_chart_points(display_payload.candles, 21),
+                "ema55": _ema_chart_points(display_payload.candles, 55),
             },
             "show": {
                 "ema9": self._ema9.isChecked(),
                 "ema21": self._ema21.isChecked(),
+                "emaPair": self._ema21_55_check.isChecked() and not self._best_parameter_indicators_check.isChecked(),
             },
             "period": period,
             "trend": trend_payload,
@@ -11044,6 +11766,20 @@ class KlineAnalysisWindow(QMainWindow):
             line_specs = (
                 ("EMA 15", payload.ema_9, self._ema9.isChecked(), _CHART_EMA15_COLOR, _EMA15_LINE_WIDTH),
                 ("SMA 50", payload.ema_21, self._ema21.isChecked(), _CHART_SMA50_COLOR, _SMA50_LINE_WIDTH),
+                (
+                    "EMA 21",
+                    _ema_chart_points(candles, 21),
+                    self._ema21_55_check.isChecked(),
+                    _CHART_EMA21_COLOR,
+                    _EMA15_LINE_WIDTH,
+                ),
+                (
+                    "EMA 55",
+                    _ema_chart_points(candles, 55),
+                    self._ema21_55_check.isChecked(),
+                    _CHART_EMA55_COLOR,
+                    _SMA50_LINE_WIDTH,
+                ),
             )
         for label, points, enabled, color, width in line_specs:
             if not enabled:
@@ -11102,7 +11838,22 @@ class KlineAnalysisWindow(QMainWindow):
                 pen.setCosmetic(True)
                 series.setPen(pen)
                 line_values: list[float] = []
+                kind = str(item.get("kind", "horizontal") or "horizontal").strip().lower()
+                ray_start = int(item.get("time_a", 0) or 0) if kind == "ray" else 0
+                if kind == "ray":
+                    start_x = _display_x_for_candle_time(
+                        candles, display_times_ms, candle_time=ray_start, display_step_ms=display_step_ms,
+                    )
+                    start_value = self._display_price_from_logical(
+                        logical_payload, float(item.get("price_a", 0.0) or 0.0), is_secondary=is_secondary,
+                    )
+                    series.append(float(start_x), start_value)
+                    line_values.append(start_value)
+                    min_price = min(min_price, start_value)
+                    max_price = max(max_price, start_value)
                 for candle_index, candle in enumerate(candles):
+                    if kind == "ray" and int(candle["time"]) < ray_start:
+                        continue
                     projected_value = self._display_price_from_logical(
                         logical_payload,
                         float(line_value_at(item, int(candle["time"]))),
@@ -11112,7 +11863,6 @@ class KlineAnalysisWindow(QMainWindow):
                     line_values.append(projected_value)
                     min_price = min(min_price, projected_value)
                     max_price = max(max_price, projected_value)
-                kind = str(item.get("kind", "horizontal") or "horizontal").strip().lower()
                 future_line_time = 0
                 if kind == "horizontal":
                     right_edge_x = float(display_times_ms[-1]) + _native_right_padding_ms(display_step_ms)
@@ -11125,6 +11875,13 @@ class KlineAnalysisWindow(QMainWindow):
                     line_values.append(projected_value)
                     min_price = min(min_price, projected_value)
                     max_price = max(max_price, projected_value)
+                elif kind == "ray":
+                    right_edge_x = float(display_times_ms[-1]) + _native_right_padding_ms(display_step_ms)
+                    projected_value = self._display_price_from_logical(
+                        logical_payload, float(item.get("price_a", 0.0) or 0.0), is_secondary=is_secondary,
+                    )
+                    series.append(right_edge_x, projected_value)
+                    line_values.append(projected_value)
                 else:
                     future_line_time = max(int(item.get("time_a", 0) or 0), int(item.get("time_b", 0) or 0))
                     if future_line_time <= last_candle_time:
@@ -11270,6 +12027,28 @@ class KlineAnalysisWindow(QMainWindow):
                 latest_price=float(candles[-1]["close"]) if candles else None,
                 restore_state=restore_state,
             )
+            if chart_view is self._native_chart_view:
+                if self._best_parameter_indicators_check.isChecked():
+                    future_ma_specs = [
+                        (ma_type, line_period, color, 2)
+                        for _label, ma_type, line_period, color in _best_parameter_indicator_specs(
+                            symbol,
+                            period,
+                            direction_filter=self._history_trade_direction_filter(),
+                        )
+                    ]
+                else:
+                    future_ma_specs = []
+                    if self._ema9.isChecked():
+                        future_ma_specs.append(("ema", 15, _CHART_EMA15_COLOR, _EMA15_LINE_WIDTH))
+                    if self._ema21.isChecked():
+                        future_ma_specs.append(("sma", 50, _CHART_SMA50_COLOR, _SMA50_LINE_WIDTH))
+                    if self._ema21_55_check.isChecked():
+                        future_ma_specs.append(("ema", 21, _CHART_EMA21_COLOR, _EMA15_LINE_WIDTH))
+                        future_ma_specs.append(("ema", 55, _CHART_EMA55_COLOR, _SMA50_LINE_WIDTH))
+                chart_view.set_future_ma_specs(future_ma_specs)
+                self._restore_area_shape_projection(chart_view, symbol=symbol, period=period)
+                self._restore_area_shape_replay(chart_view, symbol=symbol, period=period)
         else:
             axis_x.setRange(
                 QDateTime.fromMSecsSinceEpoch(display_times_ms[0]),
@@ -11325,7 +12104,34 @@ class KlineAnalysisWindow(QMainWindow):
                 return Decimal(str(item.get("price_a", "0")))
         raise ValueError("区域计划关联线已丢失，请重新创建两线草稿")
 
+    def _area_pair_lines_exist(self, plan: AreaShapePlan | None = None) -> bool:
+        target = plan or self._current_area_plan()
+        if target is None:
+            return False
+        records = self._workspace_entry(symbol=target.symbol, period=target.period).get("lines", [])
+        ids = {str(item.get("id", "")) for item in records if isinstance(item, dict)} if isinstance(records, list) else set()
+        return target.support_line_id in ids and target.pressure_line_id in ids
+
+    def _area_shape_initial_ray_time(self) -> int:
+        candles = self._pending_payload.candles if self._pending_payload else []
+        if not candles:
+            return 0
+        times = _build_display_times_ms(candles, "1H")
+        view = self._native_chart_view
+        if (isinstance(view, InteractiveKlineChartView) and view._axis_x is not None
+                and view._period.upper() == "1H" and view._symbol == self._selected_symbol().upper()):
+            left, right = view.current_x_range()
+        else:
+            left, right = _default_native_x_range_with_right_padding(
+                times, display_step_ms=_display_step_ms("1H", candles),
+                right_padding_bars=_one_hour_right_padding_bars(len(candles)),
+            )
+        midpoint = (left + right) / 2
+        index = min(range(len(times)), key=lambda item: abs(times[item] - midpoint))
+        return int(candles[index]["time"])
+
     def _create_area_shape_plan(self) -> None:
+        self._select_rr_workspace_mode("area")
         if self._pending_payload is None or not self._pending_payload.candles:
             self._set_area_shape_status("请先加载1H K线，再创建区域计划。")
             return
@@ -11337,6 +12143,20 @@ class KlineAnalysisWindow(QMainWindow):
             self._set_area_shape_status("区域形态后台服务未连接；计划创建已禁用。")
             return
         prior = self._current_area_plan(draft_only=True)
+        existing_pair_plan = prior or self._current_area_plan()
+        if self._area_pair_lines_exist(existing_pair_plan):
+            if prior is not None:
+                try:
+                    prior.support_price = self._area_line_price(prior.support_line_id)
+                    prior.pressure_price = self._area_line_price(prior.pressure_line_id)
+                    monitor.save_draft(prior)
+                    self._refresh_area_shape_status(prior)
+                except Exception as exc:
+                    self._set_area_shape_status(f"读取已有两线失败：{exc}")
+                    return
+            self._set_area_shape_status("当前计划的一键两线已在图上；此按钮不会重复生成。拖动射线调整，或先删除原计划和两线。")
+            self._sync_area_shape_workflow_actions()
+            return
         context_plans = [
             item for item in self._area_shape_plans()
             if item.symbol == self._selected_symbol().strip().upper()
@@ -11348,19 +12168,20 @@ class KlineAnalysisWindow(QMainWindow):
             config = prior.config if prior is not None else (context_plans[-1].config if context_plans else AreaShapeConfig())
             config.validate()
             candles = self._pending_payload.candles
-            lows = [Decimal(str(item["low"])) for item in candles]
-            highs = [Decimal(str(item["high"])) for item in candles]
+            recent_candles = candles[-120:]
+            lows = [Decimal(str(item["low"])) for item in recent_candles]
+            highs = [Decimal(str(item["high"])) for item in recent_candles]
             low, high = min(lows), max(highs)
             if low <= 0 or high <= low:
-                raise ValueError("当前可见K线范围无效")
-            support = low + (high - low) / Decimal("3")
-            pressure = low + (high - low) * Decimal("2") / Decimal("3")
+                raise ValueError("最近K线高低点无效，无法生成两条线")
+            support = low
+            pressure = high
             workspace = self._workspace_entry(symbol=self._selected_symbol(), period="1H")
             lines = workspace.get("lines")
             if not isinstance(lines, list):
                 lines = []
                 workspace["lines"] = lines
-            now_time = int(candles[-1].get("time", 0) or 0)
+            now_time = self._area_shape_initial_ray_time()
             if prior is not None:
                 support_id, pressure_id = prior.support_line_id, prior.pressure_line_id
                 found_support = found_pressure = False
@@ -11387,22 +12208,882 @@ class KlineAnalysisWindow(QMainWindow):
                     config=config, support_line_id=support_id, pressure_line_id=pressure_id,
                 )
                 lines.extend([
-                    {"id": support_id, "kind": "horizontal", "label": f"区域支撑 · {plan.profile_name}/{plan.environment} · {plan.plan_id[:6]}", "trigger": "touch", "action": "notify", "time_a": now_time, "price_a": float(support), "time_b": now_time, "price_b": float(support), "enabled": False, "color": "#2563eb"},
-                    {"id": pressure_id, "kind": "horizontal", "label": f"区域压力 · {plan.profile_name}/{plan.environment} · {plan.plan_id[:6]}", "trigger": "touch", "action": "notify", "time_a": now_time, "price_a": float(pressure), "time_b": now_time, "price_b": float(pressure), "enabled": False, "color": "#ea580c"},
+                    {"id": support_id, "kind": "ray", "label": f"区域支撑 · {plan.profile_name}/{plan.environment} · {plan.plan_id[:6]}", "trigger": "touch", "action": "notify", "time_a": now_time, "price_a": float(support), "time_b": now_time, "price_b": float(support), "enabled": False, "color": "#2563eb"},
+                    {"id": pressure_id, "kind": "ray", "label": f"区域压力 · {plan.profile_name}/{plan.environment} · {plan.plan_id[:6]}", "trigger": "touch", "action": "notify", "time_a": now_time, "price_a": float(pressure), "time_b": now_time, "price_b": float(pressure), "enabled": False, "color": "#ea580c"},
                 ])
             monitor.save_draft(plan)
             self._save_workspace_snapshot()
             self._populate_line_table()
+            # Workspace line bodies are QLineSeries, not paint-only handles.
+            # Rebuild them now instead of waiting for a timeframe reload.
             self._render_to_chart(self._pending_payload)
             self._refresh_area_shape_status()
             if prior is not None:
                 self._set_status("已定位当前账户草稿的两根区域线；保留原位置，可继续拖动校准。")
             else:
-                self._set_status("已生成一组成对区域线；初始位置取当前可见价格范围三等分，请拖动支撑与压力线校准。")
+                self._set_status(f"已生成一组成对区域线；初始位置取最近 {len(recent_candles)} 根 1H K 线的最低点和最高点，请手工校准。")
         except Exception as exc:
             self._set_area_shape_status(f"无法创建区域计划：{exc}")
 
+    def _auto_create_area_shape_plan(self) -> None:
+        """Create a normal area plan from confirmed, clustered swing zones."""
+        self._select_rr_workspace_mode("area")
+        if self._pending_payload is None or not self._pending_payload.raw_candles:
+            self._set_area_shape_status("请先加载1H K线，再自动找区域。")
+            return
+        if self._period_combo.currentText().strip().upper() != "1H" or not self._selected_symbol().strip().upper().endswith("-SWAP"):
+            self._set_area_shape_status("自动区域计划仅开放在1H SWAP合约图上。")
+            return
+        monitor = getattr(self, "_area_shape_monitor", None)
+        if monitor is None:
+            self._set_area_shape_status("区域形态后台服务未连接；计划创建已禁用。")
+            return
+        current = self._current_area_plan()
+        if current is not None and current.status != "draft":
+            self._set_area_shape_status("当前已有非草稿区域计划；请先结束该计划，再创建自动区域。")
+            return
+        if current is not None and self._area_pair_lines_exist(current):
+            self._set_area_shape_status("当前草稿已有区域线；请先删除当前草稿和两线，再重新自动识别。")
+            return
+        try:
+            candles = [item for item in self._pending_payload.raw_candles if item.confirmed]
+            zones = find_auto_zone_pair(candles)
+            config = current.config if current is not None else AreaShapeConfig()
+            config.validate()
+            if config.direction == "long" and zones.support.price >= zones.resistance.price:
+                raise ValueError("自动支撑压力顺序无效")
+            if zones.support.price <= 0 or zones.resistance.price <= zones.support.price:
+                raise ValueError("自动区域价格关系无效")
+            workspace = self._workspace_entry(symbol=self._selected_symbol(), period="1H")
+            lines = workspace.get("lines")
+            if not isinstance(lines, list):
+                lines = []
+                workspace["lines"] = lines
+            support_id = current.support_line_id if current is not None else uuid4().hex[:10]
+            pressure_id = current.pressure_line_id if current is not None else uuid4().hex[:10]
+            if current is not None:
+                plan = current
+                plan.support_price = zones.support.price
+                plan.pressure_price = zones.resistance.price
+                plan.config = config
+                plan._event(
+                    "auto_zones_detected",
+                    f"自动区域由最近{zones.lookback_bars}根已收盘1H K线识别；支撑簇{zones.support.touches}点，压力簇{zones.resistance.touches}点。",
+                )
+            else:
+                plan = AreaShapePlan.create(
+                    profile_name=self._active_profile_name(), environment=self._active_environment(),
+                    symbol=self._selected_symbol(), support_price=zones.support.price,
+                    pressure_price=zones.resistance.price, config=config,
+                    support_line_id=support_id, pressure_line_id=pressure_id,
+                )
+            now_time = self._area_shape_initial_ray_time()
+            lines.extend([
+                {"id": support_id, "kind": "ray", "label": f"自动支撑({zones.support.touches}) · {plan.plan_id[:6]}", "trigger": "touch", "action": "notify", "time_a": now_time, "price_a": float(zones.support.price), "time_b": now_time, "price_b": float(zones.support.price), "enabled": False, "color": "#2563eb"},
+                {"id": pressure_id, "kind": "ray", "label": f"自动压力({zones.resistance.touches}) · {plan.plan_id[:6]}", "trigger": "touch", "action": "notify", "time_a": now_time, "price_a": float(zones.resistance.price), "time_b": now_time, "price_b": float(zones.resistance.price), "enabled": False, "color": "#ea580c"},
+            ])
+            monitor.save_draft(plan)
+            self._save_workspace_snapshot()
+            self._populate_line_table()
+            self._render_to_chart(self._pending_payload)
+            self._refresh_area_shape_status(plan)
+            message = (
+                f"自动区域已生成：支撑 {zones.support.price}（{zones.support.touches}个确认摆动点），"
+                f"压力 {zones.resistance.price}（{zones.resistance.touches}个确认摆动点）；基于最近 {zones.lookback_bars} 根已收盘1H K线。"
+            )
+            self._set_area_shape_status(message)
+            self._set_status(message)
+        except Exception as exc:
+            self._set_area_shape_status(f"自动识别区域失败：{exc}")
+
+    def _area_shape_replay_signature(self, plan: AreaShapePlan, start_seconds: int) -> str:
+        payload = {
+            "version": 1,
+            "plan_id": plan.plan_id,
+            "symbol": plan.symbol.strip().upper(),
+            "period": plan.period.strip().upper(),
+            "support_line_id": plan.support_line_id,
+            "pressure_line_id": plan.pressure_line_id,
+            "support_price": str(plan.support_price),
+            "pressure_price": str(plan.pressure_price),
+            "start_seconds": int(start_seconds),
+            "config": plan.config.to_dict(),
+        }
+        return json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+    def _area_shape_replay_record(
+        self, plan_id: str, *, symbol: str, period: str,
+    ) -> dict[str, Any] | None:
+        workspace = self._workspace_entry(symbol=symbol, period=period)
+        records = workspace.get("area_replays")
+        if not isinstance(records, dict):
+            return None
+        record = records.get(str(plan_id))
+        return dict(record) if isinstance(record, dict) else None
+
+    def _run_area_shape_replay(self, _checked: bool = False, *, force: bool = False) -> None:
+        if self._area_shape_replay_thread is not None and self._area_shape_replay_thread.isRunning():
+            self._set_area_shape_status("区域复盘正在运行，请等待当前结果。")
+            return
+        plan = self._current_area_plan()
+        if plan is None or self._pending_payload is None:
+            self._set_area_shape_status("请先生成两条射线和区域计划，再运行复盘。")
+            return
+        current_period = self._period_combo.currentText().strip().upper()
+        if current_period != plan.period.strip().upper():
+            self._set_area_shape_status(f"当前图表是 {current_period}，此区域计划按 {plan.period} K 线复盘；请切换到 {plan.period} 后再运行。")
+            return
+        records = self._workspace_entry(symbol=plan.symbol, period=plan.period).get("lines", [])
+        lines = [item for item in records if isinstance(item, dict)] if isinstance(records, list) else []
+        support = next((item for item in lines if item.get("id") == plan.support_line_id), None)
+        pressure = next((item for item in lines if item.get("id") == plan.pressure_line_id), None)
+        if support is None or pressure is None:
+            self._set_area_shape_status("复盘需要两条关联射线都在图上。")
+            return
+        start_seconds = int(support.get("time_a", 0) or 0)
+        if start_seconds != int(pressure.get("time_a", 0) or 0):
+            self._set_area_shape_status("两条射线起点时间不一致；请拖动任一射线起点使它们对齐。")
+            return
+        replay_plan = copy.deepcopy(plan)
+        replay_plan.support_price = Decimal(str(support.get("price_a", plan.support_price)))
+        replay_plan.pressure_price = Decimal(str(pressure.get("price_a", plan.pressure_price)))
+        if replay_plan.support_price <= 0 or replay_plan.pressure_price <= replay_plan.support_price:
+            self._set_area_shape_status("关联射线当前价格无效：支撑价必须低于压力价；请检查两条射线。")
+            return
+        signature = self._area_shape_replay_signature(replay_plan, start_seconds)
+        cached = self._area_shape_replay_record(replay_plan.plan_id, symbol=plan.symbol, period=plan.period)
+        if not force and cached is not None and str(cached.get("input_signature", "")) == signature:
+            self._area_shape_replay_overlay = {
+                "symbol": replay_plan.symbol, "period": replay_plan.period,
+                "input_signature": signature,
+                "rows": list(cached.get("rows", [])),
+                "filters": dict(cached.get("filters", {})) if isinstance(cached.get("filters"), dict) else {},
+            }
+            self._restore_area_shape_replay(
+                self._native_chart_view, symbol=self._selected_symbol(),
+                period=self._period_combo.currentText(), focus=True,
+            )
+            self._set_area_shape_status("正在载入已保存复盘结果，不会重新扫描K线。")
+            self._show_area_shape_replay_results(
+                replay_plan, start_seconds, list(cached.get("rows", [])),
+                sides=("long", "short"), replay_record=cached,
+            )
+            self._set_area_shape_status("已载入保存的多空复盘与潜在机会；筛选器会同步控制图上标记。")
+            return
+
+        candles = [item for item in self._pending_payload.raw_candles if item.confirmed]
+        sides = ("long", "short")
+        range_snapshot = {
+            "first_candle_ts": int(candles[0].ts) if candles else 0,
+            "last_candle_ts": int(candles[-1].ts) if candles else 0,
+            "candle_count": len(candles),
+        }
+        self._area_shape_replay_button.setEnabled(False)
+        self._set_area_shape_status(
+            f"正在一次回放多空两侧 {len(candles)} 根已收盘K线，并扫描持仓期间的潜在机会；"
+            f"本次射线价：支撑 {replay_plan.support_price}，压力 {replay_plan.pressure_price}。"
+        )
+        action = lambda: self._simulate_area_shape_replay(
+            replay_plan, candles, start_ms=start_seconds * 1000, sides=sides,
+        )
+        worker = AreaShapeDemoActionThread(action, self)
+        self._area_shape_replay_thread = worker
+        self._area_shape_replay_context = (replay_plan, start_seconds, sides, signature, range_snapshot)
+        self._retired_loaders.add(worker)
+        worker.completed.connect(self._on_area_shape_replay_worker_completed)
+        worker.failed.connect(self._area_shape_replay_failed)
+        worker.finished.connect(self._on_area_shape_replay_worker_finished)
+        worker.start()
+
+    @Slot()
+    def _on_area_shape_replay_worker_finished(self) -> None:
+        worker = self.sender()
+        self._retired_loaders.discard(worker)
+        if self._area_shape_replay_thread is worker:
+            self._area_shape_replay_thread = None
+        self._area_shape_replay_context = None
+        if not bool(getattr(self, "_shutdown_requested", False)):
+            self._area_shape_replay_button.setEnabled(True)
+        if worker is not None:
+            worker.deleteLater()
+
+    @Slot(str)
+    def _area_shape_replay_failed(self, error: str) -> None:
+        if not bool(getattr(self, "_shutdown_requested", False)):
+            self._set_area_shape_status(f"区域复盘失败：{error}")
+
+    @Slot(object)
+    def _on_area_shape_replay_worker_completed(self, rows: object) -> None:
+        if bool(getattr(self, "_shutdown_requested", False)):
+            return
+        if not isinstance(rows, list):
+            self._set_area_shape_status("区域复盘失败：后台结果格式无效。")
+            return
+        context = self._area_shape_replay_context
+        if context is None:
+            self._set_area_shape_status("区域复盘失败：复盘上下文已失效。")
+            return
+        plan, start_seconds, sides, signature, range_snapshot = context
+        replay_rows = [dict(item) for item in rows if isinstance(item, dict)]
+        previous = self._area_shape_replay_record(plan.plan_id, symbol=plan.symbol, period=plan.period)
+        filters = dict(previous.get("filters", {})) if previous and isinstance(previous.get("filters"), dict) else {"kind": "all", "side": "all"}
+        stored_rows = [
+            {key: str(value) if isinstance(value, Decimal) else value for key, value in item.items()}
+            for item in replay_rows
+        ]
+        workspace = self._workspace_entry(symbol=plan.symbol, period=plan.period)
+        replay_records = workspace.get("area_replays")
+        if not isinstance(replay_records, dict):
+            replay_records = {}
+        replay_records[plan.plan_id] = {
+            "version": 1,
+            "input_signature": signature,
+            "plan_snapshot": plan.to_dict(),
+            "support_price": str(plan.support_price),
+            "pressure_price": str(plan.pressure_price),
+            "start_seconds": int(start_seconds),
+            "data_range": dict(range_snapshot),
+            "sides": list(sides),
+            "filters": filters,
+            "rows": stored_rows,
+            "saved_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+        }
+        workspace["area_replays"] = replay_records
+        self._save_workspace_snapshot()
+        self._area_shape_replay_overlay = {
+            "symbol": plan.symbol.strip().upper(),
+            "period": plan.period.strip().upper(),
+            "input_signature": signature,
+            "rows": stored_rows,
+            "filters": filters,
+        }
+        self._restore_area_shape_replay(
+            self._native_chart_view,
+            symbol=self._selected_symbol(),
+            period=self._period_combo.currentText(),
+            focus=True,
+        )
+        trade_count = sum(1 for item in rows if str(item.get("record_type", "trade")) == "trade")
+        opportunity_count = sum(1 for item in rows if str(item.get("record_type", "trade")) == "opportunity")
+        self._set_area_shape_status(
+            f"区域复盘完成：回测交易 {trade_count} 笔，潜在机会 {opportunity_count} 个。"
+        )
+        self._show_area_shape_replay_results(
+            plan, start_seconds, stored_rows, sides=sides, replay_record=replay_records[plan.plan_id],
+        )
+
+    def _restore_area_shape_replay(
+        self, chart_view: object, *, symbol: str, period: str, focus: bool = False,
+    ) -> None:
+        overlay = self._area_shape_replay_overlay
+        setter = getattr(chart_view, "set_area_shape_replay_trades", None)
+        if not callable(setter):
+            return
+        if overlay is None:
+            plan = self._current_area_plan()
+            if plan is not None and plan.symbol == str(symbol).strip().upper() and plan.period.upper() == str(period).strip().upper():
+                records = self._workspace_entry(symbol=symbol, period=period).get("lines", [])
+                lines = [item for item in records if isinstance(item, dict)] if isinstance(records, list) else []
+                support = next((item for item in lines if item.get("id") == plan.support_line_id), None)
+                pressure = next((item for item in lines if item.get("id") == plan.pressure_line_id), None)
+                if support is not None and pressure is not None:
+                    try:
+                        start_seconds = int(support.get("time_a", 0) or 0)
+                        if start_seconds == int(pressure.get("time_a", 0) or 0):
+                            replay_plan = copy.deepcopy(plan)
+                            replay_plan.support_price = Decimal(str(support.get("price_a", plan.support_price)))
+                            replay_plan.pressure_price = Decimal(str(pressure.get("price_a", plan.pressure_price)))
+                            cached = self._area_shape_replay_record(plan.plan_id, symbol=symbol, period=period)
+                            if cached is not None and cached.get("input_signature") == self._area_shape_replay_signature(replay_plan, start_seconds):
+                                overlay = {
+                                    "symbol": plan.symbol, "period": plan.period,
+                                    "input_signature": str(cached.get("input_signature", "")),
+                                    "rows": list(cached.get("rows", [])),
+                                    "filters": dict(cached.get("filters", {})) if isinstance(cached.get("filters"), dict) else {},
+                                }
+                                self._area_shape_replay_overlay = overlay
+                    except (TypeError, ValueError):
+                        overlay = None
+        if overlay is None:
+            setter(None)
+            return
+        if (
+            str(overlay.get("symbol", "")).strip().upper() != str(symbol).strip().upper()
+            or str(overlay.get("period", "")).strip().upper() != str(period).strip().upper()
+        ):
+            setter(None)
+            self._area_shape_replay_overlay = None
+            return
+        plan = self._current_area_plan()
+        if plan is not None:
+            entry = self._workspace_entry(symbol=symbol, period=period)
+            lines = entry.get("lines", [])
+            lines = [item for item in lines if isinstance(item, dict)] if isinstance(lines, list) else []
+            support = next((item for item in lines if item.get("id") == plan.support_line_id), None)
+            pressure = next((item for item in lines if item.get("id") == plan.pressure_line_id), None)
+            try:
+                if support is None or pressure is None:
+                    raise ValueError("associated rays missing")
+                start_seconds = int(support.get("time_a", 0) or 0)
+                if start_seconds != int(pressure.get("time_a", 0) or 0):
+                    raise ValueError("ray start times differ")
+                current_plan = copy.deepcopy(plan)
+                current_plan.support_price = Decimal(str(support.get("price_a", plan.support_price)))
+                current_plan.pressure_price = Decimal(str(pressure.get("price_a", plan.pressure_price)))
+                if overlay.get("input_signature") != self._area_shape_replay_signature(current_plan, start_seconds):
+                    raise ValueError("replay inputs changed")
+            except (TypeError, ValueError):
+                self._area_shape_replay_overlay = None
+                setter(None)
+                return
+        setter(
+            self._area_shape_replay_filtered_rows(
+                list(overlay.get("rows", [])), overlay.get("filters", {}),
+            ),
+            focus=focus,
+        )
+
+    @staticmethod
+    def _area_shape_replay_filtered_rows(rows: list[dict[str, Any]], filters: object) -> list[dict[str, Any]]:
+        filters = filters if isinstance(filters, dict) else {}
+        kind = str(filters.get("kind", "all") or "all")
+        side = str(filters.get("side", "all") or "all")
+        return [
+            item for item in rows
+            if isinstance(item, dict)
+            and (kind == "all" or str(item.get("record_type", "trade")) == kind)
+            and (side == "all" or str(item.get("side", "")) == side)
+        ]
+
+    def _simulate_area_shape_replay(
+        self, plan: AreaShapePlan, candles: list[Candle], *, start_ms: int, sides: tuple[str, ...],
+    ) -> list[dict[str, object]]:
+        results: list[dict[str, object]] = []
+        if not candles:
+            return results
+        from okx_quant.area_shape_trade import AreaShapePlan as ReplayPlan
+        for side in sides:
+            def make_replay(replay_side: str = side) -> AreaShapePlan:
+                replay_plan = ReplayPlan.from_dict(copy.deepcopy(plan.to_dict()))
+                replay_plan.config = replace(
+                    plan.config, direction=replay_side,
+                    signal_patterns=self._area_shape_replay_patterns(plan.config.signal_patterns, replay_side),
+                )
+                replay_plan.status = "draft"
+                replay_plan.last_candle_ts = 0
+                replay_plan.last_signal_key = ""
+                replay_plan.events = []
+                replay_plan.paper_position = None
+                replay_plan.execution_mode = "paper"
+                replay_plan.activate(
+                    last_closed_candle_ts=start_ms, profile_name=plan.profile_name,
+                    environment=plan.environment,
+                )
+                replay_plan.expires_at_candle_ts = candles[-1].ts + 3_600_000
+                return replay_plan
+
+            replay = make_replay()
+            current_trade: dict[str, object] | None = None
+            scanners: dict[str, AreaShapePlan] = {}
+            scanner_pending: dict[str, dict[str, object]] = {}
+            main_pending: dict[str, object] = {}
+            opportunities: list[dict[str, object]] = []
+            for index, candle in enumerate(candles):
+                if candle.ts <= start_ms:
+                    continue
+                occupied_before_bar = current_trade is not None
+                if occupied_before_bar:
+                    for scanner_side, scanner in scanners.items():
+                        scan_event = scanner.observe(candles[: index + 1])
+                        if scan_event and scan_event.get("kind") == "paper_pending":
+                            scanner_pending[scanner_side] = dict(scanner.paper_position or {})
+                        elif scan_event and scan_event.get("kind") == "paper_entry":
+                            position = dict(scanner.paper_position or scanner_pending.get(scanner_side, {}))
+                            signal_ts = int(position.get("signal_candle_ts", candle.ts) or candle.ts)
+                            opportunities.append({
+                                "record_type": "opportunity", "side": scanner_side,
+                                "pattern": str(scan_event.get("pattern", position.get("pattern", ""))),
+                                "signal_ts": signal_ts,
+                                "entry_ts": int(scan_event.get("candle_ts", candle.ts) or candle.ts),
+                                "entry": Decimal(str(scan_event.get("entry", "0"))),
+                                "stop": Decimal(str(scan_event.get("stop", position.get("stop", "0")))),
+                                "target": Decimal(str(position.get(
+                                    "target", plan.pressure_price if scanner_side == "long" else plan.support_price,
+                                ))),
+                                "risk": Decimal(str(scan_event.get("risk_distance", "0"))),
+                                "space_r": Decimal(str(scan_event.get("space_r", position.get("space_r", "0")))),
+                                "r": None, "pnl": None, "exit": None, "exit_ts": 0,
+                                "outcome": "模拟持仓期间出现，顺序回放未重复开仓",
+                            })
+                            scanner.status = "monitoring"
+                            scanner.paper_position = None
+                            scanner.last_signal_key = ""
+                            scanner.events.clear()
+                            scanner_pending.pop(scanner_side, None)
+
+                event: dict[str, object] | None = None
+                if replay.status in {"paper_position", "paper_break_even", "paper_locked"}:
+                    event = replay.observe_paper_candle(candle)
+                elif replay.status in {"monitoring", "touched", "paper_pending"}:
+                    event = replay.observe(candles[: index + 1])
+                if event and event.get("kind") == "paper_pending":
+                    pending_position = replay.paper_position or {}
+                    main_pending = dict(pending_position)
+                if event and event.get("kind") == "paper_entry":
+                    position = replay.paper_position or main_pending
+                    current_trade = {
+                        "side": side, "pattern": str(event.get("pattern", "")), "entry": Decimal(str(event["entry"])),
+                        "stop": Decimal(str(event.get("stop", "0"))), "risk": Decimal(str(event.get("risk_distance", "0"))),
+                        "entry_ts": int(event.get("candle_ts", candle.ts)),
+                        "signal_ts": int(position.get("signal_candle_ts", candle.ts) or candle.ts),
+                        "record_type": "trade",
+                    }
+                    scanners = {candidate_side: make_replay(candidate_side) for candidate_side in ("long", "short")}
+                    for scanner in scanners.values():
+                        scanner.last_candle_ts = candle.ts
+                    scanner_pending.clear()
+                    main_pending = {}
+                if replay.status == "paper_closed" and current_trade is not None:
+                    exit_event = next((item for item in replay.events if str(item.get("kind", "")).startswith("paper_") and item.get("exit_price") and int(item.get("candle_ts", 0) or 0) == candle.ts), {})
+                    if exit_event:
+                        results.append(self._area_shape_replay_result(plan, current_trade, exit_event))
+                    current_trade = None
+                    replay.status = "monitoring"
+                    replay.paper_position = None
+                    replay.last_candle_ts = candle.ts
+                    replay.last_signal_key = ""
+                    scanners.clear()
+                    scanner_pending.clear()
+            if current_trade is not None:
+                current_trade["exit"] = Decimal(str(candles[-1].close))
+                current_trade["exit_ts"] = candles[-1].ts
+                current_trade["outcome"] = "持仓中"
+                results.append(self._area_shape_replay_result(plan, current_trade, None))
+            trade_entries = {
+                (str(item.get("side", "")), int(item.get("entry_ts", 0) or 0))
+                for item in results
+            }
+            results.extend(
+                item for item in opportunities
+                if (str(item.get("side", "")), int(item.get("entry_ts", 0) or 0)) not in trade_entries
+            )
+        results.sort(key=lambda item: (int(item.get("signal_ts", item.get("entry_ts", 0)) or 0), str(item.get("side", ""))))
+        return results
+
+    @staticmethod
+    def _area_shape_replay_patterns(patterns: tuple[str, ...], side: str) -> tuple[str, ...]:
+        """Mirror selected directional pattern families for the requested side."""
+        pairs = (
+            ("big_bullish", "big_bearish"),
+            ("long_lower_shadow", "long_upper_shadow"),
+            ("double_reversal_up", "double_reversal_down"),
+            ("bottom_fractal", "top_fractal"),
+            ("hammer", "shooting_star"),
+            ("inverted_hammer", "hanging_man"),
+            ("dragonfly_doji", "gravestone_doji"),
+        )
+        counterpart = {name: other for long_name, short_name in pairs for name, other in ((long_name, short_name), (short_name, long_name))}
+        expected = "long" if side == "long" else "short"
+        mapped: list[str] = []
+        for pattern in patterns:
+            if pattern == "inside_bar":
+                candidate = pattern
+            else:
+                candidate = pattern
+                if pattern in counterpart:
+                    is_bullish = pattern in {long_name for long_name, _ in pairs}
+                    if (expected == "long") != is_bullish:
+                        candidate = counterpart[pattern]
+            if candidate not in mapped:
+                mapped.append(candidate)
+        return tuple(mapped)
+
+    def _area_shape_replay_result(
+        self, plan: AreaShapePlan, trade: dict[str, object], exit_event: dict[str, object] | None,
+    ) -> dict[str, object]:
+        entry = Decimal(str(trade["entry"]))
+        stop = Decimal(str(trade["stop"]))
+        risk = Decimal(str(trade["risk"]))
+        side = str(trade["side"])
+        exit_price = Decimal(str(exit_event.get("exit_price"))) if exit_event and exit_event.get("exit_price") else Decimal(str(trade.get("exit", entry)))
+        sign = Decimal("1") if side == "long" else Decimal("-1")
+        gross_r = ((exit_price - entry) * sign / risk) if risk > 0 else Decimal("0")
+        cost_rate = plan.config.round_trip_fee_rate + plan.config.slippage_rate
+        cost_r = ((entry + exit_price) * cost_rate / risk) if risk > 0 else Decimal("0")
+        net_r = gross_r - cost_r
+        pnl = net_r * plan.config.risk_amount
+        return {
+            "side": side, "pattern": str(trade.get("pattern", "")), "entry": entry, "stop": stop,
+            "exit": exit_price, "r": net_r, "pnl": pnl, "entry_ts": int(trade.get("entry_ts", 0) or 0),
+            "signal_ts": int(trade.get("signal_ts", trade.get("entry_ts", 0)) or 0),
+            "record_type": "trade",
+            "exit_ts": int(exit_event.get("candle_ts", 0) if exit_event else trade.get("exit_ts", 0) or 0),
+            "outcome": str(exit_event.get("kind", "持仓中")) if exit_event else str(trade.get("outcome", "持仓中")),
+        }
+
+    def _show_area_shape_replay_results(
+        self, plan: AreaShapePlan, start_seconds: int, rows: list[dict[str, object]], *,
+        sides: tuple[str, ...] = (), replay_record: dict[str, Any] | None = None,
+    ) -> None:
+        dialog = QDialog(self)
+        dialog.setWindowTitle("区域计划复盘结果")
+        dialog.resize(1220, 620)
+        layout = QVBoxLayout(dialog)
+        trade_rows = [item for item in rows if str(item.get("record_type", "trade")) == "trade"]
+        opportunity_rows = [item for item in rows if str(item.get("record_type", "trade")) == "opportunity"]
+        pnl_total = sum((Decimal(str(item.get("pnl", "0") or "0")) for item in trade_rows), Decimal("0"))
+        net_r_total = sum((Decimal(str(item.get("r", "0") or "0")) for item in trade_rows), Decimal("0"))
+        summary = QLabel(
+            f"{plan.symbol} | 起点 {_format_bar_time(start_seconds)} | "
+            f"<span style='color:#15803d'>回测交易 {len(trade_rows)} 笔</span> | "
+            f"<span style='color:#6d28d9'>潜在机会 {len(opportunity_rows)} 个</span> | "
+            f"支撑 {self._format_area_shape_price(plan.support_price, plan.symbol)} / "
+            f"压力 {self._format_area_shape_price(plan.pressure_price, plan.symbol)} | "
+            f"估算净盈亏 {format_decimal_fixed(pnl_total, places=2)} U / "
+            f"净R {format_decimal_fixed(net_r_total, places=2)}R（按单笔风险预算折算；含配置手续费/滑点，不含资金费）",
+            dialog,
+        )
+        summary.setWordWrap(True)
+        layout.addWidget(summary)
+
+        filter_layout = QHBoxLayout()
+        kind_filter = QComboBox(dialog)
+        kind_filter.addItem("全部记录", "all")
+        kind_filter.addItem("回测交易", "trade")
+        kind_filter.addItem("潜在机会", "opportunity")
+        side_filter = QComboBox(dialog)
+        side_filter.addItem("多空一起", "all")
+        side_filter.addItem("只看做多", "long")
+        side_filter.addItem("只看做空", "short")
+        saved_filters = replay_record.get("filters", {}) if isinstance(replay_record, dict) else {}
+        saved_filters = saved_filters if isinstance(saved_filters, dict) else {}
+        for combo, key in ((kind_filter, "kind"), (side_filter, "side")):
+            index = combo.findData(str(saved_filters.get(key, "all")))
+            combo.setCurrentIndex(max(0, index))
+        filter_layout.addWidget(QLabel("类型", dialog))
+        filter_layout.addWidget(kind_filter)
+        filter_layout.addWidget(QLabel("方向", dialog))
+        filter_layout.addWidget(side_filter)
+        filter_layout.addWidget(QLabel(
+            "图上和表格颜色：<span style='color:#15803d'>多头回测</span> / "
+            "<span style='color:#b91c1c'>空头回测</span> / "
+            "<span style='color:#0369a1'>潜在多头</span> / "
+            "<span style='color:#6d28d9'>潜在空头</span>；菱形为回测，三角为潜在机会。筛选同步控制图上显示。",
+            dialog,
+        ), 1)
+        layout.addLayout(filter_layout)
+
+        table = QTableWidget(0, 10, dialog)
+        table.setHorizontalHeaderLabels(["记录", "方向", "形态", "信号时间", "入场时间", "入场价", "止损", "退出/目标参考", "净R/空间R", "估算U/说明"])
+        table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        table.verticalHeader().setVisible(False)
+        header = table.horizontalHeader()
+        header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        for column, width in enumerate((88, 52, 100, 140, 140, 90, 90, 120, 100, 220)):
+            table.setColumnWidth(column, width)
+        table.horizontalHeader().setStretchLastSection(True)
+        layout.addWidget(table)
+
+        def populate_table() -> list[dict[str, object]]:
+            visible = self._area_shape_replay_filtered_rows(
+                rows, {"kind": kind_filter.currentData(), "side": side_filter.currentData()},
+            )
+            table.setRowCount(len(visible))
+            for row_index, item in enumerate(visible):
+                opportunity = str(item.get("record_type", "trade")) == "opportunity"
+                try:
+                    reference_price = item.get("target") if opportunity else item.get("exit")
+                    reference_text = self._format_area_shape_price(Decimal(str(reference_price)), plan.symbol) if reference_price is not None else "—"
+                    net_or_space = Decimal(str(item.get("space_r", "0") if opportunity else item.get("r", "0")))
+                    net_or_space_text = f"空间 {format_decimal_fixed(net_or_space, places=2)}R" if opportunity else f"{format_decimal_fixed(net_or_space, places=2)}R"
+                    pnl_value = item.get("pnl")
+                    amount_text = str(item.get("outcome", "潜在机会")) if opportunity else format_decimal_fixed(Decimal(str(pnl_value or "0")), places=2)
+                    values = (
+                        "潜在机会" if opportunity else "回测交易",
+                        "多" if item.get("side") == "long" else "空",
+                        _REPLAY_SIGNAL_LABELS.get(str(item.get("pattern", "")), str(item.get("pattern", ""))),
+                        _format_bar_time(int(item.get("signal_ts", item.get("entry_ts", 0)) or 0) // 1000),
+                        _format_bar_time(int(item.get("entry_ts", 0) or 0) // 1000),
+                        self._format_area_shape_price(Decimal(str(item.get("entry", "0"))), plan.symbol),
+                        self._format_area_shape_price(Decimal(str(item.get("stop", "0"))), plan.symbol),
+                        reference_text,
+                        net_or_space_text,
+                        amount_text,
+                    )
+                    palette = (
+                        ("#0369a1", "#effaff") if opportunity and item.get("side") == "long" else
+                        ("#6d28d9", "#f5f0ff") if opportunity else
+                        ("#15803d", "#eef9f1") if item.get("side") == "long" else
+                        ("#b91c1c", "#fff1f0")
+                    )
+                    for column, value in enumerate(values):
+                        cell = QTableWidgetItem(str(value))
+                        cell.setForeground(QColor(palette[0]))
+                        cell.setBackground(QColor(palette[1]))
+                        table.setItem(row_index, column, cell)
+                except (TypeError, ValueError):
+                    continue
+            return visible
+
+        def apply_filters(*_args: object) -> None:
+            filters = {"kind": str(kind_filter.currentData()), "side": str(side_filter.currentData())}
+            if self._area_shape_replay_overlay is not None:
+                self._area_shape_replay_overlay["filters"] = filters
+            visible = populate_table()
+            chart = self._native_chart_view
+            setter = getattr(chart, "set_area_shape_replay_trades", None)
+            if callable(setter):
+                setter(visible)
+            cache = self._area_shape_replay_record(plan.plan_id, symbol=plan.symbol, period=plan.period)
+            if cache is not None:
+                cache["filters"] = filters
+                self._workspace_entry(symbol=plan.symbol, period=plan.period).setdefault("area_replays", {})[plan.plan_id] = cache
+                self._save_workspace_snapshot()
+
+        populate_table()
+        kind_filter.currentIndexChanged.connect(apply_filters)
+        side_filter.currentIndexChanged.connect(apply_filters)
+        if not rows:
+            empty_state = QLabel(
+                "起点之后没有符合条件的回测交易或潜在机会；触线、所选形态、止损关系与最低目标空间均按当前计划检查。数据共 "
+                f"{sum(1 for candle in self._pending_payload.raw_candles if candle.confirmed) if self._pending_payload else 0} 根已收盘K线。"
+                "可以调整两条射线或计划参数后重新复盘。",
+                dialog,
+            )
+            empty_state.setWordWrap(True)
+            layout.addWidget(empty_state)
+        data_range = replay_record.get("data_range", {}) if isinstance(replay_record, dict) else {}
+        data_range = data_range if isinstance(data_range, dict) else {}
+        first_data = int(data_range.get("first_candle_ts", 0) or 0)
+        last_data = int(data_range.get("last_candle_ts", 0) or 0)
+        range_note = (
+            f"数据范围 {_format_bar_time(first_data // 1000) if first_data else '—'} 至 {_format_bar_time(last_data // 1000) if last_data else '—'}；"
+            "只统计起点右侧已收盘K线，同一根K线同时触及止盈止损时按止损先发生。结果为纸面估算，不代表真实成交。"
+        )
+        layout.addWidget(QLabel(range_note, dialog))
+        buttons = QHBoxLayout()
+        rerun_button = QPushButton("重新复盘", dialog)
+        close_button = QPushButton("关闭", dialog)
+        rerun_button.clicked.connect(lambda _checked=False: (dialog.accept(), self._run_area_shape_replay(force=True)))
+        close_button.clicked.connect(dialog.accept)
+        buttons.addStretch(1)
+        buttons.addWidget(rerun_button)
+        buttons.addWidget(close_button)
+        layout.addLayout(buttons)
+        dialog.exec()
+
+    def _toggle_area_shape_future_projection(self) -> None:
+        chart = self._native_chart_view
+        if not isinstance(chart, InteractiveKlineChartView) or self._pending_payload is None:
+            self._set_area_shape_status("当前图表不支持未来推演绘制。")
+            return
+        if self._area_shape_projection is not None:
+            self._area_shape_projection = None
+            chart.set_future_projection(None)
+            self._area_shape_projection_button.setText("未来推演")
+            return
+        plan = self._current_area_plan()
+        if plan is None:
+            self._set_area_shape_status("请先创建区域计划并保存参数，再选择形态进行未来推演。")
+            return
+        dialog = QDialog(self)
+        dialog.setWindowTitle("未来形态推演")
+        form = QFormLayout(dialog)
+        direction_combo = QComboBox(dialog)
+        direction_combo.addItem("做多（下方支撑为入场线）", "long")
+        direction_combo.addItem("做空（上方压力为入场线）", "short")
+        direction_combo.setCurrentIndex(direction_combo.findData(plan.config.direction))
+        pattern_combo = QComboBox(dialog)
+        patterns_by_side = {
+            "long": ("big_bullish", "long_lower_shadow", "double_reversal_up", "inside_bar", "bottom_fractal"),
+            "short": ("big_bearish", "long_upper_shadow", "double_reversal_down", "inside_bar", "top_fractal"),
+        }
+
+        def refresh_projection_patterns() -> None:
+            side = str(direction_combo.currentData())
+            previous = pattern_combo.currentData()
+            pattern_combo.clear()
+            for pattern_id in patterns_by_side[side]:
+                pattern_combo.addItem(_REPLAY_SIGNAL_LABELS[pattern_id], pattern_id)
+            index = pattern_combo.findData(previous)
+            if index >= 0:
+                pattern_combo.setCurrentIndex(index)
+
+        direction_combo.currentIndexChanged.connect(refresh_projection_patterns)
+        refresh_projection_patterns()
+        horizon = QSpinBox(dialog)
+        horizon.setRange(4, 40)
+        horizon.setValue(12)
+        form.addRow("推演方向", direction_combo)
+        form.addRow("形态", pattern_combo)
+        form.addRow("推演K线根数", horizon)
+        form.addRow(QLabel("推演会参考近期真实K线的波动，再将所选形态放到对应关键线附近；仅为情景示意，不是预测。", dialog))
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel, parent=dialog)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        form.addRow(buttons)
+        if dialog.exec() != QDialog.DialogCode.Accepted or pattern_combo.currentData() is None:
+            return
+        projection = self._build_area_shape_projection(
+            plan, str(pattern_combo.currentData()), horizon.value(), str(direction_combo.currentData()),
+        )
+        projection["_context_symbol"] = self._selected_symbol().strip().upper()
+        projection["_context_period"] = self._period_combo.currentText().strip().upper()
+        self._area_shape_projection = projection
+        chart.set_future_projection(projection)
+        self._area_shape_projection_button.setText("清除推演")
+
+    def _restore_area_shape_projection(self, chart_view: object, *, symbol: str, period: str) -> None:
+        projection = self._area_shape_projection
+        if projection is None:
+            return
+        if (
+            str(projection.get("_context_symbol", "")).strip().upper() != str(symbol).strip().upper()
+            or str(projection.get("_context_period", "")).strip().upper() != str(period).strip().upper()
+        ):
+            self._area_shape_projection = None
+            if self._area_shape_projection_button is not None:
+                self._area_shape_projection_button.setText("未来推演")
+            return
+        setter = getattr(chart_view, "set_future_projection", None)
+        if callable(setter):
+            setter(projection)
+
+    def _build_area_shape_projection(
+        self, plan: AreaShapePlan, pattern: str, horizon: int, direction: str | None = None,
+    ) -> dict[str, object]:
+        candles = self._pending_payload.candles if self._pending_payload else []
+        if not candles:
+            return {"label": _REPLAY_SIGNAL_LABELS.get(pattern, pattern), "bars": []}
+        side = direction if direction in {"long", "short"} else plan.config.direction
+        recent = candles[-max(3, plan.config.atr_period):]
+        latest = candles[-1]
+        ranges = [max(0.0, float(item["high"]) - float(item["low"])) for item in recent]
+        atr_value = max(sum(ranges) / max(len(ranges), 1), float(latest["close"]) * 0.001)
+        entry = float(plan.support_price if side == "long" else plan.pressure_price)
+        target = float(plan.pressure_price if side == "long" else plan.support_price)
+        step_seconds = _display_step_ms("1H", candles) // 1000
+        latest_time = int(latest["time"])
+        start_price = float(latest["close"])
+        bars: list[dict[str, float]] = []
+        shape_bars = 3 if pattern in {"bottom_fractal", "top_fractal"} else 2 if pattern in {
+            "double_reversal_up", "double_reversal_down", "false_breakdown", "false_breakout", "inside_bar",
+        } else 1
+        approach_bars = max(1, horizon - shape_bars)
+        source = candles[-min(len(candles), max(approach_bars, 8)):]
+        source_ranges = [max(0.0, float(item["high"]) - float(item["low"])) for item in source]
+        source_atr = max(sum(source_ranges) / max(len(source_ranges), 1), 1e-12)
+        scale = min(2.0, max(0.35, atr_value / source_atr))
+        side_sign = 1 if side == "long" else -1
+        if pattern in {"bottom_fractal", "top_fractal"}:
+            first_open_offset = 0.26
+        elif pattern in {"double_reversal_up", "double_reversal_down", "false_breakdown", "false_breakout"}:
+            first_open_offset = 0.32
+        elif pattern in {"long_lower_shadow", "long_upper_shadow"}:
+            first_open_offset = 0.18
+        else:
+            first_open_offset = 0.22 if pattern == "inside_bar" else 0.12
+        approach_end = entry + side_sign * atr_value * first_open_offset
+        distance = abs(approach_end - start_price)
+        travel_sign = 1 if approach_end > start_price else -1
+        samples = [source[(len(source) - approach_bars + index) % len(source)] for index in range(approach_bars)]
+        weights = [
+            max(abs(float(item["close"]) - float(item["open"])),
+                (float(item["high"]) - float(item["low"])) * 0.25, source_atr * 0.1)
+            for item in samples
+        ]
+        # Keep the sampled rhythm, with a few pullbacks even when the source is one-sided.
+        pullbacks = [
+            index for index in range(1, approach_bars - 1)
+            if (float(samples[index]["close"]) - float(samples[index]["open"])) * travel_sign < 0
+        ][:max(1, approach_bars // 3)]
+        if not pullbacks:
+            pullbacks = list(range(1, approach_bars - 1, 3))
+        pullback_size = min(atr_value * 0.45, max(atr_value * 0.12, distance / approach_bars * 0.45))
+        pullback_weight = sum(weights[index] for index in pullbacks)
+        trend_weight = sum(weight for index, weight in enumerate(weights) if index not in pullbacks)
+        pullback_total = pullback_size * len(pullbacks)
+        previous_close = start_price
+        for index, source_bar in enumerate(samples):
+            open_price = previous_close
+            if index in pullbacks:
+                move = -travel_sign * pullback_total * weights[index] / pullback_weight
+            else:
+                move = travel_sign * (distance + pullback_total) * weights[index] / trend_weight
+            close = previous_close + move
+            if index == approach_bars - 1:
+                close = approach_end
+            # Keep the approach on the near side of the trigger; the selected setup reaches it.
+            gap = max(atr_value * 0.06, entry * 0.00005)
+            if side == "long" and start_price > entry:
+                close = max(entry + gap, close)
+            elif side == "short" and start_price < entry:
+                close = min(entry - gap, close)
+            wick_limit = max(atr_value * 0.18, abs(close - open_price) * 0.65)
+            high_wick = min(wick_limit, max(0.0, float(source_bar["high"]) - max(float(source_bar["open"]), float(source_bar["close"]))) * scale)
+            low_wick = min(wick_limit, max(0.0, min(float(source_bar["open"]), float(source_bar["close"])) - float(source_bar["low"])) * scale)
+            high = max(open_price, close) + max(high_wick, atr_value * 0.04)
+            low = min(open_price, close) - max(low_wick, atr_value * 0.04)
+            if side == "long" and start_price > entry:
+                low = max(low, entry + gap)
+            elif side == "short" and start_price < entry:
+                high = min(high, entry - gap)
+            bars.append({"time_ms": float((latest_time + step_seconds * (index + 1)) * 1000),
+                         "open": open_price, "high": high, "low": low, "close": close})
+            previous_close = close
+        bullish = side == "long"
+        direction_sign = 1.0 if bullish else -1.0
+
+        def append_bar(open_price: float, close: float, high: float, low: float) -> None:
+            index = len(bars) + 1
+            bars.append({"time_ms": float((latest_time + step_seconds * index) * 1000),
+                         "open": open_price, "high": max(high, open_price, close),
+                         "low": min(low, open_price, close), "close": close})
+
+        if pattern in {"bottom_fractal", "top_fractal"}:
+            if bullish:
+                append_bar(entry + atr_value * 0.26, entry + atr_value * 0.08, entry + atr_value * 0.36, entry - atr_value * 0.18)
+                append_bar(entry + atr_value * 0.08, entry + atr_value * 0.16, entry + atr_value * 0.24, entry - atr_value * 0.65)
+                append_bar(entry + atr_value * 0.16, entry + atr_value * 0.48, entry + atr_value * 0.58, entry - atr_value * 0.14)
+            else:
+                append_bar(entry - atr_value * 0.26, entry - atr_value * 0.08, entry + atr_value * 0.18, entry - atr_value * 0.36)
+                append_bar(entry - atr_value * 0.08, entry - atr_value * 0.16, entry + atr_value * 0.65, entry - atr_value * 0.24)
+                append_bar(entry - atr_value * 0.16, entry - atr_value * 0.48, entry + atr_value * 0.14, entry - atr_value * 0.58)
+        elif pattern in {"double_reversal_up", "double_reversal_down", "false_breakdown", "false_breakout"}:
+            if bullish:
+                append_bar(entry + atr_value * 0.32, entry - atr_value * 0.20, entry + atr_value * 0.44, entry - atr_value * 0.56)
+                append_bar(entry - atr_value * 0.20, entry + atr_value * 0.42, entry + atr_value * 0.56, entry - atr_value * 0.28)
+            else:
+                append_bar(entry - atr_value * 0.32, entry + atr_value * 0.20, entry + atr_value * 0.56, entry - atr_value * 0.44)
+                append_bar(entry + atr_value * 0.20, entry - atr_value * 0.42, entry + atr_value * 0.28, entry - atr_value * 0.56)
+        elif pattern in {"long_lower_shadow", "long_upper_shadow"}:
+            if bullish:
+                append_bar(entry + atr_value * 0.18, entry + atr_value * 0.34, entry + atr_value * 0.48, entry - atr_value * 0.78)
+            else:
+                append_bar(entry - atr_value * 0.18, entry - atr_value * 0.34, entry + atr_value * 0.78, entry - atr_value * 0.48)
+        elif pattern == "inside_bar":
+            if bullish:
+                append_bar(entry + atr_value * 0.22, entry - atr_value * 0.12, entry + atr_value * 0.52, entry - atr_value * 0.46)
+                append_bar(entry - atr_value * 0.12, entry + atr_value * 0.20, entry + atr_value * 0.32, entry - atr_value * 0.28)
+            else:
+                append_bar(entry - atr_value * 0.22, entry + atr_value * 0.12, entry + atr_value * 0.46, entry - atr_value * 0.52)
+                append_bar(entry + atr_value * 0.12, entry - atr_value * 0.20, entry + atr_value * 0.28, entry - atr_value * 0.32)
+        else:  # Big directional candle
+            open_price = entry + direction_sign * atr_value * 0.12
+            close = entry + direction_sign * atr_value * 0.98
+            append_bar(open_price, close, max(open_price, close) + atr_value * 0.12, min(open_price, close) - atr_value * 0.26)
+        signal_lows = [item["low"] for item in bars[-3:]]
+        signal_highs = [item["high"] for item in bars[-3:]]
+        stop_base = min(signal_lows) if side_sign > 0 else max(signal_highs)
+        stop = stop_base - atr_value * float(plan.config.stop_offset_atr) if side_sign > 0 else stop_base + atr_value * float(plan.config.stop_offset_atr)
+        return {"label": _REPLAY_SIGNAL_LABELS.get(pattern, pattern), "bars": bars,
+                "entry": entry, "stop": stop, "target": target, "direction": side,
+                "support": float(plan.support_price), "pressure": float(plan.pressure_price),
+                "approach_bars": approach_bars}
+
     def _edit_area_shape_plan(self) -> None:
+        self._select_rr_workspace_mode("area")
         plan = self._current_area_plan()
         if plan is None:
             self._set_area_shape_status("请先一键生成两线草稿。")
@@ -11410,7 +13091,9 @@ class KlineAnalysisWindow(QMainWindow):
         if plan.status != "draft":
             self._set_area_shape_status("计划参数已随监控冻结；请结束此计划后新建草稿。")
             return
-        dialog = AreaShapeConfigDialog(plan.config, self)
+        dialog = AreaShapeConfigDialog(
+            plan.config, self, support_price=plan.support_price, pressure_price=plan.pressure_price,
+        )
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
         try:
@@ -11423,6 +13106,7 @@ class KlineAnalysisWindow(QMainWindow):
             self._set_area_shape_status(f"无法保存区域参数：{exc}")
 
     def _start_area_shape_monitoring(self) -> None:
+        self._select_rr_workspace_mode("area")
         mode = str(self._area_shape_mode_combo.currentData() or "paper")
         plan = self._current_area_plan(draft_only=True)
         if plan is None:
@@ -11455,6 +13139,25 @@ class KlineAnalysisWindow(QMainWindow):
             support = self._area_line_price(plan.support_line_id)
             pressure = self._area_line_price(plan.pressure_line_id)
             plan.config.validate()
+            direction_text = "做多" if plan.config.direction == "long" else "做空"
+            entry_line = f"下方支撑线 {support}" if plan.config.direction == "long" else f"上方压力线 {pressure}"
+            target_line = f"上方压力线 {pressure}" if plan.config.direction == "long" else f"下方支撑线 {support}"
+            mode_text = "纸面演练，不发送订单" if mode == "paper" else "OKX 模拟盘，可能提交模拟委托"
+            confirmation_text = (
+                f"方向：{direction_text}\n入场参考：{entry_line}\n"
+                f"盈亏比校验：{target_line}（最低 {plan.config.min_space_r}R）\n"
+                f"执行：{mode_text}\n\n确认启用此计划？"
+            )
+            if mode == "demo" and plan.config.resting_entry_enabled:
+                confirmation_text += "\n\n模拟盘会同时挂入场线 GTC；它可能在 1H 形态确认前成交。"
+            accepted = QMessageBox.question(
+                self, "启用区域计划", confirmation_text,
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if accepted != QMessageBox.StandardButton.Yes:
+                self._set_area_shape_status("已取消启用；计划保持原状态。")
+                return
             if plan.status == "draft":
                 plan.support_price, plan.pressure_price = support, pressure
                 self._area_shape_monitor.save_draft(plan)
@@ -11467,11 +13170,20 @@ class KlineAnalysisWindow(QMainWindow):
                 session = self._area_shape_demo_session_for_plan(plan)
                 if session is not None:
                     if session.get("status") == "paused":
+                        def _resume_demo_plan():
+                            resumed = execution_monitor.resume_session(
+                                str(session["session_id"]), runtime=runtime, unlocked=True,
+                            )
+                            self._area_shape_monitor.start_plan(
+                                plan.plan_id, last_closed_candle_ts=last_closed_ts,
+                                profile_name=profile_name, environment=plan.environment,
+                                execution_mode="demo_exchange",
+                            )
+                            return resumed
+
                         self._run_area_shape_demo_action(
                             "恢复模拟盘监控",
-                            lambda: execution_monitor.resume_session(
-                                str(session["session_id"]), runtime=runtime, unlocked=True,
-                            ),
+                            _resume_demo_plan,
                         )
                         return
                     if session.get("status") in {"needs_manual_rearm", "manual_review"}:
@@ -11501,9 +13213,19 @@ class KlineAnalysisWindow(QMainWindow):
                 self._sync_area_shape_demo_actions()
 
     def _pause_area_shape_monitoring(self) -> None:
+        self._select_rr_workspace_mode("area")
         plan = self._current_area_plan()
         if plan is None or self._area_shape_monitor is None:
             self._set_area_shape_status("当前没有区域形态计划。")
+            return
+        confirmed = QMessageBox.question(
+            self, "暂停区域计划",
+            "暂停后不再接受新的入场信号；模拟盘会撤销并核实未成交入场单，已有仓位的交易所保护继续运行。确认暂停？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if confirmed != QMessageBox.StandardButton.Yes:
+            self._set_area_shape_status("已取消暂停；计划保持原状态。")
             return
         try:
             if str(self._area_shape_mode_combo.currentData() or "paper") == "demo":
@@ -11512,7 +13234,8 @@ class KlineAnalysisWindow(QMainWindow):
                     self._area_shape_execution_monitor.pause_session(str(session["session_id"]))
                     self._area_shape_monitor.pause_plan(plan.plan_id)
                     self._refresh_area_shape_execution_status(session)
-                    self._set_area_shape_status("已暂停模拟盘新入场；已有仓位的交易所保护继续由后台维护。")
+                    self._set_area_shape_status("已暂停新入场；未成交入场单正在请求撤销并核实，已有仓位保护继续运行。")
+                    self._refresh_area_shape_status()
                     return
             self._area_shape_monitor.pause_plan(plan.plan_id)
             self._refresh_area_shape_status()
@@ -11520,18 +13243,41 @@ class KlineAnalysisWindow(QMainWindow):
             self._set_area_shape_status(f"暂停失败：{exc}")
 
     def _cancel_area_shape_plan(self) -> None:
+        self._select_rr_workspace_mode("area")
         plan = self._current_area_plan()
         if plan is None or self._area_shape_monitor is None:
             self._set_area_shape_status("当前没有区域形态计划。")
+            return
+        direction_text = "做多" if plan.config.direction == "long" else "做空"
+        confirmed = QMessageBox.question(
+            self, "取消区域计划",
+            f"取消 {direction_text} 计划后将停止后续入场。模拟盘未成交入场单会请求撤销并等待 OKX 确认；已有仓位不会平仓，交易所保护继续运行。确认取消？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if confirmed != QMessageBox.StandardButton.Yes:
+            self._set_area_shape_status("已取消本次操作；计划保持原状态。")
             return
         try:
             if str(self._area_shape_mode_combo.currentData() or "paper") == "demo":
                 session = self._area_shape_demo_session_for_plan(plan)
                 if session is not None:
-                    self._area_shape_execution_monitor.cancel_session(str(session["session_id"]))
+                    if isinstance(session.get("position"), dict):
+                        self._area_shape_execution_monitor.pause_session(str(session["session_id"]))
+                    else:
+                        self._area_shape_execution_monitor.cancel_session(str(session["session_id"]))
             self._area_shape_monitor.cancel_plan(plan.plan_id)
             self._refresh_area_shape_status()
             self._refresh_area_shape_execution_status()
+            session = self._area_shape_demo_session_for_plan(plan)
+            if session is not None and isinstance(session.get("position"), dict):
+                self._set_area_shape_status("计划已取消；已有模拟盘仓位未平仓，保护继续运行。")
+            elif str(self._area_shape_mode_combo.currentData() or "paper") == "paper":
+                self._set_area_shape_status("计划已取消；不会再生成纸面入场信号。")
+            elif session is None:
+                self._set_area_shape_status("计划已取消；没有关联的模拟盘会话。")
+            else:
+                self._set_area_shape_status("计划已取消；模拟盘入场撤单请求已提交，最终状态以 OKX 对账为准。")
         except Exception as exc:
             self._set_area_shape_status(f"取消失败：{exc}")
 
@@ -11558,6 +13304,11 @@ class KlineAnalysisWindow(QMainWindow):
         target = plan or self._current_area_plan()
         if target is None:
             self._set_area_shape_status("区域形态：尚未创建计划")
+            self._sync_area_shape_workflow_actions()
+            details = getattr(self, "_area_shape_plan_details", None)
+            if details is not None:
+                details.setText("计划参数：请先创建计划并保存参数。")
+            self._refresh_rr_workspace_other_status()
             lines = getattr(self, "_area_shape_lines", None)
             if lines is not None:
                 lines.setText("下方支撑：待生成\n上方压力：待生成")
@@ -11566,15 +13317,133 @@ class KlineAnalysisWindow(QMainWindow):
         latest = target.events[0] if target.events else {}
         message = str(latest.get("message", "等待监控")) if isinstance(latest, dict) else "等待监控"
         self._set_area_shape_status(f"{target.symbol} | {target.profile_name}/{target.environment} | {target.config.direction} | {target.status}\n{message}")
+        self._sync_area_shape_workflow_actions(target)
+        self._refresh_rr_workspace_other_status()
         lines = getattr(self, "_area_shape_lines", None)
         if lines is not None:
-            lines.setText(f"下方支撑：{target.support_price}\n上方压力：{target.pressure_price}")
+            support_text = self._format_area_shape_price(target.support_price, target.symbol)
+            pressure_text = self._format_area_shape_price(target.pressure_price, target.symbol)
+            lines.setText(f"下方支撑：{support_text}\n上方压力：{pressure_text}")
+        details = getattr(self, "_area_shape_plan_details", None)
+        if details is not None:
+            details.setText(self._area_shape_plan_details_text(target))
         self._refresh_area_shape_execution_status()
+
+    def _area_shape_plan_details_text(self, plan: AreaShapePlan) -> str:
+        config = plan.config
+        long_side = config.direction == "long"
+        direction = "做多" if long_side else "做空"
+        entry_name, entry_price = (
+            ("下方支撑", plan.support_price) if long_side else ("上方压力", plan.pressure_price)
+        )
+        target_name, target_price = (
+            ("上方压力", plan.pressure_price) if long_side else ("下方支撑", plan.support_price)
+        )
+        patterns = "不使用形态（直接触线）" if config.entry_trigger_mode == "direct_touch" else "、".join(
+            _REPLAY_SIGNAL_LABELS.get(item, item) for item in config.signal_patterns
+        )
+        if config.exit_template == "fixed_1r":
+            exit_text = f"固定止盈 {format_decimal(config.fixed_tp_r)}R"
+        else:
+            exit_text = (
+                f"锁盈从 {format_decimal(config.lock_trigger_r)}R 开始，先锁 {format_decimal(config.lock_profit_r)}R；"
+                f"之后每增加 {format_decimal(config.lock_trail_every_r)}R 浮盈，止损上移 {format_decimal(config.lock_trail_add_r)}R"
+                f"；远端{AREA_DYNAMIC_TAKE_PROFIT_R}R止盈固定保留"
+            )
+        if config.break_even_enabled:
+            exit_text += f"；价格保本 {format_decimal(config.be_trigger_r)}R"
+            if config.time_break_even_enabled:
+                exit_text += f"；时间保本：持仓满{config.time_break_even_bars}根1H且当前价允许保本"
+        else:
+            exit_text += "；保本关闭"
+        entry_mode = "实际触线后入场（不等形态；纸面按下一根1H开盘，模拟盘预挂入场线GTC）" if config.entry_trigger_mode == "direct_touch" else (
+            "触线+形态确认后入场（纸面按下一根1H开盘；模拟盘价格受限FOK）"
+            if config.entry_mode == "next_open" else "形态后等待价格突破（OKX条件单）"
+        )
+        paper_fee = format_decimal(config.round_trip_fee_rate * Decimal("100"))
+        slippage = format_decimal(config.slippage_rate * Decimal("100"))
+        target_buffer = format_decimal(config.target_buffer_atr)
+        entry_offset = format_decimal(config.entry_offset_atr)
+        stop_offset = format_decimal(config.stop_offset_atr)
+        if config.stop_basis == "fixed_distance":
+            stop_text = f"固定价差 {format_decimal(config.fixed_stop_distance)} U（相对入场线）"
+        else:
+            reference = "最近三根" if config.stop_basis == "three_candle" else (
+                "最近已收盘" if config.entry_trigger_mode == "direct_touch" else "信号"
+            )
+            stop_text = f"{reference}K线高低点外 {stop_offset} ATR"
+        stop_text += f" | ATR周期 {config.atr_period}" if config.requires_atr() else " | 当前组合不需ATR"
+        if config.entry_trigger_mode == "pattern" and config.entry_mode == "breakout":
+            stop_text += f" | 突破入场偏移 {entry_offset} ATR"
+        gtc_text = "直接入场自动挂单" if config.entry_trigger_mode == "direct_touch" else (
+            "开" if config.resting_entry_enabled and config.entry_mode == "next_open" else "关"
+        )
+        return "\n".join((
+            "当前计划参数",
+            f"方向：{direction} | 入场参考：{entry_name} {self._format_area_shape_price(entry_price, plan.symbol)}",
+            f"盈亏比校验：{target_name} {self._format_area_shape_price(target_price, plan.symbol)} | 最低目标空间 {format_decimal(config.min_space_r)}R",
+            f"1H触发形态：{patterns}",
+            f"单笔风险预算：{format_decimal(config.risk_amount)} U",
+            f"入场：{entry_mode} | GTC：{gtc_text}",
+            f"止损：{stop_text}",
+            f"离场管理：{exit_text}",
+            f"成本参数：纸面往返手续费估算 {paper_fee}% | 滑点上限 {slippage}% | 目标缓冲 {target_buffer} ATR",
+            f"有效期：{config.valid_for_bars} 根1H K线 | 触发价类型：{config.trigger_price_type}",
+        ))
+
+    def _format_area_shape_price(self, value: Decimal, symbol: str) -> str:
+        instrument = self._instrument_for_symbol(symbol)
+        tick_size = getattr(instrument, "tick_size", None)
+        if isinstance(tick_size, Decimal) and tick_size > 0:
+            return format_decimal_by_increment(value, tick_size)
+        return format_decimal(Decimal(format_decimal_fixed(value, places=8)))
 
     def _set_area_shape_status(self, message: str) -> None:
         label = getattr(self, "_area_shape_status", None)
         if label is not None:
             label.setText(message)
+
+    def _sync_area_shape_workflow_actions(self, plan: AreaShapePlan | None = None) -> None:
+        plan = plan or self._current_area_plan()
+        create_button = getattr(self, "_area_shape_create_button", None)
+        if create_button is not None:
+            pair_exists = self._area_pair_lines_exist(plan)
+            create_button.setText("两线已生成" if pair_exists else "一键两线")
+            create_button.setToolTip(
+                "当前计划的两条射线已在图上，可直接拖动调整；如需重新生成，请先删除当前计划和两线。"
+                if pair_exists else "快速取最近120根1H K线的最低点和最高点生成两条射线；生成后可在图上手工调整。"
+            )
+            create_button.setEnabled(not pair_exists)
+        start = getattr(self, "_area_shape_start_button", None)
+        pause = getattr(self, "_area_shape_pause_button", None)
+        cancel = getattr(self, "_area_shape_cancel_button", None)
+        if start is None or pause is None or cancel is None:
+            return
+        busy = bool(self._area_shape_demo_arm_pending or self._area_shape_demo_action_pending)
+        if plan is None:
+            start.setText("启用计划")
+            start.setEnabled(not busy)
+            pause.setEnabled(False)
+            cancel.setEnabled(False)
+            return
+
+        status = str(plan.status)
+        demo_mode = self._area_shape_mode_combo.currentData() == "demo"
+        session = self._area_shape_demo_session_for_plan(plan) if demo_mode else None
+        session_status = str(session.get("status", "")) if session else ""
+        session_paused = bool(session.get("paused")) if session else False
+        can_resume_demo = session_status == "paused" or (
+            session_paused and session_status in {"protected", "position_unprotected", "tp_pending"}
+        )
+        start.setText("恢复计划" if status == "paused" else ("监控中" if status in {"monitoring", "touched", "paper_pending", "paper_position", "paper_break_even", "paper_locked"} else "启用计划"))
+        can_start = status in {"draft", "paused"}
+        if demo_mode and status == "paused" and session is not None and not can_resume_demo:
+            can_start = False
+        if demo_mode and status in {"monitoring", "touched"} and session_status in {"arming", "monitoring", "armed", "signal_pending", "entry_intent", "position_unprotected", "tp_pending", "protected", "manual_control", "needs_manual_rearm", "manual_review"}:
+            can_start = False
+        start.setEnabled(can_start and not busy)
+        pause.setEnabled(status in {"monitoring", "touched", "paper_pending"} and not busy)
+        cancel.setEnabled(status in {"draft", "monitoring", "touched", "paper_pending", "paused"} and not busy)
 
     def _area_shape_demo_sessions(self) -> list[dict[str, object]]:
         monitor = getattr(self, "_area_shape_execution_monitor", None)
@@ -11681,6 +13550,7 @@ class KlineAnalysisWindow(QMainWindow):
             self._area_shape_demo_arm_pending = False
         self._set_area_shape_demo_error(status)
         self._sync_area_shape_demo_actions()
+        self._refresh_rr_workspace_other_status()
 
     @Slot(int)
     def _on_area_shape_mode_changed(self, _index: int) -> None:
@@ -11708,6 +13578,8 @@ class KlineAnalysisWindow(QMainWindow):
         if target is None:
             label.setText(self._area_shape_demo_ui_error or "模拟盘执行：未启用")
             self._sync_area_shape_demo_actions()
+            self._sync_area_shape_workflow_actions()
+            self._refresh_rr_workspace_other_status()
             return
         mode_combo = getattr(self, "_area_shape_mode_combo", None)
         if mode_combo is not None and str(target.get("status", "")) not in {"closed", "cancelled", "expired"}:
@@ -11761,6 +13633,8 @@ class KlineAnalysisWindow(QMainWindow):
             pieces.append(f"只读对账：entry={report.get('entry')} GTC={report.get('resting_entry')} position={report.get('position')} SL={report.get('stop')} TP={report.get('take_profit')}")
         label.setText("\n".join(pieces))
         self._sync_area_shape_demo_actions(target)
+        self._sync_area_shape_workflow_actions()
+        self._refresh_rr_workspace_other_status()
 
     def _sync_area_shape_demo_actions(self, session: dict[str, object] | None = None) -> None:
         reconcile = getattr(self, "_area_shape_reconcile_button", None)
@@ -11785,11 +13659,13 @@ class KlineAnalysisWindow(QMainWindow):
                 and not self._area_shape_demo_action_pending
                 and status not in {"arming", "armed", "signal_pending", "entry_intent", "position_unprotected", "tp_pending", "protected", "manual_control", "needs_manual_rearm", "manual_review"}
             )
+        self._sync_area_shape_workflow_actions()
         reconcile.setEnabled(available and status in {"needs_manual_rearm", "manual_review"})
         has_reconciliation = isinstance(target, dict) and bool(target.get("readonly_reconciled_at_ms"))
         rearm.setEnabled(available and status in {"needs_manual_rearm", "manual_review"} and has_reconciliation)
 
     def _reconcile_area_shape_demo_session(self) -> None:
+        self._select_rr_workspace_mode("area")
         session = self._area_shape_demo_session_for_current_context()
         if session is None:
             self._set_area_shape_demo_error("当前账户/合约没有待对账模拟盘会话。")
@@ -11805,6 +13681,7 @@ class KlineAnalysisWindow(QMainWindow):
             self._set_area_shape_demo_error(f"不能开始只读对账：{exc}")
 
     def _rearm_area_shape_demo_session(self) -> None:
+        self._select_rr_workspace_mode("area")
         session = self._area_shape_demo_session_for_current_context()
         if session is None:
             self._set_area_shape_demo_error("当前账户/合约没有可继续的模拟盘会话。")
@@ -12021,12 +13898,14 @@ class KlineAnalysisWindow(QMainWindow):
     def _on_rr_table_cell_clicked(self, row: int, _column: int) -> None:
         if row < 0:
             return
+        self._select_rr_workspace_mode("direct")
         self._populate_rr_table(selected_index=row)
 
     @Slot(int, int)
     def _on_rr_table_cell_double_clicked(self, row: int, _column: int) -> None:
         if row < 0:
             return
+        self._select_rr_workspace_mode("direct")
         self._populate_rr_table(selected_index=row)
         self._open_rr_card_for_selected()
 
@@ -12096,8 +13975,9 @@ class KlineAnalysisWindow(QMainWindow):
     def _refresh_line_price_controls(self, item: dict[str, object] | None) -> None:
         kind = str(item.get("kind", "horizontal") or "horizontal").strip().lower() if isinstance(item, dict) else "horizontal"
         is_trend = kind == "trend"
-        self._line_price_a_label.setText("起点价" if is_trend else "价格")
-        self._line_price_a_edit.setPlaceholderText("起点价" if is_trend else "价格")
+        is_ray = kind == "ray"
+        self._line_price_a_label.setText("起点价" if is_trend else ("射线价格" if is_ray else "价格"))
+        self._line_price_a_edit.setPlaceholderText("起点价" if is_trend else ("射线价格" if is_ray else "价格"))
         self._line_price_b_label.setVisible(is_trend)
         self._line_price_b_edit.setVisible(is_trend)
 
@@ -12538,25 +14418,28 @@ class KlineAnalysisWindow(QMainWindow):
         self._rr_execution_thread = thread
 
         def _completed(entry: object) -> None:
-            self._rr_execution_in_flight = False
             if not isinstance(entry, RRTradeLedgerEntry):
                 self._set_status("RR 交易返回了无效结果。")
+                if on_failure is not None:
+                    on_failure("RR 交易返回了无效结果。")
                 return
             if self._find_rr_trade_ledger_entry(entry.plan.plan_id) != entry:
                 self._save_rr_trade_ledger_entry(entry)
             on_success(entry)
 
         def _failed(message: str) -> None:
-            self._rr_execution_in_flight = False
             self._set_status(f"RR 交易失败：{message}")
             if on_failure is not None:
                 on_failure(message)
 
         def _finished() -> None:
+            self._rr_execution_in_flight = False
             if self._rr_execution_thread is thread:
                 self._rr_execution_thread = None
             thread.deleteLater()
             self._start_next_pending_rr_execution_request()
+            if not self._rr_execution_in_flight:
+                self._start_next_line_trade_execution()
 
         thread.completed.connect(_completed)
         thread.failed.connect(_failed)
@@ -12624,7 +14507,7 @@ class KlineAnalysisWindow(QMainWindow):
 
     @Slot()
     def _monitor_active_rr_trades(self) -> None:
-        if self._rr_execution_in_flight:
+        if self._rr_execution_in_flight or self._pending_rr_execution_requests:
             return
         entry = self._next_monitorable_rr_entry()
         if entry is None:
@@ -12635,7 +14518,7 @@ class KlineAnalysisWindow(QMainWindow):
             return
         self._start_rr_execution_action(
             action=lambda: self._rr_trade_execution_service.reconcile(
-                client=OkxRestClient(),
+                client=self._rr_client(runtime),
                 credentials=runtime.credentials,
                 config=_build_strategy_config(entry.plan.inst_id, runtime),
                 entry=entry,
@@ -12647,6 +14530,8 @@ class KlineAnalysisWindow(QMainWindow):
     def _enable_selected_rr_trade(self) -> None:
         try:
             plan = self._build_selected_rr_trade_plan()
+            if plan.plan_id in self._pending_rr_activation_plan_ids:
+                raise RuntimeError("该 RR 的启用请求正在处理，请勿重复提交。")
             existing = self._find_rr_trade_ledger_entry(plan.plan_id)
             if existing is not None and existing.status not in {"cancelled", "manual_review"}:
                 raise RuntimeError(f"该 RR 已有交易记录，当前状态：{existing.status}。")
@@ -12673,24 +14558,79 @@ class KlineAnalysisWindow(QMainWindow):
             self._set_status(f"无法启用 RR 交易：{exc}")
             return
 
-        self._set_status("正在提交 RR 交易...")
+        requested_at = time.perf_counter()
+        self._pending_rr_activation_plan_ids.add(plan.plan_id)
+        self._set_rr_activation_status("正在提交 RR 交易…", pending=True)
         self._start_rr_execution_action(
-            action=lambda: self._rr_trade_execution_service.activate(
-                client=OkxRestClient(),
-                credentials=runtime.credentials,
-                config=_build_strategy_config(plan.inst_id, runtime),
-                plan=plan,
-            ),
-            on_success=lambda entry: self._set_status(f"RR 交易已启用：{entry.status}"),
+            action=lambda: self._activate_rr_trade(plan, runtime, requested_at),
+            on_success=lambda entry: self._handle_rr_activation_success(entry, runtime, requested_at),
+            on_failure=lambda message: self._handle_rr_activation_failure(plan.plan_id, message),
             queue_if_busy=True,
             queued_status_text="当前正在同步已报 RR，新的启用请求已排队，稍后自动提交。",
         )
+        if self._rr_execution_in_flight and self._pending_rr_execution_requests:
+            self._set_rr_activation_status("RR 启用请求已排队，当前任务结束后优先提交。", pending=True)
+
+    def _rr_client(self, runtime) -> OkxRestClient:
+        credentials = runtime.credentials
+        key = (
+            str(getattr(credentials, "profile_name", "") or ""), str(runtime.environment),
+            str(getattr(credentials, "api_key", "") or id(credentials)),
+        )
+        if key not in self._rr_execution_clients:
+            self._rr_execution_clients[key] = OkxRestClient()
+        return self._rr_execution_clients[key]
+
+    def _set_rr_activation_status(self, text: str, *, pending: bool = False) -> None:
+        self._rr_enable_trade_btn.setEnabled(not pending)
+        self._rr_action_status.setText(text)
+        self._rr_action_status.show()
+        self._set_status(text)
+        self._refresh_rr_workspace_other_status()
+
+    def _activate_rr_trade(self, plan: RRTradePlan, runtime, requested_at: float) -> RRTradeLedgerEntry:
+        append_log_line(f"[rr_latency] start plan={plan.plan_id} queue_ms={(time.perf_counter() - requested_at) * 1000:.1f}")
+        with measure_ui_step("rr.submit", profile=plan.profile_name, environment=plan.environment, plan=plan.plan_id):
+            return self._rr_trade_execution_service.activate(
+                client=self._rr_client(runtime), credentials=runtime.credentials,
+                config=_build_strategy_config(plan.inst_id, runtime), plan=plan,
+            )
+
+    def _handle_rr_activation_success(self, entry: RRTradeLedgerEntry, runtime, requested_at: float) -> None:
+        self._pending_rr_activation_plan_ids.discard(entry.plan.plan_id)
+        order = entry.entry_order
+        if order is not None and order.order_id:
+            plan = entry.plan
+            view = OrderStatusView(
+                inst_id=plan.inst_id, inst_type="SWAP", ord_id=order.order_id,
+                side="buy" if plan.direction == "long" else "sell", pos_side="",
+                td_mode=str(getattr(runtime, "trade_mode", "")),
+                ord_type="market" if plan.entry_execution_mode == "market" else "limit",
+                state="pending_confirmation", price=order.price, avg_price=None,
+                size=order.size, filled_size=None, created_time=int(time.time() * 1000), update_time=None,
+                client_order_id=order.client_id or "", reduce_only=False,
+                raw={"_feed_source": "submit_ack", "_source_kind": "normal", "_ack_received_at": time.perf_counter(),
+                     "tpTriggerPx": str(plan.take_profit_price), "tpOrdPx": "-1",
+                     "slTriggerPx": str(plan.stop_loss_price), "slOrdPx": "-1"},
+            )
+            store = get_shared_order_store()
+            with measure_ui_step("rr.publish_ack", profile=plan.profile_name, environment=plan.environment, order=order.order_id):
+                store.publish_order_updates(profile_name=plan.profile_name, environment=plan.environment, orders=[view])
+            store.confirm_submitted_order(runtime=runtime, profile_name=plan.profile_name, order=view)
+        self._set_rr_activation_status("RR 下单已收到回执，委托已发布；确认状态见下方委托列表。")
+        append_log_line(f"[rr_latency] ack_published plan={entry.plan.plan_id} total_ms={(time.perf_counter() - requested_at) * 1000:.1f}")
+
+    def _handle_rr_activation_failure(self, plan_id: str, message: str) -> None:
+        self._pending_rr_activation_plan_ids.discard(plan_id)
+        self._set_rr_activation_status(f"RR 提交未确认：{message}；请核对订单状态，勿连续重复提交。")
 
     @Slot()
     def _cancel_selected_rr_trade(self) -> None:
+        self._set_rr_cancel_status("正在核对 RR 入场挂单…", pending=True)
         try:
             payload = self._selected_rr_payload()
             if self._purge_placeholder_rr_entry(payload, delete_item=False):
+                self._set_rr_cancel_status(self._status.text())
                 return
             entry = self._rr_ledger_entry_for_item(payload)
             if entry is None:
@@ -12701,7 +14641,7 @@ class KlineAnalysisWindow(QMainWindow):
             if runtime is None:
                 raise RuntimeError(f"API {plan_profile or '-'} 不可用。")
         except Exception as exc:  # noqa: BLE001
-            self._set_status(f"无法取消 RR 交易：{exc}")
+            self._set_rr_cancel_status(f"无法撤销 RR 入场挂单：{exc}")
             return
 
         self._submit_rr_trade_cancel(
@@ -12711,6 +14651,13 @@ class KlineAnalysisWindow(QMainWindow):
             delete_after_cancel=False,
         )
 
+    def _set_rr_cancel_status(self, text: str, *, pending: bool = False) -> None:
+        self._rr_action_status.setText(text)
+        self._rr_action_status.show()
+        self._rr_cancel_trade_btn.setEnabled(not pending)
+        self._set_status(text)
+        self._refresh_rr_workspace_other_status()
+
     def _submit_rr_trade_cancel(
         self,
         *,
@@ -12719,7 +14666,18 @@ class KlineAnalysisWindow(QMainWindow):
         confirmed_for_filled: bool,
         delete_after_cancel: bool,
     ) -> None:
-        self._start_rr_execution_action(
+        progress_text = (
+            "正在撤销 RR 入场挂单；成功后会删除本地 RR 方案…"
+            if delete_after_cancel
+            else "正在提交 RR 入场挂单撤单请求…"
+        )
+        queued_text = (
+            "撤单请求已排队；完成后会删除本地 RR 方案。"
+            if delete_after_cancel
+            else "当前正在同步 RR 状态，撤单请求已排队，稍后自动执行。"
+        )
+        self._set_rr_cancel_status(progress_text, pending=True)
+        started = self._start_rr_execution_action(
             action=lambda: self._rr_trade_execution_service.cancel(
                 client=OkxRestClient(),
                 credentials=runtime.credentials,
@@ -12732,9 +14690,12 @@ class KlineAnalysisWindow(QMainWindow):
                 runtime=runtime,
                 delete_after_cancel=delete_after_cancel,
             ),
+            on_failure=lambda message: self._set_rr_cancel_status(f"RR 入场挂单撤单失败：{message}"),
             queue_if_busy=True,
-            queued_status_text="当前正在同步 RR 状态，撤单请求已排队，稍后自动执行。",
+            queued_status_text=queued_text,
         )
+        if started is False:
+            self._set_rr_cancel_status(queued_text, pending=True)
 
     def _delete_rr_item_at_index(self, index: int) -> None:
         entry = self._workspace_entry()
@@ -12785,13 +14746,14 @@ class KlineAnalysisWindow(QMainWindow):
         return True
 
     def _handle_rr_cancel_result(self, entry: RRTradeLedgerEntry, *, runtime, delete_after_cancel: bool) -> None:
+        self._rr_cancel_trade_btn.setEnabled(True)
         if entry.status == "cancel_confirmation_required":
             confirmation_text = "该 RR 已有成交。确认后只撤销未成交部分，已成交仓位及止损/止盈保护会保留。是否继续？"
             if delete_after_cancel:
                 confirmation_text += "\n\n同时会删除本地 RR 图形和列表记录；不会平仓，也不会撤销交易所保护单。"
             confirmed = QMessageBox.question(
                 self,
-                "确认取消已成交 RR",
+                "删除 RR 方案并撤销剩余挂单" if delete_after_cancel else "确认撤销剩余入场挂单",
                 confirmation_text,
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 QMessageBox.StandardButton.No,
@@ -12804,14 +14766,16 @@ class KlineAnalysisWindow(QMainWindow):
                     delete_after_cancel=delete_after_cancel,
                 )
                 return
-            self._set_status("已取消撤单确认，原订单保持不变。")
+            self._set_rr_cancel_status("已取消撤单确认，原订单保持不变。")
             return
+        if entry.status in {"cancelled", "protected_cancelled_remainder"}:
+            get_shared_order_store().request_refresh(runtime=runtime, profile_name=entry.plan.profile_name)
         if delete_after_cancel:
             if entry.status == "cancelled":
                 index = self._find_rr_item_index_for_entry(entry)
                 if index >= 0:
                     self._delete_rr_item_at_index(index)
-                self._set_status("RR 挂单已撤销，图形已删除。")
+                self._set_rr_cancel_status("RR 撤单请求已处理，图形已删除；请以 OKX 最终订单状态为准。")
                 return
             if entry.status in {
                 "protected",
@@ -12820,10 +14784,18 @@ class KlineAnalysisWindow(QMainWindow):
                 "protected_cancelled_remainder",
             }:
                 self._delete_rr_visual_keep_protection(entry)
+                self._set_rr_cancel_status(self._status.text())
                 return
-            self._set_status(f"RR 取消结果：{entry.status}，已有成交或保护单，保留图形。")
+            self._set_rr_cancel_status(f"RR 取消结果：{entry.status}，已有成交或保护单，保留图形。")
             return
-        self._set_status(f"RR 取消结果：{entry.status}")
+        if entry.status == "cancelled":
+            message = "RR 入场挂单撤单请求已处理，请以 OKX 最终订单状态为准。"
+        elif entry.status == "protected_cancelled_remainder":
+            message = "剩余入场挂单撤单请求已处理；已成交仓位和止盈止损保护保留。请以 OKX 最终订单状态为准。"
+        else:
+            detail = entry.events[-1].message if entry.events else ""
+            message = f"RR 撤单返回状态：{entry.status}" + (f"；{detail}" if detail else "")
+        self._set_rr_cancel_status(message)
 
     def _rr_ledger_entry_for_item(self, item: dict[str, object]) -> RRTradeLedgerEntry | None:
         bound_plan_id = self._rr_trade_binding_plan_id(item)
@@ -12873,6 +14845,7 @@ class KlineAnalysisWindow(QMainWindow):
                 condition_text = _rr_condition_status_text(None)
                 self._rr_condition_status.setText(condition_text)
                 self._rr_condition_status.setToolTip(condition_text)
+            self._refresh_rr_workspace_other_status()
             return
         price_increment = self._current_rr_price_increment(item)
         rr_id = str(item.get("rr_id", "") or f"rr-{self._selected_rr_index + 1}")
@@ -12921,8 +14894,10 @@ class KlineAnalysisWindow(QMainWindow):
         tooltip_text = summary_text if ledger_entry is None else f"{summary_text}\n最后事件：{last_event}"
         self._rr_tracking_summary.setText(summary_text)
         self._rr_tracking_summary.setToolTip(tooltip_text)
+        self._refresh_rr_workspace_other_status()
 
     def _open_rr_card_for_selected(self) -> None:
+        self._select_rr_workspace_mode("direct")
         entry = self._workspace_entry()
         raw_rr = entry.get("rr", [])
         if not isinstance(raw_rr, list) or not (0 <= self._selected_rr_index < len(raw_rr)):
@@ -12954,9 +14929,14 @@ class KlineAnalysisWindow(QMainWindow):
         self._rr_r_edit.setValue(float(str(payload.get("r_multiple", "") or "2")))
         self._rr_fee_offset_check.setChecked(_rr_fee_offset_enabled(payload.get("fee_offset_enabled", False)))
         self._rr_locked_check.setChecked(bool(payload.get("locked", False)))
+        self._rr_execution_mode_combo.setCurrentIndex(
+            max(0, self._rr_execution_mode_combo.findData(str(payload.get("entry_execution_mode", "limit") or "limit")))
+        )
         self._save_rr_item(extra_payload=payload)
 
     def _set_draw_tool(self, tool: str) -> None:
+        if tool in {"rr_long", "rr_short"}:
+            self._select_rr_workspace_mode("direct")
         self._draw_tool = tool
         self._pending_line_start = None
         self._pending_rr_start = None
@@ -13326,6 +15306,22 @@ class KlineAnalysisWindow(QMainWindow):
             if self._area_line_is_frozen(str(item.get("id", ""))):
                 continue
             kind = str(item.get("kind", "horizontal") or "horizontal").strip().lower()
+            if kind == "ray":
+                endpoint_time = int(item.get("time_a", 0) or 0)
+                endpoint_price = float(item.get("price_a", 0.0) or 0.0)
+                time_score = abs(endpoint_time - candle_time) / max(float(endpoint_time_tolerance), 1.0)
+                price_score = abs(endpoint_price - price) / max(endpoint_price_tolerance, 1.0)
+                score = max(time_score, price_score)
+                if score <= 1.0 and score < best_score:
+                    best_score = score
+                    best_hit = {"index": index, "line": item, "drag_mode": "endpoint_a"}
+                if candle_time >= endpoint_time:
+                    line_distance = abs(endpoint_price - float(price))
+                    score = line_distance / max(body_price_tolerance, 1.0)
+                    if score <= 1.0 and score < best_score:
+                        best_score = score
+                        best_hit = {"index": index, "line": item, "drag_mode": "move"}
+                continue
             if kind == "trend":
                 endpoint_candidates = (
                     ("endpoint_a", int(item.get("time_a", 0) or 0), float(item.get("price_a", 0.0) or 0.0)),
@@ -13377,6 +15373,15 @@ class KlineAnalysisWindow(QMainWindow):
             anchor_price=float(state.get("anchor_price", price) or price),
         )
         lines[index] = updated
+        line_id = str(updated.get("id", ""))
+        plan = next((item for item in self._area_shape_plans() if line_id in {item.support_line_id, item.pressure_line_id} and item.status == "draft"), None)
+        if plan is not None and str(updated.get("kind", "")) == "ray":
+            partner_id = plan.pressure_line_id if line_id == plan.support_line_id else plan.support_line_id
+            for partner in lines:
+                if isinstance(partner, dict) and str(partner.get("id", "")) == partner_id:
+                    partner["time_a"] = int(updated.get("time_a", candle_time) or candle_time)
+                    partner["time_b"] = int(updated.get("time_a", candle_time) or candle_time)
+                    break
         self._selected_line_index = index
         self._apply_line_record_to_form(index, updated)
         return True
@@ -13504,6 +15509,7 @@ class KlineAnalysisWindow(QMainWindow):
         nearest_index = self._nearest_rr_index(candle_time=candle_time, price=price, records=records)
         if nearest_index < 0:
             return False
+        self._select_rr_workspace_mode("direct")
         self._clear_line_selection_for_rr_focus()
         self._populate_rr_table(selected_index=nearest_index)
         if self._pending_payload is not None:
@@ -13656,6 +15662,7 @@ class KlineAnalysisWindow(QMainWindow):
         self._selected_line_index = -1
         self._save_workspace_snapshot()
         self._populate_rr_table(selected_index=new_index)
+        self._select_rr_workspace_mode("direct")
         if self._pending_payload is not None:
             self._render_to_chart(self._pending_payload)
         self._set_status(f"已添加 RR：{payload['rr_id']}")
@@ -13766,7 +15773,7 @@ class KlineAnalysisWindow(QMainWindow):
         entry = self._workspace_entry()
         lines = entry.get("lines", [])
         count = len(lines) + 1 if isinstance(lines, list) else 1
-        prefix = "趋势线" if kind == "trend" else "水平线"
+        prefix = "趋势线" if kind == "trend" else ("射线" if kind == "ray" else "水平线")
         return f"{prefix}-{count:02d}"
 
     def _append_line_rule(self, line: dict[str, object]) -> None:
@@ -14179,7 +16186,7 @@ class KlineAnalysisWindow(QMainWindow):
 
                 let chart = null;
                 let candlestickSeries = null;
-                const lineSeries = { ema9: null, ema21: null };
+                const lineSeries = { ema9: null, ema21: null, ema21Fast: null, ema55: null };
                 let channelSeries = [];
                 let trendSeries = null;
                 let volumeSeries = null;
@@ -14514,6 +16521,18 @@ class KlineAnalysisWindow(QMainWindow):
                       safePayload.show?.ema21,
                       { color: '#58c66d', lineWidth: 3, title: 'SMA 50', priceLineVisible: false, lastValueVisible: false }
                     );
+                    syncLineSeries(
+                      'ema21Fast',
+                      emaData.ema21Fast,
+                      safePayload.show?.emaPair,
+                      { color: '#38bdf8', lineWidth: 2, title: 'EMA 21', priceLineVisible: false, lastValueVisible: false }
+                    );
+                    syncLineSeries(
+                      'ema55',
+                      emaData.ema55,
+                      safePayload.show?.emaPair,
+                      { color: '#a78bfa', lineWidth: 3, title: 'EMA 55', priceLineVisible: false, lastValueVisible: false }
+                    );
                     syncChannelSeries(Array.isArray(safePayload.channels) ? safePayload.channels : [], candles);
                     applyChartViewMode(window.__chartViewMode || 'recent');
                   } catch (error) {
@@ -14544,6 +16563,8 @@ class KlineAnalysisWindow(QMainWindow):
                     }
                     if (payload.ema9 && lineSeries.ema9) lineSeries.ema9.update(payload.ema9);
                     if (payload.ema21 && lineSeries.ema21) lineSeries.ema21.update(payload.ema21);
+                    if (payload.ema21Fast && lineSeries.ema21Fast) lineSeries.ema21Fast.update(payload.ema21Fast);
+                    if (payload.ema55 && lineSeries.ema55) lineSeries.ema55.update(payload.ema55);
                     if (window.__chartViewMode === 'recent') applyChartViewMode('recent');
                   } catch (error) {
                     if (window.console && window.console.error) window.console.error('[updateRealtimeCandle]', error);

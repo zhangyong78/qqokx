@@ -1709,24 +1709,35 @@ class PayoffChartView(QWidget):
             text_top += line_height
 
 
-def _build_moving_average_series(candles: list[Candle]) -> tuple[list[Decimal], list[Decimal | None]]:
+def _build_moving_average_series(
+    candles: list[Candle],
+    *,
+    ema_period: int = 15,
+    second_period: int = 50,
+    second_is_ema: bool = False,
+) -> tuple[list[Decimal], list[Decimal | None]]:
     if not candles:
         return [], []
     closes = [candle.close for candle in candles]
-    ema_period = 15
-    sma_period = 50
     ema_multiplier = Decimal("2") / Decimal(ema_period + 1)
-    ema15_values: list[Decimal] = []
-    sma50_values: list[Decimal | None] = []
+    second_ema_multiplier = Decimal("2") / Decimal(second_period + 1)
+    ema_values: list[Decimal] = []
+    second_values: list[Decimal | None] = []
     rolling_sum = Decimal("0")
 
     for index, close in enumerate(closes):
-        ema15_values.append(close if index == 0 else ((close - ema15_values[-1]) * ema_multiplier) + ema15_values[-1])
+        ema_values.append(close if index == 0 else ((close - ema_values[-1]) * ema_multiplier) + ema_values[-1])
+        if second_is_ema:
+            previous = second_values[-1] if second_values else None
+            second_values.append(
+                close if previous is None else ((close - previous) * second_ema_multiplier) + previous
+            )
+            continue
         rolling_sum += close
-        if index >= sma_period:
-            rolling_sum -= closes[index - sma_period]
-        sma50_values.append(rolling_sum / Decimal(sma_period) if index + 1 >= sma_period else None)
-    return ema15_values, sma50_values
+        if index >= second_period:
+            rolling_sum -= closes[index - second_period]
+        second_values.append(rolling_sum / Decimal(second_period) if index + 1 >= second_period else None)
+    return ema_values, second_values
 
 
 @dataclass(frozen=True)
@@ -1806,6 +1817,7 @@ class CandlestickChartView(QChartView):
         self._hide_wicks = False
         self._chart_title = ""
         self._show_moving_averages = False
+        self._moving_average_mode = "ema15_sma50"
         self._axis_x: QDateTimeAxis | None = None
         self._axis_y: QValueAxis | None = None
         self._full_x_min_ms = 0.0
@@ -1861,6 +1873,7 @@ class CandlestickChartView(QChartView):
         candles: list[Candle],
         hide_wicks: bool = False,
         show_moving_averages: bool | None = None,
+        moving_average_mode: str | None = None,
         tooltip_close_usdt_rate: Decimal | None = None,
         tooltip_close_usdt_basis: str = "",
         tooltip_entry_price: Decimal | None = None,
@@ -1874,6 +1887,8 @@ class CandlestickChartView(QChartView):
             show_moving_averages = self._show_moving_averages
         else:
             self._show_moving_averages = show_moving_averages
+        if moving_average_mode in {"ema15_sma50", "ema21_ema55"}:
+            self._moving_average_mode = moving_average_mode
         self._hide_wicks = hide_wicks
         self._chart_title = title
         self._clear_chart_context()
@@ -1963,17 +1978,26 @@ class CandlestickChartView(QChartView):
         up_series.attachAxis(axis_y)
         down_series.attachAxis(axis_x)
         down_series.attachAxis(axis_y)
-        ema15_values: list[Decimal] = []
-        sma50_values: list[Decimal | None] = []
+        first_ma_values: list[Decimal] = []
+        second_ma_values: list[Decimal | None] = []
+        if self._moving_average_mode == "ema21_ema55":
+            ma_specs = (("EMA 21", "#ff4d6d"), ("EMA 55", "#58c66d"))
+        else:
+            ma_specs = (("EMA 15", "#ff4d6d"), ("SMA 50", "#58c66d"))
         if show_moving_averages:
-            ema15_values, sma50_values = _build_moving_average_series(candles)
-            for label, values, color, width in (
-                ("EMA 15", ema15_values, "#ff4d6d", 2),
-                ("SMA 50", sma50_values, "#58c66d", 2),
-            ):
+            ema_period = 21 if self._moving_average_mode == "ema21_ema55" else 15
+            second_period = 55 if self._moving_average_mode == "ema21_ema55" else 50
+            first_ma_values, second_ma_values = _build_moving_average_series(
+                candles,
+                ema_period=ema_period,
+                second_period=second_period,
+                second_is_ema=self._moving_average_mode == "ema21_ema55",
+            )
+            for index, (label, color) in enumerate(ma_specs):
+                values = first_ma_values if index == 0 else second_ma_values
                 series = QLineSeries()
                 series.setName(label)
-                series.setPen(QPen(QColor(color), width))
+                series.setPen(QPen(QColor(color), 2))
                 for candle, value in zip(candles, values):
                     if value is None:
                         continue
@@ -1994,10 +2018,10 @@ class CandlestickChartView(QChartView):
         latest = candles[-1]
         suffix = "%" if self._percent_axis else ""
         moving_average_title = ""
-        if ema15_values:
-            moving_average_title += f" | EMA 15 {_format_compact_number(ema15_values[-1])}{suffix}"
-        if sma50_values and sma50_values[-1] is not None:
-            moving_average_title += f" | SMA 50 {_format_compact_number(sma50_values[-1])}{suffix}"
+        if first_ma_values:
+            moving_average_title += f" | {ma_specs[0][0]} {_format_compact_number(first_ma_values[-1])}{suffix}"
+        if second_ma_values and second_ma_values[-1] is not None:
+            moving_average_title += f" | {ma_specs[1][0]} {_format_compact_number(second_ma_values[-1])}{suffix}"
         chart.setTitle(
             f"{title} | 最新 O {_format_compact_number(latest.open)}{suffix} "
             f"H {_format_compact_number(latest.high)}{suffix} "
@@ -2012,6 +2036,7 @@ class CandlestickChartView(QChartView):
         candles: list[Candle],
         hide_wicks: bool = False,
         show_moving_averages: bool | None = None,
+        moving_average_mode: str | None = None,
         tooltip_close_usdt_rate: Decimal | None = None,
         tooltip_close_usdt_basis: str = "",
         tooltip_entry_price: Decimal | None = None,
@@ -2039,6 +2064,7 @@ class CandlestickChartView(QChartView):
             candles=candles,
             hide_wicks=hide_wicks,
             show_moving_averages=show_moving_averages,
+            moving_average_mode=moving_average_mode,
             tooltip_close_usdt_rate=tooltip_close_usdt_rate,
             tooltip_close_usdt_basis=tooltip_close_usdt_basis,
             tooltip_entry_price=tooltip_entry_price,
@@ -2061,6 +2087,31 @@ class CandlestickChartView(QChartView):
             self._fit_y_axis_to_visible_range()
             self.viewport().update()
         return True
+
+    def set_moving_average_mode(self, mode: str) -> None:
+        """Switch the displayed moving-average pair while retaining the viewport."""
+        if mode not in {"ema15_sma50", "ema21_ema55"} or mode == self._moving_average_mode or not self._candles:
+            return
+        previous_range = self._current_x_range()
+        previous_span = max(previous_range[1] - previous_range[0], 1.0)
+        self.set_candles(
+            title=self._chart_title,
+            candles=list(self._candles),
+            hide_wicks=self._hide_wicks,
+            show_moving_averages=self._show_moving_averages,
+            moving_average_mode=mode,
+            tooltip_close_usdt_rate=self._tooltip_close_usdt_rate,
+            tooltip_close_usdt_basis=self._tooltip_close_usdt_basis,
+            tooltip_entry_price=self._tooltip_entry_price,
+            time_markers=self._time_markers,
+            position_price_markers=self._position_price_markers,
+        )
+        if self._axis_x is not None:
+            new_min = max(self._full_x_min_ms, previous_range[0])
+            new_max = min(self._full_x_max_ms, max(previous_range[1], new_min + previous_span))
+            self._axis_x.setRange(QDateTime.fromMSecsSinceEpoch(int(new_min)), QDateTime.fromMSecsSinceEpoch(int(new_max)))
+            self._fit_y_axis_to_visible_range()
+            self.viewport().update()
 
     @staticmethod
     def _normalized_position_price_markers(

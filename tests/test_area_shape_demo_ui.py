@@ -2,13 +2,15 @@ from __future__ import annotations
 
 import threading
 import time
+from dataclasses import replace
 from decimal import Decimal
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from PySide6.QtCore import QObject, QPoint, Signal
 
 from okx_quant.area_shape_monitor import AreaShapeMonitor
-from okx_quant.area_shape_trade import AreaShapePlan
+from okx_quant.area_shape_trade import AreaShapeConfig, AreaShapePlan
 from okx_quant.models import Candle
 from roll_terminal_qt.kline_analysis_window import KlineAnalysisWindow, KlineChartPayload
 from tests.qt_test_case import QtWidgetTestCase
@@ -56,6 +58,11 @@ class AreaShapeDemoUiTests(QtWidgetTestCase):
         self._kline_module = kline_module
         self._original_save = kline_module.save_kline_analysis_workspace_entries
         kline_module.save_kline_analysis_workspace_entries = lambda _entries: None
+        self._confirm_patch = patch(
+            "roll_terminal_qt.kline_analysis_window.QMessageBox.question",
+            return_value=self._kline_module.QMessageBox.StandardButton.Yes,
+        )
+        self._confirm_mock = self._confirm_patch.start()
         self.window = KlineAnalysisWindow(embedded=True, preview_mode=True)
         self.window._workspace_entries = {}
         if self.window._api_profile_combo.findText("ui-test") < 0:
@@ -88,12 +95,30 @@ class AreaShapeDemoUiTests(QtWidgetTestCase):
         self.window.begin_shutdown()
         self._app.processEvents()
         self.dispose_widget(self.window)
+        self._confirm_patch.stop()
         self._kline_module.save_kline_analysis_workspace_entries = self._original_save
 
     def _create_demo_draft(self) -> AreaShapePlan:
-        self.window._create_area_shape_plan()
+        self.window._control_tabs.setCurrentIndex(self.window._control_area_tab_index)
+        self.window._area_shape_create_button.click()
         plans = self.paper_monitor.plans()
         self.assertEqual(len(plans), 1)
+        self.assertEqual(self.window._control_tabs.currentIndex(), self.window._control_area_tab_index)
+        self.assertEqual(self.window._area_shape_create_button.text(), "两线已生成")
+        self.assertFalse(self.window._area_shape_create_button.isEnabled())
+        self.assertTrue(self.window._area_pair_lines_exist(plans[0]))
+        workspace_lines = self.window._workspace_entry(symbol="BTC-USDT-SWAP", period="1H")["lines"]
+        self.assertEqual(
+            sum(str(item.get("id", "")) in {plans[0].support_line_id, plans[0].pressure_line_id} for item in workspace_lines),
+            2,
+        )
+        chart_lines = getattr(self.window._native_chart_view, "_workspace_lines", [])
+        if chart_lines:
+            self.assertEqual(
+                {str(item.get("id", "")) for item in chart_lines}
+                & {plans[0].support_line_id, plans[0].pressure_line_id},
+                {plans[0].support_line_id, plans[0].pressure_line_id},
+            )
         return plans[0]
 
     def test_demo_start_is_one_action_after_unlock_and_paper_baseline(self) -> None:
@@ -103,6 +128,10 @@ class AreaShapeDemoUiTests(QtWidgetTestCase):
 
         self.window._start_area_shape_monitoring()
 
+        confirmation = self._confirm_mock.call_args.args[2]
+        self.assertIn("做多", confirmation)
+        self.assertIn("下方支撑线", confirmation)
+        self.assertIn("上方压力线", confirmation)
         self.assertEqual(len(self.demo_monitor.arm_calls), 1)
         call = self.demo_monitor.arm_calls[0]
         self.assertTrue(call["unlocked"])
@@ -112,6 +141,442 @@ class AreaShapeDemoUiTests(QtWidgetTestCase):
         self.assertEqual(paper_plan.status, "monitoring")
         self.assertEqual(paper_plan.execution_mode, "demo_exchange")
         self.assertIn("预检中", self.window._area_shape_status.text())
+
+    def test_dragging_one_ray_origin_moves_both_origins_together(self) -> None:
+        plan = self._create_demo_draft()
+        lines = self.window._workspace_entry(symbol="BTC-USDT-SWAP", period="1H")["lines"]
+        support_index = next(index for index, item in enumerate(lines) if item["id"] == plan.support_line_id)
+        pressure_index = next(index for index, item in enumerate(lines) if item["id"] == plan.pressure_line_id)
+        for index, target_time in ((support_index, 3 * 3600), (pressure_index, 5 * 3600)):
+            line = lines[index]
+            old_time = line["time_a"]
+            self.window._line_drag_state = {
+                "index": index, "drag_mode": "endpoint_a", "anchor_line": dict(line),
+                "anchor_candle_time": old_time, "anchor_price": line["price_a"],
+            }
+            self.assertTrue(self.window._apply_line_drag_update(candle_time=target_time, price=line["price_a"]))
+            lines = self.window._workspace_entry(symbol="BTC-USDT-SWAP", period="1H")["lines"]
+            support = next(item for item in lines if item["id"] == plan.support_line_id)
+            pressure = next(item for item in lines if item["id"] == plan.pressure_line_id)
+            self.assertEqual(support["time_a"], target_time)
+            self.assertEqual(support["time_b"], target_time)
+            self.assertEqual(pressure["time_a"], target_time)
+            self.assertEqual(pressure["time_b"], target_time)
+
+    def test_future_projection_builds_selected_pattern_over_requested_horizon(self) -> None:
+        plan = self._create_demo_draft()
+        projection = self.window._build_area_shape_projection(plan, "double_reversal_up", 12)
+        self.assertEqual(len(projection["bars"]), 12)
+        self.assertEqual(projection["label"], "双线向上反转")
+        self.assertEqual(projection["entry"], float(plan.support_price))
+        self.assertIn("stop", projection)
+        approach = projection["bars"][:projection["approach_bars"]]
+        self.assertTrue(any(bar["close"] > bar["open"] for bar in approach))
+        self.assertTrue(any(bar["close"] < bar["open"] for bar in approach))
+        self.assertTrue(all(bar["low"] > projection["entry"] for bar in approach))
+
+    def test_future_projection_continues_ema15_and_sma50_from_projected_closes(self) -> None:
+        candles = [{"close": float(value)} for value in range(1, 61)]
+        bars = [
+            {"time_ms": 1000.0, "close": 61.0},
+            {"time_ms": 2000.0, "close": 62.0},
+        ]
+        ema_points = self._kline_module._future_moving_average_points(candles, bars, 15, exponential=True)
+        sma_points = self._kline_module._future_moving_average_points(candles, bars, 50, exponential=False)
+        expected_ema = self._kline_module._to_ema([*range(1, 61), 61.0, 62.0], 15)[-2:]
+        expected_sma = self._kline_module._to_sma([*range(1, 61), 61.0, 62.0], 50)[-2:]
+        self.assertEqual([point[0] for point in ema_points], [1000.0, 2000.0])
+        self.assertEqual([point[1] for point in ema_points], expected_ema)
+        self.assertEqual([point[1] for point in sma_points], expected_sma)
+
+    def test_future_projection_supports_short_and_places_shape_at_pressure_line(self) -> None:
+        plan = self._create_demo_draft()
+        projection = self.window._build_area_shape_projection(plan, "double_reversal_down", 12, "short")
+        self.assertEqual(projection["direction"], "short")
+        self.assertEqual(projection["entry"], float(plan.pressure_price))
+        self.assertEqual(projection["target"], float(plan.support_price))
+        signal_bars = projection["bars"][-2:]
+        self.assertGreaterEqual(max(bar["high"] for bar in signal_bars), projection["entry"])
+        self.assertTrue(any(bar["close"] < bar["open"] for bar in signal_bars))
+        self.assertTrue(any(bar["close"] > bar["open"] for bar in signal_bars))
+
+    def test_projection_candles_connect_without_gaps_for_both_sides_and_all_shapes(self) -> None:
+        plan = self._create_demo_draft()
+        patterns = {
+            "long": ("big_bullish", "long_lower_shadow", "double_reversal_up", "inside_bar", "bottom_fractal"),
+            "short": ("big_bearish", "long_upper_shadow", "double_reversal_down", "inside_bar", "top_fractal"),
+        }
+        for side, choices in patterns.items():
+            for pattern in choices:
+                for horizon in (4, 12, 40):
+                    with self.subTest(side=side, pattern=pattern, horizon=horizon):
+                        projection = self.window._build_area_shape_projection(plan, pattern, horizon, side)
+                        bars = projection["bars"]
+                        self.assertEqual(len(bars), horizon)
+                        previous_close = self.window._pending_payload.candles[-1]["close"]
+                        for bar in bars:
+                            self.assertAlmostEqual(bar["open"], previous_close)
+                            self.assertLessEqual(bar["low"], min(bar["open"], bar["close"]))
+                            self.assertGreaterEqual(bar["high"], max(bar["open"], bar["close"]))
+                            previous_close = bar["close"]
+
+    def test_future_projection_is_restored_after_chart_refresh(self) -> None:
+        plan = self._create_demo_draft()
+        projection = self.window._build_area_shape_projection(plan, "double_reversal_up", 12)
+        projection["_context_symbol"] = "BTC-USDT-SWAP"
+        projection["_context_period"] = "1H"
+        self.window._area_shape_projection = projection
+
+        class _ChartStub:
+            projection = None
+
+            def set_future_projection(self, value) -> None:
+                self.projection = value
+
+        chart = _ChartStub()
+        self.window._restore_area_shape_projection(chart, symbol="BTC-USDT-SWAP", period="1H")
+        self.assertIs(chart.projection, projection)
+
+        self.window._restore_area_shape_projection(chart, symbol="ETH-USDT-SWAP", period="1H")
+        self.assertIsNone(self.window._area_shape_projection)
+        self.assertEqual(self.window._area_shape_projection_button.text(), "未来推演")
+
+    def test_replay_only_processes_candles_after_shared_origin(self) -> None:
+        plan = self._create_demo_draft()
+        plan.support_price = Decimal("95")
+        plan.pressure_price = Decimal("120")
+        plan.config = AreaShapeConfig(
+            direction="long", atr_period=2, min_space_r=Decimal("1"), stop_offset_atr=Decimal("0"),
+            entry_trigger_mode="direct_touch", signal_patterns=("double_reversal_up",),
+        )
+        candles = [
+            Candle(0, Decimal("104"), Decimal("105"), Decimal("102"), Decimal("103"), Decimal("1"), True),
+            Candle(HOUR, Decimal("101"), Decimal("102"), Decimal("99"), Decimal("100"), Decimal("1"), True),
+            Candle(2 * HOUR, Decimal("96"), Decimal("97"), Decimal("94"), Decimal("96"), Decimal("1"), True),
+            Candle(3 * HOUR, Decimal("96"), Decimal("100"), Decimal("95"), Decimal("98"), Decimal("1"), True),
+        ]
+        rows = self.window._simulate_area_shape_replay(plan, candles, start_ms=HOUR, sides=("long",))
+        self.assertEqual(len(rows), 1)
+        self.assertGreater(rows[0]["entry_ts"], HOUR)
+        self.assertEqual(rows[0]["outcome"], "paper_take_profit")
+
+    def test_replay_records_same_side_signal_during_open_position_as_opportunity(self) -> None:
+        plan = self._create_demo_draft()
+        plan.support_price = Decimal("95")
+        plan.pressure_price = Decimal("125")
+        plan.config = AreaShapeConfig(
+            direction="long", risk_amount=Decimal("10"), min_space_r=Decimal("1"),
+            entry_trigger_mode="direct_touch", stop_basis="fixed_distance",
+            fixed_stop_distance=Decimal("10"), break_even_enabled=False,
+        )
+        candles = [
+            Candle(HOUR, Decimal("100"), Decimal("101"), Decimal("99"), Decimal("100"), Decimal("1"), True),
+            Candle(2 * HOUR, Decimal("100"), Decimal("102"), Decimal("94"), Decimal("100"), Decimal("1"), True),
+            Candle(3 * HOUR, Decimal("100"), Decimal("102"), Decimal("99"), Decimal("100"), Decimal("1"), True),
+            Candle(4 * HOUR, Decimal("100"), Decimal("102"), Decimal("94"), Decimal("100"), Decimal("1"), True),
+            Candle(5 * HOUR, Decimal("100"), Decimal("102"), Decimal("99"), Decimal("100"), Decimal("1"), True),
+            Candle(6 * HOUR, Decimal("100"), Decimal("102"), Decimal("99"), Decimal("100"), Decimal("1"), True),
+        ]
+
+        rows = self.window._simulate_area_shape_replay(plan, candles, start_ms=HOUR, sides=("long",))
+
+        self.assertTrue(any(item.get("record_type") == "trade" for item in rows), rows)
+        opportunities = [item for item in rows if item.get("record_type") == "opportunity"]
+        self.assertEqual(len(opportunities), 1)
+        self.assertEqual(opportunities[0]["side"], "long")
+        self.assertEqual(opportunities[0]["signal_ts"], 4 * HOUR)
+        self.assertIn("未重复开仓", opportunities[0]["outcome"])
+
+    def test_replay_scans_opposite_direction_while_simulated_position_is_open(self) -> None:
+        plan = self._create_demo_draft()
+        plan.support_price = Decimal("95")
+        plan.pressure_price = Decimal("125")
+        plan.config = AreaShapeConfig(
+            direction="long", risk_amount=Decimal("10"), min_space_r=Decimal("1"),
+            entry_trigger_mode="direct_touch", stop_basis="fixed_distance",
+            fixed_stop_distance=Decimal("1"), break_even_enabled=False,
+            exit_template="lock_2r_at_3r",
+        )
+        candles = [
+            Candle(HOUR, Decimal("100"), Decimal("101"), Decimal("99"), Decimal("100"), Decimal("1"), True),
+            Candle(2 * HOUR, Decimal("100"), Decimal("102"), Decimal("94"), Decimal("100"), Decimal("1"), True),
+            Candle(3 * HOUR, Decimal("100"), Decimal("102"), Decimal("99"), Decimal("100"), Decimal("1"), True),
+            Candle(4 * HOUR, Decimal("100"), Decimal("126"), Decimal("99"), Decimal("120"), Decimal("1"), True),
+            Candle(5 * HOUR, Decimal("124"), Decimal("126"), Decimal("123"), Decimal("124"), Decimal("1"), True),
+            Candle(6 * HOUR, Decimal("124"), Decimal("126"), Decimal("123"), Decimal("124"), Decimal("1"), True),
+        ]
+
+        rows = self.window._simulate_area_shape_replay(plan, candles, start_ms=HOUR, sides=("long",))
+
+        opportunities = [item for item in rows if item.get("record_type") == "opportunity"]
+        self.assertEqual(len(opportunities), 1)
+        self.assertEqual(opportunities[0]["side"], "short")
+        self.assertEqual(opportunities[0]["signal_ts"], 4 * HOUR)
+
+    def test_replay_maps_selected_shape_families_without_changing_plan(self) -> None:
+        plan = self._create_demo_draft()
+        selected = (
+            "big_bullish", "long_lower_shadow", "double_reversal_up", "bottom_fractal", "inside_bar",
+        )
+        plan.config = replace(plan.config, signal_patterns=selected)
+
+        mapped_short = self.window._area_shape_replay_patterns(selected, "short")
+        mapped_long = self.window._area_shape_replay_patterns(selected, "long")
+
+        self.assertEqual(
+            mapped_short,
+            ("big_bearish", "long_upper_shadow", "double_reversal_down", "top_fractal", "inside_bar"),
+        )
+        self.assertEqual(mapped_long, selected)
+        self.assertEqual(plan.config.signal_patterns, selected)
+
+    def test_replay_no_trade_result_is_empty_and_short_and_both_are_supported(self) -> None:
+        plan = self._create_demo_draft()
+        plan.support_price = Decimal("80")
+        plan.pressure_price = Decimal("120")
+        plan.config = AreaShapeConfig(
+            direction="short", atr_period=2, min_space_r=Decimal("1"), stop_offset_atr=Decimal("0"),
+            entry_trigger_mode="direct_touch", signal_patterns=("inside_bar",),
+        )
+        candles = [
+            Candle(n * HOUR, Decimal("100"), Decimal("105"), Decimal("95"), Decimal("101"), Decimal("1"), True)
+            for n in range(1, 6)
+        ]
+
+        short_rows = self.window._simulate_area_shape_replay(plan, candles, start_ms=HOUR, sides=("short",))
+        both_rows = self.window._simulate_area_shape_replay(plan, candles, start_ms=HOUR, sides=("long", "short"))
+
+        self.assertEqual(short_rows, [])
+        self.assertEqual(both_rows, [])
+        self.assertEqual(plan.config.direction, "short")
+
+    def test_replay_failure_is_reported_in_area_status(self) -> None:
+        self.window._area_shape_replay_failed("synthetic replay error")
+        self.assertIn("区域复盘失败", self.window._area_shape_status.text())
+        self.assertIn("synthetic replay error", self.window._area_shape_status.text())
+
+    def test_replay_runs_off_ui_thread_and_restores_button_after_failure(self) -> None:
+        self._create_demo_draft()
+        accepted = self._kline_module.QDialog.DialogCode.Accepted
+        with patch.object(self._kline_module.QDialog, "exec", return_value=accepted):
+            with patch.object(self.window, "_simulate_area_shape_replay", side_effect=RuntimeError("worker failure")):
+                self.window._run_area_shape_replay()
+                self.assertFalse(self.window._area_shape_replay_button.isEnabled())
+                deadline = time.monotonic() + 5
+                while self.window._area_shape_replay_thread is not None and time.monotonic() < deadline:
+                    self._app.processEvents()
+                    time.sleep(0.01)
+                self._app.processEvents()
+
+        self.assertIsNone(self.window._area_shape_replay_thread)
+        self.assertTrue(self.window._area_shape_replay_button.isEnabled())
+        self.assertIn("worker failure", self.window._area_shape_status.text())
+
+    def test_replay_completion_shows_current_ray_snapshot_and_runs_both_sides(self) -> None:
+        plan = self._create_demo_draft()
+        original_support = plan.support_price
+        original_pressure = plan.pressure_price
+        records = self.window._workspace_entry(symbol=plan.symbol, period=plan.period)["lines"]
+        next(item for item in records if item["id"] == plan.support_line_id)["price_a"] = 97.5
+        next(item for item in records if item["id"] == plan.pressure_line_id)["price_a"] = 125.5
+        with patch.object(self.window, "_simulate_area_shape_replay", return_value=[]) as simulate:
+            with patch.object(self.window, "_show_area_shape_replay_results") as show_results:
+                self.window._run_area_shape_replay()
+                deadline = time.monotonic() + 5
+                while self.window._area_shape_replay_thread is not None and time.monotonic() < deadline:
+                    self._app.processEvents()
+                    time.sleep(0.01)
+                self._app.processEvents()
+
+        self.assertEqual(simulate.call_args.args[0].support_price, Decimal("97.5"))
+        self.assertEqual(simulate.call_args.args[0].pressure_price, Decimal("125.5"))
+        self.assertEqual(simulate.call_args.kwargs["sides"], ("long", "short"))
+        self.assertEqual(show_results.call_args.args[0].support_price, Decimal("97.5"))
+        self.assertEqual(show_results.call_args.kwargs["sides"], ("long", "short"))
+        self.assertEqual(plan.support_price, original_support)
+        self.assertEqual(plan.pressure_price, original_pressure)
+
+    def test_replay_reopens_saved_results_without_running_simulation_again(self) -> None:
+        plan = self._create_demo_draft()
+        lines = self.window._workspace_entry(symbol=plan.symbol, period=plan.period)["lines"]
+        support = next(item for item in lines if item["id"] == plan.support_line_id)
+        pressure = next(item for item in lines if item["id"] == plan.pressure_line_id)
+        snapshot = replace(
+            plan,
+            support_price=Decimal(str(support["price_a"])),
+            pressure_price=Decimal(str(pressure["price_a"])),
+        )
+        start_seconds = int(support["time_a"])
+        signature = self.window._area_shape_replay_signature(snapshot, start_seconds)
+        rows = [{
+            "record_type": "opportunity", "side": "short", "signal_ts": 2 * HOUR,
+            "entry_ts": 2 * HOUR, "entry": "105", "stop": "110", "target": "95",
+            "space_r": "2", "outcome": "持仓期间出现，未重复开仓",
+        }]
+        self.window._workspace_entry(symbol=plan.symbol, period=plan.period)["area_replays"] = {
+            plan.plan_id: {"input_signature": signature, "rows": rows, "filters": {"kind": "all", "side": "all"}},
+        }
+        class _NoCandleScan:
+            def __iter__(self):
+                raise AssertionError("a cache hit must not rescan the candle history")
+
+        self.window._pending_payload = replace(self.window._pending_payload, raw_candles=_NoCandleScan())
+
+        with patch.object(self.window, "_simulate_area_shape_replay") as simulate:
+            with patch.object(self.window, "_show_area_shape_replay_results") as show_results:
+                self.window._run_area_shape_replay()
+
+        simulate.assert_not_called()
+        self.assertEqual(show_results.call_args.args[2], rows)
+        self.assertEqual(self.window._area_shape_replay_overlay["rows"], rows)
+
+    def test_replay_filters_table_and_chart_and_saves_filter_selection(self) -> None:
+        plan = self._create_demo_draft()
+        rows = [
+            {"record_type": "trade", "side": "long", "entry_ts": HOUR, "exit_ts": 2 * HOUR,
+             "entry": "100", "stop": "95", "exit": "110", "r": "2", "pnl": "20"},
+            {"record_type": "opportunity", "side": "short", "signal_ts": 3 * HOUR, "entry_ts": 3 * HOUR,
+             "entry": "105", "stop": "110", "target": "95", "space_r": "2", "outcome": "持仓期间出现"},
+        ]
+        cache = {"filters": {"kind": "all", "side": "all"}, "rows": rows}
+        self.window._workspace_entry(symbol=plan.symbol, period=plan.period).setdefault("area_replays", {})[plan.plan_id] = cache
+        self.window._area_shape_replay_overlay = {
+            "symbol": plan.symbol, "period": plan.period, "input_signature": "test",
+            "rows": rows, "filters": {"kind": "all", "side": "all"},
+        }
+        class _ChartStub:
+            def set_area_shape_replay_trades(self, visible) -> None:
+                self.trades = list(visible or [])
+
+        chart = _ChartStub()
+        self.window._native_chart_view = chart
+        accepted = self._kline_module.QDialog.DialogCode.Accepted
+
+        with patch.object(self._kline_module.QDialog, "exec", return_value=accepted):
+            self.window._show_area_shape_replay_results(plan, HOUR // 1000, rows, replay_record=cache)
+
+        dialog = next(item for item in self.window.findChildren(self._kline_module.QDialog) if item.windowTitle() == "区域计划复盘结果")
+        table = dialog.findChild(self._kline_module.QTableWidget)
+        filters = dialog.findChildren(self._kline_module.QComboBox)
+        kind_filter = next(item for item in filters if item.count() == 3)
+        self.assertEqual(table.item(0, 1).foreground().color().name(), "#15803d")
+        self.assertEqual(table.item(1, 1).foreground().color().name(), "#6d28d9")
+        kind_filter.setCurrentIndex(kind_filter.findData("opportunity"))
+        self._app.processEvents()
+
+        self.assertEqual(table.rowCount(), 1)
+        self.assertEqual(table.item(0, 0).text(), "潜在机会")
+        self.assertEqual(chart.trades, [rows[1]])
+        self.assertEqual(
+            self.window._area_shape_replay_record(plan.plan_id, symbol=plan.symbol, period=plan.period)["filters"]["kind"],
+            "opportunity",
+        )
+
+    def test_replay_result_dialog_rounds_values_and_fits_all_columns(self) -> None:
+        plan = self._create_demo_draft()
+        plan.support_price = Decimal("80363.8718251256")
+        plan.pressure_price = Decimal("84007.00907776799")
+        rows = [{
+            "side": "short", "pattern": "long_upper_shadow", "entry": Decimal("83771.4"),
+            "stop": Decimal("84414.77835830216821777195846"),
+            "exit": Decimal("82424.81264684280015639977916"),
+            "r": Decimal("1.999999999999999999999999999"),
+            "pnl": Decimal("19.99999999999999999999999999"),
+            "entry_ts": 1791741600000, "exit_ts": 1791853200000, "outcome": "paper_stop",
+        }, {
+            "side": "short", "pattern": "long_upper_shadow", "entry": Decimal("83820.1"),
+            "stop": Decimal("84543.49988036458097672462331"),
+            "exit": Decimal("81590.35259597170725521425294"),
+            "r": Decimal("2.999999999999999999999999999"),
+            "pnl": Decimal("29.99999999999999999999999999"),
+            "entry_ts": 1791878400000, "exit_ts": 1792072800000, "outcome": "paper_stop",
+        }]
+        instrument = SimpleNamespace(tick_size=Decimal("0.1"))
+        accepted = self._kline_module.QDialog.DialogCode.Accepted
+        with patch.object(self.window, "_instrument_for_symbol", return_value=instrument):
+            with patch.object(self._kline_module.QDialog, "exec", return_value=accepted):
+                self.window._show_area_shape_replay_results(plan, 1791428400, rows, sides=("short",))
+
+        dialog = next(item for item in self.window.findChildren(self._kline_module.QDialog) if item.windowTitle() == "区域计划复盘结果")
+        table = dialog.findChild(self._kline_module.QTableWidget)
+        summary = dialog.findChild(self._kline_module.QLabel)
+        self.assertIsNotNone(table)
+        self.assertEqual(table.item(0, 5).text(), "83771.4")
+        self.assertEqual(table.item(0, 6).text(), "84414.8")
+        self.assertEqual(table.item(0, 7).text(), "82424.8")
+        self.assertEqual(table.item(0, 8).text(), "2.00R")
+        self.assertEqual(table.item(0, 9).text(), "20.00")
+        self.assertEqual(table.item(0, 1).foreground().color().name(), "#b91c1c")
+        self.assertEqual(table.item(0, 1).background().color().name(), "#fff1f0")
+        self.assertIn("80363.9 / 压力 84007.0", summary.text())
+        self.assertIn("50.00 U", summary.text())
+        self.assertIn("5.00R", summary.text())
+        self.assertNotIn("999999999", summary.text() + " ".join(
+            table.item(row, column).text()
+            for row in range(table.rowCount()) for column in range(table.columnCount())
+        ))
+        self.assertEqual(table.horizontalHeader().sectionResizeMode(0), self._kline_module.QHeaderView.ResizeMode.Interactive)
+        self.assertLessEqual(sum(table.columnWidth(index) for index in range(table.columnCount())), 1220)
+
+    def test_direct_fixed_plan_details_match_actual_entry_and_stop_modes(self) -> None:
+        plan = self._create_demo_draft()
+        plan.config = AreaShapeConfig(
+            entry_trigger_mode="direct_touch", stop_basis="fixed_distance",
+            fixed_stop_distance=Decimal("1000"), resting_entry_enabled=False,
+            break_even_enabled=False,
+        )
+        details = self.window._area_shape_plan_details_text(plan)
+        self.assertIn("预挂入场线GTC", details)
+        self.assertIn("固定价差 1000 U", details)
+        self.assertIn("当前组合不需ATR", details)
+        self.assertIn("保本关闭", details)
+        self.assertNotIn("价格受限FOK", details)
+        self.assertNotIn("ATR周期", details)
+        self.assertNotIn("入场偏移", details)
+
+    def test_replay_requires_the_plan_timeframe(self) -> None:
+        self._create_demo_draft()
+        self.window._period_combo.setCurrentText("4H")
+        self.window._run_area_shape_replay()
+        self.assertIn("按 1H K 线复盘", self.window._area_shape_status.text())
+        self.assertIn("请切换到 1H", self.window._area_shape_status.text())
+
+    def test_paper_plan_actions_follow_enable_pause_cancel_flow(self) -> None:
+        plan = self._create_demo_draft()
+        workspace_lines = self.window._workspace_entry(symbol="BTC-USDT-SWAP", period="1H")["lines"]
+        support = next(item for item in workspace_lines if item["id"] == plan.support_line_id)
+        pressure = next(item for item in workspace_lines if item["id"] == plan.pressure_line_id)
+        self.assertEqual(support["kind"], "ray")
+        self.assertEqual(pressure["kind"], "ray")
+        self.assertEqual(support["time_a"], pressure["time_a"])
+        self.assertFalse(self.window._area_shape_create_button.isEnabled())
+        line_count = len(workspace_lines)
+        self.window._create_area_shape_plan()
+        self.assertEqual(len(self.window._workspace_entry(symbol="BTC-USDT-SWAP", period="1H")["lines"]), line_count)
+        details = self.window._area_shape_plan_details.text()
+        self.assertIn("当前计划参数", details)
+        self.assertIn("单笔风险预算", details)
+        self.assertIn("最低目标空间", details)
+        self.assertIn("1H触发形态", details)
+        self.assertEqual(self.window._area_shape_start_button.text(), "启用计划")
+        self.assertTrue(self.window._area_shape_start_button.isEnabled())
+        self.assertFalse(self.window._area_shape_pause_button.isEnabled())
+
+        self.window._area_shape_mode_combo.setCurrentIndex(self.window._area_shape_mode_combo.findData("paper"))
+        self.window._start_area_shape_monitoring()
+        self.assertEqual(self.paper_monitor.get_plan(plan.plan_id).status, "monitoring")
+        self.assertEqual(self.window._area_shape_start_button.text(), "监控中")
+        self.assertFalse(self.window._area_shape_start_button.isEnabled())
+        self.assertTrue(self.window._area_shape_pause_button.isEnabled())
+
+        self.window._pause_area_shape_monitoring()
+        self.assertEqual(self.paper_monitor.get_plan(plan.plan_id).status, "paused")
+        self.assertEqual(self.window._area_shape_start_button.text(), "恢复计划")
+        self.assertTrue(self.window._area_shape_start_button.isEnabled())
+
+        self.window._cancel_area_shape_plan()
+        self.assertEqual(self.paper_monitor.get_plan(plan.plan_id).status, "cancelled")
+        self.assertFalse(self.window._area_shape_start_button.isEnabled())
 
     def test_demo_start_obeys_profile_unlock_and_live_environment_gate(self) -> None:
         self._create_demo_draft()
@@ -164,6 +629,8 @@ class AreaShapeDemoUiTests(QtWidgetTestCase):
         self.window.show()
         self.window._toggle_left_panel_btn.setChecked(False)
         self.window._control_tabs.setCurrentIndex(self.window._control_area_tab_index)
+        self.window._rr_workspace_mode_combo.setCurrentIndex(self.window._rr_workspace_mode_combo.findData("area"))
+        self.assertEqual(self.window._control_tabs.currentIndex(), self.window._control_area_tab_index)
         for _ in range(5):
             self._app.processEvents()
 
@@ -175,6 +642,8 @@ class AreaShapeDemoUiTests(QtWidgetTestCase):
             self.window._area_shape_mode_combo,
             self.window._area_shape_create_button,
             self.window._area_shape_edit_button,
+            self.window._area_shape_replay_button,
+            self.window._area_shape_projection_button,
             self.window._area_shape_start_button,
             self.window._area_shape_pause_button,
             self.window._area_shape_cancel_button,
@@ -191,7 +660,37 @@ class AreaShapeDemoUiTests(QtWidgetTestCase):
         self.assertEqual(self.window._control_panel.sizePolicy().horizontalPolicy(), original[0].horizontalPolicy())
         self.assertEqual(self.window._control_tabs.sizePolicy().horizontalPolicy(), original[2].horizontalPolicy())
         self.window._control_tabs.setCurrentIndex(self.window._control_area_tab_index)
+        self.window._rr_workspace_mode_combo.setCurrentIndex(self.window._rr_workspace_mode_combo.findData("area"))
         self._app.processEvents()
+
+    def test_rr_and_smart_trade_tabs_only_change_visible_workspace(self) -> None:
+        self._create_demo_draft()
+        self.assertEqual(self.paper_monitor.plans()[0].status, "draft")
+        self.assertEqual(self.demo_monitor.arm_calls, [])
+
+        with (
+            patch.object(self.window, "_start_area_shape_monitoring") as start_area,
+            patch.object(self.window, "_enable_selected_rr_trade") as enable_rr,
+            patch.object(self.window, "_cancel_selected_rr_trade") as cancel_rr,
+        ):
+            self.window._rr_workspace_mode_combo.setCurrentIndex(
+                self.window._rr_workspace_mode_combo.findData("direct")
+            )
+            self.assertEqual(self.window._control_tabs.currentIndex(), self.window._control_rr_tab_index)
+            self.window._rr_workspace_mode_combo.setCurrentIndex(
+                self.window._rr_workspace_mode_combo.findData("area")
+            )
+            self.assertEqual(self.window._control_tabs.currentIndex(), self.window._control_area_tab_index)
+            self.window._control_tabs.setCurrentIndex(self.window._control_rr_tab_index)
+            self.assertEqual(self.window._rr_workspace_mode_combo.currentData(), "direct")
+            self.window._control_tabs.setCurrentIndex(self.window._control_area_tab_index)
+            self.assertEqual(self.window._rr_workspace_mode_combo.currentData(), "area")
+            start_area.assert_not_called()
+            enable_rr.assert_not_called()
+            cancel_rr.assert_not_called()
+
+        self.assertEqual(self.paper_monitor.plans()[0].status, "draft")
+        self.assertEqual(self.demo_monitor.arm_calls, [])
 
     def _wait_for_demo_action(self) -> None:
         deadline = time.monotonic() + 3

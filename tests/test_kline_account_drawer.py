@@ -81,6 +81,26 @@ class KlineAccountDrawerHelperTests(TestCase):
 
 
 class KlineAccountDrawerWidgetTests(QtWidgetTestCase):
+    def test_realtime_order_updates_reach_shared_store_without_waiting_for_rest(self) -> None:
+        drawer = KlineAccountDrawer()
+        try:
+            drawer._profile_name, drawer._environment = "moni", "demo"
+            drawer._shared_order_store = Mock()
+            order = object()
+            snapshot = AccountRealtimeSnapshot(
+                profile_name="moni", environment="demo", positions=(), orders=(order,),
+                account=None, generation=1, source="ws",
+            )
+            drawer._apply_realtime_snapshot(snapshot)
+            drawer._shared_order_store.publish_order_updates.assert_called_once_with(
+                profile_name="moni", environment="demo", orders=[order],
+            )
+            drawer._environment = "live"
+            drawer._apply_realtime_snapshot(snapshot)
+            self.assertEqual(drawer._shared_order_store.publish_order_updates.call_count, 1)
+        finally:
+            self.dispose_widget(drawer)
+
     def test_drawer_uses_the_holdings_realtime_snapshot_context(self) -> None:
         drawer = KlineAccountDrawer()
         try:

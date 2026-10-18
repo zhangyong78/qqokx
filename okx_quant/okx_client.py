@@ -1516,14 +1516,19 @@ class OkxRestClient:
         else:
             params["algoClOrdId"] = acl
             params["instId"] = inst_id.strip().upper()
-        payload = self._request(
-            "GET",
-            "/api/v5/trade/order-algo",
-            params=params,
-            auth=True,
-            credentials=credentials,
-            simulated=environment == "demo",
-        )
+        try:
+            payload = self._request(
+                "GET",
+                "/api/v5/trade/order-algo",
+                params=params,
+                auth=True,
+                credentials=credentials,
+                simulated=environment == "demo",
+            )
+        except OkxApiError as exc:
+            if str(exc.code) == "51603":
+                return None
+            raise
         data = payload.get("data")
         if not isinstance(data, list) or not data:
             return None
@@ -1614,8 +1619,9 @@ class OkxRestClient:
         self, credentials: Credentials, config: StrategyConfig, *, inst_id: str,
         side: str, size: Decimal, limit_price: Decimal, stop_price: Decimal,
         client_order_id: str, stop_algo_client_order_id: str,
+        take_profit_price: Decimal | None = None,
     ) -> OkxOrderResult:
-        """Demo-only FOK entry with an attached last-price initial stop.
+        """Demo-only FOK entry with attached last-price protection.
 
         The attachment is NOT considered active protection on acknowledgement;
         callers must query the child algo after actual fill and fail closed.
@@ -1635,17 +1641,18 @@ class OkxRestClient:
         if stop != stop_price:
             raise ValueError("初始止损价必须已按tickSz精确规范；拒绝扩大风险距离")
         self._enforce_order_size_safety_limit(instrument=instrument, size=size, reference_price=px)
+        attachment = _area_shape_attached_protection(
+            side=side, entry=px, stop=stop, take_profit=take_profit_price,
+            tick=tick, client_id=stop_algo_client_order_id,
+        )
         order: dict[str, Any] = {
             "instId": instrument.inst_id, "tdMode": config.trade_mode, "side": side,
             "ordType": "fok", "px": format_decimal(px), "sz": _format_exchange_contract_sz(instrument, size),
             "tag": OKX_BROKER_TAG,
-            "attachAlgoOrds": [{
-                "attachAlgoClOrdId": stop_algo_client_order_id,
-                "slTriggerPx": format_decimal(stop), "slOrdPx": "-1", "slTriggerPxType": "last",
-            }],
+            "attachAlgoOrds": [attachment],
             "clOrdId": client_order_id,
         }
-        pos_side = self._derivative_order_pos_side(credentials, config, instrument, side)
+        pos_side = self._derivative_order_pos_side(credentials, config, instrument, side, plan_pos_side=None)
         if pos_side:
             order["posSide"] = pos_side
         self._maybe_isolated_margin_ccy(order, instrument=instrument, config=config)
@@ -1662,11 +1669,12 @@ class OkxRestClient:
         self, credentials: Credentials, config: StrategyConfig, *, inst_id: str,
         side: str, size: Decimal, limit_price: Decimal, stop_price: Decimal,
         client_order_id: str, stop_algo_client_order_id: str,
+        take_profit_price: Decimal | None = None,
     ) -> OkxOrderResult:
-        """Place a demo-only GTC limit at the exact user-drawn entry line.
+        """Place a demo-only GTC limit with attached exchange-side protection.
 
-        The entry price is never rounded or improved. The attached last-price
-        stop is only a requested child order; callers must verify it after fill.
+        The entry price is never rounded or improved. Attached last-price
+        protection is only requested here; callers must verify it after fill.
         """
         if config.environment != "demo":
             raise PermissionError("区域形态限价委托只允许OKX模拟盘")
@@ -1688,18 +1696,26 @@ class OkxRestClient:
             raise ValueError("初始止损价必须符合tickSz；拒绝扩大风险距离")
         if (side == "buy" and stop_price >= limit_price) or (side == "sell" and stop_price <= limit_price):
             raise ValueError("初始止损价必须位于入场价的亏损方向")
+        if take_profit_price is not None:
+            if not isinstance(take_profit_price, Decimal) or not take_profit_price.is_finite() or take_profit_price <= 0:
+                raise ValueError("固定止盈价无效")
+            if take_profit_price % tick != 0:
+                raise ValueError("固定止盈价必须符合tickSz")
+            if (side == "buy" and take_profit_price <= limit_price) or (side == "sell" and take_profit_price >= limit_price):
+                raise ValueError("固定止盈价必须位于入场价的盈利方向")
         self._enforce_order_size_safety_limit(instrument=instrument, size=size, reference_price=limit_price)
+        attached_protection = _area_shape_attached_protection(
+            side=side, entry=limit_price, stop=stop_price, take_profit=take_profit_price,
+            tick=tick, client_id=stop_algo_client_order_id,
+        )
         order: dict[str, Any] = {
             "instId": instrument.inst_id, "tdMode": config.trade_mode, "side": side,
             "ordType": "limit", "px": format_decimal(limit_price),
             "sz": _format_exchange_contract_sz(instrument, size), "tag": OKX_BROKER_TAG,
-            "attachAlgoOrds": [{
-                "attachAlgoClOrdId": stop_algo_client_order_id,
-                "slTriggerPx": format_decimal(stop_price), "slOrdPx": "-1", "slTriggerPxType": "last",
-            }],
+            "attachAlgoOrds": [attached_protection],
             "clOrdId": client_order_id,
         }
-        pos_side = self._derivative_order_pos_side(credentials, config, instrument, side)
+        pos_side = self._derivative_order_pos_side(credentials, config, instrument, side, plan_pos_side=None)
         if pos_side:
             order["posSide"] = pos_side
         self._maybe_isolated_margin_ccy(order, instrument=instrument, config=config)
@@ -1718,8 +1734,9 @@ class OkxRestClient:
         self, credentials: Credentials, config: StrategyConfig, *, inst_id: str,
         side: str, size: Decimal, trigger_price: Decimal, limit_price: Decimal,
         stop_price: Decimal, client_order_id: str, stop_algo_client_order_id: str,
+        take_profit_price: Decimal | None = None,
     ) -> OkxOrderResult:
-        """Submit a demo-only exchange-hosted trigger entry with a bounded FOK and attached SL."""
+        """Submit a demo-only bounded trigger entry with attached TP/SL."""
         if config.environment != "demo":
             raise PermissionError("区域形态触发委托仅允许OKX模拟盘")
         if side not in {"buy", "sell"} or not client_order_id or not stop_algo_client_order_id:
@@ -1736,18 +1753,19 @@ class OkxRestClient:
         if (side == "buy" and not stop < trigger <= limit) or (side == "sell" and not limit <= trigger < stop):
             raise ValueError("触发价/成交上限/止损关系无效")
         self._enforce_order_size_safety_limit(instrument=instrument, size=size, reference_price=limit)
+        attachment = _area_shape_attached_protection(
+            side=side, entry=limit, stop=stop, take_profit=take_profit_price,
+            tick=tick, client_id=stop_algo_client_order_id,
+        )
         order: dict[str, Any] = {
             "instId": instrument.inst_id, "tdMode": config.trade_mode, "side": side,
             "ordType": "trigger", "sz": _format_exchange_contract_sz(instrument, size),
             "triggerPx": format_decimal(trigger), "triggerPxType": "last",
             "orderPx": format_decimal(limit), "advanceOrdType": "fok",
             "algoClOrdId": client_order_id, "tag": OKX_BROKER_TAG,
-            "attachAlgoOrds": [{
-                "attachAlgoClOrdId": stop_algo_client_order_id,
-                "slTriggerPx": format_decimal(stop), "slOrdPx": "-1", "slTriggerPxType": "last",
-            }],
+            "attachAlgoOrds": [attachment],
         }
-        pos_side = self._derivative_order_pos_side(credentials, config, instrument, side)
+        pos_side = self._derivative_order_pos_side(credentials, config, instrument, side, plan_pos_side=None)
         if pos_side:
             order["posSide"] = pos_side
         self._maybe_isolated_margin_ccy(order, instrument=instrument, config=config)
@@ -3897,6 +3915,25 @@ def infer_inst_type(inst_id: str) -> str:
     if FUTURES_ID_PATTERN.match(normalized):
         return "FUTURES"
     return "SPOT"
+
+
+def _area_shape_attached_protection(
+    *, side: str, entry: Decimal, stop: Decimal, take_profit: Decimal | None,
+    tick: Decimal, client_id: str,
+) -> dict[str, str]:
+    if (side not in {"buy", "sell"} or not stop.is_finite() or stop <= 0
+            or (side == "buy" and stop >= entry) or (side == "sell" and stop <= entry)):
+        raise ValueError("附带止损与入场方向关系无效")
+    result = {"attachAlgoClOrdId": client_id, "slTriggerPx": format_decimal(stop),
+              "slOrdPx": "-1", "slTriggerPxType": "last"}
+    if take_profit is not None:
+        if (not isinstance(take_profit, Decimal) or not take_profit.is_finite() or take_profit <= 0 or take_profit % tick != 0
+                or (side == "buy" and take_profit <= entry)
+                or (side == "sell" and take_profit >= entry)):
+            raise ValueError("附带止盈价不符合tickSz或与入场方向关系无效")
+        result.update({"tpTriggerPx": format_decimal(take_profit), "tpOrdPx": "-1",
+                       "tpTriggerPxType": "last"})
+    return result
 
 
 def _area_shape_validate_contract(instrument: Instrument) -> tuple[Decimal, Decimal, Decimal, Decimal]:

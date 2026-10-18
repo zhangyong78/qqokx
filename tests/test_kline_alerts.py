@@ -50,6 +50,21 @@ class KlineAlertTests(unittest.TestCase):
         self.assertFalse(normalized["alerts"]["box_breakout"]["enabled"])
         self.assertEqual(normalized["lines"], [])
 
+    def test_normalize_workspace_entry_preserves_area_replay_results_and_filters(self) -> None:
+        saved = {
+            "area_replays": {
+                "plan-1": {
+                    "input_signature": "same-plan",
+                    "filters": {"kind": "opportunity", "side": "short"},
+                    "rows": [{"record_type": "opportunity", "side": "short", "entry": "10"}],
+                },
+            },
+        }
+
+        normalized = normalize_workspace_entry(saved)
+
+        self.assertEqual(normalized["area_replays"], saved["area_replays"])
+
     def test_line_value_at_projects_trend_line(self) -> None:
         line = make_line_rule(
             kind="trend",
@@ -62,6 +77,22 @@ class KlineAlertTests(unittest.TestCase):
             price_b=20.0,
         )
         self.assertAlmostEqual(line_value_at(line, 150), 15.0)
+
+    def test_ray_keeps_its_origin_and_ignores_candles_before_it(self) -> None:
+        ray = make_line_rule(
+            kind="ray", label="区域支撑", trigger="touch", action="notify",
+            time_a=200, price_a=10.0, time_b=200, price_b=10.0,
+        )
+        workspace = normalize_workspace_entry({"lines": [ray]})
+        self.assertEqual(workspace["lines"][0]["kind"], "ray")
+        candles = [
+            {"time": 100, "open": 10.0, "high": 10.5, "low": 9.5, "close": 10.0},
+            {"time": 150, "open": 10.0, "high": 10.5, "low": 9.5, "close": 10.0},
+        ]
+        _updated, events, _summary = evaluate_workspace_alerts(
+            workspace_entry=workspace, candles=candles, ema_fast=[], ma_slow=[], raw_candles=[],
+        )
+        self.assertEqual(events, [])
 
     def test_line_email_configuration_defaults_to_disabled_once(self) -> None:
         line = make_line_rule(
