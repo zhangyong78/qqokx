@@ -104,6 +104,7 @@ from okx_quant.persistence import (
 )
 from okx_quant.arbitrage.arbitrage_executor import _build_strategy_config
 from okx_quant.signal_replay_engine import SignalReplayConfig, build_signal_replay_dataset
+from okx_quant.shape_salience import significant_range_core
 from okx_quant.strategy_catalog import STRATEGY_DYNAMIC_LONG_ID, STRATEGY_EMA55_SLOPE_SHORT_ID
 from okx_quant.strategy_symbol_defaults import get_strategy_symbol_parameter_defaults
 from roll_terminal_qt.line_trading_core import (
@@ -1902,17 +1903,30 @@ def _rank_in_recent_window(
     *,
     lookback: int = 10,
     metric: str = "body",
+    reference_start: int | None = None,
 ) -> int | None:
     if index < 0 or index >= len(candles):
         return None
-    start = max(0, index - max(int(lookback), 1) + 1)
+    lookback = max(int(lookback), 1)
+    if reference_start is None:
+        start = max(0, index - lookback + 1)
+        end = index + 1
+    else:
+        start = int(reference_start)
+        end = start + lookback
+        if start < 0 or end > len(candles):
+            return None
+        if any(not bool(getattr(candles[item], "confirmed", True)) for item in range(start, end)):
+            return None
     metric_func = _candle_amplitude if str(metric).strip().lower() == "range" else _candle_body_size
     target = metric_func(candles[index])
     if target <= 0:
         return None
     larger_count = 0
-    for candle in candles[start : index + 1]:
-        if metric_func(candle) > target:
+    for candle in candles[start:end]:
+        candidate_value = metric_func(candle)
+        exceeds_rank_threshold = candidate_value >= target if reference_start is not None else candidate_value > target
+        if exceeds_rank_threshold:
             larger_count += 1
     return larger_count + 1
 
@@ -1923,16 +1937,29 @@ def _shadow_rank_in_recent_window(
     *,
     lookback: int = 10,
     side: str,
+    reference_start: int | None = None,
 ) -> int | None:
     if index < 0 or index >= len(candles):
         return None
-    start = max(0, index - max(int(lookback), 1) + 1)
+    lookback = max(int(lookback), 1)
+    if reference_start is None:
+        start = max(0, index - lookback + 1)
+        end = index + 1
+    else:
+        start = int(reference_start)
+        end = start + lookback
+        if start < 0 or end > len(candles):
+            return None
+        if any(not bool(getattr(candles[item], "confirmed", True)) for item in range(start, end)):
+            return None
     target = _candle_shadow_size(candles[index], side=side)
     if target <= 0:
         return None
     larger_count = 0
-    for candle in candles[start : index + 1]:
-        if _candle_shadow_size(candle, side=side) > target:
+    for candle in candles[start:end]:
+        candidate_value = _candle_shadow_size(candle, side=side)
+        exceeds_rank_threshold = candidate_value >= target if reference_start is not None else candidate_value > target
+        if exceeds_rank_threshold:
             larger_count += 1
     return larger_count + 1
 
@@ -1945,12 +1972,32 @@ def _signal_core_amplitude_candle(
     lookback: int = 10,
     top_n: int = 4,
     metric: str = "body",
+    pattern_start: int | None = None,
 ) -> tuple[int, int] | None:
+    if signal_index < 0 or signal_index >= len(candles):
+        return None
+    if pattern_start is not None and str(metric).strip().lower() == "range":
+        return significant_range_core(
+            candles,
+            tuple(range(int(pattern_start), int(signal_index) + 1)),
+            lookback=lookback,
+            top_n=top_n,
+        )
+    reference_start = None
+    if pattern_start is not None:
+        reference_start = int(pattern_start) - max(int(lookback), 1)
+        if reference_start < 0:
+            return None
+        pattern_end = int(signal_index) + 1
+        if any(not bool(getattr(candles[item], "confirmed", True)) for item in range(reference_start, pattern_end)):
+            return None
     best: tuple[int, int] | None = None
     for index in _signal_pattern_index_range(signal_index=signal_index, candle_count=candle_count):
         if index < 0 or index >= len(candles):
             continue
-        rank = _rank_in_recent_window(candles, index, lookback=lookback, metric=metric)
+        rank = _rank_in_recent_window(
+            candles, index, lookback=lookback, metric=metric, reference_start=reference_start,
+        )
         if rank is None or rank > top_n:
             continue
         if best is None or rank < best[1]:
@@ -1991,31 +2038,6 @@ def _candle_touches_enabled_ma(
         (include_ema15 and _candle_crosses_line(candle, float(ema15_values[index])))
         or (include_sma50 and _candle_crosses_line(candle, float(sma50_values[index])))
     )
-
-
-def _signal_fractal_valid(
-    *,
-    candles: list[Any],
-    signal_index: int,
-    pattern_id: str,
-) -> bool:
-    pivot_index = signal_index - 1
-    if pivot_index < 0 or pivot_index >= len(candles):
-        return False
-    if pivot_index < 4:
-        return False
-    window_start = pivot_index - 4
-    window_end = pivot_index + 1
-    pivot_high = _to_float(candles[pivot_index].high)
-    pivot_low = _to_float(candles[pivot_index].low)
-    window_high = max(_to_float(item.high) for item in candles[window_start:window_end])
-    window_low = min(_to_float(item.low) for item in candles[window_start:window_end])
-    normalized_pattern_id = pattern_id.strip().lower()
-    if normalized_pattern_id == "top_fractal":
-        return pivot_high == window_high
-    if normalized_pattern_id == "bottom_fractal":
-        return pivot_low == window_low
-    return True
 
 
 def _double_reversal_reclaims_first_body(
@@ -2173,12 +2195,9 @@ def _build_replay_signal_markers(
         candle = candles[index]
         if not bool(getattr(candle, "confirmed", True)):
             continue
-        if not _signal_fractal_valid(
-            candles=candles,
-            signal_index=index,
-            pattern_id=str(signal.pattern_id),
-        ):
-            continue
+        pattern_start = _signal_pattern_index_range(
+            signal_index=index, candle_count=int(signal.candle_count),
+        ).start
         core_body_candle = _signal_core_amplitude_candle(
             candles=candles,
             signal_index=index,
@@ -2186,6 +2205,7 @@ def _build_replay_signal_markers(
             lookback=10,
             top_n=4,
             metric="body",
+            pattern_start=pattern_start,
         )
         core_range_candle = _signal_core_amplitude_candle(
             candles=candles,
@@ -2194,10 +2214,11 @@ def _build_replay_signal_markers(
             lookback=10,
             top_n=4,
             metric="range",
+            pattern_start=pattern_start,
         )
-        if core_body_candle is None and core_range_candle is None:
+        if core_range_candle is None:
             continue
-        core_index, core_rank = core_body_candle or core_range_candle  # default display metric is body.
+        core_index, core_rank = core_range_candle
         core_item = candles[core_index]
         core_ma_touch = _candle_touches_enabled_ma(
             candle=core_item,
@@ -2218,18 +2239,34 @@ def _build_replay_signal_markers(
         key = (index, signal.pattern_id)
         if key in seen:
             continue
-        seen.add(key)
         direction = str(signal.direction or "neutral").strip().lower()
         color = _REPLAY_SIGNAL_LONG_COLOR if direction == "long" else _REPLAY_SIGNAL_SHORT_COLOR
         label = _REPLAY_SIGNAL_LABELS.get(signal.pattern_id, signal.pattern_name)
         text_suffix = f"核心K前{core_rank}"
-        if nearest_name != "-" and nearest_distance is not None and nearest_distance <= _REPLAY_SIGNAL_NEAR_MA_MAX_PCT:
-            text_suffix = f"{text_suffix} @{nearest_name}"
         shadow_rank = None
         if signal.pattern_id == "long_upper_shadow":
-            shadow_rank = _shadow_rank_in_recent_window(candles, index, lookback=10, side="upper")
+            signal_range = _candle_amplitude(candle)
+            if signal_range <= 0 or _candle_shadow_size(candle, side="upper") < signal_range * 0.55:
+                continue
+            shadow_rank = _shadow_rank_in_recent_window(
+                candles, index, lookback=10, side="upper", reference_start=pattern_start - 10,
+            )
         elif signal.pattern_id == "long_lower_shadow":
-            shadow_rank = _shadow_rank_in_recent_window(candles, index, lookback=10, side="lower")
+            signal_range = _candle_amplitude(candle)
+            if signal_range <= 0 or _candle_shadow_size(candle, side="lower") < signal_range * 0.55:
+                continue
+            shadow_rank = _shadow_rank_in_recent_window(
+                candles, index, lookback=10, side="lower", reference_start=pattern_start - 10,
+            )
+            if shadow_rank is None or shadow_rank > 4:
+                continue
+        if signal.pattern_id == "long_upper_shadow" and (shadow_rank is None or shadow_rank > 4):
+            continue
+        if shadow_rank is not None:
+            text_suffix = f"核心K前{core_rank} 影线前{shadow_rank}"
+        if nearest_name != "-" and nearest_distance is not None and nearest_distance <= _REPLAY_SIGNAL_NEAR_MA_MAX_PCT:
+            text_suffix = f"{text_suffix} @{nearest_name}"
+        seen.add(key)
         markers.append(
             {
                 "index": index,
@@ -2279,6 +2316,7 @@ def _build_replay_signal_markers(
             include_sma50=include_sma50,
         ):
             continue
+        pattern_start = index - 1
         core_body_candle = _signal_core_amplitude_candle(
             candles=candles,
             signal_index=index,
@@ -2286,6 +2324,7 @@ def _build_replay_signal_markers(
             lookback=10,
             top_n=4,
             metric="body",
+            pattern_start=pattern_start,
         )
         core_range_candle = _signal_core_amplitude_candle(
             candles=candles,
@@ -2294,14 +2333,15 @@ def _build_replay_signal_markers(
             lookback=10,
             top_n=4,
             metric="range",
+            pattern_start=pattern_start,
         )
-        if core_body_candle is None and core_range_candle is None:
+        if core_range_candle is None:
             continue
         key = (index, pattern_id)
         if key in seen:
             continue
         seen.add(key)
-        core_index, core_rank = core_body_candle or core_range_candle  # default display metric is body.
+        core_index, core_rank = core_range_candle
         core_item = candles[core_index]
         core_ma_touch = _candle_touches_enabled_ma(
             candle=core_item,
@@ -2352,11 +2392,24 @@ def _build_replay_signal_markers(
         body = _candle_body_size(candle)
         upper_shadow = _candle_shadow_size(candle, side="upper")
         lower_shadow = _candle_shadow_size(candle, side="lower")
+        pattern_start = index
+        reference_start = pattern_start - 10
+        candle_range = _candle_amplitude(candle)
+        if reference_start < 0 or candle_range <= 0:
+            continue
+        range_core = significant_range_core(candles, (index,), lookback=10, top_n=4)
+        if range_core is None:
+            continue
+        _, range_rank = range_core
         candidates: list[tuple[str, str, str, int | None]] = []
-        if upper_shadow >= (body * 2.0) and upper_shadow >= lower_shadow:
-            candidates.append(("long_upper_shadow", "short", "upper", _shadow_rank_in_recent_window(candles, index, lookback=10, side="upper")))
-        if lower_shadow >= (body * 2.0) and lower_shadow >= upper_shadow:
-            candidates.append(("long_lower_shadow", "long", "lower", _shadow_rank_in_recent_window(candles, index, lookback=10, side="lower")))
+        if upper_shadow >= (body * 2.0) and upper_shadow >= (candle_range * 0.55) and upper_shadow >= lower_shadow:
+            candidates.append(("long_upper_shadow", "short", "upper", _shadow_rank_in_recent_window(
+                candles, index, lookback=10, side="upper", reference_start=reference_start,
+            )))
+        if lower_shadow >= (body * 2.0) and lower_shadow >= (candle_range * 0.55) and lower_shadow >= upper_shadow:
+            candidates.append(("long_lower_shadow", "long", "lower", _shadow_rank_in_recent_window(
+                candles, index, lookback=10, side="lower", reference_start=reference_start,
+            )))
         if not candidates:
             continue
         for pattern_id, direction, side, shadow_rank in candidates:
@@ -2383,7 +2436,7 @@ def _build_replay_signal_markers(
                 include_sma50=include_sma50,
             )
             label = _REPLAY_SIGNAL_LABELS[pattern_id]
-            text_suffix = f"影线前{shadow_rank}"
+            text_suffix = f"核心K前{range_rank} 影线前{shadow_rank}"
             if nearest_name != "-" and nearest_distance is not None and nearest_distance <= _REPLAY_SIGNAL_NEAR_MA_MAX_PCT:
                 text_suffix = f"{text_suffix} @{nearest_name}"
             markers.append(
@@ -2397,11 +2450,11 @@ def _build_replay_signal_markers(
                     "near_ma": nearest_name,
                     "distance_pct": float(nearest_distance or 0.0) * 100.0,
                     "core_index": index,
-                    "core_amplitude_rank": None,
+                    "core_amplitude_rank": range_rank,
                     "core_body_index": None,
                     "core_body_rank": None,
-                    "core_range_index": None,
-                    "core_range_rank": None,
+                    "core_range_index": index,
+                    "core_range_rank": range_rank,
                     "shadow_rank": shadow_rank,
                     "core_ma_touch": core_ma_touch,
                     "score": 62 + max(0, 4 - shadow_rank),
@@ -3853,12 +3906,12 @@ if QChartView is not None:
                 if indices:
                     left = max(0, min(indices) - 5)
                     right = min(len(self._display_times_ms) - 1, max(indices) + 7)
-                    self._apply_x_range(
-                        float(self._display_times_ms[left]),
-                        float(self._display_times_ms[right]) + self._display_step_ms,
-                        emit_signal=True,
-                    )
-                    self._fit_y_axis_to_visible_range()
+                    target_start = float(self._display_times_ms[left])
+                    target_end = float(self._display_times_ms[right]) + self._display_step_ms
+                    current_start, current_end = self.current_x_range()
+                    if target_start < current_start or target_end > current_end:
+                        self._apply_x_range(target_start, target_end, emit_signal=True)
+                        self._fit_y_axis_to_visible_range()
             self.viewport().update()
 
         def set_future_ma_specs(self, specs: list[tuple[str, int, str, int]]) -> None:
@@ -5050,7 +5103,11 @@ if QChartView is not None:
 
                 for x_pos, price, label, above in (
                     (entry_x, entry_price, f"回测{side_label}入场", side == "short"),
-                    (exit_x, exit_price, f"回测{side_label}出场 {net_r:+.2f}R", side == "long"),
+                    (
+                        exit_x, exit_price,
+                        f"回测{side_label}{'持仓中' if str(trade.get('outcome', '')) == '持仓中' else '出场'} {net_r:+.2f}R",
+                        side == "long",
+                    ),
                 ):
                     y_pos = self._y_for_value(price, plot_area)
                     diamond = QPolygonF((
@@ -12298,7 +12355,7 @@ class KlineAnalysisWindow(QMainWindow):
 
     def _area_shape_replay_signature(self, plan: AreaShapePlan, start_seconds: int) -> str:
         payload = {
-            "version": 1,
+            "version": 5,
             "plan_id": plan.plan_id,
             "symbol": plan.symbol.strip().upper(),
             "period": plan.period.strip().upper(),
@@ -12352,6 +12409,19 @@ class KlineAnalysisWindow(QMainWindow):
             return
         signature = self._area_shape_replay_signature(replay_plan, start_seconds)
         cached = self._area_shape_replay_record(replay_plan.plan_id, symbol=plan.symbol, period=plan.period)
+        overlay = self._area_shape_replay_overlay
+        if (
+            (cached is None or str(cached.get("input_signature", "")) != signature)
+            and isinstance(overlay, dict)
+            and str(overlay.get("symbol", "")).strip().upper() == replay_plan.symbol.strip().upper()
+            and str(overlay.get("period", "")).strip().upper() == replay_plan.period.strip().upper()
+            and str(overlay.get("input_signature", "")) == signature
+        ):
+            cached = {
+                "input_signature": signature,
+                "rows": list(overlay.get("rows", [])),
+                "filters": dict(overlay.get("filters", {})) if isinstance(overlay.get("filters"), dict) else {},
+            }
         if not force and cached is not None and str(cached.get("input_signature", "")) == signature:
             self._area_shape_replay_overlay = {
                 "symbol": replay_plan.symbol, "period": replay_plan.period,
@@ -12364,9 +12434,11 @@ class KlineAnalysisWindow(QMainWindow):
                 period=self._period_combo.currentText(), focus=True,
             )
             self._set_area_shape_status("正在载入已保存复盘结果，不会重新扫描K线。")
+            display_record = dict(cached)
+            display_record["_cache_hit"] = True
             self._show_area_shape_replay_results(
                 replay_plan, start_seconds, list(cached.get("rows", [])),
-                sides=("long", "short"), replay_record=cached,
+                sides=("long", "short"), replay_record=display_record,
             )
             self._set_area_shape_status("已载入保存的多空复盘与潜在机会；筛选器会同步控制图上标记。")
             return
@@ -12379,8 +12451,14 @@ class KlineAnalysisWindow(QMainWindow):
             "candle_count": len(candles),
         }
         self._area_shape_replay_button.setEnabled(False)
+        if force:
+            replay_status = "正在按当前行情重新复盘"
+        elif cached is None:
+            replay_status = "未找到已保存结果，正在首次计算并保存"
+        else:
+            replay_status = "计划参数或射线已变化，正在重新复盘"
         self._set_area_shape_status(
-            f"正在一次回放多空两侧 {len(candles)} 根已收盘K线，并扫描持仓期间的潜在机会；"
+            f"{replay_status}：多空两侧 {len(candles)} 根已收盘K线，并扫描持仓期间的潜在机会；"
             f"本次射线价：支撑 {replay_plan.support_price}，压力 {replay_plan.pressure_price}。"
         )
         action = lambda: self._simulate_area_shape_replay(
@@ -12568,6 +12646,9 @@ class KlineAnalysisWindow(QMainWindow):
                 replay_plan.config = replace(
                     plan.config, direction=replay_side,
                     signal_patterns=self._area_shape_replay_patterns(plan.config.signal_patterns, replay_side),
+                    entry_mode=("next_open" if plan.config.entry_trigger_mode == "pattern" else plan.config.entry_mode),
+                    exit_template="fixed_1r", fixed_tp_r=Decimal("2"),
+                    break_even_enabled=False, time_break_even_enabled=False,
                 )
                 replay_plan.status = "draft"
                 replay_plan.last_candle_ts = 0
@@ -12597,6 +12678,8 @@ class KlineAnalysisWindow(QMainWindow):
                         scan_event = scanner.observe(candles[: index + 1])
                         if scan_event and scan_event.get("kind") == "paper_pending":
                             scanner_pending[scanner_side] = dict(scanner.paper_position or {})
+                        elif scan_event and scan_event.get("kind") == "signal_skipped" and scan_event.get("space_r") is not None:
+                            opportunities.append(self._area_shape_replay_rejected_opportunity(scan_event, scanner_side))
                         elif scan_event and scan_event.get("kind") == "paper_entry":
                             position = dict(scanner.paper_position or scanner_pending.get(scanner_side, {}))
                             signal_ts = int(position.get("signal_candle_ts", candle.ts) or candle.ts)
@@ -12629,6 +12712,8 @@ class KlineAnalysisWindow(QMainWindow):
                 if event and event.get("kind") == "paper_pending":
                     pending_position = replay.paper_position or {}
                     main_pending = dict(pending_position)
+                if event and event.get("kind") == "signal_skipped" and event.get("space_r") is not None:
+                    opportunities.append(self._area_shape_replay_rejected_opportunity(event, side))
                 if event and event.get("kind") == "paper_entry":
                     position = replay.paper_position or main_pending
                     current_trade = {
@@ -12669,6 +12754,24 @@ class KlineAnalysisWindow(QMainWindow):
             )
         results.sort(key=lambda item: (int(item.get("signal_ts", item.get("entry_ts", 0)) or 0), str(item.get("side", ""))))
         return results
+
+    @staticmethod
+    def _area_shape_replay_rejected_opportunity(event: dict[str, object], side: str) -> dict[str, object]:
+        """Keep a valid setup visible when its next-open risk/reward gate rejects entry."""
+        entry = Decimal(str(event.get("entry", "0") or "0"))
+        stop = Decimal(str(event.get("stop", "0") or "0"))
+        target = Decimal(str(event.get("target", "0") or "0"))
+        space_r = Decimal(str(event.get("space_r", "0") or "0"))
+        minimum = Decimal(str(event.get("min_space_r", "0") or "0"))
+        return {
+            "record_type": "opportunity", "side": str(event.get("side") or side),
+            "pattern": str(event.get("pattern", "")),
+            "signal_ts": int(event.get("signal_candle_ts", event.get("candle_ts", 0)) or 0),
+            "entry_ts": int(event.get("candle_ts", 0) or 0), "entry": entry,
+            "stop": stop, "target": target, "risk": abs(entry - stop), "space_r": space_r,
+            "r": None, "pnl": None, "exit": None, "exit_ts": 0,
+            "outcome": f"盈亏比不足：{space_r:.2f}R < 最低 {minimum}R，不符合入场设置",
+        }
 
     @staticmethod
     def _area_shape_replay_patterns(patterns: tuple[str, ...], side: str) -> tuple[str, ...]:
@@ -12740,7 +12843,8 @@ class KlineAnalysisWindow(QMainWindow):
             f"支撑 {self._format_area_shape_price(plan.support_price, plan.symbol)} / "
             f"压力 {self._format_area_shape_price(plan.pressure_price, plan.symbol)} | "
             f"估算净盈亏 {format_decimal_fixed(pnl_total, places=2)} U / "
-            f"净R {format_decimal_fixed(net_r_total, places=2)}R（按单笔风险预算折算；含配置手续费/滑点，不含资金费）",
+            f"净R {format_decimal_fixed(net_r_total, places=2)}R（按单笔风险预算折算；含配置手续费/滑点，不含资金费） | "
+            f"{'复用已保存结果，未重新计算' if isinstance(replay_record, dict) and replay_record.get('_cache_hit') else '本次复盘结果'}",
             dialog,
         )
         summary.setWordWrap(True)
@@ -12798,7 +12902,12 @@ class KlineAnalysisWindow(QMainWindow):
                     net_or_space = Decimal(str(item.get("space_r", "0") if opportunity else item.get("r", "0")))
                     net_or_space_text = f"空间 {format_decimal_fixed(net_or_space, places=2)}R" if opportunity else f"{format_decimal_fixed(net_or_space, places=2)}R"
                     pnl_value = item.get("pnl")
-                    amount_text = str(item.get("outcome", "潜在机会")) if opportunity else format_decimal_fixed(Decimal(str(pnl_value or "0")), places=2)
+                    amount_text = (
+                        str(item.get("outcome", "潜在机会")) if opportunity else
+                        f"持仓中 · 浮动 {format_decimal_fixed(Decimal(str(pnl_value or '0')), places=2)} U"
+                        if str(item.get("outcome", "")) == "持仓中" else
+                        format_decimal_fixed(Decimal(str(pnl_value or "0")), places=2)
+                    )
                     values = (
                         "潜在机会" if opportunity else "回测交易",
                         "多" if item.get("side") == "long" else "空",

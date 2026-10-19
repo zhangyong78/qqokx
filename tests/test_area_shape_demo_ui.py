@@ -258,7 +258,92 @@ class AreaShapeDemoUiTests(QtWidgetTestCase):
         rows = self.window._simulate_area_shape_replay(plan, candles, start_ms=HOUR, sides=("long",))
         self.assertEqual(len(rows), 1)
         self.assertGreater(rows[0]["entry_ts"], HOUR)
-        self.assertEqual(rows[0]["outcome"], "paper_take_profit")
+        self.assertEqual(rows[0]["outcome"], "持仓中")
+
+    def test_replay_keeps_insufficient_space_as_potential_opportunity(self) -> None:
+        plan = self._create_demo_draft()
+        plan.support_price = Decimal("95")
+        plan.pressure_price = Decimal("102")
+        plan.config = AreaShapeConfig(
+            direction="long", min_space_r=Decimal("1"), entry_trigger_mode="direct_touch",
+            stop_basis="fixed_distance", fixed_stop_distance=Decimal("10"),
+            break_even_enabled=False,
+        )
+        candles = [
+            Candle(HOUR, Decimal("100"), Decimal("101"), Decimal("99"), Decimal("100"), Decimal("1"), True),
+            Candle(2 * HOUR, Decimal("100"), Decimal("102"), Decimal("94"), Decimal("100"), Decimal("1"), True),
+            Candle(3 * HOUR, Decimal("100"), Decimal("101"), Decimal("99"), Decimal("100"), Decimal("1"), True),
+        ]
+
+        rows = self.window._simulate_area_shape_replay(plan, candles, start_ms=HOUR, sides=("long",))
+
+        self.assertEqual(len(rows), 1, rows)
+        self.assertEqual(rows[0]["record_type"], "opportunity")
+        self.assertEqual(rows[0]["entry_ts"], 3 * HOUR)
+        self.assertEqual(rows[0]["entry"], Decimal("100"))
+        self.assertLess(rows[0]["space_r"], Decimal("1"))
+        self.assertIn("盈亏比不足", rows[0]["outcome"])
+
+    def test_replay_uses_fixed_net_2r_exit_for_both_sides(self) -> None:
+        cases = (
+            ("long", Decimal("95"), Decimal("150"), ("100", "102", "94", "100"),
+             ("100", "110", "99", "105"), ("105", "135", "100", "130")),
+            ("short", Decimal("95"), Decimal("150"), ("150", "156", "149", "151"),
+             ("150", "151", "140", "145"), ("145", "150", "120", "130")),
+        )
+        for side, support, pressure, touch, entry_bar, target_bar in cases:
+            with self.subTest(side=side):
+                plan = self._create_demo_draft()
+                plan.support_price = support
+                plan.pressure_price = pressure
+                plan.config = AreaShapeConfig(
+                    direction=side, min_space_r=Decimal("2"), entry_trigger_mode="direct_touch",
+                    stop_basis="fixed_distance", fixed_stop_distance=Decimal("10"),
+                    exit_template="lock_2r_at_3r", break_even_enabled=True,
+                )
+                candles = [
+                    Candle(HOUR, Decimal("100"), Decimal("101"), Decimal("99"), Decimal("100"), Decimal("1"), True),
+                    Candle(2 * HOUR, *(Decimal(value) for value in touch), Decimal("1"), True),
+                    Candle(3 * HOUR, *(Decimal(value) for value in entry_bar), Decimal("1"), True),
+                    Candle(4 * HOUR, *(Decimal(value) for value in target_bar), Decimal("1"), True),
+                ]
+
+                rows = self.window._simulate_area_shape_replay(plan, candles, start_ms=HOUR, sides=(side,))
+
+                self.assertEqual(len(rows), 1, rows)
+                self.assertEqual(rows[0]["outcome"], "paper_take_profit")
+                self.assertAlmostEqual(float(rows[0]["r"]), 2.0, places=6)
+
+    def test_fractal_replay_enters_after_close_confirmation_and_marks_low_rr(self) -> None:
+        plan = self._create_demo_draft()
+        plan.support_price = Decimal("90")
+        plan.pressure_price = Decimal("105")
+        plan.config = AreaShapeConfig(
+            direction="long", min_space_r=Decimal("1"), entry_trigger_mode="pattern",
+            signal_patterns=("bottom_fractal",), stop_basis="three_candle", stop_offset_atr=Decimal("0"),
+            entry_mode="breakout", break_even_enabled=False,
+        )
+        candles = [
+            Candle(index * HOUR, Decimal("100"), Decimal("101"), Decimal("99"), Decimal("100"), Decimal("1"), True)
+            for index in range(1, 11)
+        ]
+        candles.extend([
+            Candle(11 * HOUR, Decimal("100"), Decimal("101"), Decimal("98"), Decimal("99.5"), Decimal("1"), True),
+            Candle(12 * HOUR, Decimal("99.5"), Decimal("100"), Decimal("94"), Decimal("95"), Decimal("1"), True),
+            Candle(13 * HOUR, Decimal("95"), Decimal("101"), Decimal("90"), Decimal("100"), Decimal("1"), True),
+            Candle(14 * HOUR, Decimal("100"), Decimal("102"), Decimal("99"), Decimal("101"), Decimal("1"), True),
+        ])
+
+        rows = self.window._simulate_area_shape_replay(plan, candles, start_ms=0, sides=("long",))
+
+        self.assertEqual(len(rows), 1, rows)
+        opportunity = rows[0]
+        self.assertEqual(opportunity["record_type"], "opportunity")
+        self.assertEqual(opportunity["pattern"], "bottom_fractal")
+        self.assertEqual(opportunity["signal_ts"], 13 * HOUR)
+        self.assertEqual(opportunity["entry_ts"], 14 * HOUR)
+        self.assertEqual(opportunity["entry"], Decimal("100"))
+        self.assertIn("盈亏比不足", opportunity["outcome"])
 
     def test_replay_records_same_side_signal_during_open_position_as_opportunity(self) -> None:
         plan = self._create_demo_draft()
@@ -287,7 +372,7 @@ class AreaShapeDemoUiTests(QtWidgetTestCase):
         self.assertEqual(opportunities[0]["signal_ts"], 4 * HOUR)
         self.assertIn("未重复开仓", opportunities[0]["outcome"])
 
-    def test_replay_scans_opposite_direction_while_simulated_position_is_open(self) -> None:
+    def test_replay_does_not_count_opposite_signal_after_position_closes(self) -> None:
         plan = self._create_demo_draft()
         plan.support_price = Decimal("95")
         plan.pressure_price = Decimal("125")
@@ -308,10 +393,9 @@ class AreaShapeDemoUiTests(QtWidgetTestCase):
 
         rows = self.window._simulate_area_shape_replay(plan, candles, start_ms=HOUR, sides=("long",))
 
+        self.assertTrue(any(item.get("record_type") == "trade" for item in rows), rows)
         opportunities = [item for item in rows if item.get("record_type") == "opportunity"]
-        self.assertEqual(len(opportunities), 1)
-        self.assertEqual(opportunities[0]["side"], "short")
-        self.assertEqual(opportunities[0]["signal_ts"], 4 * HOUR)
+        self.assertEqual(opportunities, [])
 
     def test_replay_maps_selected_shape_families_without_changing_plan(self) -> None:
         plan = self._create_demo_draft()
@@ -395,6 +479,9 @@ class AreaShapeDemoUiTests(QtWidgetTestCase):
         self.assertEqual(show_results.call_args.kwargs["sides"], ("long", "short"))
         self.assertEqual(plan.support_price, original_support)
         self.assertEqual(plan.pressure_price, original_pressure)
+        saved = self.window._area_shape_replay_record(plan.plan_id, symbol=plan.symbol, period=plan.period)
+        self.assertIsNotNone(saved)
+        self.assertEqual(saved["input_signature"], show_results.call_args.kwargs["replay_record"]["input_signature"])
 
     def test_replay_reopens_saved_results_without_running_simulation_again(self) -> None:
         plan = self._create_demo_draft()
@@ -429,6 +516,74 @@ class AreaShapeDemoUiTests(QtWidgetTestCase):
         simulate.assert_not_called()
         self.assertEqual(show_results.call_args.args[2], rows)
         self.assertEqual(self.window._area_shape_replay_overlay["rows"], rows)
+
+    def test_replay_reopens_matching_memory_overlay_when_workspace_cache_is_missing(self) -> None:
+        plan = self._create_demo_draft()
+        lines = self.window._workspace_entry(symbol=plan.symbol, period=plan.period)["lines"]
+        support = next(item for item in lines if item["id"] == plan.support_line_id)
+        pressure = next(item for item in lines if item["id"] == plan.pressure_line_id)
+        snapshot = replace(
+            plan,
+            support_price=Decimal(str(support["price_a"])),
+            pressure_price=Decimal(str(pressure["price_a"])),
+        )
+        start_seconds = int(support["time_a"])
+        signature = self.window._area_shape_replay_signature(snapshot, start_seconds)
+        rows = [{
+            "record_type": "opportunity", "side": "long", "signal_ts": 2 * HOUR,
+            "entry_ts": 2 * HOUR, "entry": "100", "stop": "95", "target": "110",
+            "space_r": "2", "outcome": "持仓期间出现",
+        }]
+        entry = self.window._workspace_entry(symbol=plan.symbol, period=plan.period)
+        entry["area_replays"] = {}
+        self.window._area_shape_replay_overlay = {
+            "symbol": plan.symbol, "period": plan.period,
+            "input_signature": signature, "rows": rows, "filters": {"kind": "all", "side": "all"},
+        }
+
+        class _NoCandleScan:
+            def __iter__(self):
+                raise AssertionError("a memory cache hit must not rescan the candle history")
+
+        self.window._pending_payload = replace(self.window._pending_payload, raw_candles=_NoCandleScan())
+        with patch.object(self.window, "_simulate_area_shape_replay") as simulate:
+            with patch.object(self.window, "_show_area_shape_replay_results") as show_results:
+                self.window._run_area_shape_replay()
+
+        simulate.assert_not_called()
+        self.assertEqual(show_results.call_args.args[2], rows)
+
+    def test_replay_recomputes_results_saved_under_old_pattern_rules(self) -> None:
+        plan = self._create_demo_draft()
+        lines = self.window._workspace_entry(symbol=plan.symbol, period=plan.period)["lines"]
+        support = next(item for item in lines if item["id"] == plan.support_line_id)
+        pressure = next(item for item in lines if item["id"] == plan.pressure_line_id)
+        snapshot = replace(
+            plan, support_price=Decimal(str(support["price_a"])),
+            pressure_price=Decimal(str(pressure["price_a"])),
+        )
+        signature_data = self._kline_module.json.loads(
+            self.window._area_shape_replay_signature(snapshot, int(support["time_a"])),
+        )
+        self.assertGreater(signature_data["version"], 1)
+        signature_data["version"] = 1
+        old_signature = self._kline_module.json.dumps(
+            signature_data, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+        )
+        cache = {"input_signature": old_signature, "rows": [], "filters": {}}
+        self.window._workspace_entry(symbol=plan.symbol, period=plan.period)["area_replays"] = {plan.plan_id: cache}
+        self.window._area_shape_replay_overlay = {"symbol": plan.symbol, "period": plan.period, **cache}
+
+        with patch.object(self.window, "_simulate_area_shape_replay", return_value=[]) as simulate:
+            with patch.object(self.window, "_show_area_shape_replay_results"):
+                self.window._run_area_shape_replay()
+                deadline = time.monotonic() + 5
+                while self.window._area_shape_replay_thread is not None and time.monotonic() < deadline:
+                    self._app.processEvents()
+                    time.sleep(0.01)
+                self._app.processEvents()
+
+        simulate.assert_called_once()
 
     def test_replay_filters_table_and_chart_and_saves_filter_selection(self) -> None:
         plan = self._create_demo_draft()

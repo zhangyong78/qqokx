@@ -5,6 +5,7 @@ from decimal import Decimal
 
 from okx_quant.indicators import atr, ema, macd, sma
 from okx_quant.models import Candle
+from okx_quant.shape_salience import range_retrace_threshold, significant_range_core
 
 
 ZERO = Decimal("0")
@@ -398,9 +399,16 @@ def _iter_pattern_signals(
     if not config.enable_pattern_signals:
         return []
     signals: list[SignalReplayPoint] = []
+
+    def append_if_salient(signal: SignalReplayPoint) -> None:
+        formation_start = signal.index - signal.candle_count + 1
+        formation_indices = tuple(range(formation_start, signal.index + 1))
+        if significant_range_core(candles, formation_indices, lookback=10, top_n=4) is not None:
+            signals.append(signal)
+
     for index, candle in enumerate(candles):
         if config.enable_big_bullish and _is_bullish(candle) and _large_move_gate(large_move_hits, (index,), "single", config):
-            signals.append(
+            append_if_salient(
                 _pattern_signal(
                     candles,
                     index,
@@ -413,7 +421,7 @@ def _iter_pattern_signals(
                 )
             )
         if config.enable_big_bearish and _is_bearish(candle) and _large_move_gate(large_move_hits, (index,), "single", config):
-            signals.append(
+            append_if_salient(
                 _pattern_signal(
                     candles,
                     index,
@@ -431,7 +439,7 @@ def _iter_pattern_signals(
             and _upper_shadow(candle) >= _lower_shadow(candle)
             and _large_move_gate(large_move_hits, (index,), "single", config)
         ):
-            signals.append(
+            append_if_salient(
                 _pattern_signal(
                     candles,
                     index,
@@ -449,7 +457,7 @@ def _iter_pattern_signals(
             and _lower_shadow(candle) >= _upper_shadow(candle)
             and _large_move_gate(large_move_hits, (index,), "single", config)
         ):
-            signals.append(
+            append_if_salient(
                 _pattern_signal(
                     candles,
                     index,
@@ -477,7 +485,7 @@ def _iter_pattern_signals(
                 and _close_position(candle) >= config.false_break_reclaim_position
                 and _large_move_gate(large_move_hits, span, config.double_large_move_mode, config)
             ):
-                signals.append(
+                append_if_salient(
                     _pattern_signal(candles, index, "false_breakdown", "假跌破", 2, "long", "前面有一段下跌后，跌破结构低点再强收回", span_rules)
                 )
             if (
@@ -490,7 +498,7 @@ def _iter_pattern_signals(
                 and _close_position(candle) <= (Decimal("1") - config.false_break_reclaim_position)
                 and _large_move_gate(large_move_hits, span, config.double_large_move_mode, config)
             ):
-                signals.append(
+                append_if_salient(
                     _pattern_signal(candles, index, "false_breakout", "假突破", 2, "short", "前面有一段上涨后，突破结构高点再弱收回", span_rules)
                 )
             if (
@@ -501,7 +509,7 @@ def _iter_pattern_signals(
                 and _large_move_gate(large_move_hits, (index - 1,), "single", config)
             ):
                 direction = "long" if previous.close > previous.open else ("short" if previous.close < previous.open else "neutral")
-                signals.append(
+                append_if_salient(
                     _pattern_signal(candles, index, "inside_bar", "孕育线", 2, direction, "大K线后出现完全包含的小K线", large_move_hits[index - 1])
                 )
         if index >= 2:
@@ -510,32 +518,25 @@ def _iter_pattern_signals(
             third = candles[index]
             span = (index - 2, index - 1, index)
             span_rules = _merge_hit_rules(large_move_hits, span)
-            middle_is_small = _is_small_body(middle, body_ma[index - 1], config)
+            bottom_retrace = range_retrace_threshold(first, direction="long")
+            top_retrace = range_retrace_threshold(first, direction="short")
             if (
                 config.enable_top_fractal
                 and _is_bullish(first)
-                and middle_is_small
-                and _is_bearish(third)
-                and middle.high > first.high
-                and middle.high > third.high
-                and _has_prior_rise(candles, index - 2, config.fractal_trend_lookback, config.fractal_trend_min_bars)
-                and _large_move_gate(large_move_hits, span, config.triple_large_move_mode, config)
+                and top_retrace is not None
+                and min(middle.close, third.close) <= top_retrace
             ):
-                signals.append(
-                    _pattern_signal(candles, index, "top_fractal", "顶分型", 3, "short", "前面有一段上涨后，阳线-小K-阴线形成局部高点", span_rules)
+                append_if_salient(
+                    _pattern_signal(candles, index, "top_fractal", "顶分型", 3, "short", "首根阳线后，后两根至少一根收盘跌至首根实体60%位置", span_rules)
                 )
             if (
                 config.enable_bottom_fractal
                 and _is_bearish(first)
-                and middle_is_small
-                and _is_bullish(third)
-                and middle.low < first.low
-                and middle.low < third.low
-                and _has_prior_drop(candles, index - 2, config.fractal_trend_lookback, config.fractal_trend_min_bars)
-                and _large_move_gate(large_move_hits, span, config.triple_large_move_mode, config)
+                and bottom_retrace is not None
+                and max(middle.close, third.close) >= bottom_retrace
             ):
-                signals.append(
-                    _pattern_signal(candles, index, "bottom_fractal", "底分型", 3, "long", "前面有一段下跌后，阴线-小K-阳线形成局部低点", span_rules)
+                append_if_salient(
+                    _pattern_signal(candles, index, "bottom_fractal", "底分型", 3, "long", "首根阴线后，后两根至少一根收盘站上首根实体60%位置", span_rules)
                 )
     return signals
 

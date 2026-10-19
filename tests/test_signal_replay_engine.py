@@ -185,6 +185,30 @@ class SignalReplayEngineTest(unittest.TestCase):
         self.assertTrue(any(signal.index == 35 for signal in top))
         self.assertTrue(any(signal.index == 41 for signal in bottom))
 
+    def test_bottom_fractal_requires_close_confirmation_not_only_a_wick(self) -> None:
+        candles = [_custom_candle(index, "100", "101", "99", "100") for index in range(10)]
+        candles.extend([
+            _custom_candle(10, "100", "101", "89", "90"),  # first bearish candle; 60% level = 96
+            _custom_candle(11, "90", "98", "88", "91"),   # wick reaches it, close does not
+            _custom_candle(12, "91", "98", "90", "95"),   # wick reaches it, close does not
+        ])
+        config = SignalReplayConfig(
+            include_long=False, include_short=False, enable_large_move_gate=False,
+            enable_big_bullish=False, enable_big_bearish=False,
+            enable_long_upper_shadow=False, enable_long_lower_shadow=False,
+            enable_false_breakdown=False, enable_false_breakout=False,
+            enable_inside_bar=False, enable_top_fractal=False, enable_bottom_fractal=True,
+        )
+
+        dataset = build_signal_replay_dataset(candles, config=config)
+
+        self.assertFalse(any(signal.pattern_id == "bottom_fractal" for signal in dataset.signals))
+
+        candles[-1] = _custom_candle(12, "91", "98", "90", "96")
+        dataset = build_signal_replay_dataset(candles, config=config)
+        bottom = [signal for signal in dataset.signals if signal.pattern_id == "bottom_fractal"]
+        self.assertEqual([(signal.index, signal.ts) for signal in bottom], [(12, candles[12].ts)])
+
     def test_false_breaks_require_prior_trend(self) -> None:
         candles = [_custom_candle(index, "100", "100.3", "99.8", "100.1") for index in range(30)]
         candles.extend(

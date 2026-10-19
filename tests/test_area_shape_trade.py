@@ -19,7 +19,11 @@ def _candle(ts: int, o: str, h: str, low: str, close: str, *, confirmed: bool = 
 
 
 def _history(*, next_open_low: str = "96") -> list[Candle]:
-    return [
+    warmup = [
+        _candle((index - 10) * HOUR, "100", "100.5", "99.5", "100")
+        for index in range(10)
+    ]
+    return warmup + [
         _candle(0, "104", "105", "102", "103"),
         _candle(HOUR, "101", "102", "99", "100"),
         _candle(2 * HOUR, "96", "97.2", "93", "97"),  # confirmed hammer in the support area
@@ -38,7 +42,7 @@ def _plan(config: AreaShapeConfig | None = None) -> AreaShapePlan:
 
 def test_confirmed_area_pattern_only_creates_pending_paper_entry() -> None:
     plan = _plan()
-    event = plan.observe(_history()[:3])
+    event = plan.observe(_history()[:-1])
     assert event is not None and event["kind"] == "paper_pending"
     assert plan.status == "paper_pending"
     assert "entry" not in plan.paper_position
@@ -49,7 +53,7 @@ def test_confirmed_area_pattern_only_creates_pending_paper_entry() -> None:
 def test_pattern_without_exact_entry_line_touch_is_ignored() -> None:
     plan = _plan()
     plan.support_price = Decimal("98")  # candle high is 97.2; former ATR zone alone must not count.
-    event = plan.observe(_history()[:3])
+    event = plan.observe(_history()[:-1])
     assert event is None
     assert plan.status == "monitoring"
 
@@ -59,7 +63,7 @@ def test_pattern_without_exact_entry_line_touch_is_ignored() -> None:
 def test_entry_requires_actual_line_touch_in_both_directions(direction, trigger_mode) -> None:
     config = AreaShapeConfig(direction=direction, entry_trigger_mode=trigger_mode, atr_period=2)
     plan = _plan(config)
-    history = _history()[:3]
+    history = _history()[:-1]
     if direction == "long":
         plan.support_price = Decimal("98")
         exact_line = Decimal("97.2")
@@ -202,7 +206,7 @@ def test_time_break_even_waits_for_elapsed_hour_and_nonnegative_net_progress() -
 
 def test_paper_fill_uses_future_next_open_and_not_signal_close() -> None:
     plan = _plan()
-    plan.observe(_history()[:3])
+    plan.observe(_history()[:-1])
     event = plan.observe(_history())
     assert event is not None and event["kind"] == "paper_entry"
     assert plan.paper_position["entry"] == "97.5"
@@ -217,7 +221,7 @@ def test_paper_exit_target_includes_fees_and_dynamic_remote_cap(template, target
     config = AreaShapeConfig(atr_period=2, exit_template=template, fixed_tp_r=Decimal(2),
                              round_trip_fee_rate=Decimal("0.00036"), slippage_rate=Decimal(0))
     plan = _plan(config)
-    plan.observe(_history()[:3])
+    plan.observe(_history()[:-1])
     plan.observe(_history())
     position = plan.paper_position
     assert position is not None
@@ -229,7 +233,7 @@ def test_paper_exit_target_includes_fees_and_dynamic_remote_cap(template, target
 
 def test_next_open_fill_checks_fill_bar_stop_conservatively() -> None:
     plan = _plan()
-    plan.observe(_history()[:3])
+    plan.observe(_history()[:-1])
     history = _history(next_open_low="91")
     plan.observe(history)
     assert plan.status == "paper_closed"
@@ -241,9 +245,9 @@ def test_breakout_fill_bar_with_stop_is_closed_and_marked_ambiguous() -> None:
     config = AreaShapeConfig(atr_period=2, area_half_width_atr=Decimal("0.25"), entry_mode="breakout")
     plan = _plan(config)
     history = _history()
-    plan.observe(history[:3])
+    plan.observe(history[:-1])
     breakout = _candle(3 * HOUR, "97", "103", "90", "101")
-    plan.observe([*history[:3], breakout])
+    plan.observe([*history[:-1], breakout])
     assert plan.status == "paper_closed"
     stopped = next(item for item in plan.events if item["kind"] == "paper_stop")
     assert stopped["ambiguous_bar"] is True

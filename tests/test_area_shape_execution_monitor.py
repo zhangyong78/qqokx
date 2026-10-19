@@ -483,6 +483,10 @@ class AreaShapeExecutionMonitorTests(unittest.TestCase):
                 self.direction, self.template = direction, template
                 self.now_ms, self.signal_ts = now_ms, signal_ts
                 self.candles = [
+                    Candle(signal_ts - index * 3_600_000, Decimal("100"), Decimal("100.5"),
+                           Decimal("99.5"), Decimal("100"), Decimal("1"), True)
+                    for index in range(10, 2, -1)
+                ] + [
                     Candle(signal_ts - 2 * 3_600_000, Decimal("104"), Decimal("105"), Decimal("102"), Decimal("103"), Decimal("1"), True),
                     Candle(signal_ts - 3_600_000, Decimal("101"), Decimal("102"), Decimal("99"), Decimal("100"), Decimal("1"), True),
                 ]

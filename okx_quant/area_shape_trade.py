@@ -492,7 +492,15 @@ class AreaShapePlan:
         if space_r < self.config.min_space_r:
             self.status = "monitoring"
             self.paper_position = None
-            return self._event("signal_skipped", f"未来入场价目标空间 {space_r:.2f}R 低于最低要求，未模拟成交", candle_ts=candle.ts, space_r=str(space_r))
+            return self._event(
+                "signal_skipped",
+                f"盈亏比不足：未来入场价目标空间 {space_r:.2f}R 低于最低要求 {self.config.min_space_r}R，未模拟成交",
+                candle_ts=candle.ts,
+                signal_candle_ts=int(pending.get("signal_candle_ts", 0) or 0),
+                entry=str(entry), stop=str(stop), target=str(target), risk_distance=str(risk),
+                space_r=str(space_r), min_space_r=str(self.config.min_space_r),
+                pattern=str(pending.get("pattern", "")), side=side,
+            )
         fixed = self.config.exit_template == "fixed_1r"
         target_r = self.config.fixed_tp_r if fixed else AREA_DYNAMIC_TAKE_PROFIT_R
         try:

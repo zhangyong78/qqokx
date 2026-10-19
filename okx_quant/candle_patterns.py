@@ -6,6 +6,7 @@ from decimal import Decimal
 from typing import Literal
 
 from okx_quant.models import Candle
+from okx_quant.shape_salience import significant_range_core
 
 TrendContext = Literal["uptrend", "downtrend", "sideways", "unknown"]
 PatternBias = Literal[
@@ -97,6 +98,13 @@ def analyze_single_candle_patterns(
         )
 
     trend_context = _infer_trend_context(candles, config)
+    if significant_range_core(candles, (len(candles) - 1,), lookback=10, top_n=4) is None:
+        return SingleCandlePatternReport(
+            inst_id=inst_id,
+            candle=candle,
+            trend_context=trend_context,
+            matches=(),
+        )
     matches: list[SingleCandlePatternMatch] = []
     _detect_doji_family(matches, metrics, config)
     _detect_hammer_family(matches, metrics, trend_context, config)

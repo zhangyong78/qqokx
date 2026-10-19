@@ -691,8 +691,8 @@ def _pattern_summary(pattern_id: str, direction: str) -> str:
     return {
         "false_breakdown": "先跌破又收回，短线更像止跌反抽。",
         "false_breakout": "先冲高又收回，短线更像冲高回落。",
-        "top_fractal": "三根K线做出局部高点，短线要防回落。",
-        "bottom_fractal": "三根K线做出局部低点，短线先看反弹。",
+        "top_fractal": "首根阳线后，后两根至少一根收盘跌至首根实体60%位置，短线留意转弱。",
+        "bottom_fractal": "首根阴线后，后两根至少一根收盘站上首根实体60%位置，短线留意转强。",
         "inside_bar": "波动先收住了，后面容易选方向。",
         "big_bullish": "单根阳线很强，买盘发力明显。",
         "big_bearish": "单根阴线很强，卖盘发力明显。",

@@ -134,6 +134,9 @@ class AreaShapeKlineUiTests(QtWidgetTestCase):
 
         chart.set_area_shape_replay_trades(results, focus=True)
         self._app.processEvents()
+        with patch.object(chart, "_apply_x_range", wraps=chart._apply_x_range) as apply_range:
+            chart.set_area_shape_replay_trades(results, focus=True)
+            apply_range.assert_not_called()
 
         left, right = chart.current_x_range()
         self.assertLess(left, entry_ts)
