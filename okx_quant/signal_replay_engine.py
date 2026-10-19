@@ -5,7 +5,10 @@ from decimal import Decimal
 
 from okx_quant.indicators import atr, ema, macd, sma
 from okx_quant.models import Candle
-from okx_quant.shape_salience import range_retrace_threshold, significant_range_core
+from okx_quant.shape_salience import (
+    pattern_quality_score,
+    range_retrace_threshold,
+)
 
 
 ZERO = Decimal("0")
@@ -95,6 +98,8 @@ class SignalReplayPoint:
     pattern_name: str = "指标组合"
     candle_count: int = 1
     large_move_rules: tuple[str, ...] = ()
+    range_rank: int | None = None
+    score_detail: str = ""
 
 
 @dataclass(frozen=True)
@@ -401,10 +406,13 @@ def _iter_pattern_signals(
     signals: list[SignalReplayPoint] = []
 
     def append_if_salient(signal: SignalReplayPoint) -> None:
+        # Salience ranks the candidate; it no longer suppresses a valid shape.
         formation_start = signal.index - signal.candle_count + 1
-        formation_indices = tuple(range(formation_start, signal.index + 1))
-        if significant_range_core(candles, formation_indices, lookback=10, top_n=4) is not None:
-            signals.append(signal)
+        if formation_start < 0 or any(
+            not candles[item].confirmed for item in range(formation_start, signal.index + 1)
+        ):
+            return
+        signals.append(signal)
 
     for index, candle in enumerate(candles):
         if config.enable_big_bullish and _is_bullish(candle) and _large_move_gate(large_move_hits, (index,), "single", config):
@@ -473,6 +481,24 @@ def _iter_pattern_signals(
             previous = candles[index - 1]
             span = (index - 1, index)
             span_rules = _merge_hit_rules(large_move_hits, span)
+            bottom_reversal = range_retrace_threshold(previous, direction="long")
+            top_reversal = range_retrace_threshold(previous, direction="short")
+            if _is_bearish(previous) and bottom_reversal is not None and candle.close >= bottom_reversal:
+                append_if_salient(
+                    _pattern_signal(
+                        candles, index, "double_reversal_up", "双线向上反转", 2, "long",
+                        "首根阴线后，第二根收盘回升至首根实体60%位置；按双线反转确认",
+                        span_rules,
+                    )
+                )
+            if _is_bullish(previous) and top_reversal is not None and candle.close <= top_reversal:
+                append_if_salient(
+                    _pattern_signal(
+                        candles, index, "double_reversal_down", "双线向下反转", 2, "short",
+                        "首根阳线后，第二根收盘回落至首根实体60%位置；按双线反转确认",
+                        span_rules,
+                    )
+                )
             breakdown_reference = _prior_low(candles, index, config.false_break_reference_lookback)
             breakout_reference = _prior_high(candles, index, config.false_break_reference_lookback)
             if (
@@ -520,23 +546,35 @@ def _iter_pattern_signals(
             span_rules = _merge_hit_rules(large_move_hits, span)
             bottom_retrace = range_retrace_threshold(first, direction="long")
             top_retrace = range_retrace_threshold(first, direction="short")
+            bottom_confirmed_on_second = (
+                _is_bearish(first)
+                and bottom_retrace is not None
+                and middle.close >= bottom_retrace
+            )
+            top_confirmed_on_second = (
+                _is_bullish(first)
+                and top_retrace is not None
+                and middle.close <= top_retrace
+            )
             if (
                 config.enable_top_fractal
                 and _is_bullish(first)
                 and top_retrace is not None
-                and min(middle.close, third.close) <= top_retrace
+                and not top_confirmed_on_second
+                and third.close <= top_retrace
             ):
                 append_if_salient(
-                    _pattern_signal(candles, index, "top_fractal", "顶分型", 3, "short", "首根阳线后，后两根至少一根收盘跌至首根实体60%位置", span_rules)
+                    _pattern_signal(candles, index, "top_fractal", "顶分型", 3, "short", "第二根未确认双线反转；第三根收盘回落至首根阳线实体60%位置后确认", span_rules)
                 )
             if (
                 config.enable_bottom_fractal
                 and _is_bearish(first)
                 and bottom_retrace is not None
-                and max(middle.close, third.close) >= bottom_retrace
+                and not bottom_confirmed_on_second
+                and third.close >= bottom_retrace
             ):
                 append_if_salient(
-                    _pattern_signal(candles, index, "bottom_fractal", "底分型", 3, "long", "首根阴线后，后两根至少一根收盘站上首根实体60%位置", span_rules)
+                    _pattern_signal(candles, index, "bottom_fractal", "底分型", 3, "long", "第二根未确认双线反转；第三根收盘回升至首根阴线实体60%位置后确认", span_rules)
                 )
     return signals
 
@@ -551,7 +589,11 @@ def _pattern_signal(
     reason: str,
     large_move_rules: tuple[str, ...],
 ) -> SignalReplayPoint:
-    score = min(100, 50 + (candle_count * 6) + (len(large_move_rules) * 5))
+    formation_indices = tuple(range(index - candle_count + 1, index + 1))
+    score, range_rank = pattern_quality_score(candles, formation_indices)
+    salience = score - 60
+    rank_text = f"振幅第{range_rank}" if range_rank is not None else "振幅排名不可用"
+    score_detail = f"结构60 + 振幅显著性{salience}（{rank_text}）"
     return SignalReplayPoint(
         index=index,
         ts=candles[index].ts,
@@ -564,6 +606,8 @@ def _pattern_signal(
         pattern_name=pattern_name,
         candle_count=candle_count,
         large_move_rules=large_move_rules,
+        range_rank=range_rank,
+        score_detail=score_detail,
     )
 
 

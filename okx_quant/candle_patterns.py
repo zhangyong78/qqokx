@@ -6,7 +6,7 @@ from decimal import Decimal
 from typing import Literal
 
 from okx_quant.models import Candle
-from okx_quant.shape_salience import significant_range_core
+from okx_quant.shape_salience import pattern_quality_score
 
 TrendContext = Literal["uptrend", "downtrend", "sideways", "unknown"]
 PatternBias = Literal[
@@ -52,6 +52,8 @@ class SingleCandlePatternMatch:
     pattern: str
     bias: PatternBias
     reason: str
+    score: int = 60
+    score_detail: str = ""
 
 
 @dataclass(frozen=True)
@@ -89,7 +91,7 @@ def analyze_single_candle_patterns(
 
     candle = candles[-1]
     metrics = _build_metrics(candle)
-    if metrics is None:
+    if metrics is None or not candle.confirmed:
         return SingleCandlePatternReport(
             inst_id=inst_id,
             candle=candle,
@@ -98,19 +100,19 @@ def analyze_single_candle_patterns(
         )
 
     trend_context = _infer_trend_context(candles, config)
-    if significant_range_core(candles, (len(candles) - 1,), lookback=10, top_n=4) is None:
-        return SingleCandlePatternReport(
-            inst_id=inst_id,
-            candle=candle,
-            trend_context=trend_context,
-            matches=(),
-        )
     matches: list[SingleCandlePatternMatch] = []
     _detect_doji_family(matches, metrics, config)
     _detect_hammer_family(matches, metrics, trend_context, config)
     _detect_inverted_hammer_family(matches, metrics, trend_context, config)
     _detect_marubozu(matches, candle, metrics, config)
     _detect_spinning_top(matches, metrics, config)
+    score, range_rank = pattern_quality_score(candles, (len(candles) - 1,))
+    rank_text = f"振幅第{range_rank}" if range_rank is not None else "振幅排名不可用"
+    score_detail = f"结构60 + 振幅显著性{score - 60}（{rank_text}）"
+    matches = [
+        SingleCandlePatternMatch(item.pattern, item.bias, item.reason, score, score_detail)
+        for item in matches
+    ]
     return SingleCandlePatternReport(
         inst_id=inst_id,
         candle=candle,
@@ -173,6 +175,8 @@ def single_candle_report_payload(report: SingleCandlePatternReport) -> dict[str,
                 "pattern": item.pattern,
                 "bias": item.bias,
                 "reason": item.reason,
+                "score": item.score,
+                "score_detail": item.score_detail,
             }
             for item in report.matches
         ],

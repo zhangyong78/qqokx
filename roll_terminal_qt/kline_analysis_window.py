@@ -104,7 +104,7 @@ from okx_quant.persistence import (
 )
 from okx_quant.arbitrage.arbitrage_executor import _build_strategy_config
 from okx_quant.signal_replay_engine import SignalReplayConfig, build_signal_replay_dataset
-from okx_quant.shape_salience import significant_range_core
+from okx_quant.shape_salience import formation_range_rank, pattern_quality_score, significant_range_core
 from okx_quant.strategy_catalog import STRATEGY_DYNAMIC_LONG_ID, STRATEGY_EMA55_SLOPE_SHORT_ID
 from okx_quant.strategy_symbol_defaults import get_strategy_symbol_parameter_defaults
 from roll_terminal_qt.line_trading_core import (
@@ -2049,10 +2049,15 @@ def _double_reversal_reclaims_first_body(
     first_open = _to_float(first.open)
     first_close = _to_float(first.close)
     second_close = _to_float(second.close)
-    body_midpoint = (first_open + first_close) / 2.0
     if direction == "long":
-        return second_close >= body_midpoint
-    return second_close <= body_midpoint
+        if first_close >= first_open:
+            return False
+        reclaim_level = first_close + (first_open - first_close) * 0.6
+        return second_close >= reclaim_level
+    if first_close <= first_open:
+        return False
+    reclaim_level = first_close - (first_close - first_open) * 0.6
+    return second_close <= reclaim_level
 
 
 def _double_reversal_is_local_extreme(
@@ -2185,7 +2190,9 @@ def _build_replay_signal_markers(
     markers: list[dict[str, Any]] = []
     seen: set[tuple[int, str]] = set()
     for signal in dataset.signals:
-        if signal.pattern_id in {"false_breakdown", "false_breakout"}:
+        if signal.pattern_id in {
+            "false_breakdown", "false_breakout", "double_reversal_up", "double_reversal_down",
+        }:
             continue
         if signal.pattern_id not in _REPLAY_SIGNAL_LABELS:
             continue
@@ -2198,6 +2205,11 @@ def _build_replay_signal_markers(
         pattern_start = _signal_pattern_index_range(
             signal_index=index, candle_count=int(signal.candle_count),
         ).start
+        if pattern_start < 0 or any(
+            not bool(getattr(candles[item], "confirmed", True))
+            for item in range(pattern_start, index + 1)
+        ):
+            continue
         core_body_candle = _signal_core_amplitude_candle(
             candles=candles,
             signal_index=index,
@@ -2207,27 +2219,21 @@ def _build_replay_signal_markers(
             metric="body",
             pattern_start=pattern_start,
         )
-        core_range_candle = _signal_core_amplitude_candle(
-            candles=candles,
-            signal_index=index,
-            candle_count=int(signal.candle_count),
+        ranked_range_candle = formation_range_rank(
+            candles,
+            tuple(range(pattern_start, index + 1)),
             lookback=10,
-            top_n=4,
-            metric="range",
-            pattern_start=pattern_start,
         )
-        if core_range_candle is None:
-            continue
-        core_index, core_rank = core_range_candle
-        core_item = candles[core_index]
-        core_ma_touch = _candle_touches_enabled_ma(
+        core_index, core_rank = ranked_range_candle if ranked_range_candle is not None else (None, None)
+        core_item = candles[core_index] if core_index is not None else None
+        core_ma_touch = bool(core_item is not None and _candle_touches_enabled_ma(
             candle=core_item,
-            index=core_index,
+            index=int(core_index),
             ema15_values=ema15_values,
             sma50_values=sma50_values,
             include_ema15=include_ema15,
             include_sma50=include_sma50,
-        )
+        ))
         nearest_name, nearest_distance = _nearest_enabled_ma_distance(
             candle=candle,
             index=index,
@@ -2242,7 +2248,7 @@ def _build_replay_signal_markers(
         direction = str(signal.direction or "neutral").strip().lower()
         color = _REPLAY_SIGNAL_LONG_COLOR if direction == "long" else _REPLAY_SIGNAL_SHORT_COLOR
         label = _REPLAY_SIGNAL_LABELS.get(signal.pattern_id, signal.pattern_name)
-        text_suffix = f"核心K前{core_rank}"
+        text_suffix = f"核心K振幅第{core_rank}" if core_rank is not None else "核心K振幅排名不可用"
         shadow_rank = None
         if signal.pattern_id == "long_upper_shadow":
             signal_range = _candle_amplitude(candle)
@@ -2258,12 +2264,8 @@ def _build_replay_signal_markers(
             shadow_rank = _shadow_rank_in_recent_window(
                 candles, index, lookback=10, side="lower", reference_start=pattern_start - 10,
             )
-            if shadow_rank is None or shadow_rank > 4:
-                continue
-        if signal.pattern_id == "long_upper_shadow" and (shadow_rank is None or shadow_rank > 4):
-            continue
         if shadow_rank is not None:
-            text_suffix = f"核心K前{core_rank} 影线前{shadow_rank}"
+            text_suffix = f"核心K振幅第{core_rank if core_rank is not None else '—'} 影线第{shadow_rank}"
         if nearest_name != "-" and nearest_distance is not None and nearest_distance <= _REPLAY_SIGNAL_NEAR_MA_MAX_PCT:
             text_suffix = f"{text_suffix} @{nearest_name}"
         seen.add(key)
@@ -2281,11 +2283,12 @@ def _build_replay_signal_markers(
                 "core_amplitude_rank": core_rank,
                 "core_body_index": core_body_candle[0] if core_body_candle is not None else None,
                 "core_body_rank": core_body_candle[1] if core_body_candle is not None else None,
-                "core_range_index": core_range_candle[0] if core_range_candle is not None else None,
-                "core_range_rank": core_range_candle[1] if core_range_candle is not None else None,
+                "core_range_index": core_index,
+                "core_range_rank": core_rank,
                 "shadow_rank": shadow_rank,
                 "core_ma_touch": core_ma_touch,
                 "score": int(signal.score),
+                "score_detail": str(getattr(signal, "score_detail", "") or ""),
                 "color": color,
             }
         )
@@ -2326,26 +2329,16 @@ def _build_replay_signal_markers(
             metric="body",
             pattern_start=pattern_start,
         )
-        core_range_candle = _signal_core_amplitude_candle(
-            candles=candles,
-            signal_index=index,
-            candle_count=2,
-            lookback=10,
-            top_n=4,
-            metric="range",
-            pattern_start=pattern_start,
-        )
-        if core_range_candle is None:
-            continue
+        ranked_range_candle = formation_range_rank(candles, (pattern_start, index), lookback=10)
+        core_index, core_rank = ranked_range_candle if ranked_range_candle is not None else (None, None)
         key = (index, pattern_id)
         if key in seen:
             continue
         seen.add(key)
-        core_index, core_rank = core_range_candle
-        core_item = candles[core_index]
+        core_item = candles[core_index] if core_index is not None else None
         core_ma_touch = _candle_touches_enabled_ma(
-            candle=core_item,
-            index=core_index,
+            candle=core_item if core_item is not None else second,
+            index=int(core_index) if core_index is not None else index,
             ema15_values=ema15_values,
             sma50_values=sma50_values,
             include_ema15=include_ema15,
@@ -2360,7 +2353,9 @@ def _build_replay_signal_markers(
             include_sma50=include_sma50,
         )
         label = _REPLAY_SIGNAL_LABELS[pattern_id]
-        text_suffix = f"核心K前{core_rank}"
+        text_suffix = f"核心K振幅第{core_rank}" if core_rank is not None else "核心K振幅排名不可用"
+        score, score_rank = pattern_quality_score(candles, (pattern_start, index))
+        score_detail = f"结构60 + 振幅显著性{score - 60}（振幅第{score_rank}）" if score_rank is not None else "结构60 + 振幅排名不可用"
         if nearest_name != "-" and nearest_distance is not None and nearest_distance <= _REPLAY_SIGNAL_NEAR_MA_MAX_PCT:
             text_suffix = f"{text_suffix} @{nearest_name}"
         markers.append(
@@ -2377,10 +2372,11 @@ def _build_replay_signal_markers(
                 "core_amplitude_rank": core_rank,
                 "core_body_index": core_body_candle[0] if core_body_candle is not None else None,
                 "core_body_rank": core_body_candle[1] if core_body_candle is not None else None,
-                "core_range_index": core_range_candle[0] if core_range_candle is not None else None,
-                "core_range_rank": core_range_candle[1] if core_range_candle is not None else None,
+                "core_range_index": core_index,
+                "core_range_rank": core_rank,
                 "core_ma_touch": core_ma_touch,
-                "score": 62 + max(0, 4 - core_rank),
+                "score": score,
+                "score_detail": score_detail,
                 "color": _REPLAY_SIGNAL_LONG_COLOR if direction == "long" else _REPLAY_SIGNAL_SHORT_COLOR,
             }
         )
@@ -2395,12 +2391,10 @@ def _build_replay_signal_markers(
         pattern_start = index
         reference_start = pattern_start - 10
         candle_range = _candle_amplitude(candle)
-        if reference_start < 0 or candle_range <= 0:
+        if candle_range <= 0:
             continue
-        range_core = significant_range_core(candles, (index,), lookback=10, top_n=4)
-        if range_core is None:
-            continue
-        _, range_rank = range_core
+        range_core = formation_range_rank(candles, (index,), lookback=10)
+        range_rank = range_core[1] if range_core is not None else None
         candidates: list[tuple[str, str, str, int | None]] = []
         if upper_shadow >= (body * 2.0) and upper_shadow >= (candle_range * 0.55) and upper_shadow >= lower_shadow:
             candidates.append(("long_upper_shadow", "short", "upper", _shadow_rank_in_recent_window(
@@ -2413,8 +2407,6 @@ def _build_replay_signal_markers(
         if not candidates:
             continue
         for pattern_id, direction, side, shadow_rank in candidates:
-            if shadow_rank is None or shadow_rank > 4:
-                continue
             key = (index, pattern_id)
             if key in seen:
                 continue
@@ -2436,9 +2428,13 @@ def _build_replay_signal_markers(
                 include_sma50=include_sma50,
             )
             label = _REPLAY_SIGNAL_LABELS[pattern_id]
-            text_suffix = f"核心K前{range_rank} 影线前{shadow_rank}"
+            text_suffix = (
+                f"核心K振幅第{range_rank if range_rank is not None else '—'} "
+                f"影线第{shadow_rank if shadow_rank is not None else '—'}"
+            )
             if nearest_name != "-" and nearest_distance is not None and nearest_distance <= _REPLAY_SIGNAL_NEAR_MA_MAX_PCT:
                 text_suffix = f"{text_suffix} @{nearest_name}"
+            marker_score, marker_rank = pattern_quality_score(candles, (index,))
             markers.append(
                 {
                     "index": index,
@@ -2457,7 +2453,11 @@ def _build_replay_signal_markers(
                     "core_range_rank": range_rank,
                     "shadow_rank": shadow_rank,
                     "core_ma_touch": core_ma_touch,
-                    "score": 62 + max(0, 4 - shadow_rank),
+                    "score": marker_score,
+                    "score_detail": (
+                        f"结构60 + 振幅显著性{marker_score - 60}"
+                        f"（振幅第{marker_rank if marker_rank is not None else '—'}）"
+                    ),
                     "color": _REPLAY_SIGNAL_LONG_COLOR if direction == "long" else _REPLAY_SIGNAL_SHORT_COLOR,
                 }
             )
@@ -5233,7 +5233,11 @@ if QChartView is not None:
                 label = str(marker.get("text", marker.get("label", "")) or "")
                 distance = float(marker.get("distance_pct", 0.0) or 0.0)
                 score = int(marker.get("score", 0) or 0)
-                lines.append(f"信号 {label} | 均线距离 {distance:.2f}% | 评分 {score}")
+                score_detail = str(marker.get("score_detail", "") or "")
+                lines.append(
+                    f"信号 {label} | 均线距离 {distance:.2f}% | 评分 {score}"
+                    + (f"（{score_detail}）" if score_detail else "")
+                )
             return tuple(lines)
 
         def _draw_future_projection(self, painter: QPainter, plot_area: QRectF) -> None:
@@ -12355,7 +12359,7 @@ class KlineAnalysisWindow(QMainWindow):
 
     def _area_shape_replay_signature(self, plan: AreaShapePlan, start_seconds: int) -> str:
         payload = {
-            "version": 5,
+            "version": 7,
             "plan_id": plan.plan_id,
             "symbol": plan.symbol.strip().upper(),
             "period": plan.period.strip().upper(),
@@ -12686,6 +12690,7 @@ class KlineAnalysisWindow(QMainWindow):
                             opportunities.append({
                                 "record_type": "opportunity", "side": scanner_side,
                                 "pattern": str(scan_event.get("pattern", position.get("pattern", ""))),
+                                "pattern_score": int(scan_event.get("pattern_score", position.get("pattern_score", 0)) or 0),
                                 "signal_ts": signal_ts,
                                 "entry_ts": int(scan_event.get("candle_ts", candle.ts) or candle.ts),
                                 "entry": Decimal(str(scan_event.get("entry", "0"))),
@@ -12718,6 +12723,7 @@ class KlineAnalysisWindow(QMainWindow):
                     position = replay.paper_position or main_pending
                     current_trade = {
                         "side": side, "pattern": str(event.get("pattern", "")), "entry": Decimal(str(event["entry"])),
+                        "pattern_score": int(event.get("pattern_score", position.get("pattern_score", 0)) or 0),
                         "stop": Decimal(str(event.get("stop", "0"))), "risk": Decimal(str(event.get("risk_distance", "0"))),
                         "entry_ts": int(event.get("candle_ts", candle.ts)),
                         "signal_ts": int(position.get("signal_candle_ts", candle.ts) or candle.ts),
@@ -12766,6 +12772,7 @@ class KlineAnalysisWindow(QMainWindow):
         return {
             "record_type": "opportunity", "side": str(event.get("side") or side),
             "pattern": str(event.get("pattern", "")),
+            "pattern_score": int(event.get("pattern_score", 0) or 0),
             "signal_ts": int(event.get("signal_candle_ts", event.get("candle_ts", 0)) or 0),
             "entry_ts": int(event.get("candle_ts", 0) or 0), "entry": entry,
             "stop": stop, "target": target, "risk": abs(entry - stop), "space_r": space_r,
@@ -12817,6 +12824,7 @@ class KlineAnalysisWindow(QMainWindow):
         pnl = net_r * plan.config.risk_amount
         return {
             "side": side, "pattern": str(trade.get("pattern", "")), "entry": entry, "stop": stop,
+            "pattern_score": int(trade.get("pattern_score", 0) or 0),
             "exit": exit_price, "r": net_r, "pnl": pnl, "entry_ts": int(trade.get("entry_ts", 0) or 0),
             "signal_ts": int(trade.get("signal_ts", trade.get("entry_ts", 0)) or 0),
             "record_type": "trade",
@@ -12877,14 +12885,14 @@ class KlineAnalysisWindow(QMainWindow):
         ), 1)
         layout.addLayout(filter_layout)
 
-        table = QTableWidget(0, 10, dialog)
-        table.setHorizontalHeaderLabels(["记录", "方向", "形态", "信号时间", "入场时间", "入场价", "止损", "退出/目标参考", "净R/空间R", "估算U/说明"])
+        table = QTableWidget(0, 11, dialog)
+        table.setHorizontalHeaderLabels(["记录", "方向", "形态", "评分", "信号时间", "入场时间", "入场价", "止损", "退出/目标参考", "净R/空间R", "估算U/说明"])
         table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         table.verticalHeader().setVisible(False)
         header = table.horizontalHeader()
         header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
-        for column, width in enumerate((88, 52, 100, 140, 140, 90, 90, 120, 100, 220)):
+        for column, width in enumerate((88, 52, 100, 80, 140, 140, 90, 90, 120, 100, 220)):
             table.setColumnWidth(column, width)
         table.horizontalHeader().setStretchLastSection(True)
         layout.addWidget(table)
@@ -12912,6 +12920,11 @@ class KlineAnalysisWindow(QMainWindow):
                         "潜在机会" if opportunity else "回测交易",
                         "多" if item.get("side") == "long" else "空",
                         _REPLAY_SIGNAL_LABELS.get(str(item.get("pattern", "")), str(item.get("pattern", ""))),
+                        (
+                            f"{int(item.get('pattern_score', 0) or 0)} · "
+                            f"{'重点' if int(item.get('pattern_score', 0) or 0) >= 80 else '普通' if int(item.get('pattern_score', 0) or 0) >= 65 else '弱'}"
+                            if int(item.get("pattern_score", 0) or 0) > 0 else "—"
+                        ),
                         _format_bar_time(int(item.get("signal_ts", item.get("entry_ts", 0)) or 0) // 1000),
                         _format_bar_time(int(item.get("entry_ts", 0) or 0) // 1000),
                         self._format_area_shape_price(Decimal(str(item.get("entry", "0"))), plan.symbol),

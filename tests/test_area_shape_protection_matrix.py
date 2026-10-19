@@ -180,3 +180,6 @@ def test_multi_candle_shape_only_uses_its_own_post_activation_touch(pattern, spa
     with patch("okx_quant.area_shape_trade._chart_patterns_by_candle_ts", return_value={4*hour:[(pattern,"long")]}):
         event = plan.observe(candles)
     assert (event is not None and event["kind"] == "paper_pending") == (touch_location == "inside")
+    if touch_location == "inside":
+        assert event["pattern_score"] == 75
+        assert plan.paper_position["pattern_score"] == 75

@@ -46,7 +46,7 @@ def test_pattern_cores_share_the_ten_candles_before_the_pattern():
 
 
 @pytest.mark.parametrize("candle_count", [1, 2, 3])
-@pytest.mark.parametrize(("candidate_range", "expected_rank"), [(9.5, 4), (9.0, None)])
+@pytest.mark.parametrize(("candidate_range", "expected_rank"), [(9.5, 4), (9.0, 5)])
 def test_one_two_three_candle_patterns_use_prior_window_and_rank_boundary(
     monkeypatch, candle_count, candidate_range, expected_rank,
 ):
@@ -61,9 +61,6 @@ def test_one_two_three_candle_patterns_use_prior_window_and_rank_boundary(
     markers = _build(sample, monkeypatch, index=signal_index, candle_count=candle_count)
     pattern_markers = [item for item in markers if item["pattern_id"] == "inside_bar"]
 
-    if expected_rank is None:
-        assert pattern_markers == []  # insertion rank 5 is outside the top 4.
-        return
     assert len(pattern_markers) == 1
     assert pattern_markers[0]["core_range_rank"] == expected_rank
     assert pattern_markers[0]["core_index"] == len(refs)
@@ -89,10 +86,13 @@ def test_range_rank_uses_conservative_ties_and_requires_ten_prior_candles():
     ) is None
 
 
-def test_body_rank_cannot_bypass_range_gate(monkeypatch):
+def test_candidate_is_not_suppressed_when_amplitude_ranks_below_top_four(monkeypatch):
     refs = [_candle(100, 110, 100, 101) for _ in range(10)]
     candidate = _candle(100, 109, 100, 108.9)
-    assert _build([*refs, candidate], monkeypatch, index=10, candle_count=1) == []
+    markers = _build([*refs, candidate], monkeypatch, index=10, candle_count=1)
+    inside_markers = [item for item in markers if item["pattern_id"] == "inside_bar"]
+    assert len(inside_markers) == 1
+    assert inside_markers[0]["core_range_rank"] == 11
 
 
 def test_unconfirmed_reference_or_pattern_member_rejects_previously_valid_signal(monkeypatch):
@@ -107,12 +107,15 @@ def test_unconfirmed_reference_or_pattern_member_rejects_previously_valid_signal
     unconfirmed_reference = [*sample]
     unconfirmed_reference[0] = _candle(100, 103, 100, 102.9)
     unconfirmed_reference[0].confirmed = False
-    assert _build(unconfirmed_reference, monkeypatch, index=11, candle_count=2) == []
+    with_unconfirmed_reference = _build(unconfirmed_reference, monkeypatch, index=11, candle_count=2)
+    assert len(with_unconfirmed_reference) == 1
+    assert with_unconfirmed_reference[0]["core_range_rank"] is None
 
     unconfirmed_member = [*sample]
     unconfirmed_member[10] = _candle(100, 109.5, 100, 109.4)
     unconfirmed_member[10].confirmed = False
-    assert _build(unconfirmed_member, monkeypatch, index=11, candle_count=2) == []
+    unconfirmed_markers = _build(unconfirmed_member, monkeypatch, index=11, candle_count=2)
+    assert all(item["pattern_id"] != "inside_bar" for item in unconfirmed_markers)
 
 
 def test_invalid_signal_index_keeps_none_result():
@@ -153,6 +156,6 @@ def test_shadow_pattern_requires_fifty_five_percent_range_and_mirrors(
     accepted = [item for item in build(above) if item["pattern_id"] == pattern_id]
     assert len(accepted) == 1
     assert accepted[0]["direction"] == direction
-    assert "核心K前" in accepted[0]["text"] and "影线前" in accepted[0]["text"]
+    assert "核心K振幅第" in accepted[0]["text"] and "影线第" in accepted[0]["text"]
     assert "@MA50" in accepted[0]["text"]
 

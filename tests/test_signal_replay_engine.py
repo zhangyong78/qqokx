@@ -209,6 +209,49 @@ class SignalReplayEngineTest(unittest.TestCase):
         bottom = [signal for signal in dataset.signals if signal.pattern_id == "bottom_fractal"]
         self.assertEqual([(signal.index, signal.ts) for signal in bottom], [(12, candles[12].ts)])
 
+    def test_second_candle_retracement_confirms_two_line_reversal_and_cancels_fractal_extension(self) -> None:
+        candles = [_custom_candle(index, "100", "101", "99", "100") for index in range(10)]
+        candles.extend([
+            _custom_candle(10, "100", "101", "87", "90"),  # first bearish candle; 60% level = 96
+            _custom_candle(11, "90", "99", "89", "98"),   # confirms at the second close
+            _custom_candle(12, "98", "99", "80", "82"),   # later selloff cannot relabel it as a fractal
+        ])
+        config = SignalReplayConfig(
+            enable_trend_filter=False, enable_pullback_trigger=False,
+            enable_macd_filter=False, enable_volume_filter=False, enable_bias_filter=False,
+            include_long=False, include_short=False, enable_large_move_gate=False,
+            enable_big_bullish=False, enable_big_bearish=False,
+            enable_long_upper_shadow=False, enable_long_lower_shadow=False,
+            enable_false_breakdown=False, enable_false_breakout=False,
+            enable_inside_bar=False, enable_top_fractal=False, enable_bottom_fractal=True,
+        )
+
+        dataset = build_signal_replay_dataset(candles, config=config)
+
+        two_line = [signal for signal in dataset.signals if signal.pattern_id == "double_reversal_up"]
+        fractals = [signal for signal in dataset.signals if signal.pattern_id == "bottom_fractal"]
+        self.assertTrue(any(signal.index == 11 and signal.candle_count == 2 for signal in two_line))
+        self.assertFalse(any(signal.index == 12 for signal in fractals))
+
+    def test_structural_pattern_is_kept_and_scored_when_range_rank_is_below_top_four(self) -> None:
+        candles = [_custom_candle(index, "100", "105", "95", "102") for index in range(10)]
+        candles.extend([
+            _custom_candle(10, "100", "108", "99.5", "107"),
+            _custom_candle(11, "107", "107.5", "98", "99"),
+        ])
+        dataset = build_signal_replay_dataset(candles, config=SignalReplayConfig(
+            include_long=False, include_short=False, enable_large_move_gate=False,
+            enable_big_bullish=False, enable_big_bearish=False,
+            enable_long_upper_shadow=False, enable_long_lower_shadow=False,
+            enable_false_breakdown=False, enable_false_breakout=False,
+            enable_inside_bar=False, enable_top_fractal=False, enable_bottom_fractal=False,
+        ))
+
+        reversal = next(signal for signal in dataset.signals if signal.pattern_id == "double_reversal_down")
+        self.assertEqual(reversal.range_rank, 11)
+        self.assertEqual(reversal.score, 60)
+        self.assertIn("结构60", reversal.score_detail)
+
     def test_false_breaks_require_prior_trend(self) -> None:
         candles = [_custom_candle(index, "100", "100.3", "99.8", "100.1") for index in range(30)]
         candles.extend(

@@ -345,6 +345,30 @@ class AreaShapeDemoUiTests(QtWidgetTestCase):
         self.assertEqual(opportunity["entry"], Decimal("100"))
         self.assertIn("盈亏比不足", opportunity["outcome"])
 
+    def test_bottom_fractal_is_rejected_when_confirmation_candle_closes_back_below_retrace(self) -> None:
+        plan = self._create_demo_draft()
+        plan.support_price = Decimal("81146.5")
+        plan.pressure_price = Decimal("83953.9")
+        plan.config = AreaShapeConfig(
+            direction="long", min_space_r=Decimal("2"), entry_trigger_mode="pattern",
+            signal_patterns=("double_reversal_up", "bottom_fractal"),
+            stop_basis="fixed_distance", fixed_stop_distance=Decimal("1000"),
+            break_even_enabled=False,
+        )
+        candles = [
+            Candle(index * HOUR, Decimal("83000"), Decimal("83100"), Decimal("82900"), Decimal("83000"), Decimal("1"), True)
+            for index in range(1, 11)
+        ]
+        candles.extend([
+            Candle(11 * HOUR, Decimal("82279.5"), Decimal("82610.9"), Decimal("81711"), Decimal("82141.9"), Decimal("1"), True),
+            Candle(12 * HOUR, Decimal("82141.9"), Decimal("82748.1"), Decimal("82090.9"), Decimal("82659.9"), Decimal("1"), True),
+            Candle(13 * HOUR, Decimal("82659.9"), Decimal("82659.9"), Decimal("80910.4"), Decimal("80991.9"), Decimal("1"), True),
+        ])
+
+        rows = self.window._simulate_area_shape_replay(plan, candles, start_ms=0, sides=("long",))
+
+        self.assertEqual(rows, [])
+
     def test_replay_records_same_side_signal_during_open_position_as_opportunity(self) -> None:
         plan = self._create_demo_draft()
         plan.support_price = Decimal("95")
@@ -656,11 +680,12 @@ class AreaShapeDemoUiTests(QtWidgetTestCase):
         table = dialog.findChild(self._kline_module.QTableWidget)
         summary = dialog.findChild(self._kline_module.QLabel)
         self.assertIsNotNone(table)
-        self.assertEqual(table.item(0, 5).text(), "83771.4")
-        self.assertEqual(table.item(0, 6).text(), "84414.8")
-        self.assertEqual(table.item(0, 7).text(), "82424.8")
-        self.assertEqual(table.item(0, 8).text(), "2.00R")
-        self.assertEqual(table.item(0, 9).text(), "20.00")
+        self.assertEqual(table.item(0, 3).text(), "—")
+        self.assertEqual(table.item(0, 6).text(), "83771.4")
+        self.assertEqual(table.item(0, 7).text(), "84414.8")
+        self.assertEqual(table.item(0, 8).text(), "82424.8")
+        self.assertEqual(table.item(0, 9).text(), "2.00R")
+        self.assertEqual(table.item(0, 10).text(), "20.00")
         self.assertEqual(table.item(0, 1).foreground().color().name(), "#b91c1c")
         self.assertEqual(table.item(0, 1).background().color().name(), "#fff1f0")
         self.assertIn("80363.9 / 压力 84007.0", summary.text())

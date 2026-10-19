@@ -391,10 +391,14 @@ class AreaShapePlan:
                 continue
             entry_line = self.support_price if self.config.direction == "long" else self.pressure_price
             expected_direction = self.config.direction
-            matching_pattern = "direct_touch" if self.config.entry_trigger_mode == "direct_touch" else _matching_chart_pattern(
+            matched_chart_pattern = None if self.config.entry_trigger_mode == "direct_touch" else _matching_chart_pattern(
                 chart_patterns_by_ts, candle_ts=candle.ts,
                 expected_direction=expected_direction, selected=patterns,
             )
+            matching_pattern = "direct_touch" if self.config.entry_trigger_mode == "direct_touch" else (
+                matched_chart_pattern[0] if matched_chart_pattern is not None else None
+            )
+            matching_score = matched_chart_pattern[1] if matched_chart_pattern is not None else None
             # Old persisted drafts retain their original single-candle signal semantics.
             if self.config.entry_trigger_mode != "direct_touch" and matching_pattern is None and patterns.intersection({
                 "hammer", "inverted_hammer", "dragonfly_doji", "shooting_star", "hanging_man", "gravestone_doji",
@@ -402,6 +406,8 @@ class AreaShapePlan:
                 matching_pattern = _matching_legacy_single_candle_pattern(
                     confirmed[: index + 1], expected_direction=expected_direction, selected=patterns,
                 )
+                if matching_pattern is not None:
+                    matching_score = 60
             # Multi-candle patterns may touch the line before their confirmation
             # candle. Limit the touch to this pattern's own confirmed window and
             # to candles after activation; never retain an unrelated old touch.
@@ -428,7 +434,11 @@ class AreaShapePlan:
                 self.config, self.config.direction, entry_reference=entry_line,
                 signal_candle=candle, recent_candles=stop_candles, atr_value=current_atr,
             )
-            event = self._build_paper_entry(candle, current_atr, matching_pattern, signal_key, stop_price=stop_price)
+            pattern_score = min(100, int(matching_score or 60) + 15) if matching_pattern != "direct_touch" else None
+            event = self._build_paper_entry(
+                candle, current_atr, matching_pattern, signal_key,
+                stop_price=stop_price, pattern_score=pattern_score,
+            )
             self.last_signal_key = signal_key
             self._event(str(event["kind"]), str(event["message"]), **{k: v for k, v in event.items() if k not in {"kind", "message"}})
             if event["kind"] == "paper_pending":
@@ -438,7 +448,8 @@ class AreaShapePlan:
         return None
 
     def _build_paper_entry(
-        self, candle: Candle, current_atr: Decimal, pattern: str, key: str, *, stop_price: Decimal | None = None,
+        self, candle: Candle, current_atr: Decimal, pattern: str, key: str, *,
+        stop_price: Decimal | None = None, pattern_score: int | None = None,
     ) -> dict[str, object]:
         side = self.config.direction
         stop = stop_price if stop_price is not None else calculate_initial_stop(
@@ -456,13 +467,14 @@ class AreaShapePlan:
             "entry_trigger": str(trigger),
             "entry_mode": self.config.entry_mode, "entry_trigger_mode": self.config.entry_trigger_mode,
             "stop_basis": self.config.stop_basis, "stage": "pending_entry", "pattern": pattern,
+            "pattern_score": pattern_score,
             "risk_amount": str(self.config.risk_amount), "rule_version": self.version,
             "target_buffer_atr": str(current_atr * self.config.target_buffer_atr),
         }
         return {
             "kind": "paper_pending",
             "message": f"{side} {pattern} 信号通过方向与区域检查；纸面入场等待未来行情触发",
-            "candle_ts": candle.ts, "paper_position": pending,
+            "candle_ts": candle.ts, "pattern_score": pattern_score, "paper_position": pending,
         }
 
     def _observe_pending_entry(self, candle: Candle) -> dict[str, object] | None:
@@ -500,6 +512,7 @@ class AreaShapePlan:
                 entry=str(entry), stop=str(stop), target=str(target), risk_distance=str(risk),
                 space_r=str(space_r), min_space_r=str(self.config.min_space_r),
                 pattern=str(pending.get("pattern", "")), side=side,
+                pattern_score=pending.get("pattern_score"),
             )
         fixed = self.config.exit_template == "fixed_1r"
         target_r = self.config.fixed_tp_r if fixed else AREA_DYNAMIC_TAKE_PROFIT_R
@@ -526,6 +539,7 @@ class AreaShapePlan:
             "paper_entry", f"纸面模拟按未来1H行情在 {entry} 成交；成交K线不参与止损/止盈回放",
             candle_ts=candle.ts, entry=str(entry), stop=str(stop), risk_distance=str(risk),
             pattern=str(pending.get("pattern", "")), space_r=str(space_r), entry_mode=self.config.entry_mode,
+            pattern_score=pending.get("pattern_score"),
         )
         if self.config.entry_mode == "breakout":
             # Entry and stop can both be crossed in this bar; OHLC does not reveal
@@ -639,7 +653,7 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
-def _chart_patterns_by_candle_ts(candles: list[Candle]) -> dict[int, list[tuple[str, str]]]:
+def _chart_patterns_by_candle_ts(candles: list[Candle]) -> dict[int, list[tuple[str, str, int]]]:
     """Run the same confirmed-candle marker algorithm used by the 1H chart."""
     if not candles:
         return {}
@@ -651,7 +665,7 @@ def _chart_patterns_by_candle_ts(candles: list[Candle]) -> dict[int, list[tuple[
         candles=candles, period="1H", ema15_values=_to_ema(closes, 15),
         sma50_values=_to_sma(closes, 50),
     )
-    result: dict[int, list[tuple[str, str]]] = {}
+    result: dict[int, list[tuple[str, str, int]]] = {}
     for marker in markers:
         try:
             candle_ts = int(marker.get("time", 0)) * 1000
@@ -660,19 +674,26 @@ def _chart_patterns_by_candle_ts(candles: list[Candle]) -> dict[int, list[tuple[
         pattern = str(marker.get("pattern_id", "")).strip().lower()
         direction = str(marker.get("direction", "")).strip().lower()
         if candle_ts > 0 and pattern and direction in {"long", "short"}:
-            result.setdefault(candle_ts, []).append((pattern, direction))
+            result.setdefault(candle_ts, []).append((pattern, direction, int(marker.get("score", 60) or 60)))
     return result
 
 
 def _matching_chart_pattern(
-    patterns_by_ts: dict[int, list[tuple[str, str]]], *, candle_ts: int,
+    patterns_by_ts: dict[int, list[tuple[str, ...]]], *, candle_ts: int,
     expected_direction: str, selected: set[str],
-) -> str | None:
+) -> tuple[str, int] | None:
     if not selected.intersection(CHART_PATTERN_SIGNALS):
         return None
-    for pattern, direction in patterns_by_ts.get(int(candle_ts), []):
+    for item in patterns_by_ts.get(int(candle_ts), []):
+        if len(item) < 2:
+            continue
+        pattern, direction = str(item[0]), str(item[1])
         if pattern in selected and direction == expected_direction:
-            return pattern
+            try:
+                score = int(item[2]) if len(item) >= 3 else 60
+            except (TypeError, ValueError):
+                score = 60
+            return pattern, max(0, min(score, 100))
     return None
 
 
