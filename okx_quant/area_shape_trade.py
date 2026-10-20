@@ -507,9 +507,13 @@ class AreaShapePlan:
         self.last_signal_key = signal_key
         if event.get("kind") != "paper_pending":
             self.status = "monitoring"
+            details = {key: value for key, value in event.items() if key not in {"kind", "message"}}
+            details.update(
+                candle_ts=timestamp_ms, trigger_price=str(entry_line), trigger_source=source,
+            )
             return self._event(
                 str(event.get("kind", "signal_skipped")), str(event.get("message", "直接触线信号无效")),
-                candle_ts=timestamp_ms, trigger_price=str(entry_line), trigger_source=source,
+                **details,
             )
         pending = dict(event.get("paper_position", {}))
         pending["trigger_source"] = source
@@ -644,7 +648,7 @@ class AreaShapePlan:
             tp_hit = bool(self.paper_position.get("take_profit")) and (candle.high >= tp if side == "long" else candle.low <= tp)
             if stop_hit:
                 self.status = "paper_closed"
-                self._event("paper_stop", "突破成交bar同时包含入场与止损条件；按保守顺序记止损退出", candle_ts=candle.ts, exit_price=str(stop), ambiguous_bar=True, take_profit_also_touched=tp_hit)
+                self._event("paper_stop", "突破成交bar同时包含入场与止损条件；按保守顺序记止损退出", candle_ts=candle.ts, exit_price=str(stop), stop_price=str(stop), ambiguous_bar=True, take_profit_also_touched=tp_hit)
                 self.paper_position = None
         elif str(pending.get("entry_trigger_mode")) != "direct_touch":
             # Next-open fill occurs before the rest of the confirmed bar.
@@ -667,7 +671,7 @@ class AreaShapePlan:
             self.status = "paper_closed"
             result = self._event(
                 "paper_stop", f"纸面最新价触发止损于 {stop}", candle_ts=timestamp_ms,
-                exit_price=str(stop), trigger_source="live_last_price",
+                exit_price=str(stop), stop_price=str(stop), trigger_source="live_last_price",
             )
             self.paper_position = None
             self._complete_deferred_cancel()
@@ -706,7 +710,10 @@ class AreaShapePlan:
         if stop_hit:
             self.status = "paper_closed"
             ambiguous = tp_hit
-            result = self._event("paper_stop", f"纸面止损触发于 {stop}；同bar多价位顺序不明时按止损先发生处理", candle_ts=candle.ts, exit_price=str(stop), ambiguous_bar=ambiguous)
+            result = self._event(
+                "paper_stop", f"纸面止损触发于 {stop}；同bar多价位顺序不明时按止损先发生处理",
+                candle_ts=candle.ts, exit_price=str(stop), stop_price=str(stop), ambiguous_bar=ambiguous,
+            )
             self.paper_position = None
             self._complete_deferred_cancel()
             return result

@@ -3081,7 +3081,14 @@ class AccountPositionsHomeWidget(QWidget):
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        self._runtime = load_runtime("159") or load_runtime()
+        active_profile_provider = getattr(parent, "active_profile_name", None)
+        active_profile_name = str(active_profile_provider() or "").strip() if callable(active_profile_provider) else ""
+        self._runtime = (
+            load_runtime(active_profile_name)
+            if active_profile_name
+            else load_runtime("159") or load_runtime()
+        )
+        self._page_active = True
         self._profile_snapshots: dict[str, dict[str, str]] = {}
         self._unlocked_profiles: set[str] = set()
         self._last_profile_name = self._runtime.credential_profile_name if self._runtime is not None else ""
@@ -3206,6 +3213,12 @@ class AccountPositionsHomeWidget(QWidget):
 
     def workspace_profile_name(self) -> str:
         return self._last_profile_name
+
+    def set_page_active(self, active: bool) -> None:
+        self._page_active = bool(active)
+        set_interval = getattr(self._realtime_store, "set_reconcile_interval_seconds", None)
+        if callable(set_interval):
+            set_interval(60 if self._page_active else 300)
 
     def connection_snapshot(self) -> dict[str, object]:
         text = self._account_status.text().strip() if hasattr(self, "_account_status") else ""
@@ -7315,11 +7328,23 @@ class AccountPositionsHomeWidget(QWidget):
             # historical orders and closed positions must not compete with
             # that urgent account check during the initial page load.
             self._history_sync_deferred_timer.start(15_000)
-        if hasattr(self, "_set_account_status"):
-            self._set_account_status("正在检查现有持仓...")
-        if hasattr(self, "_set_order_status"):
-            self._set_order_status("等待持仓检查完成后同步当前委托...")
-        self._realtime_store.start(self._runtime)
+        self._realtime_store.start_if_needed(self._runtime)
+        snapshot = self._realtime_store.snapshot_for(
+            profile_name=self._last_profile_name,
+            environment=str(getattr(self._runtime, "environment", "") or "").strip(),
+        )
+        if snapshot is None:
+            if hasattr(self, "_set_account_status"):
+                self._set_account_status("正在检查现有持仓...")
+            if hasattr(self, "_set_order_status"):
+                self._set_order_status("等待持仓检查完成后同步当前委托...")
+        else:
+            self._apply_realtime_snapshot(snapshot)
+            if snapshot.source != "rest":
+                if hasattr(self, "_set_account_status"):
+                    self._set_account_status("已载入实时账户缓存，后台校验中")
+                if hasattr(self, "_set_order_status"):
+                    self._set_order_status("已载入实时委托缓存，后台校验中")
         if start_history and not self._history_sync_waiting_for_realtime:
             # Compatibility path for lightweight callers that do not install
             # the shared history manager around this widget.

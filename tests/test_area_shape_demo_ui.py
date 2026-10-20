@@ -121,6 +121,50 @@ class AreaShapeDemoUiTests(QtWidgetTestCase):
             )
         return plans[0]
 
+    def test_manual_area_prices_update_draft_and_both_chart_rays(self) -> None:
+        plan = self._create_demo_draft()
+
+        self.window._apply_area_shape_prices(plan, Decimal("90"), Decimal("110"))
+
+        self.assertEqual(plan.support_price, Decimal("90"))
+        self.assertEqual(plan.pressure_price, Decimal("110"))
+        lines = self.window._workspace_entry(symbol=plan.symbol, period=plan.period)["lines"]
+        support = next(item for item in lines if item["id"] == plan.support_line_id)
+        pressure = next(item for item in lines if item["id"] == plan.pressure_line_id)
+        self.assertEqual((support["price_a"], support["price_b"]), (90.0, 90.0))
+        self.assertEqual((pressure["price_a"], pressure["price_b"]), (110.0, 110.0))
+        saved_plan = self.paper_monitor.plans()[0]
+        self.assertEqual(saved_plan.support_price, Decimal("90"))
+        self.assertEqual(saved_plan.pressure_price, Decimal("110"))
+        self.assertIn("下方支撑：90", self.window._area_shape_lines.text())
+        self.assertIn("上方压力：110", self.window._area_shape_lines.text())
+
+    def test_manual_area_prices_reject_invalid_support_pressure_order(self) -> None:
+        plan = self._create_demo_draft()
+        original_prices = plan.support_price, plan.pressure_price
+
+        with self.assertRaisesRegex(ValueError, "支撑低于上方压力"):
+            self.window._apply_area_shape_prices(plan, Decimal("110"), Decimal("100"))
+
+        self.assertEqual((plan.support_price, plan.pressure_price), original_prices)
+
+    def test_manual_area_price_dialog_accepts_typed_price(self) -> None:
+        plan = self._create_demo_draft()
+
+        def accept_dialog(dialog) -> int:
+            edits = dialog.findChildren(self._kline_module.QLineEdit)
+            edits[0].setText("80000")
+            edits[1].setText("84000")
+            return int(self._kline_module.QDialog.DialogCode.Accepted)
+
+        with patch.object(self._kline_module.QDialog, "exec", new=accept_dialog):
+            self.window._edit_area_shape_prices()
+
+        saved_plan = self.paper_monitor.plans()[0]
+        self.assertEqual(saved_plan.support_price, Decimal("80000"))
+        self.assertEqual(saved_plan.pressure_price, Decimal("84000"))
+        self.assertIn("上方压力：84000", self.window._area_shape_lines.text())
+
     def test_demo_start_is_one_action_after_unlock_and_paper_baseline(self) -> None:
         self._create_demo_draft()
         self._assert_area_controls_fit_viewport()
@@ -162,6 +206,26 @@ class AreaShapeDemoUiTests(QtWidgetTestCase):
             self.assertEqual(support["time_b"], target_time)
             self.assertEqual(pressure["time_a"], target_time)
             self.assertEqual(pressure["time_b"], target_time)
+
+    def test_dragging_area_price_refreshes_values_and_plan_details(self) -> None:
+        plan = self._create_demo_draft()
+        lines = self.window._workspace_entry(symbol=plan.symbol, period=plan.period)["lines"]
+        support_index = next(index for index, item in enumerate(lines) if item["id"] == plan.support_line_id)
+        support_line = lines[support_index]
+        self.window._line_drag_state = {
+            "index": support_index,
+            "drag_mode": "move",
+            "anchor_line": dict(support_line),
+            "anchor_candle_time": support_line["time_a"],
+            "anchor_price": support_line["price_a"],
+        }
+
+        with patch.object(self.window, "_resolve_primary_chart_click", return_value=(support_line["time_a"], 90.0)):
+            self.window._on_chart_pointer_released(0.0, 0.0)
+
+        self.assertIn("下方支撑：90", self.window._area_shape_lines.text())
+        self.assertIn("入场参考：下方支撑 90", self.window._area_shape_plan_details.text())
+        self.assertEqual(self.paper_monitor.plans()[0].support_price, Decimal("90"))
 
     def test_future_projection_builds_selected_pattern_over_requested_horizon(self) -> None:
         plan = self._create_demo_draft()
@@ -253,12 +317,39 @@ class AreaShapeDemoUiTests(QtWidgetTestCase):
             Candle(0, Decimal("104"), Decimal("105"), Decimal("102"), Decimal("103"), Decimal("1"), True),
             Candle(HOUR, Decimal("101"), Decimal("102"), Decimal("99"), Decimal("100"), Decimal("1"), True),
             Candle(2 * HOUR, Decimal("96"), Decimal("97"), Decimal("94"), Decimal("96"), Decimal("1"), True),
-            Candle(3 * HOUR, Decimal("96"), Decimal("100"), Decimal("95"), Decimal("98"), Decimal("1"), True),
+            Candle(3 * HOUR, Decimal("96"), Decimal("100"), Decimal("94"), Decimal("98"), Decimal("1"), True),
+            Candle(4 * HOUR, Decimal("98"), Decimal("102"), Decimal("97"), Decimal("101"), Decimal("1"), True),
         ]
         rows = self.window._simulate_area_shape_replay(plan, candles, start_ms=HOUR, sides=("long",))
         self.assertEqual(len(rows), 1)
         self.assertGreater(rows[0]["entry_ts"], HOUR)
         self.assertEqual(rows[0]["outcome"], "paper_take_profit")
+
+    def test_first_ray_touch_is_reference_only_and_later_touch_can_trade(self) -> None:
+        plan = self._create_demo_draft()
+        plan.support_price = Decimal("95")
+        plan.pressure_price = Decimal("150")
+        plan.config = AreaShapeConfig(
+            direction="long", min_space_r=Decimal("1"), entry_trigger_mode="direct_touch",
+            stop_basis="fixed_distance", fixed_stop_distance=Decimal("10"),
+            target_buffer_atr=Decimal("0"), round_trip_fee_rate=Decimal("0"),
+            break_even_enabled=False,
+        )
+        candles = [
+            Candle(HOUR, Decimal("100"), Decimal("101"), Decimal("99"), Decimal("100"), Decimal("1"), True),
+            Candle(2 * HOUR, Decimal("100"), Decimal("101"), Decimal("94"), Decimal("96"), Decimal("1"), True),
+            Candle(3 * HOUR, Decimal("96"), Decimal("101"), Decimal("96"), Decimal("100"), Decimal("1"), True),
+            Candle(4 * HOUR, Decimal("100"), Decimal("102"), Decimal("94"), Decimal("96"), Decimal("1"), True),
+            Candle(5 * HOUR, Decimal("95"), Decimal("100"), Decimal("94"), Decimal("98"), Decimal("1"), True),
+            Candle(6 * HOUR, Decimal("98"), Decimal("120"), Decimal("97"), Decimal("115"), Decimal("1"), True),
+        ]
+
+        rows = self.window._simulate_area_shape_replay(plan, candles, start_ms=HOUR, sides=("long",))
+
+        trades = [row for row in rows if row.get("record_type") == "trade"]
+        self.assertEqual(len(trades), 1, rows)
+        self.assertEqual(trades[0]["signal_ts"], 4 * HOUR)
+        self.assertEqual(trades[0]["entry_ts"], 5 * HOUR)
 
     def test_replay_keeps_insufficient_space_as_potential_opportunity(self) -> None:
         plan = self._create_demo_draft()
@@ -273,13 +364,15 @@ class AreaShapeDemoUiTests(QtWidgetTestCase):
             Candle(HOUR, Decimal("100"), Decimal("101"), Decimal("99"), Decimal("100"), Decimal("1"), True),
             Candle(2 * HOUR, Decimal("100"), Decimal("102"), Decimal("94"), Decimal("100"), Decimal("1"), True),
             Candle(3 * HOUR, Decimal("100"), Decimal("101"), Decimal("99"), Decimal("100"), Decimal("1"), True),
+            Candle(4 * HOUR, Decimal("100"), Decimal("102"), Decimal("94"), Decimal("100"), Decimal("1"), True),
+            Candle(5 * HOUR, Decimal("100"), Decimal("101"), Decimal("99"), Decimal("100"), Decimal("1"), True),
         ]
 
         rows = self.window._simulate_area_shape_replay(plan, candles, start_ms=HOUR, sides=("long",))
 
         self.assertEqual(len(rows), 1, rows)
         self.assertEqual(rows[0]["record_type"], "opportunity")
-        self.assertEqual(rows[0]["entry_ts"], 3 * HOUR)
+        self.assertEqual(rows[0]["entry_ts"], 5 * HOUR)
         self.assertEqual(rows[0]["entry"], Decimal("95"))
         self.assertLess(rows[0]["space_r"], Decimal("1"))
         self.assertIn("盈亏比不足", rows[0]["outcome"])
@@ -287,11 +380,11 @@ class AreaShapeDemoUiTests(QtWidgetTestCase):
     def test_replay_uses_fixed_net_2r_exit_for_both_sides(self) -> None:
         cases = (
             ("long", Decimal("95"), Decimal("150"), ("100", "102", "94", "100"),
-             ("100", "110", "99", "105"), ("105", "135", "100", "130")),
-            ("short", Decimal("95"), Decimal("150"), ("150", "156", "149", "151"),
-             ("150", "151", "140", "145"), ("145", "150", "120", "130")),
+             ("100", "102", "94", "100"), ("100", "110", "99", "105"), ("105", "135", "100", "130")),
+            ("short", Decimal("95"), Decimal("150"), ("150", "156", "149", "149"),
+             ("149", "151", "148", "150"), ("150", "151", "140", "145"), ("145", "150", "120", "130")),
         )
-        for side, support, pressure, touch, entry_bar, target_bar in cases:
+        for side, support, pressure, touch, second_touch, entry_bar, target_bar in cases:
             with self.subTest(side=side):
                 plan = self._create_demo_draft()
                 plan.support_price = support
@@ -304,8 +397,9 @@ class AreaShapeDemoUiTests(QtWidgetTestCase):
                 candles = [
                     Candle(HOUR, Decimal("100"), Decimal("101"), Decimal("99"), Decimal("100"), Decimal("1"), True),
                     Candle(2 * HOUR, *(Decimal(value) for value in touch), Decimal("1"), True),
-                    Candle(3 * HOUR, *(Decimal(value) for value in entry_bar), Decimal("1"), True),
-                    Candle(4 * HOUR, *(Decimal(value) for value in target_bar), Decimal("1"), True),
+                    Candle(3 * HOUR, *(Decimal(value) for value in second_touch), Decimal("1"), True),
+                    Candle(4 * HOUR, *(Decimal(value) for value in entry_bar), Decimal("1"), True),
+                    Candle(5 * HOUR, *(Decimal(value) for value in target_bar), Decimal("1"), True),
                 ]
 
                 rows = self.window._simulate_area_shape_replay(plan, candles, start_ms=HOUR, sides=(side,))
@@ -315,7 +409,27 @@ class AreaShapeDemoUiTests(QtWidgetTestCase):
                 self.assertEqual(trades[0]["outcome"], "paper_take_profit")
                 self.assertAlmostEqual(float(trades[0]["r"]), 2.0, places=6)
 
-    def test_fractal_replay_enters_after_close_confirmation_and_marks_low_rr(self) -> None:
+    def test_replay_stop_uses_stop_price_and_only_two_sided_fees(self) -> None:
+        plan = self._create_demo_draft()
+        plan.config = AreaShapeConfig(
+            round_trip_fee_rate=Decimal("0.00036"), slippage_rate=Decimal("0.01"),
+        )
+        trade = {
+            "side": "short", "entry": Decimal("100"), "stop": Decimal("110"),
+            "risk": Decimal("10"), "entry_ts": HOUR,
+        }
+        # Deliberately make exit_price look like an adverse candle close. A
+        # stop event's explicit stop_price must be used for settlement.
+        result = self.window._area_shape_replay_result(plan, trade, {
+            "kind": "paper_stop", "exit_price": "125", "stop_price": "110",
+            "candle_ts": 2 * HOUR,
+        })
+        expected_fee_r = (Decimal("100") + Decimal("110")) * Decimal("0.00036") / Decimal("10")
+        self.assertEqual(result["exit"], Decimal("110"))
+        self.assertEqual(result["r"], Decimal("-1") - expected_fee_r)
+        self.assertEqual(result["pnl"], result["r"] * plan.config.risk_amount)
+
+    def test_first_fractal_touch_is_reference_and_not_a_replay_opportunity(self) -> None:
         plan = self._create_demo_draft()
         plan.support_price = Decimal("90")
         plan.pressure_price = Decimal("105")
@@ -337,14 +451,7 @@ class AreaShapeDemoUiTests(QtWidgetTestCase):
 
         rows = self.window._simulate_area_shape_replay(plan, candles, start_ms=0, sides=("long",))
 
-        self.assertEqual(len(rows), 1, rows)
-        opportunity = rows[0]
-        self.assertEqual(opportunity["record_type"], "opportunity")
-        self.assertEqual(opportunity["pattern"], "bottom_fractal")
-        self.assertEqual(opportunity["signal_ts"], 13 * HOUR)
-        self.assertEqual(opportunity["entry_ts"], 14 * HOUR)
-        self.assertEqual(opportunity["entry"], Decimal("100"))
-        self.assertIn("盈亏比不足", opportunity["outcome"])
+        self.assertEqual(rows, [])
 
     def test_bottom_fractal_is_rejected_when_confirmation_candle_closes_back_below_retrace(self) -> None:
         plan = self._create_demo_draft()
@@ -385,7 +492,7 @@ class AreaShapeDemoUiTests(QtWidgetTestCase):
             Candle(3 * HOUR, Decimal("100"), Decimal("102"), Decimal("99"), Decimal("100"), Decimal("1"), True),
             Candle(4 * HOUR, Decimal("100"), Decimal("102"), Decimal("94"), Decimal("100"), Decimal("1"), True),
             Candle(5 * HOUR, Decimal("100"), Decimal("102"), Decimal("99"), Decimal("100"), Decimal("1"), True),
-            Candle(6 * HOUR, Decimal("100"), Decimal("102"), Decimal("99"), Decimal("100"), Decimal("1"), True),
+            Candle(6 * HOUR, Decimal("100"), Decimal("102"), Decimal("94"), Decimal("100"), Decimal("1"), True),
         ]
 
         rows = self.window._simulate_area_shape_replay(plan, candles, start_ms=HOUR, sides=("long",))
@@ -394,7 +501,7 @@ class AreaShapeDemoUiTests(QtWidgetTestCase):
         opportunities = [item for item in rows if item.get("record_type") == "opportunity"]
         self.assertEqual(len(opportunities), 1)
         self.assertEqual(opportunities[0]["side"], "long")
-        self.assertEqual(opportunities[0]["signal_ts"], 4 * HOUR)
+        self.assertEqual(opportunities[0]["signal_ts"], 6 * HOUR)
         self.assertIn("未重复开仓", opportunities[0]["outcome"])
 
     def test_replay_does_not_count_opposite_signal_after_position_closes(self) -> None:
@@ -411,9 +518,11 @@ class AreaShapeDemoUiTests(QtWidgetTestCase):
             Candle(HOUR, Decimal("100"), Decimal("101"), Decimal("99"), Decimal("100"), Decimal("1"), True),
             Candle(2 * HOUR, Decimal("100"), Decimal("102"), Decimal("94"), Decimal("100"), Decimal("1"), True),
             Candle(3 * HOUR, Decimal("100"), Decimal("102"), Decimal("99"), Decimal("100"), Decimal("1"), True),
-            Candle(4 * HOUR, Decimal("100"), Decimal("126"), Decimal("99"), Decimal("120"), Decimal("1"), True),
-            Candle(5 * HOUR, Decimal("124"), Decimal("126"), Decimal("123"), Decimal("124"), Decimal("1"), True),
-            Candle(6 * HOUR, Decimal("124"), Decimal("126"), Decimal("123"), Decimal("124"), Decimal("1"), True),
+            Candle(4 * HOUR, Decimal("100"), Decimal("102"), Decimal("94"), Decimal("100"), Decimal("1"), True),
+            Candle(5 * HOUR, Decimal("100"), Decimal("101"), Decimal("99"), Decimal("100"), Decimal("1"), True),
+            Candle(6 * HOUR, Decimal("100"), Decimal("126"), Decimal("99"), Decimal("120"), Decimal("1"), True),
+            Candle(7 * HOUR, Decimal("124"), Decimal("126"), Decimal("123"), Decimal("124"), Decimal("1"), True),
+            Candle(8 * HOUR, Decimal("124"), Decimal("126"), Decimal("123"), Decimal("124"), Decimal("1"), True),
         ]
 
         rows = self.window._simulate_area_shape_replay(plan, candles, start_ms=HOUR, sides=("long",))

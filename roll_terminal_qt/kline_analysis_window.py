@@ -6983,6 +6983,10 @@ class KlineAnalysisWindow(QMainWindow):
 
     def set_page_active(self, active: bool) -> None:
         self._page_active = bool(active)
+        account_store = getattr(getattr(self, "_account_drawer", None), "_realtime_store", None)
+        set_reconcile_interval = getattr(account_store, "set_reconcile_interval_seconds", None)
+        if callable(set_reconcile_interval):
+            set_reconcile_interval(60 if self._page_active else 300)
         if not active:
             self._refresh_timer.stop()
             if self._load_request_timer.isActive():
@@ -7898,6 +7902,11 @@ class KlineAnalysisWindow(QMainWindow):
         self._area_shape_lines.setWordWrap(True)
         self._area_shape_lines.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         area_layout.addWidget(self._area_shape_lines)
+        self._area_shape_price_button = QPushButton("手动调整支撑/压力")
+        self._area_shape_price_button.setToolTip("为当前草稿直接输入支撑和压力价；会同步移动图上的两条射线。监控计划不可修改。")
+        self._area_shape_price_button.clicked.connect(self._edit_area_shape_prices)
+        self._area_shape_price_button.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+        area_layout.addWidget(self._area_shape_price_button)
         area_layout.addWidget(QLabel("执行模式"))
         self._area_shape_mode_combo = QComboBox()
         self._area_shape_mode_combo.addItem("纸面演练", "paper")
@@ -12386,6 +12395,116 @@ class KlineAnalysisWindow(QMainWindow):
                 return Decimal(str(item.get("price_a", "0")))
         raise ValueError("区域计划关联线已丢失，请重新创建两线草稿")
 
+    def _apply_area_shape_prices(self, plan: AreaShapePlan, support: Decimal, pressure: Decimal) -> None:
+        if plan.status != "draft":
+            raise ValueError("仅草稿计划可以手动调整支撑和压力价")
+        if support <= 0 or pressure <= support:
+            raise ValueError("请输入有效价格，并确保下方支撑低于上方压力")
+        if self._area_line_is_frozen(plan.support_line_id) or self._area_line_is_frozen(plan.pressure_line_id):
+            raise ValueError("监控中的区域线与冻结参数不能修改")
+
+        entry = self._workspace_entry(symbol=plan.symbol, period=plan.period)
+        lines = entry.get("lines")
+        if not isinstance(lines, list):
+            raise ValueError("找不到区域射线，请重新创建两线草稿")
+        prices_by_id = {plan.support_line_id: support, plan.pressure_line_id: pressure}
+        found: set[str] = set()
+        previous_lines: dict[str, tuple[object, object]] = {}
+        previous_prices = plan.support_price, plan.pressure_price
+        for record in lines:
+            if not isinstance(record, dict):
+                continue
+            line_id = str(record.get("id", ""))
+            if line_id not in prices_by_id:
+                continue
+            found.add(line_id)
+            previous_lines[line_id] = record.get("price_a"), record.get("price_b")
+            price = float(prices_by_id[line_id])
+            record["price_a"] = price
+            record["price_b"] = price
+        if found != set(prices_by_id):
+            for record in lines:
+                if isinstance(record, dict) and str(record.get("id", "")) in previous_lines:
+                    old_a, old_b = previous_lines[str(record["id"])]
+                    record["price_a"], record["price_b"] = old_a, old_b
+            raise ValueError("区域计划关联线已丢失，请重新创建两线草稿")
+
+        plan.support_price = support
+        plan.pressure_price = pressure
+        try:
+            monitor = getattr(self, "_area_shape_monitor", None)
+            if monitor is None:
+                raise ValueError("区域形态后台服务未连接")
+            monitor.save_draft(plan)
+        except Exception:
+            for record in lines:
+                if isinstance(record, dict) and str(record.get("id", "")) in previous_lines:
+                    old_a, old_b = previous_lines[str(record["id"])]
+                    record["price_a"], record["price_b"] = old_a, old_b
+            plan.support_price, plan.pressure_price = previous_prices
+            raise
+
+        self._save_workspace_snapshot()
+        self._populate_line_table()
+        if self._pending_payload is not None:
+            self._render_to_chart(self._pending_payload)
+        self._refresh_area_shape_status(plan)
+
+    def _edit_area_shape_prices(self) -> None:
+        plan = self._current_area_plan(draft_only=True)
+        if plan is None:
+            self._set_area_shape_status("请先创建草稿；监控中的计划不能手动改价。")
+            return
+        if not self._area_pair_lines_exist(plan):
+            self._set_area_shape_status("区域计划关联线已丢失，请重新创建两线草稿。")
+            return
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("手动调整支撑 / 压力")
+        layout = QVBoxLayout(dialog)
+        form = QFormLayout()
+        support_edit = QLineEdit(self._format_area_shape_price(plan.support_price, plan.symbol), dialog)
+        pressure_edit = QLineEdit(self._format_area_shape_price(plan.pressure_price, plan.symbol), dialog)
+        support_edit.setPlaceholderText("例如 80799.5")
+        pressure_edit.setPlaceholderText("例如 84000")
+        form.addRow("下方支撑", support_edit)
+        form.addRow("上方压力", pressure_edit)
+        layout.addLayout(form)
+        layout.addWidget(QLabel("应用后会同步更新图上线条和当前草稿。"))
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel,
+            parent=dialog,
+        )
+        buttons.button(QDialogButtonBox.StandardButton.Ok).setText("应用")
+        buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("取消")
+        layout.addWidget(buttons)
+
+        def _accept_prices() -> None:
+            try:
+                support = Decimal(support_edit.text().strip())
+                pressure = Decimal(pressure_edit.text().strip())
+                if not support.is_finite() or not pressure.is_finite() or support <= 0 or pressure <= support:
+                    raise ValueError("请输入有效价格，并确保下方支撑低于上方压力")
+            except Exception as exc:
+                QMessageBox.warning(dialog, "价格无效", str(exc) or "请输入有效数字。")
+                return
+            dialog.accept()
+
+        buttons.accepted.connect(_accept_prices)
+        buttons.rejected.connect(dialog.reject)
+        if dialog.exec() != int(QDialog.DialogCode.Accepted):
+            return
+        try:
+            self._apply_area_shape_prices(
+                plan,
+                Decimal(support_edit.text().strip()),
+                Decimal(pressure_edit.text().strip()),
+            )
+        except Exception as exc:
+            QMessageBox.warning(self, "调整失败", str(exc))
+            return
+        self._set_area_shape_status("支撑和压力价已更新；图上射线与草稿计划已同步。")
+
     def _area_pair_lines_exist(self, plan: AreaShapePlan | None = None) -> bool:
         target = plan or self._current_area_plan()
         if target is None:
@@ -12605,7 +12724,7 @@ class KlineAnalysisWindow(QMainWindow):
 
     def _area_shape_replay_signature(self, plan: AreaShapePlan, start_seconds: int) -> str:
         payload = {
-            "version": 7,
+            "version": 9,
             "plan_id": plan.plan_id,
             "symbol": plan.symbol.strip().upper(),
             "period": plan.period.strip().upper(),
@@ -12890,6 +13009,28 @@ class KlineAnalysisWindow(QMainWindow):
         if not candles:
             return results
         from okx_quant.area_shape_trade import AreaShapePlan as ReplayPlan
+
+        def first_touch_after_origin(price: Decimal) -> int:
+            previous_close: Decimal | None = None
+            for candle in candles:
+                if candle.ts <= start_ms:
+                    previous_close = candle.close
+                    continue
+                touched = candle.low <= price <= candle.high
+                crossed_gap = previous_close is not None and (
+                    (previous_close > price and candle.high < price)
+                    or (previous_close < price and candle.low > price)
+                )
+                if touched or crossed_gap:
+                    return candle.ts
+                previous_close = candle.close
+            return 0
+
+        reference_touch_by_side = {
+            "long": first_touch_after_origin(plan.support_price),
+            "short": first_touch_after_origin(plan.pressure_price),
+        }
+
         for side in sides:
             def make_replay(replay_side: str = side) -> AreaShapePlan:
                 replay_plan = ReplayPlan.from_dict(copy.deepcopy(plan.to_dict()))
@@ -12906,8 +13047,9 @@ class KlineAnalysisWindow(QMainWindow):
                 replay_plan.events = []
                 replay_plan.paper_position = None
                 replay_plan.execution_mode = "paper"
+                replay_start_ms = max(start_ms, reference_touch_by_side.get(replay_side, 0))
                 replay_plan.activate(
-                    last_closed_candle_ts=start_ms, profile_name=plan.profile_name,
+                    last_closed_candle_ts=replay_start_ms, profile_name=plan.profile_name,
                     environment=plan.environment,
                 )
                 replay_plan.expires_at_candle_ts = candles[-1].ts + 3_600_000
@@ -13061,10 +13203,21 @@ class KlineAnalysisWindow(QMainWindow):
         stop = Decimal(str(trade["stop"]))
         risk = Decimal(str(trade["risk"]))
         side = str(trade["side"])
-        exit_price = Decimal(str(exit_event.get("exit_price"))) if exit_event and exit_event.get("exit_price") else Decimal(str(trade.get("exit", entry)))
+        exit_kind = str(exit_event.get("kind", "")) if exit_event else ""
+        if exit_kind == "paper_stop":
+            # A stop is executed at the protective stop level, never at the
+            # triggering candle's close. Older events have no stop_price field;
+            # their exit_price was also recorded at the stop level.
+            exit_price = Decimal(str(
+                exit_event.get("stop_price") or exit_event.get("exit_price") or stop
+            ))
+        else:
+            exit_price = Decimal(str(exit_event.get("exit_price"))) if exit_event and exit_event.get("exit_price") else Decimal(str(trade.get("exit", entry)))
         sign = Decimal("1") if side == "long" else Decimal("-1")
         gross_r = ((exit_price - entry) * sign / risk) if risk > 0 else Decimal("0")
-        cost_rate = plan.config.round_trip_fee_rate + plan.config.slippage_rate
+        cost_rate = plan.config.round_trip_fee_rate
+        if exit_kind != "paper_stop":
+            cost_rate += plan.config.slippage_rate
         cost_r = ((entry + exit_price) * cost_rate / risk) if risk > 0 else Decimal("0")
         net_r = gross_r - cost_r
         pnl = net_r * plan.config.risk_amount
@@ -13227,7 +13380,7 @@ class KlineAnalysisWindow(QMainWindow):
         last_data = int(data_range.get("last_candle_ts", 0) or 0)
         range_note = (
             f"数据范围 {_format_bar_time(first_data // 1000) if first_data else '—'} 至 {_format_bar_time(last_data // 1000) if last_data else '—'}；"
-            "只统计起点右侧已收盘K线，同一根K线同时触及止盈止损时按止损先发生。结果为纸面估算，不代表真实成交。"
+            "射线起点后的首次触线仅作参考、不计入回测；之后只统计已收盘K线。同一根K线同时触及止盈止损时按止损先发生。结果为纸面估算，不代表真实成交。"
         )
         layout.addWidget(QLabel(range_note, dialog))
         buttons = QHBoxLayout()
@@ -13805,6 +13958,18 @@ class KlineAnalysisWindow(QMainWindow):
             else:
                 create_button.setToolTip("快速取最近120根1H K线的最低点和最高点生成两条射线；生成后可在图上手工调整。")
             create_button.setEnabled(not pair_exists or can_start_new_draft)
+        price_button = getattr(self, "_area_shape_price_button", None)
+        if price_button is not None:
+            can_edit_prices = bool(
+                plan is not None
+                and plan.status == "draft"
+                and self._area_pair_lines_exist(plan)
+                and plan.symbol == self._selected_symbol().strip().upper()
+                and self._period_combo.currentText().strip().upper() == "1H"
+                and not self._area_shape_demo_arm_pending
+                and not self._area_shape_demo_action_pending
+            )
+            price_button.setEnabled(can_edit_prices)
         start = getattr(self, "_area_shape_start_button", None)
         pause = getattr(self, "_area_shape_pause_button", None)
         cancel = getattr(self, "_area_shape_cancel_button", None)
@@ -15542,6 +15707,7 @@ class KlineAnalysisWindow(QMainWindow):
             self._save_workspace_snapshot()
             if line_drag_in_progress:
                 self._sync_area_shape_draft_lines()
+                self._refresh_area_shape_status()
             if self._pending_payload is not None:
                 self._render_to_chart(self._pending_payload)
         entry = self._workspace_entry()

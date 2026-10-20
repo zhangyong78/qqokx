@@ -7,7 +7,7 @@ from unittest import TestCase
 from unittest.mock import MagicMock, patch
 
 from PySide6.QtCore import Qt
-from PySide6.QtWidgets import QHeaderView
+from PySide6.QtWidgets import QHeaderView, QWidget
 
 from tests.qt_test_case import QtWidgetTestCase
 import roll_terminal_qt.account_positions_home as account_positions_module
@@ -410,6 +410,29 @@ class PositionDisplayForegroundColorsTest(TestCase):
 
 
 class AccountPositionsHistoryTabWiringTest(QtWidgetTestCase):
+    def test_positions_page_starts_with_workspace_selected_api_profile(self) -> None:
+        class ProfileParent(QWidget):
+            def active_profile_name(self) -> str:
+                return "selected-profile"
+
+        runtime = SimpleNamespace(
+            credential_profile_name="selected-profile",
+            credentials=SimpleNamespace(profile_name="selected-profile"),
+            environment="live",
+        )
+        parent = ProfileParent()
+        with (
+            patch("roll_terminal_qt.account_positions_home.load_runtime", return_value=runtime) as load_runtime,
+            patch.object(AccountPositionsHomeWidget, "_start_private_threads"),
+        ):
+            widget = AccountPositionsHomeWidget(parent)
+            try:
+                load_runtime.assert_called_once_with("selected-profile")
+                self.assertEqual(widget.workspace_profile_name(), "selected-profile")
+            finally:
+                self.dispose_widget(widget)
+                parent.deleteLater()
+
     def test_account_equity_is_visible_on_positions_page(self) -> None:
         overview = OkxAccountOverview(
             total_equity=Decimal("2831.69499695"),
@@ -784,6 +807,7 @@ class AccountPositionsHomeQtHelpersTest(TestCase):
     def test_start_private_threads_uses_realtime_store_not_legacy_order_feed(self) -> None:
         runtime = SimpleNamespace(environment="demo")
         realtime_store = MagicMock()
+        realtime_store.snapshot_for.return_value = None
         app = SimpleNamespace(
             _runtime=runtime,
             _private_thread_generation=0,
@@ -796,7 +820,7 @@ class AccountPositionsHomeQtHelpersTest(TestCase):
 
         AccountPositionsHomeWidget._start_private_threads(app)
 
-        realtime_store.start.assert_called_once_with(runtime)
+        realtime_store.start_if_needed.assert_called_once_with(runtime)
         app._start_order_history_refresh.assert_called_once_with(force_restart=False)
         app._start_fill_history_refresh.assert_called_once_with(force_restart=False)
         app._start_position_history_refresh.assert_called_once_with(force_restart=False)

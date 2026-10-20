@@ -79,6 +79,13 @@ class RealtimeAccountStore(QObject):
         self._cache_completed.connect(self._apply_cache_result)
         self._event_received.connect(self._queue_cache_refresh)
 
+    def set_reconcile_interval_seconds(self, seconds: int) -> None:
+        """Adjust the safety REST cadence without restarting account streams."""
+        interval_ms = max(1, int(seconds)) * 1000
+        if self._reconcile_timer.interval() == interval_ms:
+            return
+        self._reconcile_timer.setInterval(interval_ms)
+
     def start(self, runtime: ArbitrageTradeRuntime | object) -> None:
         self.stop()
         self._generation += 1

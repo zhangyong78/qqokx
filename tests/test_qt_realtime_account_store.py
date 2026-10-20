@@ -126,6 +126,40 @@ def test_store_stop_unsubscribes_and_keeps_profiles_isolated() -> None:
     assert client._algo_listeners == []
 
 
+def test_start_if_needed_preserves_warm_snapshot_for_same_profile() -> None:
+    client = _FakeRealtimeClient()
+    runtime = _runtime("selected", "live")
+    store = RealtimeAccountStore(client=client, coalesce_ms=0, reconcile_seconds=60)
+    try:
+        store.start(runtime)
+        _drain_qt_events()
+        generation = store._generation
+
+        store.start_if_needed(runtime)
+
+        snapshot = store.snapshot_for(profile_name="selected", environment="live")
+        assert store._generation == generation
+        assert snapshot is not None
+        assert snapshot.source == "rest"
+        assert len(client._private_listeners) == 1
+    finally:
+        store.stop()
+
+
+def test_reconcile_interval_can_be_changed_without_restarting_store() -> None:
+    store = RealtimeAccountStore(client=_FakeRealtimeClient(), reconcile_seconds=60)
+    try:
+        store.start(_runtime())
+        generation = store._generation
+        store.set_reconcile_interval_seconds(300)
+
+        assert store._reconcile_timer.interval() == 300_000
+        assert store._reconcile_timer.isActive()
+        assert store._generation == generation
+    finally:
+        store.stop()
+
+
 def test_profile_switch_detaches_slow_websockets_without_blocking_ui_thread() -> None:
     stopped = threading.Event()
     release = threading.Event()
