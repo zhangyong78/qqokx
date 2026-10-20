@@ -56,10 +56,10 @@ class AreaShapeConfig:
     direction: str = "long"
     risk_amount: Decimal = Decimal("10")
     min_space_r: Decimal = Decimal("2")
-    atr_period: int = 14
+    atr_period: int = 10
     area_half_width_atr: Decimal = Decimal("0.25")
     entry_offset_atr: Decimal = Decimal("0")
-    stop_offset_atr: Decimal = Decimal("0.2")
+    stop_offset_atr: Decimal = Decimal("0.5")
     target_buffer_atr: Decimal = Decimal("0")
     round_trip_fee_rate: Decimal = AREA_TAKER_FEE_RATE
     slippage_rate: Decimal = Decimal("0")
@@ -153,7 +153,7 @@ class AreaShapeConfig:
             direction=str(raw.get("direction", "long")),
             risk_amount=_required_decimal(raw, "risk_amount"),
             min_space_r=_required_decimal(raw, "min_space_r"),
-            atr_period=max(2, int(raw.get("atr_period", 14) or 14)),
+            atr_period=max(2, int(raw.get("atr_period", 10) or 10)),
             area_half_width_atr=_required_decimal(raw, "area_half_width_atr"),
             entry_offset_atr=_required_decimal(raw, "entry_offset_atr"),
             stop_offset_atr=_required_decimal(raw, "stop_offset_atr"),
@@ -261,6 +261,7 @@ class AreaShapePlan:
     version: int = AREA_PLAN_VERSION
     execution_enabled: bool = False
     execution_mode: str = "paper"
+    cancel_after_position: bool = False
 
     def __post_init__(self) -> None:
         self.config.validate()
@@ -305,6 +306,7 @@ class AreaShapePlan:
             "activation_candle_ts": self.activation_candle_ts,
             "last_signal_key": self.last_signal_key, "last_candle_ts": self.last_candle_ts,
             "events": list(self.events), "paper_position": self.paper_position,
+            "cancel_after_position": self.cancel_after_position,
             "execution_enabled": False,
             "execution_mode": self.execution_mode,
         }
@@ -327,6 +329,7 @@ class AreaShapePlan:
             last_signal_key=str(payload.get("last_signal_key", "")), last_candle_ts=int(payload.get("last_candle_ts", 0) or 0),
             events=[dict(item) for item in payload.get("events", []) if isinstance(item, dict)],
             paper_position=dict(payload["paper_position"]) if isinstance(payload.get("paper_position"), dict) else None,
+            cancel_after_position=bool(payload.get("cancel_after_position", False)),
             execution_enabled=False,
             execution_mode=str(payload.get("execution_mode", "paper")),
         )
@@ -351,7 +354,12 @@ class AreaShapePlan:
             self._event("paused", "已暂停新入场信号")
 
     def cancel(self) -> None:
-        if self.status in {"draft", "monitoring", "touched", "paper_pending", "paused"}:
+        if self.status in {"paper_position", "paper_break_even", "paper_locked"} and self.paper_position is not None:
+            if not self.cancel_after_position:
+                self.cancel_after_position = True
+                self._event("cancel_after_position", "已请求取消；当前纸面持仓保护继续运行，平仓后计划取消")
+            return
+        if self.status in {"draft", "monitoring", "touched", "paper_pending", "paused", "paper_closed", "expired"}:
             if self.status == "paper_pending":
                 self.paper_position = None
             self.status = "cancelled"
@@ -374,6 +382,9 @@ class AreaShapePlan:
         values = atr(confirmed, self.config.atr_period) if needs_atr else []
         patterns = set(self.config.signal_patterns)
         chart_patterns_by_ts = _chart_patterns_by_candle_ts(confirmed) if self.config.entry_trigger_mode == "pattern" else {}
+        activation_baseline = self.activation_candle_ts or (
+            self.expires_at_candle_ts - self.config.valid_for_bars * 3_600_000
+        )
         for index, candle in enumerate(confirmed):
             if candle.ts <= self.last_candle_ts:
                 continue
@@ -390,6 +401,23 @@ class AreaShapePlan:
             if needs_atr and (current_atr is None or current_atr <= 0):
                 continue
             entry_line = self.support_price if self.config.direction == "long" else self.pressure_price
+            if self.config.entry_trigger_mode == "direct_touch":
+                # A resting buy at support is triggered by a downward cross;
+                # a resting sell at resistance is triggered by an upward cross.
+                # Merely straddling the line while approaching from the wrong
+                # side must not create an entry or replay opportunity.
+                previous_price = confirmed[index - 1].close if index > 0 else candle.open
+                crossed = (
+                    previous_price > entry_line and candle.low <= entry_line
+                    if self.config.direction == "long"
+                    else previous_price < entry_line and candle.high >= entry_line
+                )
+                if candle.ts <= activation_baseline or not crossed:
+                    continue
+                return self.observe_direct_touch_price(
+                    entry_line, candle.ts + 3_600_000, confirmed[: index + 1],
+                    source="confirmed_1h_backfill",
+                )
             expected_direction = self.config.direction
             matched_chart_pattern = None if self.config.entry_trigger_mode == "direct_touch" else _matching_chart_pattern(
                 chart_patterns_by_ts, candle_ts=candle.ts,
@@ -414,7 +442,6 @@ class AreaShapePlan:
             span = 3 if matching_pattern in {"bottom_fractal", "top_fractal"} else (
                 2 if matching_pattern in {"double_reversal_up", "double_reversal_down", "inside_bar"} else 1
             )
-            activation_baseline = self.activation_candle_ts or (self.expires_at_candle_ts - self.config.valid_for_bars * 3_600_000)
             touched = any(
                 item.ts > activation_baseline and item.low <= entry_line <= item.high
                 for item in confirmed[max(0, index - span + 1): index + 1]
@@ -446,6 +473,63 @@ class AreaShapePlan:
                 self.status = "paper_pending"
             return event
         return None
+
+    def observe_direct_touch_price(
+        self, price: Decimal, timestamp_ms: int, candles: list[Candle], *, source: str = "live_last_price",
+    ) -> dict[str, object] | None:
+        """Enter a paper trade at the configured line after a direct last-price touch."""
+        if (self.config.entry_trigger_mode != "direct_touch"
+                or self.status not in {"monitoring", "touched"} or not candles):
+            return None
+        confirmed = sorted((item for item in candles if item.confirmed), key=lambda item: item.ts)
+        if not confirmed:
+            return None
+        signal_candle = confirmed[-1]
+        current_atr = Decimal("0")
+        if self.config.requires_atr():
+            values = atr(confirmed, self.config.atr_period)
+            current_atr = values[-1] if values else None
+            if current_atr is None or current_atr <= 0:
+                return None
+        side = self.config.direction
+        entry_line = self.support_price if side == "long" else self.pressure_price
+        signal_key = f"{self.profile_name}|{self.environment}|{self.symbol}|{signal_candle.ts}|direct_touch"
+        if signal_key == self.last_signal_key:
+            return None
+        recent = confirmed[-3:]
+        stop = calculate_initial_stop(
+            self.config, side, entry_reference=entry_line,
+            signal_candle=signal_candle, recent_candles=recent, atr_value=current_atr,
+        )
+        event = self._build_paper_entry(
+            signal_candle, current_atr, "direct_touch", signal_key, stop_price=stop,
+        )
+        self.last_signal_key = signal_key
+        if event.get("kind") != "paper_pending":
+            self.status = "monitoring"
+            return self._event(
+                str(event.get("kind", "signal_skipped")), str(event.get("message", "直接触线信号无效")),
+                candle_ts=timestamp_ms, trigger_price=str(entry_line), trigger_source=source,
+            )
+        pending = dict(event.get("paper_position", {}))
+        pending["trigger_source"] = source
+        pending["trigger_price"] = str(entry_line)
+        self.paper_position = pending
+        self.status = "paper_pending"
+        fill_ts = max(int(timestamp_ms), signal_candle.ts + 1)
+        tick_candle = Candle(fill_ts, price, price, price, price, Decimal("0"), True)
+        result = self._observe_pending_entry(tick_candle)
+        if result is None:
+            return self._event(
+                "touch_without_fill", "已触及入场线，但纸面入场校验未通过",
+                candle_ts=fill_ts, trigger_price=str(entry_line), trigger_source=source,
+            )
+        if result.get("kind") == "paper_entry":
+            # The entry is the planned line price; current last price is retained
+            # for audit and later paper protection updates.
+            result["trigger_price"] = str(entry_line)
+            result["trigger_source"] = source
+        return result
 
     def _build_paper_entry(
         self, candle: Candle, current_atr: Decimal, pattern: str, key: str, *,
@@ -483,7 +567,9 @@ class AreaShapePlan:
             return None
         side = str(pending["side"])
         stop = _decimal(pending["stop"])
-        if str(pending.get("entry_mode")) == "breakout":
+        if str(pending.get("entry_trigger_mode")) == "direct_touch":
+            entry = self.support_price if side == "long" else self.pressure_price
+        elif str(pending.get("entry_mode")) == "breakout":
             trigger = _decimal(pending.get("entry_trigger"))
             crossed = candle.high >= trigger if side == "long" else candle.low <= trigger
             if not crossed:
@@ -495,7 +581,7 @@ class AreaShapePlan:
         if entry <= 0 or (side == "long" and stop >= entry) or (side == "short" and stop <= entry):
             self.status = "monitoring"
             self.paper_position = None
-            return self._event("signal_skipped", "未来纸面入场价已越过初始止损，未模拟成交", candle_ts=candle.ts)
+            return self._event("signal_skipped", "纸面入场价已越过初始止损，未模拟成交", candle_ts=candle.ts)
         risk = abs(entry - stop)
         target = self.pressure_price if side == "long" else self.support_price
         buffer = entry * (self.config.round_trip_fee_rate + self.config.slippage_rate) + _decimal(pending.get("target_buffer_atr"))
@@ -506,7 +592,7 @@ class AreaShapePlan:
             self.paper_position = None
             return self._event(
                 "signal_skipped",
-                f"盈亏比不足：未来入场价目标空间 {space_r:.2f}R 低于最低要求 {self.config.min_space_r}R，未模拟成交",
+                f"盈亏比不足：入场价目标空间 {space_r:.2f}R 低于最低要求 {self.config.min_space_r}R，未模拟成交",
                 candle_ts=candle.ts,
                 signal_candle_ts=int(pending.get("signal_candle_ts", 0) or 0),
                 entry=str(entry), stop=str(stop), target=str(target), risk_distance=str(risk),
@@ -531,15 +617,24 @@ class AreaShapePlan:
             **pending, "entry": str(entry), "initial_stop": str(stop), "risk_distance": str(risk),
             "target": str(target), "take_profit": str(take_profit),
             "entry_ts": candle.ts, "entry_time": datetime.fromtimestamp(candle.ts / 1000, tz=timezone.utc).isoformat(),
-            "last_checked_ts": candle.ts - 1, "stage": "initial", "space_r": str(space_r),
+            "last_checked_ts": (
+                (candle.ts - 1 if pending.get("trigger_source") == "confirmed_1h_backfill"
+                 else candle.ts // 3_600_000 * 3_600_000)
+                if str(pending.get("entry_trigger_mode")) == "direct_touch" else candle.ts - 1
+            ),
+            "stage": "initial", "space_r": str(space_r),
             "contracts": None, "sizing_status": "未计算：未核验合约张值、手续费与滑点规格",
         }
         self.status = "paper_position"
         result = self._event(
-            "paper_entry", f"纸面模拟按未来1H行情在 {entry} 成交；成交K线不参与止损/止盈回放",
+            "paper_entry",
+            (f"纸面价格触发在画线价 {entry} 入场；成交所在1H K线不倒推保护触发，后续实时价继续检查止损/止盈"
+             if str(pending.get("entry_trigger_mode")) == "direct_touch"
+             else f"纸面模拟按未来1H行情在 {entry} 成交；成交K线不参与止损/止盈回放"),
             candle_ts=candle.ts, entry=str(entry), stop=str(stop), risk_distance=str(risk),
             pattern=str(pending.get("pattern", "")), space_r=str(space_r), entry_mode=self.config.entry_mode,
-            pattern_score=pending.get("pattern_score"),
+            pattern_score=pending.get("pattern_score"), trigger_source=pending.get("trigger_source"),
+            trigger_price=pending.get("trigger_price"), last_price=str(candle.close),
         )
         if self.config.entry_mode == "breakout":
             # Entry and stop can both be crossed in this bar; OHLC does not reveal
@@ -551,10 +646,42 @@ class AreaShapePlan:
                 self.status = "paper_closed"
                 self._event("paper_stop", "突破成交bar同时包含入场与止损条件；按保守顺序记止损退出", candle_ts=candle.ts, exit_price=str(stop), ambiguous_bar=True, take_profit_also_touched=tp_hit)
                 self.paper_position = None
-        else:
+        elif str(pending.get("entry_trigger_mode")) != "direct_touch":
             # Next-open fill occurs before the rest of the confirmed bar.
             self.observe_paper_candle(candle)
         return result
+
+    def observe_paper_live_price(self, price: Decimal, timestamp_ms: int) -> dict[str, object] | None:
+        """Apply paper stop/target checks to a fresh live last-price update."""
+        position = self.paper_position
+        if (not position or position.get("trigger_source") != "live_last_price"
+                or self.status not in {"paper_position", "paper_break_even", "paper_locked"}):
+            return None
+        side = str(position["side"])
+        stop = _decimal(position["stop"])
+        take_profit_raw = str(position.get("take_profit", "") or "")
+        take_profit = _decimal(take_profit_raw)
+        stop_hit = price <= stop if side == "long" else price >= stop
+        target_hit = bool(take_profit_raw) and (price >= take_profit if side == "long" else price <= take_profit)
+        if stop_hit:
+            self.status = "paper_closed"
+            result = self._event(
+                "paper_stop", f"纸面最新价触发止损于 {stop}", candle_ts=timestamp_ms,
+                exit_price=str(stop), trigger_source="live_last_price",
+            )
+            self.paper_position = None
+            self._complete_deferred_cancel()
+            return result
+        if target_hit:
+            self.status = "paper_closed"
+            result = self._event(
+                "paper_take_profit", f"纸面最新价触发止盈于 {take_profit}", candle_ts=timestamp_ms,
+                exit_price=str(take_profit), trigger_source="live_last_price",
+            )
+            self.paper_position = None
+            self._complete_deferred_cancel()
+            return result
+        return None
 
     def observe_paper_candle(self, candle: Candle) -> dict[str, object] | None:
         """Conservative paper-only stop/exit management; stop wins ambiguous bars."""
@@ -581,12 +708,14 @@ class AreaShapePlan:
             ambiguous = tp_hit
             result = self._event("paper_stop", f"纸面止损触发于 {stop}；同bar多价位顺序不明时按止损先发生处理", candle_ts=candle.ts, exit_price=str(stop), ambiguous_bar=ambiguous)
             self.paper_position = None
+            self._complete_deferred_cancel()
             return result
         if tp_hit:
             self.status = "paper_closed"
             target_r = self.config.fixed_tp_r if self.config.exit_template == "fixed_1r" else AREA_DYNAMIC_TAKE_PROFIT_R
             result = self._event("paper_take_profit", f"纸面 {target_r}R 止盈触发于 {tp}", candle_ts=candle.ts, exit_price=str(tp))
             self.paper_position = None
+            self._complete_deferred_cancel()
             return result
         fee_rate = AREA_TAKER_FEE_RATE if self.config.fee_offset_enabled else Decimal("0")
         progress_r = area_shape_net_progress_r(
@@ -642,6 +771,11 @@ class AreaShapePlan:
                 self.status = "paper_locked" if updated_stage == "locked" else "paper_break_even"
                 return self._event("paper_stop_tightened", f"纸面保护档位已在当前收盘价校验后更新至 {target_stop}", candle_ts=candle.ts, stop=str(target_stop), progress_r=str(progress_r), stage=updated_stage)
         return None
+
+    def _complete_deferred_cancel(self) -> None:
+        if self.cancel_after_position:
+            self.status = "cancelled"
+            self._event("cancelled", "纸面持仓已结束，计划按待取消请求结束")
 
     def _event(self, kind: str, message: str, **payload: object) -> dict[str, object]:
         event = {"kind": kind, "message": message, "occurred_at": _now(), **payload}

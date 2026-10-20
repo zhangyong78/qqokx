@@ -59,6 +59,7 @@ class AreaShapeMonitor(QObject):
         self._clients: dict[str, Any] = {}
         self._subscriptions: dict[tuple[str, str], Callable[[], None]] = {}
         self._candles: dict[tuple[str, str], list[Candle]] = {}
+        self._last_live_prices: dict[tuple[str, str, str], Any] = {}
         self._catchup_required: set[tuple[str, str]] = set()
         self._last_fallback_poll: dict[tuple[str, str], float] = {}
         self._last_reconcile: dict[tuple[str, str], float] = {}
@@ -377,6 +378,7 @@ class AreaShapeMonitor(QObject):
         candles.sort(key=lambda item: item.ts)
         del candles[:-240]
         if not candle.confirmed:
+            self._process_unconfirmed_price(key, candle)
             return
         updated: list[AreaShapePlan] = []
         with self._lock:
@@ -393,6 +395,47 @@ class AreaShapeMonitor(QObject):
                         continue
                     if self._process_plan_candle(plan, candles, candle):
                         updated.append(plan)
+            if updated:
+                self._persist_locked()
+        for plan in updated:
+            self.plan_updated.emit(plan.to_dict())
+
+    def _process_unconfirmed_price(self, key: tuple[str, str], candle: Candle) -> None:
+        """Use the current 1H candle's last price for direct paper entries and exits."""
+        price = candle.close
+        if price <= 0:
+            return
+        symbol, environment = key
+        timestamp_ms = int(time.time() * 1000)
+        confirmed = [item for item in self._candles.get(key, []) if item.confirmed]
+        updated: list[AreaShapePlan] = []
+        with self._lock:
+            for plan in self._plans.values():
+                if plan.symbol != symbol or plan.environment != environment or plan.execution_mode == "demo_exchange":
+                    continue
+                price_key = (symbol, environment, plan.plan_id)
+                previous_price = self._last_live_prices.get(price_key)
+                self._last_live_prices[price_key] = price
+                result = None
+                if (plan.status in {"monitoring", "touched"}
+                        and plan.config.entry_trigger_mode == "direct_touch"):
+                    entry_line = plan.support_price if plan.config.direction == "long" else plan.pressure_price
+                    crossed = (
+                        (price <= entry_line and (previous_price is None or previous_price > entry_line))
+                        if plan.config.direction == "long"
+                        else (price >= entry_line and (previous_price is None or previous_price < entry_line))
+                    )
+                    if crossed:
+                        result = plan.observe_direct_touch_price(
+                            price, timestamp_ms, confirmed, source="live_last_price",
+                        )
+                        if (result is not None and plan.paper_position is not None
+                                and plan.status in {"paper_position", "paper_break_even", "paper_locked"}):
+                            result = plan.observe_paper_live_price(price, timestamp_ms) or result
+                elif plan.status in {"paper_position", "paper_break_even", "paper_locked"}:
+                    result = plan.observe_paper_live_price(price, timestamp_ms)
+                if result is not None:
+                    updated.append(plan)
             if updated:
                 self._persist_locked()
         for plan in updated:

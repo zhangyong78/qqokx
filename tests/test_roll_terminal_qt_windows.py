@@ -84,6 +84,7 @@ from roll_terminal_qt.kline_analysis_window import (
     _build_display_times_ms,
     _candle_body_pen_width,
     _compute_axis_y_padding,
+    _atr_chart_values,
     _axis_y_label_format,
     _compute_hover_overlay_layout,
     _default_chart_stack_splitter_sizes,
@@ -6935,6 +6936,8 @@ class RollTerminalQtWindowHelperTests(QtWidgetTestCase):
             window = KlineAnalysisWindow()
             try:
                 initial_minimum_width = window.minimumSizeHint().width()
+                self.assertEqual(window._atr10_check.text(), "ATR 10")
+                self.assertFalse(window._atr10_check.isChecked())
 
                 with patch.object(window, "_load_data"):
                     window._secondary_chart_check.setChecked(True)
@@ -7274,6 +7277,7 @@ class RollTerminalQtWindowHelperTests(QtWidgetTestCase):
                 chart_view._axis_y = object()
                 chart_view._candles = [{"time": 1, "open": 100.0, "high": 110.0, "low": 90.0, "close": 105.0, "volume": 1.0}]
                 chart_view.capture_view_state = lambda: None
+                window._atr10_check.setChecked(True)
 
                 payload = KlineChartPayload(
                     candles=[
@@ -7309,6 +7313,8 @@ class RollTerminalQtWindowHelperTests(QtWidgetTestCase):
                         include_workspace_lines=False,
                         is_secondary=False,
                     )
+                self.assertTrue(chart_view._show_atr)
+                self.assertEqual(chart_view._atr_values, [None, None])
             finally:
                 self.__class__.dispose_widget(window)
 
@@ -7767,6 +7773,23 @@ class RollTerminalQtWindowHelperTests(QtWidgetTestCase):
     def test_axis_y_padding_reserves_more_space_below_for_volume_overlay(self) -> None:
         top_padding, bottom_padding = _compute_axis_y_padding(100.0, 200.0)
         self.assertGreater(bottom_padding, top_padding)
+
+    def test_axis_y_padding_reserves_extra_space_when_atr_is_visible(self) -> None:
+        _, volume_bottom_padding = _compute_axis_y_padding(100.0, 200.0)
+        _, atr_bottom_padding = _compute_axis_y_padding(100.0, 200.0, show_atr=True)
+        self.assertGreater(atr_bottom_padding, volume_bottom_padding)
+
+    def test_atr_chart_values_use_wilder_smoothing_and_align_to_candles(self) -> None:
+        candles = [
+            {"high": 10.0, "low": 8.0, "close": 9.0},
+            {"high": 12.0, "low": 9.0, "close": 11.0},
+            {"high": 13.0, "low": 10.0, "close": 12.0},
+            {"high": 14.0, "low": 12.0, "close": 13.0},
+        ]
+        values = _atr_chart_values(candles, 3)
+        self.assertEqual(values[:2], [None, None])
+        self.assertAlmostEqual(values[2], 8.0 / 3.0)
+        self.assertAlmostEqual(values[3], ((8.0 / 3.0) * 2.0 + 2.0) / 3.0)
 
     def test_axis_y_padding_keeps_min_price_above_volume_reserved_band(self) -> None:
         min_price = 100.0

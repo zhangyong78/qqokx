@@ -96,6 +96,41 @@ def test_no_event_paper_candle_cursor_change_is_persisted() -> None:
     monitor.stop()
 
 
+def test_live_last_price_cross_enters_direct_touch_paper_plan_at_the_line() -> None:
+    saved: list[list[dict[str, object]]] = []
+    target = AreaShapePlan.create(
+        profile_name="demo-profile", environment="demo", symbol="BTC-USDT-SWAP",
+        support_price=Decimal("95"), pressure_price=Decimal("120"),
+        config=AreaShapeConfig(
+            direction="long", entry_trigger_mode="direct_touch", stop_basis="fixed_distance",
+            fixed_stop_distance=Decimal("5"), atr_period=2,
+        ),
+    )
+    target.status = "monitoring"
+    target.activation_candle_ts = HOUR
+    target.last_candle_ts = HOUR
+    target.expires_at_candle_ts = 100 * HOUR
+    monitor = AreaShapeMonitor(
+        store_load=lambda: [target.to_dict()], store_save=lambda records: saved.append(records),
+    )
+    key = (target.symbol, target.environment)
+    monitor._candles[key] = [candle(2 * HOUR), candle(3 * HOUR)]
+
+    monitor._handle_candle(
+        f"{target.symbol}|{target.environment}",
+        Candle(4 * HOUR, Decimal("100"), Decimal("100"), Decimal("94"), Decimal("94"), Decimal("1"), False),
+    )
+
+    restored = monitor.get_plan(target.plan_id)
+    assert restored is not None
+    assert restored.status == "paper_position"
+    assert restored.paper_position is not None
+    assert restored.paper_position["entry"] == "95"
+    assert restored.paper_position["trigger_source"] == "live_last_price"
+    assert saved
+    monitor.stop()
+
+
 def test_websocket_gap_blocks_later_candle_until_contiguous_rest_replay() -> None:
     saved: list[list[dict[str, object]]] = []
     target = plan()

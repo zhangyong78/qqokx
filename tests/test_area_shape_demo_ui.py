@@ -258,7 +258,7 @@ class AreaShapeDemoUiTests(QtWidgetTestCase):
         rows = self.window._simulate_area_shape_replay(plan, candles, start_ms=HOUR, sides=("long",))
         self.assertEqual(len(rows), 1)
         self.assertGreater(rows[0]["entry_ts"], HOUR)
-        self.assertEqual(rows[0]["outcome"], "持仓中")
+        self.assertEqual(rows[0]["outcome"], "paper_take_profit")
 
     def test_replay_keeps_insufficient_space_as_potential_opportunity(self) -> None:
         plan = self._create_demo_draft()
@@ -280,7 +280,7 @@ class AreaShapeDemoUiTests(QtWidgetTestCase):
         self.assertEqual(len(rows), 1, rows)
         self.assertEqual(rows[0]["record_type"], "opportunity")
         self.assertEqual(rows[0]["entry_ts"], 3 * HOUR)
-        self.assertEqual(rows[0]["entry"], Decimal("100"))
+        self.assertEqual(rows[0]["entry"], Decimal("95"))
         self.assertLess(rows[0]["space_r"], Decimal("1"))
         self.assertIn("盈亏比不足", rows[0]["outcome"])
 
@@ -310,9 +310,10 @@ class AreaShapeDemoUiTests(QtWidgetTestCase):
 
                 rows = self.window._simulate_area_shape_replay(plan, candles, start_ms=HOUR, sides=(side,))
 
-                self.assertEqual(len(rows), 1, rows)
-                self.assertEqual(rows[0]["outcome"], "paper_take_profit")
-                self.assertAlmostEqual(float(rows[0]["r"]), 2.0, places=6)
+                trades = [row for row in rows if row.get("record_type") == "trade"]
+                self.assertEqual(len(trades), 1, rows)
+                self.assertEqual(trades[0]["outcome"], "paper_take_profit")
+                self.assertAlmostEqual(float(trades[0]["r"]), 2.0, places=6)
 
     def test_fractal_replay_enters_after_close_confirmation_and_marks_low_rr(self) -> None:
         plan = self._create_demo_draft()

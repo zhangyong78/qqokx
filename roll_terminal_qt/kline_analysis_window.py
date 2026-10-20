@@ -153,6 +153,7 @@ _LINKED_MIN_VISIBLE_BARS = {
 _KLINE_PAYLOAD_CACHE_LIMIT = 8
 _KLINE_SPLITTER_LEFT_RATIO = 0.11
 _VOLUME_OVERLAY_HEIGHT_RATIO = 0.18
+_ATR_OVERLAY_HEIGHT_RATIO = 0.13
 _EMA15_LINE_WIDTH = 2
 _SMA50_LINE_WIDTH = 3
 _SECONDARY_CHART_TOP_RATIO = 0.31
@@ -802,15 +803,43 @@ def _compute_hover_tooltip_x(
     return safe_right if float(anchor_x) <= (float(bounds_left) + float(bounds_right)) / 2.0 else safe_left
 
 
-def _compute_axis_y_padding(min_price: float, max_price: float) -> tuple[float, float]:
+def _compute_axis_y_padding(min_price: float, max_price: float, *, show_atr: bool = False) -> tuple[float, float]:
     price_span = max(float(max_price) - float(min_price), 0.0)
     reference_price = max(abs(float(min_price)), abs(float(max_price)))
     baseline = max(price_span, reference_price * 0.002, 1e-8)
     top_padding = max(price_span * 0.08, reference_price * 0.002, 1e-8)
-    reserved_ratio = min(0.42, max(_VOLUME_OVERLAY_HEIGHT_RATIO + 0.03, 0.12))
+    overlay_ratio = _VOLUME_OVERLAY_HEIGHT_RATIO + (_ATR_OVERLAY_HEIGHT_RATIO if show_atr else 0.0)
+    reserved_ratio = min(0.42, max(overlay_ratio + 0.03, 0.12))
     visible_ratio = max(0.18, 1.0 - reserved_ratio)
     bottom_padding = max((price_span + top_padding) * (reserved_ratio / visible_ratio), baseline * 0.12)
     return top_padding, bottom_padding
+
+
+def _atr_chart_values(candles: list[dict[str, Any]], period: int = 10) -> list[float | None]:
+    """Calculate Wilder ATR values for chart candles, aligned to candle indexes."""
+    if period <= 0:
+        raise ValueError("period must be positive")
+    values: list[float | None] = [None] * len(candles)
+    if len(candles) < period:
+        return values
+    true_ranges: list[float] = []
+    previous_close: float | None = None
+    for candle in candles:
+        high = float(candle["high"])
+        low = float(candle["low"])
+        close = float(candle["close"])
+        true_ranges.append(
+            high - low
+            if previous_close is None
+            else max(high - low, abs(high - previous_close), abs(low - previous_close))
+        )
+        previous_close = close
+    current_atr = sum(true_ranges[:period]) / period
+    values[period - 1] = current_atr
+    for index in range(period, len(true_ranges)):
+        current_atr = ((current_atr * (period - 1)) + true_ranges[index]) / period
+        values[index] = current_atr
+    return values
 
 
 def _axis_y_label_format(min_price: float, max_price: float) -> str:
@@ -3637,6 +3666,8 @@ if QChartView is not None:
             # kept outside the candle/axis data so it cannot change scaling.
             self._latest_price: float | None = None
             self._indicator_series: list[dict[str, Any]] = []
+            self._atr_values: list[float | None] = []
+            self._show_atr = False
             self._chart_note_lines: list[str] = []
             self._workspace_lines: list[dict[str, object]] = []
             self._workspace_rr_items: list[dict[str, object]] = []
@@ -3776,6 +3807,8 @@ if QChartView is not None:
             symbol: str,
             venue_label: str = "OKX",
             indicator_series: list[dict[str, Any]] | None = None,
+            atr_values: list[float | None] | None = None,
+            show_atr: bool = False,
             chart_note_lines: list[str] | None = None,
             workspace_lines: list[dict[str, object]] | None = None,
             workspace_rr_items: list[dict[str, object]] | None = None,
@@ -3817,6 +3850,8 @@ if QChartView is not None:
                 else (float(candles[-1]["close"]) if candles else None)
             )
             self._indicator_series = list(indicator_series or [])
+            self._atr_values = list(atr_values or [])
+            self._show_atr = bool(show_atr and self._atr_values)
             self._chart_note_lines = [str(item).strip() for item in (chart_note_lines or []) if str(item).strip()]
             self._trend_indicators = [dict(item) for item in (trend_indicators or []) if isinstance(item, dict)]
             self._workspace_lines = [dict(item) for item in (workspace_lines or []) if isinstance(item, dict)]
@@ -4183,6 +4218,7 @@ if QChartView is not None:
                 painter = QPainter(self.viewport())
                 painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
                 self._draw_latest_price_indicator(painter, plot_area)
+                self._draw_atr_overlay(painter, plot_area)
                 self._draw_volume_overlay(painter, plot_area)
                 self._draw_channel_overlays(painter, plot_area)
                 self._draw_box_overlays(painter, plot_area)
@@ -4238,26 +4274,45 @@ if QChartView is not None:
                 snapped_x = self._x_for_index(hover_index, plot_area)
                 candle_color = QColor(_CHART_UP_COLOR if float(candle["close"]) >= float(candle["open"]) else _CHART_DOWN_COLOR)
                 marker_y = self._y_for_value(float(candle["close"]), plot_area)
+                atr_cursor_value = (
+                    self._atr_values[hover_index]
+                    if self._show_atr and hover_index < len(self._atr_values)
+                    else None
+                )
+                atr_geometry = self._atr_overlay_geometry(plot_area)
+                pointer_in_atr = bool(
+                    atr_geometry is not None
+                    and atr_geometry[0] <= hover_y <= atr_geometry[1]
+                    and atr_cursor_value is not None
+                )
+                crosshair_y = (
+                    self._atr_overlay_y(float(atr_cursor_value), plot_area)
+                    if pointer_in_atr and atr_cursor_value is not None
+                    else hover_y
+                )
+                if crosshair_y is None:
+                    crosshair_y = hover_y
                 cross_pen = QPen(QColor(_CHART_CROSSHAIR_COLOR), 1)
                 cross_pen.setStyle(Qt.PenStyle.DashLine)
                 painter.setPen(cross_pen)
                 painter.drawLine(QPointF(snapped_x, plot_area.top()), QPointF(snapped_x, plot_area.bottom()))
-                painter.drawLine(QPointF(plot_area.left(), hover_y), QPointF(plot_area.right(), hover_y))
+                painter.drawLine(QPointF(plot_area.left(), crosshair_y), QPointF(plot_area.right(), crosshair_y))
                 painter.setPen(QPen(candle_color, 2))
                 painter.setBrush(QColor("#ffffff"))
                 painter.drawEllipse(QPointF(snapped_x, marker_y), 4.0, 4.0)
                 painter.end()
                 self._update_hover_overlays(
                     bounds=plot_area,
-                    anchor=QPointF(snapped_x, hover_y),
+                    anchor=QPointF(snapped_x, crosshair_y),
                     candle_color=candle_color,
-                    price_text=self._format_hover_value(hover_value),
+                    price_text=self._format_hover_value(float(atr_cursor_value)) if pointer_in_atr else self._format_hover_value(hover_value),
                     time_text=_format_chart_time(int(candle["time"])),
                     tooltip_lines=(
                         _format_chart_time(int(candle["time"])),
                         f"O {self._format_hover_value(float(candle['open']))}  H {self._format_hover_value(float(candle['high']))}",
                         f"L {self._format_hover_value(float(candle['low']))}  C {self._format_hover_value(float(candle['close']))}",
                         f"成交量 {self._format_hover_value(float(candle['volume']))}",
+                        *( (f"ATR 10 {self._format_hover_value(float(atr_cursor_value))}",) if atr_cursor_value is not None else () ),
                         *self._box_tooltip_lines(hover_index),
                         *self._signal_tooltip_lines(hover_index),
                     ),
@@ -4376,6 +4431,16 @@ if QChartView is not None:
                         ("   ", QColor(_CHART_AXIS_TEXT_COLOR)),
                     ]
                 )
+            if self._show_atr and candle_index < len(self._atr_values):
+                atr_value = self._atr_values[candle_index]
+                if atr_value is not None:
+                    indicator_segments.extend(
+                        [
+                            ("ATR 10 ", QColor(_CHART_AXIS_TEXT_COLOR)),
+                            (self._format_hover_value(float(atr_value)), QColor("#f59e0b")),
+                            ("   ", QColor(_CHART_AXIS_TEXT_COLOR)),
+                        ]
+                    )
             if indicator_segments:
                 self._draw_colored_segments(
                     painter,
@@ -4617,7 +4682,7 @@ if QChartView is not None:
                     highs.append(price)
             min_price = min(lows) if lows else self._full_y_min
             max_price = max(highs) if highs else self._full_y_max
-            top_padding, bottom_padding = _compute_axis_y_padding(min_price, max_price)
+            top_padding, bottom_padding = _compute_axis_y_padding(min_price, max_price, show_atr=self._show_atr)
             axis_y.setRange(min_price - bottom_padding, max_price + top_padding)
 
         def _visible_index_range(self) -> tuple[int, int]:
@@ -4703,6 +4768,95 @@ if QChartView is not None:
                     trend_color.setAlpha(_DAILY_TREND_BAND_ALPHA)
                     painter.setBrush(trend_color)
                     painter.drawRect(QRectF(x_left, trend_band_top, bar_width, float(plot_area.bottom()) - trend_band_top))
+
+        def _atr_overlay_geometry(self, plot_area: QRectF) -> tuple[float, float, float, float, float, float] | None:
+            if not self._show_atr or not self._atr_values or not self._candles:
+                return None
+            left_index, right_index = self._visible_index_range()
+            if right_index < left_index:
+                return None
+            volume_band_height = max(42.0, float(plot_area.height()) * _VOLUME_OVERLAY_HEIGHT_RATIO)
+            volume_band_top = float(plot_area.bottom()) - volume_band_height
+            atr_band_height = max(36.0, float(plot_area.height()) * _ATR_OVERLAY_HEIGHT_RATIO)
+            atr_band_bottom = volume_band_top - 1.0
+            atr_band_top = atr_band_bottom - atr_band_height
+            if atr_band_top <= float(plot_area.top()) + 8.0:
+                return None
+            visible_values = [
+                float(self._atr_values[index])
+                for index in range(left_index, min(right_index + 1, len(self._atr_values)))
+                if self._atr_values[index] is not None
+            ]
+            if not visible_values:
+                return None
+            value_min = min(visible_values)
+            value_max = max(visible_values)
+            value_span = max(value_max - value_min, max(value_max, 1e-8) * 0.08)
+            value_min -= value_span * 0.08
+            value_max += value_span * 0.08
+            return atr_band_top, atr_band_bottom, atr_band_top + 15.0, atr_band_bottom - 3.0, value_min, value_max
+
+        def _atr_overlay_y(self, value: float, plot_area: QRectF) -> float | None:
+            geometry = self._atr_overlay_geometry(plot_area)
+            if geometry is None:
+                return None
+            _band_top, _band_bottom, draw_top, draw_bottom, value_min, value_max = geometry
+            return draw_bottom - ((float(value) - value_min) / (value_max - value_min)) * (draw_bottom - draw_top)
+
+        def _draw_atr_overlay(self, painter: QPainter, plot_area: QRectF) -> None:
+            if not self._show_atr or not self._atr_values or not self._candles:
+                return
+            left_index, right_index = self._visible_index_range()
+            if right_index < left_index:
+                return
+            geometry = self._atr_overlay_geometry(plot_area)
+            if geometry is None:
+                return
+            atr_band_top, atr_band_bottom, draw_top, draw_bottom, value_min, value_max = geometry
+            atr_band_height = atr_band_bottom - atr_band_top
+            painter.save()
+            painter.fillRect(
+                QRectF(float(plot_area.left()), atr_band_top, float(plot_area.width()), atr_band_height),
+                QColor(11, 15, 20, 205),
+            )
+            painter.setPen(QPen(QColor(_CHART_GRID_COLOR), 1))
+            painter.drawLine(QPointF(plot_area.left(), atr_band_top), QPointF(plot_area.right(), atr_band_top))
+            painter.setPen(QPen(QColor("#f59e0b"), 1.5))
+            previous_point: QPointF | None = None
+            for index in range(left_index, min(right_index + 1, len(self._atr_values), len(self._candles))):
+                value = self._atr_values[index]
+                if value is None:
+                    previous_point = None
+                    continue
+                y = draw_bottom - ((float(value) - value_min) / (value_max - value_min)) * (draw_bottom - draw_top)
+                point = QPointF(self._x_for_index(index, plot_area), y)
+                if previous_point is not None:
+                    painter.drawLine(previous_point, point)
+                previous_point = point
+            latest = self._atr_values[min(right_index, len(self._atr_values) - 1)]
+            selected_index: int | None = None
+            hover_context = self._resolve_hover_context()
+            if hover_context is not None:
+                selected_index = hover_context[1]
+            elif self._external_hover_time is not None:
+                selected_index = self._index_for_candle_time(self._external_hover_time)
+            selected = (
+                self._atr_values[selected_index]
+                if selected_index is not None and 0 <= selected_index < len(self._atr_values)
+                else latest
+            )
+            if selected_index is not None and selected is not None:
+                selected_y = self._atr_overlay_y(float(selected), plot_area)
+                if selected_y is not None:
+                    painter.setPen(QPen(QColor("#fbbf24"), 1.0, Qt.PenStyle.DashLine))
+                    painter.drawLine(QPointF(plot_area.left(), selected_y), QPointF(plot_area.right(), selected_y))
+                    painter.setPen(QPen(QColor("#fbbf24"), 1.5))
+                    painter.setBrush(QColor("#0b0f14"))
+                    painter.drawEllipse(QPointF(self._x_for_index(selected_index, plot_area), selected_y), 4.0, 4.0)
+            label = f"ATR 10  {float(selected):,.2f}" if selected is not None else "ATR 10"
+            painter.setPen(QPen(QColor("#fbbf24")))
+            painter.drawText(QPointF(float(plot_area.left()) + 8.0, atr_band_top + 12.0), label)
+            painter.restore()
 
         def _draw_signal_markers(self, painter: QPainter, plot_area: QRectF) -> None:
             if not self._signal_markers or not self._candles:
@@ -5025,6 +5179,7 @@ if QChartView is not None:
                     exit_ts = int(trade.get("exit_ts", 0) or 0)
                     entry_price = float(trade.get("entry", 0) or 0)
                     exit_price = float(trade.get("exit", 0) or 0)
+                    stop_price = float(trade.get("stop", 0) or 0)
                     net_r = float(trade.get("r", 0) or 0)
                     space_r = float(trade.get("space_r", 0) or 0)
                 except (TypeError, ValueError):
@@ -5039,6 +5194,59 @@ if QChartView is not None:
                 entry_index = self._index_for_candle_time(entry_ts // 1000)
                 if not (0 <= entry_index < len(self._candles) and 0 <= marker_index < len(self._candles)):
                     continue
+                if is_opportunity:
+                    marker_display_x = self._display_times_ms[marker_index]
+                    if marker_display_x < start_x or marker_display_x > end_x:
+                        continue
+                    exit_index = -1
+                else:
+                    exit_index = self._index_for_candle_time(exit_ts // 1000)
+                    if not (0 <= exit_index < len(self._candles)):
+                        continue
+                    entry_display_x = self._display_times_ms[entry_index]
+                    exit_display_x = self._display_times_ms[exit_index]
+                    if exit_display_x < start_x or entry_display_x > end_x:
+                        continue
+
+                # Show the risk boundary for at most eight candles. Opportunities
+                # have no exit yet; completed/held trades also keep the line
+                # within their active interval.
+                if stop_price > 0 and self._axis_y is not None:
+                    axis_low = float(self._axis_y.min())
+                    axis_high = float(self._axis_y.max())
+                    if axis_low <= stop_price <= axis_high:
+                        stop_y = self._y_for_value(stop_price, plot_area)
+                        stop_start_x = self._x_for_index(entry_index, plot_area)
+                        trade_end_index = exit_index if not is_opportunity else len(self._candles) - 1
+                        stop_end_index = min(entry_index + 8, trade_end_index)
+                        stop_end_x = self._x_for_index(stop_end_index, plot_area)
+                        if stop_end_x > stop_start_x:
+                            stop_color = QColor("#fb7185")
+                            stop_pen = QPen(stop_color, 1.4)
+                            stop_pen.setStyle(Qt.PenStyle.DashLine)
+                            painter.setPen(stop_pen)
+                            painter.drawLine(QPointF(stop_start_x, stop_y), QPointF(stop_end_x, stop_y))
+                            stop_label = f"{'多' if str(trade.get('side', 'long')).lower() == 'long' else '空'}止损 {self._format_hover_value(stop_price)}"
+                            label_width = float(metrics.horizontalAdvance(stop_label)) + 10.0
+                            label_height = float(metrics.height()) + 6.0
+                            label_x = _clamp(
+                                stop_start_x + 5.0, float(plot_area.left()) + 2.0,
+                                float(plot_area.right()) - label_width - 2.0,
+                            )
+                            label_y = _clamp(
+                                stop_y - label_height - 2.0,
+                                float(plot_area.top()) + 2.0,
+                                float(plot_area.bottom()) - label_height - 2.0,
+                            )
+                            stop_rect = QRectF(label_x, label_y, label_width, label_height)
+                            painter.setPen(QPen(stop_color, 1))
+                            painter.setBrush(QColor("#111827"))
+                            painter.drawRoundedRect(stop_rect, 3.0, 3.0)
+                            painter.setPen(stop_color.lighter(125))
+                            painter.drawText(
+                                QPointF(stop_rect.left() + 5.0, stop_rect.top() + metrics.ascent() + 3.0),
+                                stop_label,
+                            )
 
                 side = str(trade.get("side", "long")).strip().lower()
                 side_label = "多" if side == "long" else "空"
@@ -5047,9 +5255,6 @@ if QChartView is not None:
                     QColor("#eab308"),
                 )
                 if is_opportunity:
-                    marker_display_x = self._display_times_ms[marker_index]
-                    if marker_display_x < start_x or marker_display_x > end_x:
-                        continue
                     x_pos = self._x_for_index(marker_index, plot_area)
                     y_pos = self._y_for_value(entry_price, plot_area)
                     if side == "long":
@@ -5085,13 +5290,6 @@ if QChartView is not None:
                     painter.drawText(QPointF(rect.left() + 5.0, rect.top() + metrics.ascent() + 3.0), label)
                     continue
 
-                exit_index = self._index_for_candle_time(exit_ts // 1000)
-                if not (0 <= exit_index < len(self._candles)):
-                    continue
-                entry_display_x = self._display_times_ms[entry_index]
-                exit_display_x = self._display_times_ms[exit_index]
-                if exit_display_x < start_x or entry_display_x > end_x:
-                    continue
                 entry_x = self._x_for_index(entry_index, plot_area)
                 exit_x = self._x_for_index(exit_index, plot_area)
                 entry_y = self._y_for_value(entry_price, plot_area)
@@ -5783,7 +5981,8 @@ if QChartView is not None:
             self._price_badge.setText(price_text)
             self._price_badge.adjustSize()
             price_size = self._price_badge.sizeHint()
-            volume_reserved_height = max(42.0, float(bounds.height()) * _VOLUME_OVERLAY_HEIGHT_RATIO)
+            reserved_ratio = _VOLUME_OVERLAY_HEIGHT_RATIO + (_ATR_OVERLAY_HEIGHT_RATIO if self._show_atr else 0.0)
+            volume_reserved_height = max(42.0, float(bounds.height()) * reserved_ratio)
             overlay_layout = _compute_hover_overlay_layout(
                 viewport_top=float(viewport.top()),
                 viewport_bottom=float(viewport.bottom()),
@@ -7218,6 +7417,11 @@ class KlineAnalysisWindow(QMainWindow):
         self._ema21_55_check.toggled.connect(self._sync_chart_options)
         ma_group_layout.addWidget(self._ema21_55_check)
 
+        self._atr10_check = QCheckBox("ATR 10")
+        self._atr10_check.setToolTip("在K线图下方显示或隐藏 Wilder ATR(10) 波动率曲线。")
+        self._atr10_check.toggled.connect(self._sync_chart_options)
+        ma_group_layout.addWidget(self._atr10_check)
+
         self._best_parameter_indicators_check = QCheckBox("最佳参数指标")
         self._best_parameter_indicators_check.setToolTip(
             "显示当前品种已固化的最佳参数均线；会按当前 K 线周期重新计算，开启时隐藏手动选择的均线。"
@@ -7698,7 +7902,7 @@ class KlineAnalysisWindow(QMainWindow):
         self._area_shape_mode_combo = QComboBox()
         self._area_shape_mode_combo.addItem("纸面演练", "paper")
         self._area_shape_mode_combo.addItem("OKX模拟盘", "demo")
-        self._area_shape_mode_combo.setToolTip("纸面只推演；模拟盘默认同时在入场线挂GTC限价单，并在触线+1H形态确认后尝试价格受限FOK。任一路径成交后撤销另一入场并保护真实成交。")
+        self._area_shape_mode_combo.setToolTip("价格触发模式：做多下穿支撑线、做空上穿压力线时按画线价模拟入场；实时流不可用时按1H OHLC检查同方向穿越。OKX模拟盘在对应入场线挂GTC限价单。形态模式仍等待1H收盘确认。")
         self._area_shape_mode_combo.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
         self._area_shape_mode_combo.setMinimumContentsLength(8)
         self._area_shape_mode_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
@@ -7765,7 +7969,7 @@ class KlineAnalysisWindow(QMainWindow):
         self._area_shape_demo_status.setWordWrap(True)
         self._area_shape_demo_status.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         area_layout.addWidget(self._area_shape_demo_status)
-        self._area_shape_summary = QLabel("纸面按下一根1H开盘价假设入场；模拟盘可在入场线挂GTC，并在触线+形态确认后提交FOK。GTC先成交时按实际成交管理并取消后续入场。")
+        self._area_shape_summary = QLabel("直接价格触发：做多下穿支撑、做空上穿压力后按画线价模拟入场；形态确认模式按下一根1H开盘价推演。纸面不发送订单。")
         self._area_shape_summary.setObjectName("Subtle")
         self._area_shape_summary.setWordWrap(True)
         self._area_shape_summary.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
@@ -10850,6 +11054,11 @@ class KlineAnalysisWindow(QMainWindow):
             "ema21": ema21,
             "ema21Fast": ema21_fast_points[-1] if ema21_fast_points else None,
             "ema55": ema55_points[-1] if ema55_points else None,
+            "atr10": (
+                {"time": int(display_candles[-1]["time"]), "value": _atr_chart_values(display_candles, 10)[-1]}
+                if self._atr10_check.isChecked() and display_candles
+                else None
+            ),
         }
         self._run_js(
             f"window.updateRealtimeCandle({json.dumps(realtime_payload)});"
@@ -10918,6 +11127,8 @@ class KlineAnalysisWindow(QMainWindow):
             # Reuse the existing candle stream for the right-axis latest-price
             # marker; no extra ticker request or high-frequency timer is added.
             if isinstance(self._native_chart_view, InteractiveKlineChartView):
+                if self._atr10_check.isChecked():
+                    self._native_chart_view._atr_values = _atr_chart_values(display_payload.candles, 10)
                 self._native_chart_view.set_latest_price(float(candle_values["close"]))
             self._native_chart_view.update()
 
@@ -11242,7 +11453,13 @@ class KlineAnalysisWindow(QMainWindow):
                 "ema9": self._ema9.isChecked(),
                 "ema21": self._ema21.isChecked(),
                 "emaPair": self._ema21_55_check.isChecked() and not self._best_parameter_indicators_check.isChecked(),
+                "atr10": self._atr10_check.isChecked(),
             },
+            "atr10": [
+                {"time": int(display_payload.candles[index]["time"]), "value": value}
+                for index, value in enumerate(_atr_chart_values(display_payload.candles, 10))
+                if value is not None
+            ] if self._atr10_check.isChecked() else [],
             "period": period,
             "trend": trend_payload,
             "signals": signal_markers,
@@ -11756,6 +11973,8 @@ class KlineAnalysisWindow(QMainWindow):
         min_price = min(float(item["low"]) for item in candles)
         max_price = max(float(item["high"]) for item in candles)
         candle_price_span = max_price - min_price
+        show_atr = self._atr10_check.isChecked() and not (is_secondary and self._all_charts_volatility_enabled())
+        atr_values = _atr_chart_values(candles, 10) if show_atr else []
         overlay_values: list[list[float]] = []
         indicator_series: list[dict[str, Any]] = []
         workspace_lines: list[dict[str, object]] = []
@@ -12042,7 +12261,7 @@ class KlineAnalysisWindow(QMainWindow):
         axis_x.setGridLineVisible(False)
 
         axis_y = QValueAxis()
-        top_padding, bottom_padding = _compute_axis_y_padding(min_price, max_price)
+        top_padding, bottom_padding = _compute_axis_y_padding(min_price, max_price, show_atr=show_atr)
         axis_y.setRange(min_price - bottom_padding, max_price + top_padding)
         axis_y.setLabelFormat(_axis_y_label_format(min_price, max_price))
         axis_y.setTickCount(8)
@@ -12069,6 +12288,8 @@ class KlineAnalysisWindow(QMainWindow):
                 symbol=symbol,
                 venue_label=venue_label,
                 indicator_series=indicator_series,
+                atr_values=atr_values,
+                show_atr=show_atr,
                 chart_note_lines=chart_note_lines,
                 trend_indicators=trend_indicators,
                 signal_markers=self._filter_replay_signal_markers_for_chart(
@@ -12204,7 +12425,16 @@ class KlineAnalysisWindow(QMainWindow):
             self._set_area_shape_status("区域形态后台服务未连接；计划创建已禁用。")
             return
         prior = self._current_area_plan(draft_only=True)
-        existing_pair_plan = prior or self._current_area_plan()
+        current_plan = self._current_area_plan()
+        existing_pair_plan = prior or current_plan
+        reusable_terminal_plan = (
+            current_plan
+            if prior is None and current_plan is not None
+            and current_plan.status in {"cancelled", "paper_closed", "expired"}
+            and current_plan.paper_position is None
+            and self._area_pair_lines_exist(current_plan)
+            else None
+        )
         if self._area_pair_lines_exist(existing_pair_plan):
             if prior is not None:
                 try:
@@ -12215,9 +12445,13 @@ class KlineAnalysisWindow(QMainWindow):
                 except Exception as exc:
                     self._set_area_shape_status(f"读取已有两线失败：{exc}")
                     return
-            self._set_area_shape_status("当前计划的一键两线已在图上；此按钮不会重复生成。拖动射线调整，或先删除原计划和两线。")
-            self._sync_area_shape_workflow_actions()
-            return
+                self._set_area_shape_status("当前计划的一键两线已在图上；拖动射线调整即可。")
+                self._sync_area_shape_workflow_actions()
+                return
+            if reusable_terminal_plan is None:
+                self._set_area_shape_status("当前计划的一键两线已在图上；请先结束计划，再新建草稿。")
+                self._sync_area_shape_workflow_actions()
+                return
         context_plans = [
             item for item in self._area_shape_plans()
             if item.symbol == self._selected_symbol().strip().upper()
@@ -12261,6 +12495,18 @@ class KlineAnalysisWindow(QMainWindow):
                     raise ValueError("草稿支撑/压力线顺序无效，请先校准两线")
                 prior.support_price, prior.pressure_price, prior.config = support, pressure, config
                 plan = prior
+            elif reusable_terminal_plan is not None:
+                support_id = reusable_terminal_plan.support_line_id
+                pressure_id = reusable_terminal_plan.pressure_line_id
+                support = self._area_line_price(support_id)
+                pressure = self._area_line_price(pressure_id)
+                if support <= 0 or pressure <= support:
+                    raise ValueError("原计划两线顺序无效，请先校准两线")
+                plan = AreaShapePlan.create(
+                    profile_name=self._active_profile_name(), environment=self._active_environment(),
+                    symbol=self._selected_symbol(), support_price=support, pressure_price=pressure,
+                    config=config, support_line_id=support_id, pressure_line_id=pressure_id,
+                )
             else:
                 support_id, pressure_id = uuid4().hex[:10], uuid4().hex[:10]
                 plan = AreaShapePlan.create(
@@ -13210,8 +13456,9 @@ class KlineAnalysisWindow(QMainWindow):
         if plan is None:
             self._set_area_shape_status("请先一键生成两线草稿。")
             return
-        if plan.status != "draft":
-            self._set_area_shape_status("计划参数已随监控冻结；请结束此计划后新建草稿。")
+        terminal_plan = plan.status in {"cancelled", "paper_closed", "expired"} and plan.paper_position is None
+        if plan.status != "draft" and not terminal_plan:
+            self._set_area_shape_status("计划参数已随监控冻结；已有持仓保护结束后，可新建草稿调整参数。")
             return
         dialog = AreaShapeConfigDialog(
             plan.config, self, support_price=plan.support_price, pressure_price=plan.pressure_price,
@@ -13219,11 +13466,23 @@ class KlineAnalysisWindow(QMainWindow):
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
         try:
-            plan.config = dialog.config()
-            plan.support_price = self._area_line_price(plan.support_line_id)
-            plan.pressure_price = self._area_line_price(plan.pressure_line_id)
+            config = dialog.config()
+            support = self._area_line_price(plan.support_line_id)
+            pressure = self._area_line_price(plan.pressure_line_id)
+            if terminal_plan:
+                plan = AreaShapePlan.create(
+                    profile_name=plan.profile_name, environment=plan.environment, symbol=plan.symbol,
+                    support_price=support, pressure_price=pressure, config=config,
+                    support_line_id=plan.support_line_id, pressure_line_id=plan.pressure_line_id,
+                )
+            else:
+                plan.config = config
+                plan.support_price = support
+                plan.pressure_price = pressure
             self._area_shape_monitor.save_draft(plan)
-            self._refresh_area_shape_status()
+            self._refresh_area_shape_status(plan)
+            if terminal_plan:
+                self._set_area_shape_status("已基于原区域线创建新草稿；可继续调整射线并启用计划。")
         except Exception as exc:
             self._set_area_shape_status(f"无法保存区域参数：{exc}")
 
@@ -13391,6 +13650,10 @@ class KlineAnalysisWindow(QMainWindow):
             self._area_shape_monitor.cancel_plan(plan.plan_id)
             self._refresh_area_shape_status()
             self._refresh_area_shape_execution_status()
+            updated_plan = self._current_area_plan()
+            if updated_plan is not None and updated_plan.cancel_after_position:
+                self._set_area_shape_status("已提交持仓后取消；当前纸面持仓的止损/止盈继续运行，平仓后计划结束。")
+                return
             session = self._area_shape_demo_session_for_plan(plan)
             if session is not None and isinstance(session.get("position"), dict):
                 self._set_area_shape_status("计划已取消；已有模拟盘仓位未平仓，保护继续运行。")
@@ -13478,7 +13741,7 @@ class KlineAnalysisWindow(QMainWindow):
                 exit_text += f"；时间保本：持仓满{config.time_break_even_bars}根1H且当前价允许保本"
         else:
             exit_text += "；保本关闭"
-        entry_mode = "实际触线后入场（不等形态；纸面按下一根1H开盘，模拟盘预挂入场线GTC）" if config.entry_trigger_mode == "direct_touch" else (
+        entry_mode = "做多下穿支撑/做空上穿压力即触发（纸面按线价模拟；OKX模拟盘预挂入场线GTC）" if config.entry_trigger_mode == "direct_touch" else (
             "触线+形态确认后入场（纸面按下一根1H开盘；模拟盘价格受限FOK）"
             if config.entry_mode == "next_open" else "形态后等待价格突破（OKX条件单）"
         )
@@ -13530,12 +13793,18 @@ class KlineAnalysisWindow(QMainWindow):
         create_button = getattr(self, "_area_shape_create_button", None)
         if create_button is not None:
             pair_exists = self._area_pair_lines_exist(plan)
-            create_button.setText("两线已生成" if pair_exists else "一键两线")
-            create_button.setToolTip(
-                "当前计划的两条射线已在图上，可直接拖动调整；如需重新生成，请先删除当前计划和两线。"
-                if pair_exists else "快速取最近120根1H K线的最低点和最高点生成两条射线；生成后可在图上手工调整。"
+            can_start_new_draft = bool(
+                plan is not None and plan.status in {"cancelled", "paper_closed", "expired"}
+                and plan.paper_position is None and pair_exists
             )
-            create_button.setEnabled(not pair_exists)
+            create_button.setText("新建草稿" if can_start_new_draft else ("两线已生成" if pair_exists else "一键两线"))
+            if can_start_new_draft:
+                create_button.setToolTip("沿用当前两条区域线新建草稿；旧计划记录保留，可再调整参数。")
+            elif pair_exists:
+                create_button.setToolTip("当前计划的两条射线已在图上，可直接拖动调整。")
+            else:
+                create_button.setToolTip("快速取最近120根1H K线的最低点和最高点生成两条射线；生成后可在图上手工调整。")
+            create_button.setEnabled(not pair_exists or can_start_new_draft)
         start = getattr(self, "_area_shape_start_button", None)
         pause = getattr(self, "_area_shape_pause_button", None)
         cancel = getattr(self, "_area_shape_cancel_button", None)
@@ -13565,7 +13834,26 @@ class KlineAnalysisWindow(QMainWindow):
             can_start = False
         start.setEnabled(can_start and not busy)
         pause.setEnabled(status in {"monitoring", "touched", "paper_pending"} and not busy)
-        cancel.setEnabled(status in {"draft", "monitoring", "touched", "paper_pending", "paused"} and not busy)
+        cancelable_statuses = {"draft", "monitoring", "touched", "paper_pending", "paused", "paper_closed", "expired"}
+        paper_position_statuses = {"paper_position", "paper_break_even", "paper_locked"}
+        paper_position_cancelable = (
+            status in paper_position_statuses and plan.execution_mode == "paper"
+            and plan.paper_position is not None and not plan.cancel_after_position
+        )
+        cancel.setText("持仓后取消" if status in paper_position_statuses else "取消计划")
+        cancel.setEnabled(
+            (status in cancelable_statuses and plan.paper_position is None or paper_position_cancelable)
+            and not busy
+        )
+        if status in paper_position_statuses and plan.execution_mode == "paper":
+            cancel.setToolTip(
+                "提交持仓后取消请求；当前纸面持仓继续接受止损/止盈检查，平仓后结束计划。"
+                if not plan.cancel_after_position else "已提交持仓后取消；当前纸面持仓保护仍在运行。"
+            )
+        elif busy:
+            cancel.setToolTip("模拟盘操作正在处理中；完成后即可取消计划。")
+        else:
+            cancel.setToolTip("结束当前计划。不会平掉已有仓位，也不会撤销其交易所止盈止损保护。")
 
     def _area_shape_demo_sessions(self) -> list[dict[str, object]]:
         monitor = getattr(self, "_area_shape_execution_monitor", None)
@@ -13679,7 +13967,7 @@ class KlineAnalysisWindow(QMainWindow):
         if not hasattr(self, "_area_shape_mode_combo"):
             return
         self._area_shape_summary.setText(
-            "纸面按下一根已确认1H K线开盘价假设入场；不会发送订单。"
+            "直接价格触发按方向穿越触发：做多下穿支撑、做空上穿压力，纸面按画线价模拟入场；形态确认模式按下一根1H开盘价推演。纸面不发送订单。"
             if self._area_shape_mode_combo.currentData() == "paper"
             else "OKX模拟盘默认同时挂入场线GTC限价单，并由本地触线+1H形态确认后提交价格受限FOK；任一路径成交后取消另一入场。"
         )
@@ -16312,6 +16600,7 @@ class KlineAnalysisWindow(QMainWindow):
                 let channelSeries = [];
                 let trendSeries = null;
                 let volumeSeries = null;
+                let atrSeries = null;
                 let latestPriceLine = null;
                 let trendByTime = {};
                 let signalByTime = {};
@@ -16326,7 +16615,7 @@ class KlineAnalysisWindow(QMainWindow):
                   return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${weekdays[date.getDay()]} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
                 }
 
-                function toTooltipText(time, payload, trendPayload) {
+                function toTooltipText(time, payload, trendPayload, atrPayload) {
                   if (!time || !payload) {
                     return '';
                   }
@@ -16340,7 +16629,8 @@ class KlineAnalysisWindow(QMainWindow):
                     : '中性';
                   const dateText = formatChartTime(time);
                   const trendTitle = trendPayload?.title || trendTitleForPeriod(payload?.period);
-                  return `时间 ${dateText}\n开 ${formatNumber(o)}  高 ${formatNumber(h)}\n低 ${formatNumber(l)}  收 ${formatNumber(c)}\n量 ${formatNumber(v)}\n${trendTitle} ${trendText}`;
+                  const atrText = atrPayload ? `\nATR 10 ${formatNumber(atrPayload.value)}` : '';
+                  return `时间 ${dateText}\n开 ${formatNumber(o)}  高 ${formatNumber(h)}\n低 ${formatNumber(l)}  收 ${formatNumber(c)}\n量 ${formatNumber(v)}${atrText}\n${trendTitle} ${trendText}`;
                 }
 
                 function trendTitleForPeriod(period) {
@@ -16626,6 +16916,26 @@ class KlineAnalysisWindow(QMainWindow):
                     if (volumeSeries) {
                       volumeSeries.setData(volumePoints);
                     }
+                    if (safePayload.show?.atr10) {
+                      if (!atrSeries) {
+                        atrSeries = chart.addLineSeries({
+                          priceScaleId: 'atr10',
+                          color: '#f59e0b',
+                          lineWidth: 2,
+                          title: 'ATR 10',
+                          priceLineVisible: false,
+                          lastValueVisible: true,
+                        });
+                        chart.priceScale('atr10').applyOptions({
+                          scaleMargins: { top: 0.66, bottom: 0.20 },
+                          borderVisible: false,
+                        });
+                      }
+                      atrSeries.setData(Array.isArray(safePayload.atr10) ? safePayload.atr10 : []);
+                    } else if (atrSeries) {
+                      chart.removeSeries(atrSeries);
+                      atrSeries = null;
+                    }
                     syncTrendSeries(
                       Array.isArray(safePayload.trend) ? safePayload.trend : [],
                       safePayload.period === '1D' || safePayload.period === '1W'
@@ -16683,6 +16993,9 @@ class KlineAnalysisWindow(QMainWindow):
                       const color = candle.close >= candle.open ? 'rgba(34, 197, 94, 0.85)' : 'rgba(224, 79, 132, 0.85)';
                       volumeSeries.update({ time, value: Number(candle.volume) || 0, color });
                     }
+                    if (payload.atr10 && atrSeries && Number.isFinite(Number(payload.atr10.value))) {
+                      atrSeries.update(payload.atr10);
+                    }
                     if (payload.ema9 && lineSeries.ema9) lineSeries.ema9.update(payload.ema9);
                     if (payload.ema21 && lineSeries.ema21) lineSeries.ema21.update(payload.ema21);
                     if (payload.ema21Fast && lineSeries.ema21Fast) lineSeries.ema21Fast.update(payload.ema21Fast);
@@ -16711,7 +17024,8 @@ class KlineAnalysisWindow(QMainWindow):
                       return;
                     }
                     const trendPayload = trendByTime[String(param.time)] || null;
-                    const text = toTooltipText(param.time, candleData, trendPayload);
+                    const atrPayload = atrSeries ? param.seriesData.get(atrSeries) : null;
+                    const text = toTooltipText(param.time, candleData, trendPayload, atrPayload);
                     setCrosshairTooltip(param.point, true, text);
                   });
                   chart.subscribeClick(() => {

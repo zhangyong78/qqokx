@@ -120,16 +120,16 @@ class AreaShapeKlineUiTests(QtWidgetTestCase):
         exit_ts = self.rows[12].ts
         results = [{
             "side": "short", "entry_ts": entry_ts, "exit_ts": exit_ts,
-            "entry": Decimal("101"), "exit": Decimal("98"), "r": Decimal("2.0"),
+            "entry": Decimal("101"), "stop": Decimal("104"), "exit": Decimal("98"), "r": Decimal("2.0"),
         }, {
             "record_type": "opportunity", "side": "long", "signal_ts": self.rows[15].ts,
-            "entry_ts": self.rows[15].ts, "entry": Decimal("100"), "space_r": Decimal("1.5"),
+            "entry_ts": self.rows[15].ts, "entry": Decimal("100"), "stop": Decimal("96"), "space_r": Decimal("1.5"),
         }, {
             "side": "long", "entry_ts": self.rows[2].ts, "exit_ts": self.rows[4].ts,
-            "entry": Decimal("100"), "exit": Decimal("102"), "r": Decimal("0.5"),
+            "entry": Decimal("100"), "stop": Decimal("96"), "exit": Decimal("102"), "r": Decimal("0.5"),
         }, {
             "record_type": "opportunity", "side": "short", "signal_ts": self.rows[17].ts,
-            "entry_ts": self.rows[17].ts, "entry": Decimal("102"), "space_r": Decimal("2.0"),
+            "entry_ts": self.rows[17].ts, "entry": Decimal("102"), "stop": Decimal("104"), "space_r": Decimal("2.0"),
         }]
 
         chart.set_area_shape_replay_trades(results, focus=True)
@@ -144,12 +144,15 @@ class AreaShapeKlineUiTests(QtWidgetTestCase):
         self.assertEqual(chart._area_shape_replay_trades, results)
         image = chart.grab().toImage()
         replay_pixels = 0
+        stop_line_pixels = 0
         opportunity_pixels = 0
         long_trade_pixels = 0
         short_opportunity_pixels = 0
         for y in range(image.height()):
             for x in range(image.width()):
                 color = image.pixelColor(x, y)
+                if color.red() > 220 and 80 <= color.green() <= 150 and 100 <= color.blue() <= 180:
+                    stop_line_pixels += 1
                 if color.red() > 200 and color.green() < 160 and color.blue() < 160:
                     replay_pixels += 1
                 if color.red() < 100 and color.green() >= 150 and color.blue() >= 200:
@@ -159,6 +162,7 @@ class AreaShapeKlineUiTests(QtWidgetTestCase):
                 if color.red() >= 150 and color.green() >= 100 and color.blue() >= 180:
                     short_opportunity_pixels += 1
         self.assertGreater(replay_pixels, 20)
+        self.assertGreater(stop_line_pixels, 20)
         self.assertGreater(opportunity_pixels, 20)
         self.assertGreater(long_trade_pixels, 20)
         self.assertGreater(short_opportunity_pixels, 20)

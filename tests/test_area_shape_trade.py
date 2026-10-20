@@ -65,13 +65,15 @@ def test_entry_requires_actual_line_touch_in_both_directions(direction, trigger_
     plan = _plan(config)
     history = _history()[:-1]
     if direction == "long":
-        plan.support_price = Decimal("98")
+        # Keep the first price-trigger case above the bar's full range; a
+        # directional cross across the line should count even on a gap.
+        plan.support_price = Decimal("92" if trigger_mode == "direct_touch" else "98")
         exact_line = Decimal("97.2")
     else:
         history = [Candle(item.ts, 200 - item.open, 200 - item.low, 200 - item.high,
                           200 - item.close, item.volume, item.confirmed) for item in history]
         plan.support_price = Decimal("80")
-        plan.pressure_price = Decimal("102")
+        plan.pressure_price = Decimal("108" if trigger_mode == "direct_touch" else "102")
         exact_line = Decimal("102.8")
     assert plan.observe(history) is None
     assert plan.status == "monitoring"
@@ -81,7 +83,12 @@ def test_entry_requires_actual_line_touch_in_both_directions(direction, trigger_
     else:
         plan.pressure_price = exact_line
     event = plan.observe(history)
-    assert event is not None and event["kind"] == "paper_pending"
+    assert event is not None
+    if trigger_mode == "direct_touch":
+        assert event["kind"] == "paper_entry"
+        assert plan.paper_position["entry"] == str(exact_line)
+    else:
+        assert event["kind"] == "paper_pending"
 
 
 def test_fixed_distance_direct_entry_does_not_wait_for_unused_atr_warmup() -> None:
@@ -92,13 +99,9 @@ def test_fixed_distance_direct_entry_does_not_wait_for_unused_atr_warmup() -> No
     plan = _plan(config)
     assert not config.requires_atr()
     event = plan.observe([_candle(2 * HOUR, "96", "97", "94", "96")])
-    assert event is not None and event["kind"] == "paper_pending"
-    assert plan.paper_position["stop"] == "90"
-    event = plan.observe([
-        _candle(2 * HOUR, "96", "97", "94", "96"),
-        _candle(3 * HOUR, "96", "99", "95", "98"),
-    ])
     assert event is not None and event["kind"] == "paper_entry"
+    assert plan.paper_position["entry"] == "95"
+    assert plan.paper_position["stop"] == "90"
 
 
 def test_atr_target_buffer_still_requires_warmup_with_fixed_stop() -> None:
@@ -123,7 +126,8 @@ def test_direct_touch_skips_pattern_check_and_three_candle_stop_uses_recent_extr
         _candle(2 * HOUR, "96", "97.2", "93", "97"),
     ]
     event = plan.observe(history)
-    assert event is not None and event["kind"] == "paper_pending"
+    assert event is not None and event["kind"] == "paper_entry"
+    assert plan.paper_position["entry"] == "95"
     assert plan.paper_position["pattern"] == "direct_touch"
     assert Decimal(plan.paper_position["stop"]) < Decimal("93")
     assert plan.paper_position["stop_basis"] == "three_candle"
@@ -164,6 +168,15 @@ def test_old_fixed_target_config_keeps_break_even_disabled_and_new_setting_round
     assert restored.break_even_enabled is True
     assert restored.time_break_even_enabled is True
     assert restored.time_break_even_bars == 8
+
+
+def test_area_shape_atr_defaults_and_missing_period_fallback() -> None:
+    config = AreaShapeConfig()
+    assert config.atr_period == 10
+    assert config.stop_offset_atr == Decimal("0.5")
+    saved = config.to_dict()
+    saved.pop("atr_period")
+    assert AreaShapeConfig.from_dict(saved).atr_period == 10
 
 
 def test_fixed_target_can_move_stop_to_break_even_without_changing_take_profit() -> None:
@@ -211,9 +224,59 @@ def test_paper_fill_uses_future_next_open_and_not_signal_close() -> None:
     assert event is not None and event["kind"] == "paper_entry"
     assert plan.paper_position["entry"] == "97.5"
     assert plan.paper_position["entry_ts"] == 3 * HOUR
+
+
+def test_direct_touch_paper_entry_fills_at_the_line_on_live_price_trigger() -> None:
+    config = AreaShapeConfig(
+        direction="long", entry_trigger_mode="direct_touch", stop_basis="fixed_distance",
+        fixed_stop_distance=Decimal("5"), atr_period=2,
+    )
+    plan = _plan(config)
+    candles = [_candle(2 * HOUR, "100", "101", "99", "100"),
+               _candle(3 * HOUR, "100", "101", "99", "100")]
+
+    event = plan.observe_direct_touch_price(
+        Decimal("94"), 3 * HOUR + 60_000, candles, source="live_last_price",
+    )
+
+    assert event is not None and event["kind"] == "paper_entry"
+    assert plan.status == "paper_position"
+    assert plan.paper_position is not None
+    assert plan.paper_position["entry"] == "95"
+    assert plan.paper_position["trigger_source"] == "live_last_price"
+    assert event["last_price"] == "94"
     assert plan.paper_position["last_checked_ts"] == 3 * HOUR
     assert plan.paper_position["contracts"] is None
     assert "未核验" in plan.paper_position["sizing_status"]
+
+
+@pytest.mark.parametrize(
+    ("direction", "first_close", "wrong_open", "wrong_high", "wrong_low", "wrong_close", "right_open", "right_high", "right_low", "right_close"),
+    [
+        ("long", "94", "94", "96", "93", "96", "96", "97", "94", "94"),
+        ("short", "121", "121", "122", "119", "119", "119", "121", "118", "121"),
+    ],
+)
+def test_direct_touch_replay_requires_cross_in_the_order_direction(
+    direction, first_close, wrong_open, wrong_high, wrong_low, wrong_close,
+    right_open, right_high, right_low, right_close,
+) -> None:
+    config = AreaShapeConfig(
+        direction=direction, entry_trigger_mode="direct_touch", stop_basis="fixed_distance",
+        fixed_stop_distance=Decimal("5"), target_buffer_atr=Decimal("0"),
+        round_trip_fee_rate=Decimal("0"), slippage_rate=Decimal("0"),
+    )
+    plan = _plan(config)
+    first = _candle(HOUR, first_close, first_close, first_close, first_close)
+    wrong_way = _candle(2 * HOUR, wrong_open, wrong_high, wrong_low, wrong_close)
+    event = plan.observe([first, wrong_way])
+    assert event is None
+    assert plan.status == "monitoring"
+
+    right_way = _candle(3 * HOUR, right_open, right_high, right_low, right_close)
+    event = plan.observe([first, wrong_way, right_way])
+    assert event is not None and event["kind"] == "paper_entry"
+    assert plan.paper_position["entry"] == str(plan.support_price if direction == "long" else plan.pressure_price)
 
 
 @pytest.mark.parametrize("template,target_r", [("fixed_1r", Decimal(2)), ("lock_2r_at_3r", Decimal(15))])

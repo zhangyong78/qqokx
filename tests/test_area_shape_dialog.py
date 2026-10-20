@@ -11,6 +11,46 @@ from roll_terminal_qt.area_shape_dialog import AreaShapeConfigDialog
 
 
 class AreaShapeDialogTests(QtWidgetTestCase):
+    def test_atr_defaults_are_period_10_and_stop_offset_0_5(self) -> None:
+        dialog = AreaShapeConfigDialog(AreaShapeConfig())
+        try:
+            self.assertEqual(dialog.atr_period.value(), 10)
+            self.assertEqual(dialog.stop_offset.value(), 0.5)
+            legacy_config = AreaShapeConfig().to_dict()
+            legacy_config.pop("atr_period")
+            self.assertEqual(AreaShapeConfig.from_dict(legacy_config).atr_period, 10)
+        finally:
+            self.dispose_widget(dialog)
+
+    def test_mouse_wheel_does_not_change_dialog_numeric_fields(self) -> None:
+        dialog = AreaShapeConfigDialog(AreaShapeConfig())
+
+        class IgnoredWheelEvent:
+            ignored = False
+
+            def ignore(self) -> None:
+                self.ignored = True
+
+        try:
+            fields = (
+                dialog.risk_amount,
+                dialog.min_space_r,
+                dialog.atr_period,
+                dialog.fixed_tp_r,
+                dialog.time_break_even_bars,
+                dialog.lock_trigger_r,
+                dialog.valid_bars,
+            )
+            for field in fields:
+                with self.subTest(field=field.objectName()):
+                    before = field.value()
+                    event = IgnoredWheelEvent()
+                    field.wheelEvent(event)
+                    self.assertTrue(event.ignored)
+                    self.assertEqual(field.value(), before)
+        finally:
+            self.dispose_widget(dialog)
+
     def test_direct_touch_disables_pattern_options_but_uses_automatic_gtc(self) -> None:
         dialog = AreaShapeConfigDialog(AreaShapeConfig())
         try:

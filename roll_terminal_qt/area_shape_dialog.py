@@ -37,6 +37,16 @@ _PATTERNS = (
 )
 
 
+class _WheelSafeDoubleSpinBox(QDoubleSpinBox):
+    def wheelEvent(self, event) -> None:  # noqa: ANN001
+        event.ignore()
+
+
+class _WheelSafeSpinBox(QSpinBox):
+    def wheelEvent(self, event) -> None:  # noqa: ANN001
+        event.ignore()
+
+
 class AreaShapeConfigDialog(QDialog):
     def __init__(
         self, config: AreaShapeConfig | None = None, parent=None, *,
@@ -98,7 +108,7 @@ class AreaShapeConfigDialog(QDialog):
         self.risk_amount = self._number(self._initial.risk_amount, 0.01, 1_000_000, 2)
         self.min_space_r = self._number(self._initial.min_space_r, 0.1, 100, 2)
         self.min_space_r.setToolTip("另一条线用于核算可用空间；低于此R门槛不入场。此筛选门槛与固定止盈目标独立。")
-        self.atr_period = QSpinBox()
+        self.atr_period = _WheelSafeSpinBox()
         self.atr_period.setRange(2, 200)
         self.atr_period.setValue(self._initial.atr_period)
         self.entry_offset = self._number(self._initial.entry_offset_atr, 0, 10, 3)
@@ -146,7 +156,7 @@ class AreaShapeConfigDialog(QDialog):
         self.time_break_even_enabled = QCheckBox("启用时间保本")
         self.time_break_even_enabled.setToolTip("持仓达到所设1H根数，且当前利润足以覆盖保本价时才尝试保本；与价格保本任一条件满足即可。")
         self.time_break_even_enabled.setChecked(self._initial.time_break_even_enabled)
-        self.time_break_even_bars = QSpinBox()
+        self.time_break_even_bars = _WheelSafeSpinBox()
         self.time_break_even_bars.setRange(1, 10_000)
         self.time_break_even_bars.setValue(max(1, self._initial.time_break_even_bars))
         self.lock_trigger_r = self._number(self._initial.lock_trigger_r, 0.2, 200, 2)
@@ -165,7 +175,7 @@ class AreaShapeConfigDialog(QDialog):
         self.be_trigger_r.valueChanged.connect(self._refresh_exit_controls)
         self.exit_note = QLabel()
         self.exit_note.setWordWrap(True)
-        self.valid_bars = QSpinBox()
+        self.valid_bars = _WheelSafeSpinBox()
         self.valid_bars.setRange(1, 10_000)
         self.valid_bars.setValue(self._initial.valid_for_bars)
 
@@ -475,7 +485,7 @@ class AreaShapeConfigDialog(QDialog):
 
     @staticmethod
     def _number(value: Decimal, minimum: float, maximum: float, decimals: int) -> QDoubleSpinBox:
-        field = QDoubleSpinBox()
+        field = _WheelSafeDoubleSpinBox()
         field.setRange(minimum, maximum)
         field.setDecimals(decimals)
         field.setValue(float(value))
