@@ -3,6 +3,7 @@
 import json
 import math
 import os
+import random
 import re
 import sys
 import time
@@ -11,6 +12,7 @@ from bisect import bisect_right
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
+from statistics import median
 from typing import Any, Callable
 from uuid import uuid4
 
@@ -5447,7 +5449,7 @@ if QChartView is not None:
             if not ordered:
                 return
             step_width = float(plot_area.width()) * self._display_step_ms / max(self.current_x_range()[1] - self.current_x_range()[0], 1.0)
-            body_width = max(2.0, min(18.0, step_width * 0.68))
+            body_width = max(1.0, min(18.0, step_width * 0.72))
             first_x = self._x_for_display_value(float(ordered[0].get("time_ms", 0) or 0), plot_area)
             last_x = self._x_for_display_value(float(ordered[-1].get("time_ms", 0) or 0), plot_area)
             boundary_x = first_x - step_width * 0.5
@@ -5460,8 +5462,6 @@ if QChartView is not None:
             boundary_pen = QPen(QColor("#a78bfa"), 1.0, Qt.PenStyle.DashLine)
             painter.setPen(boundary_pen)
             painter.drawLine(QPointF(boundary_x, plot_area.top()), QPointF(boundary_x, plot_area.bottom()))
-            outline_color = QColor("#c4b5fd")
-            outline_color.setAlpha(170)
             for bar in ordered:
                 x = self._x_for_display_value(float(bar.get("time_ms", 0) or 0), plot_area)
                 open_y = self._y_for_value(float(bar.get("open", 0) or 0), plot_area)
@@ -5473,9 +5473,9 @@ if QChartView is not None:
                 painter.setPen(QPen(candle_color, 1.2))
                 painter.drawLine(QPointF(x, high_y), QPointF(x, low_y))
                 body = QRectF(x - body_width / 2, min(open_y, close_y), body_width, max(2.0, abs(close_y - open_y)))
-                candle_color.setAlpha(140)
+                candle_color.setAlpha(225)
                 painter.fillRect(body, candle_color)
-                painter.setPen(QPen(outline_color, 1.0))
+                painter.setPen(QPen(candle_color, 1.0))
                 painter.drawRect(body)
             for ma_type, period, color, width in self._future_ma_specs:
                 if not self._candles:
@@ -13446,7 +13446,7 @@ class KlineAnalysisWindow(QMainWindow):
         form.addRow("推演方向", direction_combo)
         form.addRow("形态", pattern_combo)
         form.addRow("推演K线根数", horizon)
-        form.addRow(QLabel("推演会参考近期真实K线的波动，再将所选形态放到对应关键线附近；仅为情景示意，不是预测。", dialog))
+        form.addRow(QLabel("推演参考近期真实K线的波动、实体与影线；关键线较远时会延长根数。仅为情景示意，不是预测。", dialog))
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel, parent=dialog)
         buttons.accepted.connect(dialog.accept)
         buttons.rejected.connect(dialog.reject)
@@ -13461,6 +13461,10 @@ class KlineAnalysisWindow(QMainWindow):
         self._area_shape_projection = projection
         chart.set_future_projection(projection)
         self._area_shape_projection_button.setText("清除推演")
+        if not projection.get("setup_reached", True):
+            self._set_area_shape_status("关键线距当前价较远，已按近期波动推演 96 根接近行情，尚未到达所选形态位置。")
+        elif len(projection.get("bars", [])) > horizon.value():
+            self._set_area_shape_status(f"按近期波动将推演延长到 {len(projection['bars'])} 根，所选形态放在关键线附近。")
 
     def _restore_area_shape_projection(self, chart_view: object, *, symbol: str, period: str) -> None:
         projection = self._area_shape_projection
@@ -13485,10 +13489,16 @@ class KlineAnalysisWindow(QMainWindow):
         if not candles:
             return {"label": _REPLAY_SIGNAL_LABELS.get(pattern, pattern), "bars": []}
         side = direction if direction in {"long", "short"} else plan.config.direction
-        recent = candles[-max(3, plan.config.atr_period):]
         latest = candles[-1]
-        ranges = [max(0.0, float(item["high"]) - float(item["low"])) for item in recent]
-        atr_value = max(sum(ranges) / max(len(ranges), 1), float(latest["close"]) * 0.001)
+        source = candles[-96:]
+        true_ranges: list[float] = []
+        previous_close = float(source[0]["open"])
+        for item in source:
+            high, low = float(item["high"]), float(item["low"])
+            true_ranges.append(max(high - low, abs(high - previous_close), abs(low - previous_close)))
+            previous_close = float(item["close"])
+        recent_ranges = true_ranges[-max(3, plan.config.atr_period):]
+        atr_value = max(sum(recent_ranges) / len(recent_ranges), float(latest["close"]) * 0.000001)
         entry = float(plan.support_price if side == "long" else plan.pressure_price)
         target = float(plan.pressure_price if side == "long" else plan.support_price)
         step_seconds = _display_step_ms("1H", candles) // 1000
@@ -13498,11 +13508,13 @@ class KlineAnalysisWindow(QMainWindow):
         shape_bars = 3 if pattern in {"bottom_fractal", "top_fractal"} else 2 if pattern in {
             "double_reversal_up", "double_reversal_down", "false_breakdown", "false_breakout", "inside_bar",
         } else 1
-        approach_bars = max(1, horizon - shape_bars)
-        source = candles[-min(len(candles), max(approach_bars, 8)):]
-        source_ranges = [max(0.0, float(item["high"]) - float(item["low"])) for item in source]
-        source_atr = max(sum(source_ranges) / max(len(source_ranges), 1), 1e-12)
+        rng = random.Random(str((
+            plan.symbol, side, pattern, horizon,
+            [(item["time"], item["open"], item["high"], item["low"], item["close"]) for item in source],
+        )))
+        source_atr = max(sum(true_ranges) / len(true_ranges), 1e-12)
         scale = min(2.0, max(0.35, atr_value / source_atr))
+        shape_atr = min(atr_value * rng.uniform(0.9, 1.1), entry * 0.25)
         side_sign = 1 if side == "long" else -1
         if pattern in {"bottom_fractal", "top_fractal"}:
             first_open_offset = 0.26
@@ -13512,54 +13524,69 @@ class KlineAnalysisWindow(QMainWindow):
             first_open_offset = 0.18
         else:
             first_open_offset = 0.22 if pattern == "inside_bar" else 0.12
-        approach_end = entry + side_sign * atr_value * first_open_offset
+        approach_end = entry + side_sign * shape_atr * first_open_offset
         distance = abs(approach_end - start_price)
-        travel_sign = 1 if approach_end > start_price else -1
-        samples = [source[(len(source) - approach_bars + index) % len(source)] for index in range(approach_bars)]
-        weights = [
-            max(abs(float(item["close"]) - float(item["open"])),
-                (float(item["high"]) - float(item["low"])) * 0.25, source_atr * 0.1)
-            for item in samples
-        ]
-        # Keep the sampled rhythm, with a few pullbacks even when the source is one-sided.
-        pullbacks = [
-            index for index in range(1, approach_bars - 1)
-            if (float(samples[index]["close"]) - float(samples[index]["open"])) * travel_sign < 0
-        ][:max(1, approach_bars // 3)]
-        if not pullbacks:
-            pullbacks = list(range(1, approach_bars - 1, 3))
-        pullback_size = min(atr_value * 0.45, max(atr_value * 0.12, distance / approach_bars * 0.45))
-        pullback_weight = sum(weights[index] for index in pullbacks)
-        trend_weight = sum(weight for index, weight in enumerate(weights) if index not in pullbacks)
-        pullback_total = pullback_size * len(pullbacks)
+        required_approach = max(1, math.ceil(distance / (atr_value * 0.75)))
+        setup_reached = required_approach <= 96
+        approach_bars = min(96, max(1, int(horizon) - shape_bars, required_approach))
+        if not setup_reached:
+            approach_end = start_price + (approach_end - start_price) * approach_bars / required_approach
+
+        # Short historical blocks preserve changes in volatility and wick
+        # proportions. The seeded bridge removes the fixed pullback rhythm
+        # while joining the selected setup continuously at the scenario level.
+        samples: list[dict[str, Any]] = []
+        while len(samples) < approach_bars:
+            start_index = rng.randrange(len(source))
+            samples.extend(source[(start_index + offset) % len(source)] for offset in range(rng.randint(2, 5)))
+        samples = samples[:approach_bars]
+        source_moves = [float(item["close"]) - float(item["open"]) for item in source]
+        mean_move = sum(source_moves) / len(source_moves)
+        noise_scale = max(median(abs(value) for value in source_moves) * scale, atr_value * 0.28)
+        cumulative_noise = [0.0]
+        last_noise = 0.0
+        for item in samples:
+            sampled_move = (float(item["close"]) - float(item["open"]) - mean_move) * scale
+            last_noise = 0.22 * last_noise + 0.65 * sampled_move + rng.gauss(0, noise_scale) * 0.45
+            last_noise = max(-atr_value * 1.4, min(atr_value * 1.4, last_noise))
+            cumulative_noise.append(cumulative_noise[-1] + last_noise)
         previous_close = start_price
         for index, source_bar in enumerate(samples):
             open_price = previous_close
-            if index in pullbacks:
-                move = -travel_sign * pullback_total * weights[index] / pullback_weight
+            progress = (index + 1) / approach_bars
+            baseline = start_price + (approach_end - start_price) * progress
+            noise = cumulative_noise[index + 1] - progress * cumulative_noise[-1]
+            gap = min(atr_value * 0.025, shape_atr * first_open_offset * 0.2)
+            if (start_price - entry) * side_sign > 0:
+                clearance = max((baseline - entry) * side_sign - gap, atr_value * 1e-6)
+                close = baseline + side_sign * clearance * math.tanh(noise * side_sign / clearance)
             else:
-                move = travel_sign * (distance + pullback_total) * weights[index] / trend_weight
-            close = previous_close + move
-            if index == approach_bars - 1:
-                close = approach_end
-            # Keep the approach on the near side of the trigger; the selected setup reaches it.
-            gap = max(atr_value * 0.06, entry * 0.00005)
+                close = max(start_price * 1e-6, baseline + noise)
+            source_high, source_low = float(source_bar["high"]), float(source_bar["low"])
+            source_open, source_close = float(source_bar["open"]), float(source_bar["close"])
+            high_wick = max(atr_value * rng.uniform(0.015, 0.065),
+                            (source_high - max(source_open, source_close)) * scale * rng.uniform(0.75, 1.25))
+            low_wick = max(atr_value * rng.uniform(0.015, 0.065),
+                           (min(source_open, source_close) - source_low) * scale * rng.uniform(0.75, 1.25))
+            high_wick = min(high_wick, atr_value * 1.3)
+            low_wick = min(low_wick, atr_value * 1.3)
             if side == "long" and start_price > entry:
-                close = max(entry + gap, close)
+                clearance = max(min(open_price, close) - entry - gap, 0.0)
+                low_wick = low_wick * clearance / max(low_wick + clearance, 1e-12)
             elif side == "short" and start_price < entry:
-                close = min(entry - gap, close)
-            wick_limit = max(atr_value * 0.18, abs(close - open_price) * 0.65)
-            high_wick = min(wick_limit, max(0.0, float(source_bar["high"]) - max(float(source_bar["open"]), float(source_bar["close"]))) * scale)
-            low_wick = min(wick_limit, max(0.0, min(float(source_bar["open"]), float(source_bar["close"])) - float(source_bar["low"])) * scale)
-            high = max(open_price, close) + max(high_wick, atr_value * 0.04)
-            low = min(open_price, close) - max(low_wick, atr_value * 0.04)
-            if side == "long" and start_price > entry:
-                low = max(low, entry + gap)
-            elif side == "short" and start_price < entry:
-                high = min(high, entry - gap)
+                clearance = max(entry - gap - max(open_price, close), 0.0)
+                high_wick = high_wick * clearance / max(high_wick + clearance, 1e-12)
+            high = max(open_price, close) + high_wick
+            low = max(min(open_price, close) - low_wick, start_price * 1e-9)
             bars.append({"time_ms": float((latest_time + step_seconds * (index + 1)) * 1000),
                          "open": open_price, "high": high, "low": low, "close": close})
             previous_close = close
+        if not setup_reached:
+            return {"label": f"{_REPLAY_SIGNAL_LABELS.get(pattern, pattern)} · 尚未到关键线", "bars": bars,
+                    "entry": entry, "target": target, "direction": side,
+                    "support": float(plan.support_price), "pressure": float(plan.pressure_price),
+                    "approach_bars": approach_bars, "setup_reached": False}
+        atr_value = shape_atr
         bullish = side == "long"
         direction_sign = 1.0 if bullish else -1.0
 

@@ -432,6 +432,47 @@ class AreaShapeDemoUiTests(QtWidgetTestCase):
         self.assertEqual([point[1] for point in ema_points], expected_ema)
         self.assertEqual([point[1] for point in sma_points], expected_sma)
 
+    def test_projection_varies_bodies_and_wicks_but_is_repeatable(self) -> None:
+        plan = self._create_demo_draft()
+        first = self.window._build_area_shape_projection(plan, "double_reversal_up", 24, "long")
+        repeated = self.window._build_area_shape_projection(plan, "double_reversal_up", 24, "long")
+        self.assertEqual(first, repeated)
+        approach = first["bars"][:first["approach_bars"]]
+        bodies = {round(abs(bar["close"] - bar["open"]), 6) for bar in approach}
+        upper_wicks = {round(bar["high"] - max(bar["open"], bar["close"]), 6) for bar in approach}
+        lower_wicks = {round(min(bar["open"], bar["close"]) - bar["low"], 6) for bar in approach}
+        self.assertGreater(len(bodies), len(approach) // 2)
+        self.assertGreater(len(upper_wicks), len(approach) // 2)
+        self.assertGreater(len(lower_wicks), len(approach) // 2)
+        self.assertTrue(any(bar["close"] > bar["open"] for bar in approach))
+        self.assertTrue(any(bar["close"] < bar["open"] for bar in approach))
+
+    def test_far_projection_extends_horizon_without_oversized_candles(self) -> None:
+        plan = self._create_demo_draft()
+        plan.pressure_price = Decimal("300")
+        projection = self.window._build_area_shape_projection(plan, "double_reversal_down", 4, "short")
+        bars = projection["bars"]
+        self.assertGreater(len(bars), 4)
+        self.assertLessEqual(len(bars), 98)
+        self.assertLessEqual(max(abs(bar["close"] - bar["open"]) for bar in bars), 30.0)
+        self.assertTrue(all(bar["high"] < 300.0 for bar in bars[:projection["approach_bars"]]))
+        self.assertGreaterEqual(max(bar["high"] for bar in bars[-2:]), 300.0)
+        previous_close = self.window._pending_payload.candles[-1]["close"]
+        for bar in bars:
+            self.assertAlmostEqual(bar["open"], previous_close)
+            previous_close = bar["close"]
+
+    def test_unreachable_projection_does_not_force_a_jump_to_the_setup(self) -> None:
+        plan = self._create_demo_draft()
+        plan.pressure_price = Decimal("5000")
+        projection = self.window._build_area_shape_projection(plan, "top_fractal", 12, "short")
+        self.assertFalse(projection["setup_reached"])
+        self.assertIn("尚未到关键线", projection["label"])
+        self.assertEqual(len(projection["bars"]), 96)
+        self.assertNotIn("stop", projection)
+        self.assertLess(max(bar["high"] for bar in projection["bars"]), 5000.0)
+        self.assertLessEqual(max(abs(bar["close"] - bar["open"]) for bar in projection["bars"]), 30.0)
+
     def test_future_projection_supports_short_and_places_shape_at_pressure_line(self) -> None:
         plan = self._create_demo_draft()
         projection = self.window._build_area_shape_projection(plan, "double_reversal_down", 12, "short")
