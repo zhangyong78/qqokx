@@ -10,7 +10,7 @@ import copy
 from bisect import bisect_right
 from dataclasses import dataclass, field, replace
 from datetime import datetime
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from typing import Any, Callable
 from uuid import uuid4
 
@@ -12398,7 +12398,11 @@ class KlineAnalysisWindow(QMainWindow):
     def _apply_area_shape_prices(self, plan: AreaShapePlan, support: Decimal, pressure: Decimal) -> None:
         if plan.status != "draft":
             raise ValueError("仅草稿计划可以手动调整支撑和压力价")
-        if support <= 0 or pressure <= support:
+        if (
+            not support.is_finite() or not pressure.is_finite()
+            or not math.isfinite(float(support)) or not math.isfinite(float(pressure))
+            or float(support) <= 0 or float(pressure) <= float(support)
+        ):
             raise ValueError("请输入有效价格，并确保下方支撑低于上方压力")
         if self._area_line_is_frozen(plan.support_line_id) or self._area_line_is_frozen(plan.pressure_line_id):
             raise ValueError("监控中的区域线与冻结参数不能修改")
@@ -12431,20 +12435,27 @@ class KlineAnalysisWindow(QMainWindow):
 
         plan.support_price = support
         plan.pressure_price = pressure
+        monitor_saved = False
         try:
             monitor = getattr(self, "_area_shape_monitor", None)
             if monitor is None:
                 raise ValueError("区域形态后台服务未连接")
             monitor.save_draft(plan)
-        except Exception:
+            monitor_saved = True
+            self._save_workspace_snapshot()
+        except Exception as exc:
             for record in lines:
                 if isinstance(record, dict) and str(record.get("id", "")) in previous_lines:
                     old_a, old_b = previous_lines[str(record["id"])]
                     record["price_a"], record["price_b"] = old_a, old_b
             plan.support_price, plan.pressure_price = previous_prices
+            if monitor_saved:
+                try:
+                    monitor.save_draft(plan)
+                except Exception as rollback_exc:
+                    raise RuntimeError(f"保存价位失败：{exc}；草稿回退失败，请核对计划价位：{rollback_exc}") from exc
             raise
 
-        self._save_workspace_snapshot()
         self._populate_line_table()
         if self._pending_payload is not None:
             self._render_to_chart(self._pending_payload)
@@ -12483,27 +12494,23 @@ class KlineAnalysisWindow(QMainWindow):
             try:
                 support = Decimal(support_edit.text().strip())
                 pressure = Decimal(pressure_edit.text().strip())
-                if not support.is_finite() or not pressure.is_finite() or support <= 0 or pressure <= support:
-                    raise ValueError("请输入有效价格，并确保下方支撑低于上方压力")
-            except Exception as exc:
-                QMessageBox.warning(dialog, "价格无效", str(exc) or "请输入有效数字。")
+            except InvalidOperation:
+                QMessageBox.warning(dialog, "价格无效", "请输入有效数字，例如 84000 或 84000.5。")
                 return
+            try:
+                self._apply_area_shape_prices(plan, support, pressure)
+            except Exception as exc:
+                QMessageBox.warning(dialog, "调整失败", str(exc))
+                return
+            self._set_area_shape_status("支撑和压力价已更新；图上射线与草稿计划已同步。")
             dialog.accept()
 
         buttons.accepted.connect(_accept_prices)
         buttons.rejected.connect(dialog.reject)
-        if dialog.exec() != int(QDialog.DialogCode.Accepted):
-            return
         try:
-            self._apply_area_shape_prices(
-                plan,
-                Decimal(support_edit.text().strip()),
-                Decimal(pressure_edit.text().strip()),
-            )
-        except Exception as exc:
-            QMessageBox.warning(self, "调整失败", str(exc))
-            return
-        self._set_area_shape_status("支撑和压力价已更新；图上射线与草稿计划已同步。")
+            dialog.exec()
+        finally:
+            dialog.deleteLater()
 
     def _area_pair_lines_exist(self, plan: AreaShapePlan | None = None) -> bool:
         target = plan or self._current_area_plan()
@@ -15708,6 +15715,8 @@ class KlineAnalysisWindow(QMainWindow):
             if line_drag_in_progress:
                 self._sync_area_shape_draft_lines()
                 self._refresh_area_shape_status()
+                if self._line_drag_state is not None and self._line_drag_state.get("area_price_error"):
+                    self._set_area_shape_status(str(self._line_drag_state["area_price_error"]))
             if self._pending_payload is not None:
                 self._render_to_chart(self._pending_payload)
         entry = self._workspace_entry()
@@ -15948,9 +15957,20 @@ class KlineAnalysisWindow(QMainWindow):
             anchor_candle_time=int(state.get("anchor_candle_time", candle_time) or candle_time),
             anchor_price=float(state.get("anchor_price", price) or price),
         )
-        lines[index] = updated
         line_id = str(updated.get("id", ""))
         plan = next((item for item in self._area_shape_plans() if line_id in {item.support_line_id, item.pressure_line_id} and item.status == "draft"), None)
+        if plan is not None:
+            candidates = {str(item.get("id", "")): item for item in lines if isinstance(item, dict)}
+            candidates[line_id] = updated
+            support = float(candidates.get(plan.support_line_id, {}).get("price_a", 0) or 0)
+            pressure = float(candidates.get(plan.pressure_line_id, {}).get("price_a", 0) or 0)
+            if not math.isfinite(support) or not math.isfinite(pressure) or support <= 0 or pressure <= support:
+                message = "支撑必须大于 0 且低于压力，已保留上一次有效价位。"
+                state["area_price_error"] = message
+                self._set_area_shape_status(message)
+                return False
+            state.pop("area_price_error", None)
+        lines[index] = updated
         if plan is not None and str(updated.get("kind", "")) == "ray":
             partner_id = plan.pressure_line_id if line_id == plan.support_line_id else plan.support_line_id
             for partner in lines:

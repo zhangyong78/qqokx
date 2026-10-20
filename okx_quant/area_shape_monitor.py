@@ -116,7 +116,14 @@ class AreaShapeMonitor(QObject):
             if plan.execution_enabled:
                 raise ValueError("area plan exchange execution is disabled")
             self._plans[plan.plan_id] = AreaShapePlan.from_dict(plan.to_dict())
-            self._persist_locked()
+            try:
+                self._persist_locked()
+            except Exception:
+                if existing is None:
+                    self._plans.pop(plan.plan_id, None)
+                else:
+                    self._plans[plan.plan_id] = existing
+                raise
 
     def start_plan(
         self, plan_id: str, *, last_closed_candle_ts: int, profile_name: str, environment: str,

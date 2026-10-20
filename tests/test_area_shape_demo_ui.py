@@ -4,6 +4,8 @@ import threading
 import time
 from dataclasses import replace
 from decimal import Decimal
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -11,7 +13,9 @@ from PySide6.QtCore import QObject, QPoint, Signal
 
 from okx_quant.area_shape_monitor import AreaShapeMonitor
 from okx_quant.area_shape_trade import AreaShapeConfig, AreaShapePlan
+from okx_quant.area_shape_store import load_area_shape_plans, save_area_shape_plans
 from okx_quant.models import Candle
+from okx_quant.persistence import load_kline_analysis_workspace_entries
 from roll_terminal_qt.kline_analysis_window import KlineAnalysisWindow, KlineChartPayload
 from tests.qt_test_case import QtWidgetTestCase
 
@@ -155,7 +159,10 @@ class AreaShapeDemoUiTests(QtWidgetTestCase):
             edits = dialog.findChildren(self._kline_module.QLineEdit)
             edits[0].setText("80000")
             edits[1].setText("84000")
-            return int(self._kline_module.QDialog.DialogCode.Accepted)
+            dialog.findChild(self._kline_module.QDialogButtonBox).button(
+                self._kline_module.QDialogButtonBox.StandardButton.Ok,
+            ).click()
+            return dialog.result()
 
         with patch.object(self._kline_module.QDialog, "exec", new=accept_dialog):
             self.window._edit_area_shape_prices()
@@ -164,6 +171,167 @@ class AreaShapeDemoUiTests(QtWidgetTestCase):
         self.assertEqual(saved_plan.support_price, Decimal("80000"))
         self.assertEqual(saved_plan.pressure_price, Decimal("84000"))
         self.assertIn("上方压力：84000", self.window._area_shape_lines.text())
+
+    def test_manual_area_price_rebuilds_real_chart_series(self) -> None:
+        plan = self._create_demo_draft()
+        self.window._render_to_chart = KlineAnalysisWindow._render_to_chart.__get__(self.window)
+        self.window._use_native_chart = True
+        self.window._native_chart, self.window._native_chart_view = self.window._create_native_chart_view(
+            title="测试区域线", allow_draw_clicks=False,
+        )
+        self.window._native_chart_view.setParent(self.window)
+
+        self.window._apply_area_shape_prices(plan, Decimal("90"), Decimal("110"))
+
+        chart_lines = {item["id"]: item for item in self.window._native_chart_view._workspace_lines}
+        self.assertEqual(chart_lines[plan.support_line_id]["price_a"], 90.0)
+        self.assertEqual(chart_lines[plan.pressure_line_id]["price_a"], 110.0)
+        records = self.window._workspace_entry(symbol=plan.symbol, period=plan.period)["lines"]
+        for line_id, price in ((plan.support_line_id, 90.0), (plan.pressure_line_id, 110.0)):
+            label = next(item["label"] for item in records if item["id"] == line_id)
+            series = next(item for item in self.window._native_chart.series() if item.name() == label)
+            self.assertTrue(series.points())
+            self.assertTrue(all(point.y() == price for point in series.points()))
+
+    def test_manual_price_cancel_keeps_plan_and_rays_unchanged(self) -> None:
+        plan = self._create_demo_draft()
+        before = self._kline_module.copy.deepcopy(self.window._workspace_entries)
+
+        def cancel_dialog(dialog) -> int:
+            dialog.findChildren(self._kline_module.QLineEdit)[0].setText("90")
+            buttons = dialog.findChild(self._kline_module.QDialogButtonBox)
+            buttons.button(self._kline_module.QDialogButtonBox.StandardButton.Cancel).click()
+            return dialog.result()
+
+        with patch.object(self._kline_module.QDialog, "exec", new=cancel_dialog):
+            self.window._edit_area_shape_prices()
+
+        self.assertEqual(self.window._workspace_entries, before)
+        self.assertEqual(self.paper_monitor.get_plan(plan.plan_id).support_price, plan.support_price)
+
+    def test_failed_draft_save_keeps_monitor_and_rays_at_old_prices(self) -> None:
+        plan = self._create_demo_draft()
+        before = self._kline_module.copy.deepcopy(self.window._workspace_entries)
+
+        with patch.object(self.paper_monitor, "_store_save", side_effect=OSError("disk full")):
+            with self.assertRaises(OSError):
+                self.window._apply_area_shape_prices(plan, Decimal("90"), Decimal("110"))
+
+        self.assertEqual(self.window._workspace_entries, before)
+        self.assertEqual(self.paper_monitor.get_plan(plan.plan_id).support_price, Decimal("95"))
+        self.assertEqual(self.paper_monitor.get_plan(plan.plan_id).pressure_price, Decimal("105"))
+
+    def test_failed_price_apply_keeps_dialog_open_for_retry(self) -> None:
+        plan = self._create_demo_draft()
+
+        def retry_dialog(dialog) -> int:
+            edits = dialog.findChildren(self._kline_module.QLineEdit)
+            edits[0].setText("90")
+            edits[1].setText("110")
+            apply_button = dialog.findChild(self._kline_module.QDialogButtonBox).button(
+                self._kline_module.QDialogButtonBox.StandardButton.Ok,
+            )
+            with patch.object(self.paper_monitor, "_store_save", side_effect=OSError("disk full")):
+                apply_button.click()
+            self.assertEqual(dialog.result(), int(self._kline_module.QDialog.DialogCode.Rejected))
+            self.assertEqual(edits[0].text(), "90")
+            self.assertEqual(self.paper_monitor.get_plan(plan.plan_id).support_price, Decimal("95"))
+            apply_button.click()
+            self.assertEqual(dialog.result(), int(self._kline_module.QDialog.DialogCode.Accepted))
+            return dialog.result()
+
+        with (
+            patch.object(self._kline_module.QDialog, "exec", new=retry_dialog),
+            patch.object(self._kline_module.QMessageBox, "warning"),
+        ):
+            self.window._edit_area_shape_prices()
+        self.assertEqual(self.paper_monitor.get_plan(plan.plan_id).support_price, Decimal("90"))
+
+    def test_failed_workspace_save_rolls_draft_prices_back(self) -> None:
+        plan = self._create_demo_draft()
+        before = self._kline_module.copy.deepcopy(self.window._workspace_entries)
+        with patch.object(self.window, "_save_workspace_snapshot", side_effect=OSError("disk full")):
+            with self.assertRaises(OSError):
+                self.window._apply_area_shape_prices(plan, Decimal("90"), Decimal("110"))
+        self.assertEqual(self.window._workspace_entries, before)
+        self.assertEqual(self.paper_monitor.get_plan(plan.plan_id).support_price, Decimal("95"))
+
+    def test_price_dialog_rejects_invalid_input_without_modifying_plan(self) -> None:
+        plan = self._create_demo_draft()
+        before = self._kline_module.copy.deepcopy(self.window._workspace_entries)
+
+        def invalid_dialog(dialog) -> int:
+            edits = dialog.findChildren(self._kline_module.QLineEdit)
+            button = dialog.findChild(self._kline_module.QDialogButtonBox).button(
+                self._kline_module.QDialogButtonBox.StandardButton.Ok,
+            )
+            for support, pressure in (("", "110"), ("abc", "110"), ("0", "110"), ("-1", "110"),
+                                      ("110", "110"), ("120", "110"), ("NaN", "110"),
+                                      ("90", "Infinity"), ("90", "1e999")):
+                with self.subTest(support=support, pressure=pressure):
+                    edits[0].setText(support)
+                    edits[1].setText(pressure)
+                    button.click()
+                    self.assertEqual(dialog.result(), int(self._kline_module.QDialog.DialogCode.Rejected))
+                    self.assertEqual(self.window._workspace_entries, before)
+                    self.assertEqual(self.paper_monitor.get_plan(plan.plan_id).support_price, Decimal("95"))
+            dialog.reject()
+            return dialog.result()
+
+        with (
+            patch.object(self._kline_module.QDialog, "exec", new=invalid_dialog),
+            patch.object(self._kline_module.QMessageBox, "warning"),
+        ):
+            self.window._edit_area_shape_prices()
+
+    def test_price_dialog_cannot_overwrite_plan_activated_while_open(self) -> None:
+        plan = self._create_demo_draft()
+        before = self._kline_module.copy.deepcopy(self.window._workspace_entries)
+
+        def stale_dialog(dialog) -> int:
+            edits = dialog.findChildren(self._kline_module.QLineEdit)
+            edits[0].setText("90")
+            edits[1].setText("110")
+            self.paper_monitor.start_plan(
+                plan.plan_id, last_closed_candle_ts=20 * HOUR,
+                profile_name=plan.profile_name, environment=plan.environment,
+            )
+            dialog.findChild(self._kline_module.QDialogButtonBox).button(
+                self._kline_module.QDialogButtonBox.StandardButton.Ok,
+            ).click()
+            self.assertEqual(dialog.result(), int(self._kline_module.QDialog.DialogCode.Rejected))
+            dialog.reject()
+            return dialog.result()
+
+        with (
+            patch.object(self._kline_module.QDialog, "exec", new=stale_dialog),
+            patch.object(self._kline_module.QMessageBox, "warning"),
+        ):
+            self.window._edit_area_shape_prices()
+        self.assertEqual(self.window._workspace_entries, before)
+        self.assertEqual(self.paper_monitor.get_plan(plan.plan_id).status, "monitoring")
+        self.assertFalse(self.window._area_shape_price_button.isEnabled())
+
+    def test_manual_prices_survive_workspace_and_plan_file_reload(self) -> None:
+        plan = self._create_demo_draft()
+        with TemporaryDirectory() as directory:
+            workspace_path = Path(directory) / "workspace.json"
+            plan_path = Path(directory) / "plans.json"
+            self.paper_monitor._store_save = lambda records: save_area_shape_plans(records, plan_path)
+            with patch.object(
+                self.window, "_save_workspace_snapshot",
+                side_effect=lambda: self._original_save(self.window._workspace_entries, workspace_path),
+            ):
+                self.window._apply_area_shape_prices(plan, Decimal("80970.2"), Decimal("84000"))
+            restored_monitor = AreaShapeMonitor(
+                store_load=lambda: load_area_shape_plans(plan_path), store_save=lambda _records: None,
+            )
+            self.window._workspace_entries = load_kline_analysis_workspace_entries(workspace_path)
+            restored = restored_monitor.get_plan(plan.plan_id)
+            self.assertEqual(restored.support_price, Decimal("80970.2"))
+            self.assertEqual(restored.pressure_price, Decimal("84000"))
+            self.assertEqual(self.window._area_line_price(plan.support_line_id), restored.support_price)
+            self.assertEqual(self.window._area_line_price(plan.pressure_line_id), restored.pressure_price)
 
     def test_demo_start_is_one_action_after_unlock_and_paper_baseline(self) -> None:
         self._create_demo_draft()
@@ -226,6 +394,17 @@ class AreaShapeDemoUiTests(QtWidgetTestCase):
         self.assertIn("下方支撑：90", self.window._area_shape_lines.text())
         self.assertIn("入场参考：下方支撑 90", self.window._area_shape_plan_details.text())
         self.assertEqual(self.paper_monitor.plans()[0].support_price, Decimal("90"))
+
+    def test_dragging_support_above_pressure_is_rejected_before_chart_changes(self) -> None:
+        plan = self._create_demo_draft()
+        lines = self.window._workspace_entry(symbol=plan.symbol, period=plan.period)["lines"]
+        support_index = next(index for index, item in enumerate(lines) if item["id"] == plan.support_line_id)
+        self.window._line_drag_state = {"index": support_index, "drag_mode": "move"}
+
+        self.assertFalse(self.window._apply_line_drag_update(candle_time=3 * 3600, price=110.0))
+
+        self.assertEqual(self.window._area_line_price(plan.support_line_id), Decimal("95"))
+        self.assertEqual(self.paper_monitor.get_plan(plan.plan_id).support_price, Decimal("95"))
 
     def test_future_projection_builds_selected_pattern_over_requested_horizon(self) -> None:
         plan = self._create_demo_draft()
