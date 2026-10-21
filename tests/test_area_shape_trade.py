@@ -297,7 +297,7 @@ def test_paper_exit_target_includes_fees_and_dynamic_remote_cap(template, target
 def test_next_open_fill_checks_fill_bar_stop_conservatively() -> None:
     plan = _plan()
     plan.observe(_history()[:-1])
-    history = _history(next_open_low="91")
+    history = _history(next_open_low="90")
     plan.observe(history)
     assert plan.status == "paper_closed"
     assert plan.paper_position is None

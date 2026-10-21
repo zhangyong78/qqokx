@@ -142,10 +142,14 @@ class AreaShapeExecutionCoreTests(unittest.TestCase):
     def test_execution_store_version_and_secret_filter(self):
         with tempfile.TemporaryDirectory() as folder:
             path = Path(folder) / "state.json"
-            save_area_shape_execution_records([{"session_id": "s", "mode": "bad", "api_key": "secret"}], path)
+            save_area_shape_execution_records([{"session_id": "s", "environment": "demo",
+                                                "mode": "demo_exchange", "api_key": "secret"}], path)
             stored = path.read_text(encoding="utf-8")
             self.assertNotIn("secret", stored)
             self.assertEqual(load_area_shape_execution_records(path)[0]["mode"], "demo_exchange")
+            with self.assertRaises(ValueError):
+                save_area_shape_execution_records([{"session_id": "s", "environment": "live",
+                                                    "mode": "demo_exchange"}], path)
             path.write_text('{"version":99,"sessions":[]}', encoding="utf-8")
             with self.assertRaises(ValueError):
                 load_area_shape_execution_records(path)

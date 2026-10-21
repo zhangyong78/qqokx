@@ -223,9 +223,19 @@ class KlineRRTradeTest(TestCase):
             ),
             filled_size=Decimal("3"),
             remaining_size=Decimal("7"),
+            entry_filled_at=datetime(2026, 10, 21, 12, 34, 56, 789000, tzinfo=timezone.utc),
+            favorable_price=Decimal("61234.5"),
+            history_hour_cursor_ts=1792580400000,
+            history_minute_cursor_ts=1792586340000,
+            history_scan_bucket=29876437,
         )
 
         restored = RRTradeLedgerEntry.from_dict(entry.to_dict())
 
         self.assertEqual(restored.filled_size, Decimal("3"))
         self.assertEqual(restored.remaining_size, Decimal("7"))
+        self.assertEqual(restored.entry_filled_at, datetime(2026, 10, 21, 12, 34, 56, 789000, tzinfo=timezone.utc))
+        self.assertEqual(restored.favorable_price, Decimal("61234.5"))
+        self.assertEqual(restored.history_hour_cursor_ts, 1792580400000)
+        self.assertEqual(restored.history_minute_cursor_ts, 1792586340000)
+        self.assertEqual(restored.history_scan_bucket, 29876437)

@@ -46,7 +46,7 @@ class KlineLoaderLifecycleTests(QtWidgetTestCase):
                 window._load_secondary_data(symbol='BTC-USDT-SWAP')
             self.assertIs(window._secondary_volatility_loader, loader)
             self.assertTrue(window._has_active_loaders())
-            self.assertTrue(window._pending_reload_after_load)
+            self.assertTrue(window._pending_secondary_reload)
         finally:
             window._secondary_volatility_loader = None
             window.close()

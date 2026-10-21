@@ -790,7 +790,16 @@ class AccountPositionsHomeQtHelpersTest(TestCase):
     def test_legacy_option_tools_launch_in_external_process(self, popen: MagicMock) -> None:
         host = LegacyOptionToolsHost(parent=SimpleNamespace(), runtime_provider=lambda: None)
 
-        host.open_option_roll(position=object(), instrument=object(), ticker=object(), api_name="moni")
+        host.open_option_roll(
+            position=SimpleNamespace(
+                inst_id="BTC-USD-260731-60000-P",
+                pos_side="long",
+                position=Decimal("1"),
+            ),
+            instrument=object(),
+            ticker=object(),
+            api_name="moni",
+        )
 
         popen.assert_called_once()
     def test_sync_order_watchlist_clears_symbol_restriction_for_current_orders(self) -> None:
@@ -1190,12 +1199,19 @@ class AccountPositionsHomeQtHelpersTest(TestCase):
 
     @patch("roll_terminal_qt.account_positions_home._reconcile_current_position_note_records", return_value=True)
     def test_apply_positions_payload_saves_changed_note_state(self, reconcile_notes: MagicMock) -> None:
-        position = MagicMock()
+        position = SimpleNamespace(
+            inst_id="BTC-USDT-SWAP",
+            pos_side="net",
+            mgn_mode="cross",
+            position=Decimal("1"),
+            avail_position=Decimal("1"),
+        )
         app = SimpleNamespace(
             _raw_positions=[],
             _position_instruments={},
             _position_tickers={},
             _upl_usdt_prices={},
+            _unchecked_position_row_keys=set(),
             _last_profile_name="moni",
             _current_notes={},
             _note_environment=lambda: "demo",
@@ -1261,30 +1277,27 @@ class AccountPositionsHomeQtHelpersTest(TestCase):
             _order_history_feed=running_thread,
             _stop_order_history_thread=MagicMock(),
             _clear_order_history_thread=MagicMock(),
+            _request_history_sync=MagicMock(),
             _private_thread_generation=1,
         )
 
         AccountPositionsHomeWidget._start_order_history_refresh(app, force_restart=True)
 
+        app._request_history_sync.assert_called_once_with(sources=("orders",), deep=False)
         app._stop_order_history_thread.assert_not_called()
         thread_type.assert_not_called()
 
     @patch("roll_terminal_qt.account_positions_home.OrderHistoryFeedThread")
     def test_start_order_history_refresh_uses_shared_store(self, thread_type: MagicMock) -> None:
-        store = MagicMock()
         runtime = SimpleNamespace(environment="demo")
         app = SimpleNamespace(
             _runtime=runtime,
-            _last_profile_name="moni",
-            _shared_order_store=store,
-            _order_history_feed=None,
-            _private_thread_generation=1,
-            _clear_order_history_thread=MagicMock(),
+            _request_history_sync=MagicMock(),
         )
 
         AccountPositionsHomeWidget._start_order_history_refresh(app)
 
-        store.request_refresh.assert_called_once_with(runtime=runtime, profile_name="moni")
+        app._request_history_sync.assert_called_once_with(sources=("orders",), deep=False)
         thread_type.assert_not_called()
 
     @patch("roll_terminal_qt.account_positions_home._validate_protection_live_price_availability")
@@ -1317,6 +1330,7 @@ class AccountPositionsHomeQtHelpersTest(TestCase):
         session = ProtectionSessionSnapshot(
             session_id="P01",
             api_name="QQzhangyong",
+            environment="demo",
             option_inst_id="BTC-USD-260717-57000-P",
             trigger_inst_id="BTC-USDT",
             trigger_label="BTC-USDT 最新价",
@@ -1348,11 +1362,12 @@ class AccountPositionsHomeQtHelpersTest(TestCase):
 
         PositionProtectionDialog._refresh_sessions(dialog)
 
-        values = [table.items.get((0, column), SimpleNamespace(text=lambda: "")).text() for column in range(13)]
+        values = [table.items.get((0, column), SimpleNamespace(text=lambda: "")).text() for column in range(14)]
         self.assertEqual(
             values,
             [
                 "QQzhangyong",
+                "demo",
                 "BTC-USD-260717-57000-P",
                 "BTC-USDT 最新价",
                 "BTC-USDT",
@@ -1518,6 +1533,7 @@ class AccountPositionsHomeQtHelpersTest(TestCase):
         session = ProtectionSessionSnapshot(
             session_id="P01",
             api_name="QQzhangyong",
+            environment="demo",
             option_inst_id="BTC-USD-260717-57000-P",
             trigger_inst_id="BTC-USDT",
             trigger_label="BTC-USDT 最新价",
@@ -1554,15 +1570,16 @@ class AccountPositionsHomeQtHelpersTest(TestCase):
     def test_configure_sessions_table_columns_applies_default_widths_for_long_fields(self) -> None:
         table = _ColumnConfigTableStub()
 
-        PositionProtectionDialog._configure_sessions_table_columns(SimpleNamespace(_sessions_table=table), 13)
+        PositionProtectionDialog._configure_sessions_table_columns(SimpleNamespace(_sessions_table=table), 14)
 
         self.assertFalse(table.horizontalHeader().stretch_last_section)
         self.assertEqual(table.column_widths[0], 120)
-        self.assertEqual(table.column_widths[1], 210)
-        self.assertEqual(table.column_widths[2], 170)
-        self.assertEqual(table.column_widths[3], 120)
-        self.assertEqual(table.column_widths[9], 230)
-        self.assertEqual(table.column_widths[12], 96)
+        self.assertEqual(table.column_widths[1], 90)
+        self.assertEqual(table.column_widths[2], 210)
+        self.assertEqual(table.column_widths[3], 170)
+        self.assertEqual(table.column_widths[4], 120)
+        self.assertEqual(table.column_widths[10], 230)
+        self.assertEqual(table.column_widths[13], 96)
 
     def test_parse_positive_decimal_returns_decimal_without_widget_context(self) -> None:
         value = AccountPositionsHomeWidget._parse_positive_decimal("1.25", "平仓币数")

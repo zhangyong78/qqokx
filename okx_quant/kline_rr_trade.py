@@ -212,6 +212,11 @@ class RRTradeLedgerEntry:
     events: tuple[RRTradeEvent, ...] = ()
     created_at: datetime | None = None
     updated_at: datetime | None = None
+    entry_filled_at: datetime | None = None
+    favorable_price: Decimal | None = None
+    history_hour_cursor_ts: int | None = None
+    history_minute_cursor_ts: int | None = None
+    history_scan_bucket: int | None = None
 
     def to_dict(self) -> dict[str, object]:
         created_at = self.created_at or self.plan.created_at
@@ -228,6 +233,11 @@ class RRTradeLedgerEntry:
             "events": [item.to_dict() for item in self.events],
             "created_at": _datetime_to_text(created_at),
             "updated_at": _datetime_to_text(updated_at),
+            "entry_filled_at": _datetime_to_text(self.entry_filled_at) if self.entry_filled_at else None,
+            "favorable_price": _decimal_to_text(self.favorable_price),
+            "history_hour_cursor_ts": self.history_hour_cursor_ts,
+            "history_minute_cursor_ts": self.history_minute_cursor_ts,
+            "history_scan_bucket": self.history_scan_bucket,
         }
 
     @classmethod
@@ -249,6 +259,11 @@ class RRTradeLedgerEntry:
             ),
             created_at=_parse_datetime(payload.get("created_at")),
             updated_at=_parse_datetime(payload.get("updated_at")),
+            entry_filled_at=_parse_datetime(payload.get("entry_filled_at")),
+            favorable_price=_parse_decimal(payload.get("favorable_price")),
+            history_hour_cursor_ts=_parse_int(payload.get("history_hour_cursor_ts")),
+            history_minute_cursor_ts=_parse_int(payload.get("history_minute_cursor_ts")),
+            history_scan_bucket=_parse_int(payload.get("history_scan_bucket")),
         )
 
 
@@ -492,6 +507,15 @@ def _parse_decimal(value: object) -> Decimal | None:
         return None
 
 
+def _parse_int(value: object) -> int | None:
+    if value in (None, ""):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def _decimal_to_text(value: Decimal | None) -> str | None:
     if value is None:
         return None
@@ -514,7 +538,7 @@ def _parse_datetime(value: object) -> datetime | None:
 
 def _datetime_to_text(value: datetime) -> str:
     normalized = value.astimezone(timezone.utc)
-    return normalized.isoformat(timespec="seconds").replace("+00:00", "Z")
+    return normalized.isoformat(timespec="microseconds").replace("+00:00", "Z")
 
 
 def _normalize_optional_text(value: object) -> str | None:

@@ -62,6 +62,8 @@ def preferred_profile_name(
             return target
     if "159" in normalized:
         return "159"
+    if "moni" in normalized:
+        return "moni"
     selected_target = str(selected or "").strip()
     if selected_target in normalized:
         return selected_target

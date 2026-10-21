@@ -1,16 +1,20 @@
 ﻿from __future__ import annotations
 
 import threading
+import hashlib
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from decimal import Decimal
+from pathlib import Path
 from typing import Callable, Literal
+from uuid import uuid4
 
 from okx_quant.models import Credentials, StrategyConfig
 from okx_quant.client_order_id import with_custom_order_id_prefix
 from okx_quant.notifications import EmailNotifier
 from okx_quant.okx_client import OkxApiError, OkxOrderResult, OkxOrderStatus, OkxPosition, OkxRestClient, OkxTicker
 from okx_quant.pricing import format_decimal, snap_to_increment
+from okx_quant.persistence import load_option_protection_tasks_snapshot, save_option_protection_tasks_snapshot
 
 
 Logger = Callable[[str], None]
@@ -133,6 +137,8 @@ class OptionProtectionConfig:
     stop_loss_slippage: Decimal
     poll_seconds: float = 10.0
     trigger_label: str = ""
+    position_id: str | None = None
+    position_created_at: str | None = None
 
 
 @dataclass(frozen=True)
@@ -157,6 +163,7 @@ class ProtectionSessionSnapshot:
     status: str
     started_at: datetime
     last_message: str
+    environment: str = ""
 
 
 @dataclass(frozen=True)
@@ -224,6 +231,7 @@ class _ProtectionWorker:
     close_target_size: Decimal | None = None
     close_filled_size: Decimal = Decimal("0")
     close_recorded_order_keys: set[str] = field(default_factory=set)
+    auto_resume: bool = True
 
 
 class PositionProtectionManager:
@@ -237,6 +245,7 @@ class PositionProtectionManager:
         transient_alert_interval_seconds: float = 180.0,
         transient_status_interval_seconds: float = 15.0,
         monitor_heartbeat_interval_seconds: float = MONITOR_HEARTBEAT_INTERVAL_SECONDS,
+        state_path: Path | None = None,
     ) -> None:
         self._client = client
         self._logger = logger
@@ -245,6 +254,8 @@ class PositionProtectionManager:
         self._lock = threading.Lock()
         self._counter = 0
         self._workers: dict[str, _ProtectionWorker] = {}
+        self._state_path = state_path
+        self._restore_in_progress: set[tuple[str, str]] = set()
         self._transient_alert_interval_seconds = max(transient_alert_interval_seconds, 0.0)
         self._transient_status_interval_seconds = max(transient_status_interval_seconds, 0.0)
         self._monitor_heartbeat_interval_seconds = max(monitor_heartbeat_interval_seconds, 0.0)
@@ -596,7 +607,11 @@ class PositionProtectionManager:
             raise RuntimeError(f"{worker.protection.option_inst_id} 保护平仓后仍有剩余仓位 {format_decimal(remaining)}")
 
     def _find_matching_position(self, worker: _ProtectionWorker) -> OkxPosition | None:
-        positions = self._client.get_positions(worker.credentials, environment=worker.config.environment)
+        positions = self._client.get_positions(
+            worker.credentials,
+            environment=worker.config.environment,
+            prefer_cache=False,
+        )
         matches = [
             item
             for item in positions
@@ -606,6 +621,25 @@ class PositionProtectionManager:
             side_matches = [item for item in matches if item.pos_side == worker.protection.pos_side]
             if side_matches:
                 matches = side_matches
+        if worker.protection.position_id or worker.protection.position_created_at:
+            identity_matches = [
+                item
+                for item in matches
+                if (
+                    not worker.protection.position_id
+                    or str((item.raw or {}).get("posId") or "") == worker.protection.position_id
+                )
+                and (
+                    not worker.protection.position_created_at
+                    or str((item.raw or {}).get("cTime") or "") == worker.protection.position_created_at
+                )
+            ]
+            if matches and not identity_matches:
+                raise RuntimeError(
+                    f"{worker.protection.option_inst_id} 当前同方向仓位与保护任务绑定的原始仓位身份不一致，"
+                    "已停止自动平仓，请人工检查。"
+                )
+            matches = identity_matches
         if not matches:
             return None
         matches.sort(key=lambda item: abs(item.position), reverse=True)
@@ -631,6 +665,7 @@ class PositionProtectionManager:
         worker.active_close_cl_ord_id = None
         worker.active_close_ord_id = None
         worker.active_close_submitted_at = None
+        self._persist_worker(worker)
 
     def _reconcile_active_close_order(
         self,
@@ -1371,6 +1406,7 @@ def _pp_list_sessions(self: PositionProtectionManager) -> list[ProtectionSession
         ProtectionSessionSnapshot(
             session_id=item.session_id,
             api_name=item.api_name or item.credentials.profile_name or "",
+            environment=item.config.environment,
             option_inst_id=item.protection.option_inst_id,
             trigger_inst_id=item.protection.trigger_inst_id,
             trigger_label=item.protection.trigger_label or item.protection.trigger_inst_id,
@@ -1400,19 +1436,30 @@ def _pp_start(
     config: StrategyConfig,
     protection: OptionProtectionConfig,
 ) -> str:
+    api_name = credentials.profile_name.strip()
+    if self._state_path is not None and not api_name:
+        raise RuntimeError("期权保护任务需要命名的 API Profile，才能在重启后安全解析凭证。")
     with self._lock:
-        for existing in self._workers.values():
-            existing_status = _repair_mojibake_text(existing.status)
-            if existing.protection.option_inst_id == protection.option_inst_id and existing_status in {
+        active_keys = [
+            (existing.credentials.profile_name or existing.credentials.api_key, existing.protection)
+            for existing in self._workers.values()
+            if _repair_mojibake_text(existing.status) in {
                 "准备中",
                 "运行中",
                 "平仓重试中",
                 "持续未成交待人工",
-            }:
-                raise RuntimeError(f"{protection.option_inst_id} 已经存在一个运行中的保护任务。")
+                "恢复待人工核对",
+            }
+            and existing.config.environment == config.environment
+        ]
+        if self._protection_key_conflicts(api_name, protection, active_keys):
+            raise RuntimeError(
+                f"{api_name} / {protection.option_inst_id} / {protection.pos_side or '-'} "
+                "已经有一个运行中的保护任务。"
+            )
 
         self._counter += 1
-        session_id = f"P{self._counter:02d}"
+        session_id = f"P-{uuid4().hex[:10].upper()}"
         worker = _ProtectionWorker(
             session_id=session_id,
             credentials=credentials,
@@ -1430,6 +1477,7 @@ def _pp_start(
         self._workers[session_id] = worker
 
     self._set_status(worker, "准备中", "期权持仓保护任务已创建。")
+    self._persist_worker(worker)
     assert worker.thread is not None
     worker.thread.start()
     return session_id
@@ -1440,6 +1488,8 @@ def _pp_stop(self: PositionProtectionManager, session_id: str) -> None:
         worker = self._workers.get(session_id)
     if worker is None:
         raise RuntimeError("未找到对应的保护任务。")
+    worker.auto_resume = False
+    self._persist_worker(worker)
     worker.stop_event.set()
     self._set_status(worker, "停止中", "已请求停止保护任务。")
 
@@ -1448,6 +1498,8 @@ def _pp_stop_all(self: PositionProtectionManager) -> None:
     with self._lock:
         workers = list(self._workers.values())
     for worker in workers:
+        if worker.thread is None and worker.status == "恢复待人工核对":
+            continue
         worker.stop_event.set()
         self._set_status(worker, "停止中", "主程序关闭，正在停止保护任务。")
 
@@ -1506,6 +1558,7 @@ def _pp_run_worker(self: PositionProtectionManager, worker: _ProtectionWorker) -
                 self._reset_transient_state(worker)
                 worker.close_retry_count = 0
                 worker.last_close_retry_notify_key = None
+                worker.auto_resume = False
                 self._set_status(worker, "已完成", f"{worker.pending_close_reason}已完成平仓流程。")
                 return
 
@@ -1568,6 +1621,7 @@ def _pp_run_worker(self: PositionProtectionManager, worker: _ProtectionWorker) -
             worker.stop_event.wait(max(protection.poll_seconds, 0.2))
             continue
         except ProtectionPriceGuardError as exc:
+            worker.auto_resume = False
             self._set_status(worker, "异常", f"价格保护拦截：{exc}")
             self._notify(
                 subject=f"[QQOKX] 持仓保护价格拦截 | {protection.option_inst_id}",
@@ -1588,6 +1642,7 @@ def _pp_run_worker(self: PositionProtectionManager, worker: _ProtectionWorker) -
                 self._handle_transient_error(worker, exc)
                 worker.stop_event.wait(max(protection.poll_seconds, 0.05))
                 continue
+            worker.auto_resume = False
             self._set_status(worker, "异常", f"保护任务异常：{exc}")
             self._notify(
                 subject=f"[QQOKX] 持仓保护异常 | {protection.option_inst_id}",
@@ -1962,6 +2017,298 @@ def _pp_handle_transient_error(self: PositionProtectionManager, worker: _Protect
 def _pp_notify(self: PositionProtectionManager, *, subject: str, body: str) -> None:
     if self._notifier is not None and self._notifier.enabled:
         self._notifier.notify_async(_repair_mojibake_text(subject), _repair_mojibake_text(body))
+
+
+_OPTION_PROTECTION_STORE_LOCK = threading.Lock()
+
+
+def _pp_credentials_fingerprint(credentials: Credentials) -> str:
+    raw = "\0".join((credentials.api_key, credentials.secret_key, credentials.passphrase)).encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()
+
+
+def _pp_decimal(value: object) -> Decimal | None:
+    if value in (None, ""):
+        return None
+
+
+def _pp_int(value: object, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError, OverflowError):
+        return default
+    try:
+        return Decimal(str(value))
+    except Exception:
+        return None
+
+
+def _pp_protection_to_snapshot(protection: OptionProtectionConfig) -> dict[str, object]:
+    return {
+        "option_inst_id": protection.option_inst_id,
+        "trigger_inst_id": protection.trigger_inst_id,
+        "trigger_price_type": protection.trigger_price_type,
+        "direction": protection.direction,
+        "pos_side": protection.pos_side,
+        "take_profit_trigger": str(protection.take_profit_trigger) if protection.take_profit_trigger is not None else None,
+        "stop_loss_trigger": str(protection.stop_loss_trigger) if protection.stop_loss_trigger is not None else None,
+        "take_profit_order_mode": protection.take_profit_order_mode,
+        "take_profit_order_price": str(protection.take_profit_order_price) if protection.take_profit_order_price is not None else None,
+        "take_profit_slippage": str(protection.take_profit_slippage),
+        "stop_loss_order_mode": protection.stop_loss_order_mode,
+        "stop_loss_order_price": str(protection.stop_loss_order_price) if protection.stop_loss_order_price is not None else None,
+        "stop_loss_slippage": str(protection.stop_loss_slippage),
+        "poll_seconds": protection.poll_seconds,
+        "trigger_label": protection.trigger_label,
+        "position_id": protection.position_id,
+        "position_created_at": protection.position_created_at,
+    }
+
+
+def _pp_protection_from_snapshot(payload: object) -> OptionProtectionConfig | None:
+    if not isinstance(payload, dict):
+        return None
+    try:
+        trigger_type = str(payload.get("trigger_price_type") or "").strip().lower()
+        direction = str(payload.get("direction") or "").strip().lower()
+        tp_mode = str(payload.get("take_profit_order_mode") or "").strip()
+        sl_mode = str(payload.get("stop_loss_order_mode") or "").strip()
+        if trigger_type not in {"last", "mark"} or direction not in {"long", "short"}:
+            return None
+        if tp_mode not in {"fixed_price", "mark_with_slippage"} or sl_mode not in {"fixed_price", "mark_with_slippage"}:
+            return None
+        return OptionProtectionConfig(
+            option_inst_id=str(payload.get("option_inst_id") or "").strip().upper(),
+            trigger_inst_id=str(payload.get("trigger_inst_id") or "").strip().upper(),
+            trigger_price_type=trigger_type,  # type: ignore[arg-type]
+            direction=direction,  # type: ignore[arg-type]
+            pos_side=str(payload.get("pos_side") or "").strip().lower() or None,  # type: ignore[arg-type]
+            take_profit_trigger=_pp_decimal(payload.get("take_profit_trigger")),
+            stop_loss_trigger=_pp_decimal(payload.get("stop_loss_trigger")),
+            take_profit_order_mode=tp_mode,  # type: ignore[arg-type]
+            take_profit_order_price=_pp_decimal(payload.get("take_profit_order_price")),
+            take_profit_slippage=_pp_decimal(payload.get("take_profit_slippage")) or Decimal("0"),
+            stop_loss_order_mode=sl_mode,  # type: ignore[arg-type]
+            stop_loss_order_price=_pp_decimal(payload.get("stop_loss_order_price")),
+            stop_loss_slippage=_pp_decimal(payload.get("stop_loss_slippage")) or Decimal("0"),
+            poll_seconds=max(float(payload.get("poll_seconds") or 10), 0.2),
+            trigger_label=str(payload.get("trigger_label") or ""),
+            position_id=str(payload.get("position_id") or "").strip() or None,
+            position_created_at=str(payload.get("position_created_at") or "").strip() or None,
+        )
+    except (TypeError, ValueError):
+        return None
+
+
+def _pp_parse_snapshot_datetime(value: object) -> datetime | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed.astimezone(timezone.utc) if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
+def _pp_worker_to_snapshot(worker: _ProtectionWorker) -> dict[str, object]:
+    return {
+        "schema_version": 1,
+        "session_id": worker.session_id,
+        "profile_name": worker.api_name.strip(),
+        "credential_fingerprint": _pp_credentials_fingerprint(worker.credentials),
+        "environment": worker.config.environment,
+        "config": {
+            "trade_mode": worker.config.trade_mode,
+            "position_mode": worker.config.position_mode,
+            "order_size": str(worker.config.order_size),
+        },
+        "protection": _pp_protection_to_snapshot(worker.protection),
+        "started_at": worker.started_at.isoformat(),
+        "status": worker.status,
+        "last_message": worker.last_message,
+        "auto_resume": worker.auto_resume,
+        "pending_close_reason": worker.pending_close_reason,
+        "close_retry_count": worker.close_retry_count,
+        "close_order_sequence": worker.close_order_sequence,
+        "active_close_cl_ord_id": worker.active_close_cl_ord_id,
+        "active_close_ord_id": worker.active_close_ord_id,
+        "active_close_submitted_at": worker.active_close_submitted_at.isoformat() if worker.active_close_submitted_at else None,
+        "close_target_size": str(worker.close_target_size) if worker.close_target_size is not None else None,
+        "close_filled_size": str(worker.close_filled_size),
+        "close_recorded_order_keys": sorted(worker.close_recorded_order_keys),
+        "last_trigger_price": str(worker.last_trigger_price) if worker.last_trigger_price is not None else None,
+        "trigger_notification_sent": worker.trigger_notification_sent,
+    }
+
+
+def _pp_persist_worker(self: PositionProtectionManager, worker: _ProtectionWorker) -> None:
+    if self._state_path is None or not worker.api_name.strip():
+        return
+    record = _pp_worker_to_snapshot(worker)
+    with _OPTION_PROTECTION_STORE_LOCK:
+        snapshot = load_option_protection_tasks_snapshot(self._state_path)
+        items = [item for item in snapshot.get("items", []) if isinstance(item, dict)]
+        for index, item in enumerate(items):
+            if str(item.get("session_id") or "") == worker.session_id:
+                items[index] = record
+                break
+        else:
+            items.append(record)
+        save_option_protection_tasks_snapshot(items, self._state_path)
+
+
+def _pp_build_snapshot_config(payload: object, protection: OptionProtectionConfig, environment: str) -> StrategyConfig | None:
+    if not isinstance(payload, dict):
+        return None
+    trade_mode = str(payload.get("trade_mode") or "cross").strip().lower()
+    position_mode = str(payload.get("position_mode") or "net").strip().lower()
+    order_size = _pp_decimal(payload.get("order_size")) or Decimal("0")
+    if environment not in {"demo", "live"} or trade_mode not in {"cross", "isolated"}:
+        return None
+    if position_mode not in {"net", "long_short"}:
+        return None
+    return StrategyConfig(
+        inst_id=protection.trigger_inst_id,
+        bar="1H",
+        ema_period=1,
+        atr_period=1,
+        atr_stop_multiplier=Decimal("1"),
+        atr_take_multiplier=Decimal("1"),
+        order_size=order_size,
+        trade_mode=trade_mode,  # type: ignore[arg-type]
+        signal_mode="long_only" if protection.direction == "long" else "short_only",
+        position_mode=position_mode,  # type: ignore[arg-type]
+        environment=environment,  # type: ignore[arg-type]
+        tp_sl_trigger_type=protection.trigger_price_type,
+        strategy_id="manual_option_protection",
+        poll_seconds=protection.poll_seconds,
+        trade_inst_id=protection.option_inst_id,
+        tp_sl_mode="local_trade",
+        local_tp_sl_inst_id=protection.trigger_inst_id,
+        entry_side_mode="follow_signal",
+        run_mode="trade",
+    )
+
+
+def _pp_restore_for_profile(
+    self: PositionProtectionManager,
+    credentials: Credentials,
+    *,
+    environment: str,
+) -> threading.Thread | None:
+    if self._state_path is None or not credentials.profile_name.strip():
+        return None
+    normalized_environment = environment.strip().lower()
+    key = (credentials.profile_name.strip(), normalized_environment)
+    with self._lock:
+        if key in self._restore_in_progress:
+            return None
+        self._restore_in_progress.add(key)
+
+    def restore() -> None:
+        try:
+            snapshot = load_option_protection_tasks_snapshot(self._state_path)
+            items = snapshot.get("items", [])
+            for raw in items if isinstance(items, list) else []:
+                if not isinstance(raw, dict):
+                    continue
+                if _pp_int(raw.get("schema_version"), 1) != 1:
+                    continue
+                if (
+                    str(raw.get("profile_name") or "").strip() != key[0]
+                    or str(raw.get("environment") or "").strip().lower() != key[1]
+                    or not (
+                        bool(raw.get("auto_resume", False))
+                        or str(raw.get("status") or "") == "恢复待人工核对"
+                    )
+                ):
+                    continue
+                session_id = str(raw.get("session_id") or "").strip()
+                if not session_id:
+                    continue
+                with self._lock:
+                    if session_id in self._workers:
+                        continue
+                protection = _pp_protection_from_snapshot(raw.get("protection"))
+                config = _pp_build_snapshot_config(raw.get("config"), protection, key[1]) if protection else None
+                if protection is None or config is None:
+                    continue
+                original_fingerprint = str(raw.get("credential_fingerprint") or "")
+                reason = "任务规则快照无效，未自动恢复。"
+                if original_fingerprint != _pp_credentials_fingerprint(credentials):
+                    reason = "API Profile 凭证已变化，未自动接管旧保护任务。"
+                else:
+                    try:
+                        positions = self._client.get_positions(
+                            credentials,
+                            environment=key[1],
+                            inst_type="OPTION",
+                            prefer_cache=False,
+                        )
+                    except Exception as exc:
+                        self._logger(f"[持仓保护恢复 {key[0]}] 读取真实仓位失败，保留快照待重试 | {exc}")
+                        continue
+                    candidates = [
+                        item for item in positions
+                        if item.inst_id.upper() == protection.option_inst_id.upper()
+                        and derive_position_direction(item) == protection.direction
+                        and (not protection.pos_side or item.pos_side.lower() == protection.pos_side.lower())
+                    ]
+                    exact_identity = bool(protection.position_id and protection.position_created_at)
+                    matching = [
+                        item for item in candidates
+                        if exact_identity
+                        and str((item.raw or {}).get("posId") or "") == protection.position_id
+                        and str((item.raw or {}).get("cTime") or "") == protection.position_created_at
+                    ]
+                    if not exact_identity:
+                        reason = "快照缺少完整 posId/cTime，未自动接管。"
+                    elif not matching:
+                        reason = "当前仓位与快照中的 posId/cTime 不一致或已不存在，未自动接管。"
+                    elif raw.get("pending_close_reason"):
+                        reason = "存在未完成的平仓意图；需先人工核对交易所订单状态，未自动重发。"
+                    else:
+                        reason = "重启期间未补查触发源历史，需人工核对后重新启用保护。"
+
+                worker = _ProtectionWorker(
+                    session_id=session_id,
+                    credentials=credentials,
+                    config=config,
+                    protection=protection,
+                    api_name=key[0],
+                    status="恢复待人工核对",
+                    started_at=_pp_parse_snapshot_datetime(raw.get("started_at")) or datetime.now(),
+                    pending_close_reason=(
+                        raw.get("pending_close_reason")
+                        if raw.get("pending_close_reason") in {"止盈", "止损"}
+                        else None
+                    ),
+                    close_retry_count=max(_pp_int(raw.get("close_retry_count")), 0),
+                    close_order_sequence=max(_pp_int(raw.get("close_order_sequence")), 0),
+                    active_close_cl_ord_id=str(raw.get("active_close_cl_ord_id") or "").strip() or None,
+                    active_close_ord_id=str(raw.get("active_close_ord_id") or "").strip() or None,
+                    active_close_submitted_at=_pp_parse_snapshot_datetime(raw.get("active_close_submitted_at")),
+                    close_target_size=_pp_decimal(raw.get("close_target_size")),
+                    close_filled_size=_pp_decimal(raw.get("close_filled_size")) or Decimal("0"),
+                    close_recorded_order_keys={str(value) for value in raw.get("close_recorded_order_keys", []) if str(value)}
+                    if isinstance(raw.get("close_recorded_order_keys"), list) else set(),
+                    last_trigger_price=_pp_decimal(raw.get("last_trigger_price")),
+                    trigger_notification_sent=bool(raw.get("trigger_notification_sent", False)),
+                    auto_resume=False,
+                )
+                with self._lock:
+                    if session_id in self._workers:
+                        continue
+                    self._workers[session_id] = worker
+                self._set_status(worker, "恢复待人工核对", reason)
+        finally:
+            with self._lock:
+                self._restore_in_progress.discard(key)
+
+    thread = threading.Thread(target=restore, daemon=True, name=f"qqokx-protection-restore-{key[0]}-{key[1]}")
+    thread.start()
+    return thread
 
 
 def _pp_format_ticker_snapshot(self: PositionProtectionManager, ticker: OkxTicker | None) -> str:
@@ -2503,6 +2850,7 @@ def _pp_run_worker(self: PositionProtectionManager, worker: _ProtectionWorker) -
                 self._reset_transient_state(worker)
                 worker.close_retry_count = 0
                 worker.last_close_retry_notify_key = None
+                worker.auto_resume = False
                 self._set_status(worker, "已完成", f"{worker.pending_close_reason}已完成平仓流程。")
                 return
 
@@ -2563,6 +2911,7 @@ def _pp_run_worker(self: PositionProtectionManager, worker: _ProtectionWorker) -
             worker.stop_event.wait(max(protection.poll_seconds, 0.2))
             continue
         except ProtectionPriceGuardError as exc:
+            worker.auto_resume = False
             self._set_status(worker, "异常", f"价格保护拦截：{exc}")
             self._notify(
                 subject=f"[QQOKX] 持仓保护价格拦截 | {protection.option_inst_id}",
@@ -2584,6 +2933,7 @@ def _pp_run_worker(self: PositionProtectionManager, worker: _ProtectionWorker) -
                 self._handle_transient_error(worker, exc)
                 worker.stop_event.wait(max(protection.poll_seconds, 0.05))
                 continue
+            worker.auto_resume = False
             self._set_status(worker, "异常", f"保护任务异常：{exc}")
             self._notify(
                 subject=f"[QQOKX] 持仓保护异常 | {protection.option_inst_id}",
@@ -2689,6 +3039,7 @@ def _pp_close_position(self: PositionProtectionManager, worker: _ProtectionWorke
         )
         worker.active_close_cl_ord_id = cl_ord_id
         worker.active_close_submitted_at = datetime.now()
+        self._persist_worker(worker)
         result = self._client.place_simple_order(
             worker.credentials,
             worker.config,
@@ -2702,6 +3053,7 @@ def _pp_close_position(self: PositionProtectionManager, worker: _ProtectionWorke
         )
         worker.active_close_ord_id = result.ord_id or None
         worker.active_close_cl_ord_id = result.cl_ord_id or cl_ord_id
+        self._persist_worker(worker)
         try:
             filled_size, filled_price = wait_order_fill(
                 client=self._client,
@@ -2768,6 +3120,7 @@ def _pp_record_close_fill(
 ) -> None:
     if not _pp_register_close_fill(worker, order_key=order_key, filled_size=filled_size):
         return
+    self._persist_worker(worker)
     self._logger(
         f"{_protection_worker_prefix_clean(worker)} {reason}平仓成交 | {worker.protection.option_inst_id} | "
         f"方向={close_side.upper()} | 成交价={format_decimal(filled_price)} | 成交量={format_decimal(filled_size)} | "
@@ -2807,6 +3160,7 @@ def _pp_set_status(
     with self._lock:
         worker.status = repaired_status
         worker.last_message = repaired_message
+    self._persist_worker(worker)
     if emit_log:
         self._logger(f"{_protection_worker_prefix_clean(worker)} {repaired_message}")
     self._emit_change()
@@ -2896,3 +3250,5 @@ PositionProtectionManager._handle_transient_error = _pp_handle_transient_error
 PositionProtectionManager._notify = _pp_notify
 PositionProtectionManager._format_ticker_snapshot = _pp_format_ticker_snapshot
 PositionProtectionManager._pp_handle_close_retry = _pp_handle_close_retry
+PositionProtectionManager._persist_worker = _pp_persist_worker
+PositionProtectionManager.restore_for_profile = _pp_restore_for_profile

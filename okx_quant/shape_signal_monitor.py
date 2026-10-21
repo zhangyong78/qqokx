@@ -79,6 +79,9 @@ class ShapeSignalMonitor(QObject):
             except Exception:
                 pass
 
+    def is_running(self) -> bool:
+        return self._worker is not None and self._worker.is_alive()
+
     def reload_subscriptions(self, items: list[dict[str, object]] | None = None) -> None:
         with self._lock:
             self._subscriptions = [normalize_subscription(item) for item in (items if items is not None else load_subscriptions())]

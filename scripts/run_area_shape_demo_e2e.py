@@ -14,6 +14,7 @@ from dataclasses import replace
 from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
+from urllib.error import HTTPError, URLError
 from uuid import uuid4
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -55,17 +56,25 @@ class DemoClient(OkxRestClient):
         record = path.startswith("/api/v5/trade/")
         if record:
             self.journal.emit("request", method=method, endpoint=path, body=body, params=kwargs.get("params"), simulated=True)
-        try:
-            result = super()._request(method, path, **kwargs)
-        except Exception as exc:
+        for attempt in range(3):
+            try:
+                result = super()._request(method, path, **kwargs)
+            except Exception as exc:
+                cause = exc.__cause__ or exc
+                network_failure = isinstance(cause, (TimeoutError, ConnectionError, URLError)) and not isinstance(cause, HTTPError)
+                if method == "GET" and network_failure and attempt < 2:
+                    self.journal.emit("readonly_network_retry", endpoint=path, attempt=attempt + 1,
+                                      error=str(exc), simulated=True)
+                    time.sleep(0.5 * (attempt + 1))
+                    continue
+                if record:
+                    expected_missing = method == "GET" and path == "/api/v5/trade/order-algo" and str(getattr(exc, "code", "")) == "51603"
+                    self.journal.emit("expected_missing" if expected_missing else "api_error", endpoint=path,
+                                      error=str(exc), code=getattr(exc, "code", None))
+                raise
             if record:
-                expected_missing = method == "GET" and path == "/api/v5/trade/order-algo" and str(getattr(exc, "code", "")) == "51603"
-                self.journal.emit("expected_missing" if expected_missing else "api_error", endpoint=path,
-                                  error=str(exc), code=getattr(exc, "code", None))
-            raise
-        if record:
-            self.journal.emit("response", endpoint=path, payload=result)
-        return result
+                self.journal.emit("response", endpoint=path, payload=result)
+            return result
 
 
 def wait_read(read, done, attempts=6):

@@ -1372,7 +1372,7 @@ class LineTradingQtWindow(QMainWindow):
         if requested_contracts <= 0:
             raise RuntimeError("平仓数量换算后不能小于等于0。")
         if requested_contracts > size:
-            raise RuntimeError("平仓数量不能超过当前可平仓。")
+            raise RuntimeError("\u5e73\u4ed3\u6570\u91cf\u4e0d\u80fd\u8d85\u8fc7\u5f53\u524d\u53ef\u5e73\u4ed3。")
         if requested_contracts < instrument.min_size:
             raise RuntimeError("平仓数量低于最小下单数量。")
         return requested_contracts
@@ -1405,7 +1405,7 @@ class LineTradingQtWindow(QMainWindow):
         if requested_contracts <= 0:
             raise RuntimeError("平仓币数换算后不能小于等于 0。")
         if requested_contracts > size:
-            raise RuntimeError("平仓币数不能超过当前可平仓。")
+            raise RuntimeError("\u5e73\u4ed3\u6570\u91cf\u4e0d\u80fd\u8d85\u8fc7\u5f53\u524d\u53ef\u5e73\u4ed3。")
         if requested_contracts < min_size:
             raise RuntimeError("平仓币数小于最小下单量。")
         return requested_contracts

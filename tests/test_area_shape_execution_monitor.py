@@ -295,6 +295,8 @@ class AreaShapeExecutionMonitorTests(unittest.TestCase):
 
     def test_resume_reconciles_old_gtc_before_preparing_new_epoch(self):
         monitor, session, client, _order = _fixture()
+        client.get_positions = lambda *_args, **_kwargs: []
+        client.get_area_shape_pending_orders = lambda *_args, **_kwargs: []
         calls = []
         credentials = monitor._runtimes[session["session_id"]].credentials
         monitor._sessions[session["session_id"]].update({
@@ -452,7 +454,10 @@ class AreaShapeExecutionMonitorTests(unittest.TestCase):
 
     def test_pause_cancels_exchange_trigger_and_waits_for_terminal_confirmation(self):
         monitor, session, client, _order = _fixture()
-        algo_state = {"state": "live", "ordIdList": [], "algoClOrdId": "entry-id"}
+        session["pending_intent"]["trigger_px"] = "100"
+        algo_state = {"state": "live", "ordIdList": [], "algoClOrdId": "entry-id",
+                      "instId": "BTC-USDT-SWAP", "side": "buy", "sz": "1", "ordType": "trigger",
+                      "triggerPx": "100", "triggerPxType": "last", "ordPx": "100"}
         cancel_calls = []
 
         def get_algo(credentials, *, environment, inst_id, algo_id=None, algo_cl_ord_id=None):
@@ -539,7 +544,7 @@ class AreaShapeExecutionMonitorTests(unittest.TestCase):
                 status = SimpleNamespace(state="filled", ord_id="entry-child", avg_price=Decimal("97.1") if side == "buy" else Decimal("103.9"),
                                          filled_size=size, raw={"fillTime": self.now_ms, "instId": inst_id,
                                                                "clOrdId": client_order_id, "side": side,
-                                                               "ordType": "fok", "sz": str(size)})
+                                                               "ordType": "fok", "sz": str(size), "px": str(limit_price)})
                 self.orders["entry-child"] = status
                 self.orders[client_order_id] = status
                 self.algos[stop_algo_client_order_id] = {

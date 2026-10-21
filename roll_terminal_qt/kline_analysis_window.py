@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import json
 import math
@@ -7249,6 +7249,7 @@ class KlineAnalysisWindow(QMainWindow):
             getattr(self, "_history_trade_loader", None),
             getattr(self, "_weekly_cache_backfill_loader", None),
             getattr(self, "_rr_execution_thread", None),
+            *tuple(getattr(self, "_area_shape_demo_workers", ())),
             *tuple(self._retired_loaders),
         )
         active = any(
@@ -7888,7 +7889,7 @@ class KlineAnalysisWindow(QMainWindow):
         self._area_workspace_other_status.hide()
         area_layout.addWidget(self._area_workspace_other_status)
 
-        area_notice = QLabel("支持纸面演练和 OKX 模拟盘。")
+        area_notice = QLabel("支持纸面演练、OKX 模拟盘和实盘。")
         area_notice.setObjectName("Subtle")
         area_notice.setWordWrap(True)
         area_notice.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
@@ -7911,7 +7912,8 @@ class KlineAnalysisWindow(QMainWindow):
         self._area_shape_mode_combo = QComboBox()
         self._area_shape_mode_combo.addItem("纸面演练", "paper")
         self._area_shape_mode_combo.addItem("OKX模拟盘", "demo")
-        self._area_shape_mode_combo.setToolTip("价格触发模式：做多下穿支撑线、做空上穿压力线时按画线价模拟入场；实时流不可用时按1H OHLC检查同方向穿越。OKX模拟盘在对应入场线挂GTC限价单。形态模式仍等待1H收盘确认。")
+        self._area_shape_mode_combo.addItem("OKX实盘", "live")
+        self._area_shape_mode_combo.setToolTip("价格触发模式：做多下穿支撑线、做空上穿压力线时按画线价模拟入场；实时流不可用时按1H OHLC检查同方向穿越。OKX实盘/模拟盘在对应入场线挂GTC限价单。形态模式仍等待1H收盘确认。")
         self._area_shape_mode_combo.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
         self._area_shape_mode_combo.setMinimumContentsLength(8)
         self._area_shape_mode_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
@@ -7946,12 +7948,12 @@ class KlineAnalysisWindow(QMainWindow):
         self._area_shape_projection_button.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
         area_layout.addWidget(self._area_shape_projection_button)
         self._area_shape_start_button = QPushButton("启用计划")
-        self._area_shape_start_button.setToolTip("核对方向、入场线和另一条线的盈亏比后启用。每个计划只运行一个方向；模拟盘启用前会显示订单风险确认。")
+        self._area_shape_start_button.setToolTip("核对方向、入场线和另一条线的盈亏比后启用。每个计划只运行一个方向；OKX实盘/模拟盘启用前会显示对应环境的订单确认。")
         self._area_shape_start_button.clicked.connect(self._start_area_shape_monitoring)
         self._area_shape_start_button.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
         area_layout.addWidget(self._area_shape_start_button)
         self._area_shape_pause_button = QPushButton("暂停新入场")
-        self._area_shape_pause_button.setToolTip("停止新入场；模拟盘会请求撤销未成交入场单，已有仓位的交易所保护继续运行。")
+        self._area_shape_pause_button.setToolTip("停止新入场；OKX实盘/模拟盘会请求撤销未成交入场单，已有仓位的交易所保护继续运行。")
         self._area_shape_pause_button.clicked.connect(self._pause_area_shape_monitoring)
         self._area_shape_pause_button.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
         area_layout.addWidget(self._area_shape_pause_button)
@@ -7973,7 +7975,7 @@ class KlineAnalysisWindow(QMainWindow):
         self._area_shape_rearm_button.clicked.connect(self._rearm_area_shape_demo_session)
         demo_actions.addWidget(self._area_shape_rearm_button)
         area_layout.addLayout(demo_actions)
-        self._area_shape_demo_status = QLabel("模拟盘执行：未启用")
+        self._area_shape_demo_status = QLabel("OKX执行：未启用")
         self._area_shape_demo_status.setObjectName("Subtle")
         self._area_shape_demo_status.setWordWrap(True)
         self._area_shape_demo_status.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
@@ -8478,7 +8480,7 @@ class KlineAnalysisWindow(QMainWindow):
             ]
             if active_sessions:
                 session_text = ", ".join(active_sessions[-2:])
-                message = f"{message} {('；' if message else '')}区域模拟盘会话：{session_text}（切换只改变显示）。"
+                message = f"{message} {('；' if message else '')}智能辅助交易会话：{session_text}（切换只改变显示）。"
         else:
             terminal_rr_statuses = {"closed", "cancelled", "expired"}
             active_entries = [
@@ -9735,11 +9737,10 @@ class KlineAnalysisWindow(QMainWindow):
         super().keyPressEvent(event)
 
     def _has_active_loaders(self) -> bool:
-        # A finished QThread may remain referenced until its queued ``finished``
-        # slot runs. It is no longer an active request, so do not block a new
-        # symbol load on that stale reference.
+        # Keep a slot occupied until the queued ``finished`` callback clears
+        # the reference, even when QThread.isRunning() has already flipped false.
         return any(
-            loader is not None and loader.isRunning()
+            loader is not None
             for loader in (
                 self._loader,
                 self._secondary_loader,
@@ -9981,7 +9982,7 @@ class KlineAnalysisWindow(QMainWindow):
 
     @Slot()
     def _prefetch_account_drawer_after_chart_ready(self) -> None:
-        if self._preview_mode or bool(getattr(self, "_shutdown_requested", False)):
+        if bool(getattr(self, "_preview_mode", False)) or bool(getattr(self, "_shutdown_requested", False)):
             return
         if self._account_drawer is None or self._runtime is None:
             return
@@ -10373,10 +10374,7 @@ class KlineAnalysisWindow(QMainWindow):
         if self._pending_reload_after_load and not primary_busy:
             self._pending_reload_after_load = False
             self._schedule_load_data(10)
-        if self._pending_secondary_reload and not any(
-            loader is not None and loader.isRunning()
-            for loader in (self._secondary_loader, self._secondary_volatility_loader)
-        ):
+        if self._pending_secondary_reload and self._secondary_loader is None and self._secondary_volatility_loader is None:
             self._pending_secondary_reload = False
             self._load_secondary_data(symbol=self._selected_secondary_symbol())
         if self._pending_tertiary_reload and not (
@@ -10393,10 +10391,7 @@ class KlineAnalysisWindow(QMainWindow):
             (self._pending_reload_after_load and primary_busy)
             or (
                 self._pending_secondary_reload
-                and any(
-                    loader is not None and loader.isRunning()
-                    for loader in (self._secondary_loader, self._secondary_volatility_loader)
-                )
+                and (self._secondary_loader is not None or self._secondary_volatility_loader is not None)
             )
             or (
                 self._pending_tertiary_reload
@@ -10515,16 +10510,20 @@ class KlineAnalysisWindow(QMainWindow):
         self._schedule_pending_reload_if_ready()
 
     def _retire_loader(self, attribute: str) -> None:
-        """Let an obsolete worker finish without occupying its current load slot."""
+        """Keep an obsolete worker owned until its completion signal is delivered."""
         loader = getattr(self, attribute, None)
         if loader is None:
             return
-        setattr(self, attribute, None)
-        if loader.isRunning():
-            loader.requestInterruption()
-            self._retired_loaders.add(loader)
+        if not loader.isRunning():
+            # A completed thread can still have its queued finished callback
+            # pending; keep the slot occupied until that callback releases it.
             return
-        loader.deleteLater()
+        loader.requestInterruption()
+        # The request slot can be reused immediately, while the retired set
+        # keeps the QThread alive until its queued ``finished`` callback.
+        self._retired_loaders.add(loader)
+        if getattr(self, attribute, None) is loader:
+            setattr(self, attribute, None)
 
     def _release_finished_loader(self, attribute: str) -> None:
         loader = self.sender()
@@ -10571,10 +10570,7 @@ class KlineAnalysisWindow(QMainWindow):
             self._retire_loader("_secondary_loader")
         else:
             self._retire_loader("_secondary_volatility_loader")
-        if any(
-            loader is not None and loader.isRunning()
-            for loader in (self._secondary_loader, self._secondary_volatility_loader)
-        ):
+        if self._secondary_loader is not None or self._secondary_volatility_loader is not None:
             self._pending_secondary_reload = True
             self._schedule_pending_reload_if_ready()
             return
@@ -13681,7 +13677,7 @@ class KlineAnalysisWindow(QMainWindow):
             candidate = self._current_area_plan()
             if candidate is not None and (
                 candidate.status == "paused"
-                or (mode == "demo" and candidate.execution_mode == "demo_exchange" and candidate.status in {"monitoring", "touched"})
+                or (mode in {"demo", "live"} and candidate.execution_mode == f"{mode}_exchange" and candidate.status in {"monitoring", "touched"})
             ):
                 plan = candidate
         if plan is None or self._area_shape_monitor is None:
@@ -13690,7 +13686,14 @@ class KlineAnalysisWindow(QMainWindow):
         try:
             if self._period_combo.currentText().strip().upper() != "1H":
                 raise ValueError("请切换到1H图启动监控")
-            retry_demo_arm = mode == "demo" and plan.execution_mode == "demo_exchange" and plan.status in {"monitoring", "touched"}
+            if mode in {"demo", "live"}:
+                active_environment = self._active_environment().strip().lower()
+                runtime_environment = str(getattr(self._runtime, "environment", "") or "").strip().lower()
+                if plan.environment != mode or active_environment != mode or runtime_environment != mode:
+                    if mode == "demo":
+                        raise PermissionError("区域形态订单只允许OKX模拟盘；计划、顶部环境与运行时环境必须同时匹配")
+                    raise PermissionError("计划、顶部环境与运行时环境必须同时匹配所选执行环境")
+            retry_demo_arm = mode in {"demo", "live"} and plan.execution_mode == f"{mode}_exchange" and plan.status in {"monitoring", "touched"}
             if plan.status not in {"draft", "paused"} and not retry_demo_arm:
                 paused = [
                     item for item in self._area_shape_plans()
@@ -13710,14 +13713,25 @@ class KlineAnalysisWindow(QMainWindow):
             direction_text = "做多" if plan.config.direction == "long" else "做空"
             entry_line = f"下方支撑线 {support}" if plan.config.direction == "long" else f"上方压力线 {pressure}"
             target_line = f"上方压力线 {pressure}" if plan.config.direction == "long" else f"下方支撑线 {support}"
-            mode_text = "纸面演练，不发送订单" if mode == "paper" else "OKX 模拟盘，可能提交模拟委托"
+            mode_text = ("纸面演练，不发送订单" if mode == "paper" else
+                         "OKX 模拟盘，可能提交模拟委托" if mode == "demo" else
+                         "OKX 实盘，可能提交真实委托")
+            profile_text = self._active_profile_name().strip() or "未选账户"
+            if plan.config.entry_trigger_mode == "direct_touch":
+                execution_text = "入场线触发 GTC 限价单"
+            else:
+                signal_entry = "形态确认 FOK" if plan.config.entry_mode == "next_open" else "形态确认条件限价单"
+                execution_text = (f"入场线 GTC + {signal_entry}" if plan.config.resting_entry_enabled
+                                 else signal_entry)
             confirmation_text = (
-                f"方向：{direction_text}\n入场参考：{entry_line}\n"
+                f"账户：{profile_text} / {mode if mode in {'demo', 'live'} else plan.environment}\n方向：{direction_text}\n"
+                f"风险预算：{plan.config.risk_amount} USDT\n执行方式：{execution_text}\n"
+                f"入场参考：{entry_line}\n"
                 f"盈亏比校验：{target_line}（最低 {plan.config.min_space_r}R）\n"
                 f"执行：{mode_text}\n\n确认启用此计划？"
             )
-            if mode == "demo" and plan.config.resting_entry_enabled:
-                confirmation_text += "\n\n模拟盘会同时挂入场线 GTC；它可能在 1H 形态确认前成交。"
+            if mode in {"demo", "live"} and plan.config.resting_entry_enabled:
+                confirmation_text += f"\n\n{mode_text}会同时挂入场线 GTC；它可能在 1H 形态确认前成交。"
             accepted = QMessageBox.question(
                 self, "启用区域计划", confirmation_text,
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
@@ -13730,11 +13744,11 @@ class KlineAnalysisWindow(QMainWindow):
                 plan.support_price, plan.pressure_price = support, pressure
                 self._area_shape_monitor.save_draft(plan)
             last_closed_ts = int(confirmed[-1].ts)
-            if mode == "demo":
-                runtime, profile_name = self._require_area_shape_demo_access()
+            if mode in {"demo", "live"}:
+                runtime, profile_name = self._require_area_shape_demo_access(environment=mode)
                 execution_monitor = self._area_shape_execution_monitor
                 if execution_monitor is None:
-                    raise RuntimeError("模拟盘执行服务未连接")
+                    raise RuntimeError(f"{mode_text}执行服务未连接")
                 session = self._area_shape_demo_session_for_plan(plan)
                 if session is not None:
                     if session.get("status") == "paused":
@@ -13745,39 +13759,41 @@ class KlineAnalysisWindow(QMainWindow):
                             self._area_shape_monitor.start_plan(
                                 plan.plan_id, last_closed_candle_ts=last_closed_ts,
                                 profile_name=profile_name, environment=plan.environment,
-                                execution_mode="demo_exchange",
+                                execution_mode=f"{mode}_exchange",
                             )
                             return resumed
 
                         self._run_area_shape_demo_action(
-                            "恢复模拟盘监控",
+                            f"恢复{mode}监控",
                             _resume_demo_plan,
                         )
                         return
                     if session.get("status") in {"needs_manual_rearm", "manual_review"}:
                         raise RuntimeError("此会话重启后处于只读状态；请先执行只读对账，再显式继续保护")
-                    raise RuntimeError(f"该计划已有模拟盘会话（{session.get('status', 'unknown')}），请使用现有会话操作")
+                    raise RuntimeError(f"该计划已有{mode}会话（{session.get('status', 'unknown')}），请使用现有会话操作")
             started_plan = plan if retry_demo_arm else self._area_shape_monitor.start_plan(
                 plan.plan_id, last_closed_candle_ts=last_closed_ts,
                 profile_name=self._active_profile_name(), environment=self._active_environment(),
-                execution_mode="demo_exchange" if mode == "demo" else "paper",
+                execution_mode=f"{mode}_exchange" if mode in {"demo", "live"} else "paper",
             )
             self._refresh_area_shape_status()
-            if mode == "demo":
+            if mode in {"demo", "live"}:
                 self._area_shape_demo_arm_pending = True
                 execution_monitor.request_arm(
                     plan=started_plan, runtime=runtime, unlocked=True, paper_monitor=self._area_shape_monitor,
+                    environment=mode,
                 )
-                self._set_area_shape_status("模拟盘启用预检中：纸面基线已启动；完成账户UID、合约与保护条件核对后才会启用新信号执行。")
-                self._set_status("区域形态模拟盘启用预检中；默认等待线触碰和1H形态确认，再提交OKX价格受限FOK。")
+                self._set_area_shape_status(f"{mode}启用预检中：完成账户UID、合约与保护条件核对后才会启用新信号执行。")
+                self._set_status(f"区域形态{mode}启用预检中；等待线触碰和1H形态确认，再提交价格受限FOK。")
             else:
                 self._set_status("区域形态纸面监控已启动；next_open按下一根已确认1H K线开盘价假设入场，不发送订单。")
             self._refresh_area_shape_execution_status()
         except Exception as exc:
             self._area_shape_demo_arm_pending = False
             self._set_area_shape_status(f"未启动区域监控：{exc}")
-            if str(self._area_shape_mode_combo.currentData() or "paper") == "demo":
-                self._set_area_shape_demo_error(f"模拟盘未启用：{exc}")
+            if str(self._area_shape_mode_combo.currentData() or "paper") in {"demo", "live"}:
+                environment_label = "实盘" if str(self._area_shape_mode_combo.currentData()) == "live" else "模拟盘"
+                self._set_area_shape_demo_error(f"{environment_label}未启用：{exc}")
                 self._sync_area_shape_demo_actions()
 
     def _pause_area_shape_monitoring(self) -> None:
@@ -13788,7 +13804,7 @@ class KlineAnalysisWindow(QMainWindow):
             return
         confirmed = QMessageBox.question(
             self, "暂停区域计划",
-            "暂停后不再接受新的入场信号；模拟盘会撤销并核实未成交入场单，已有仓位的交易所保护继续运行。确认暂停？",
+            "暂停后不再接受新的入场信号；OKX实盘/模拟盘会撤销并核实未成交入场单，已有仓位的交易所保护继续运行。确认暂停？",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No,
         )
@@ -13796,7 +13812,7 @@ class KlineAnalysisWindow(QMainWindow):
             self._set_area_shape_status("已取消暂停；计划保持原状态。")
             return
         try:
-            if str(self._area_shape_mode_combo.currentData() or "paper") == "demo":
+            if str(self._area_shape_mode_combo.currentData() or "paper") in {"demo", "live"}:
                 session = self._area_shape_demo_session_for_plan(plan)
                 if session is not None:
                     self._area_shape_execution_monitor.pause_session(str(session["session_id"]))
@@ -13819,7 +13835,7 @@ class KlineAnalysisWindow(QMainWindow):
         direction_text = "做多" if plan.config.direction == "long" else "做空"
         confirmed = QMessageBox.question(
             self, "取消区域计划",
-            f"取消 {direction_text} 计划后将停止后续入场。模拟盘未成交入场单会请求撤销并等待 OKX 确认；已有仓位不会平仓，交易所保护继续运行。确认取消？",
+            f"取消 {direction_text} 计划后将停止后续入场。OKX实盘/模拟盘未成交入场单会请求撤销并等待 OKX 确认；已有仓位不会平仓，交易所保护继续运行。确认取消？",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No,
         )
@@ -13827,7 +13843,7 @@ class KlineAnalysisWindow(QMainWindow):
             self._set_area_shape_status("已取消本次操作；计划保持原状态。")
             return
         try:
-            if str(self._area_shape_mode_combo.currentData() or "paper") == "demo":
+            if str(self._area_shape_mode_combo.currentData() or "paper") in {"demo", "live"}:
                 session = self._area_shape_demo_session_for_plan(plan)
                 if session is not None:
                     if isinstance(session.get("position"), dict):
@@ -13843,13 +13859,13 @@ class KlineAnalysisWindow(QMainWindow):
                 return
             session = self._area_shape_demo_session_for_plan(plan)
             if session is not None and isinstance(session.get("position"), dict):
-                self._set_area_shape_status("计划已取消；已有模拟盘仓位未平仓，保护继续运行。")
+                self._set_area_shape_status("计划已取消；已有OKX仓位未平仓，保护继续运行。")
             elif str(self._area_shape_mode_combo.currentData() or "paper") == "paper":
                 self._set_area_shape_status("计划已取消；不会再生成纸面入场信号。")
             elif session is None:
-                self._set_area_shape_status("计划已取消；没有关联的模拟盘会话。")
+                self._set_area_shape_status("计划已取消；没有关联的OKX执行会话。")
             else:
-                self._set_area_shape_status("计划已取消；模拟盘入场撤单请求已提交，最终状态以 OKX 对账为准。")
+                self._set_area_shape_status("计划已取消；OKX入场撤单请求已提交，最终状态以 OKX 对账为准。")
         except Exception as exc:
             self._set_area_shape_status(f"取消失败：{exc}")
 
@@ -13867,8 +13883,9 @@ class KlineAnalysisWindow(QMainWindow):
     @Slot(str)
     def _on_area_monitor_status(self, status: str) -> None:
         if status:
-            if self._area_shape_mode_combo.currentData() == "demo":
-                self._area_shape_summary.setText(f"后台：{status}。默认形态触发由本地识别并提交价格受限FOK；本地对账成交与管理仓位保护。")
+            if self._area_shape_mode_combo.currentData() in {"demo", "live"}:
+                environment_text = "实盘" if self._area_shape_mode_combo.currentData() == "live" else "模拟盘"
+                self._area_shape_summary.setText(f"后台：{status}。{environment_text}形态触发由本地识别并提交价格受限FOK；本地对账成交与管理仓位保护。")
             else:
                 self._area_shape_summary.setText(f"后台：{status}。纸面按下一根1H开盘价假设入场，不发送订单。")
 
@@ -13928,8 +13945,8 @@ class KlineAnalysisWindow(QMainWindow):
                 exit_text += f"；时间保本：持仓满{config.time_break_even_bars}根1H且当前价允许保本"
         else:
             exit_text += "；保本关闭"
-        entry_mode = "做多下穿支撑/做空上穿压力即触发（纸面按线价模拟；OKX模拟盘预挂入场线GTC）" if config.entry_trigger_mode == "direct_touch" else (
-            "触线+形态确认后入场（纸面按下一根1H开盘；模拟盘价格受限FOK）"
+        entry_mode = "做多下穿支撑/做空上穿压力即触发（纸面按线价模拟；OKX实盘/模拟盘预挂入场线GTC）" if config.entry_trigger_mode == "direct_touch" else (
+            "触线+形态确认后入场（纸面按下一根1H开盘；OKX实盘/模拟盘价格受限FOK）"
             if config.entry_mode == "next_open" else "形态后等待价格突破（OKX条件单）"
         )
         paper_fee = format_decimal(config.round_trip_fee_rate * Decimal("100"))
@@ -14018,7 +14035,7 @@ class KlineAnalysisWindow(QMainWindow):
             return
 
         status = str(plan.status)
-        demo_mode = self._area_shape_mode_combo.currentData() == "demo"
+        demo_mode = self._area_shape_mode_combo.currentData() in {"demo", "live"}
         session = self._area_shape_demo_session_for_plan(plan) if demo_mode else None
         session_status = str(session.get("status", "")) if session else ""
         session_paused = bool(session.get("paused")) if session else False
@@ -14029,7 +14046,7 @@ class KlineAnalysisWindow(QMainWindow):
         can_start = status in {"draft", "paused"}
         if demo_mode and status == "paused" and session is not None and not can_resume_demo:
             can_start = False
-        if demo_mode and status in {"monitoring", "touched"} and session_status in {"arming", "monitoring", "armed", "signal_pending", "entry_intent", "position_unprotected", "tp_pending", "protected", "manual_control", "needs_manual_rearm", "manual_review"}:
+        if demo_mode and status in {"monitoring", "touched"} and session_status in {"arming", "monitoring", "armed", "signal_pending", "entry_intent", "position_unprotected", "tp_pending", "protected", "closing_pending", "manual_control", "needs_manual_rearm", "manual_review"}:
             can_start = False
         start.setEnabled(can_start and not busy)
         pause.setEnabled(status in {"monitoring", "touched", "paper_pending"} and not busy)
@@ -14050,7 +14067,7 @@ class KlineAnalysisWindow(QMainWindow):
                 if not plan.cancel_after_position else "已提交持仓后取消；当前纸面持仓保护仍在运行。"
             )
         elif busy:
-            cancel.setToolTip("模拟盘操作正在处理中；完成后即可取消计划。")
+            cancel.setToolTip("OKX执行操作正在处理中；完成后即可取消计划。")
         else:
             cancel.setToolTip("结束当前计划。不会平掉已有仓位，也不会撤销其交易所止盈止损保护。")
 
@@ -14071,16 +14088,17 @@ class KlineAnalysisWindow(QMainWindow):
                 and str(item.get("symbol", "")).strip().upper() == symbol
             ]
         except Exception as exc:
-            self._set_area_shape_demo_error(f"读取模拟盘会话失败：{exc}")
+            self._set_area_shape_demo_error(f"读取OKX执行会话失败：{exc}")
             return []
 
     def _area_shape_demo_session_for_plan(self, plan: AreaShapePlan) -> dict[str, object] | None:
         matches = [item for item in self._area_shape_demo_sessions() if str(item.get("plan_id", "")) == plan.plan_id]
         return matches[-1] if matches else None
 
-    def _require_area_shape_demo_access(self):
+    def _require_area_shape_demo_access(self, *, environment: str | None = None):
         profile_name = self._active_profile_name().strip()
-        environment = self._active_environment().strip().lower()
+        active_environment = self._active_environment().strip().lower()
+        expected_environment = str(environment or active_environment).strip().lower()
         runtime = self._runtime
         runtime_profile = str(getattr(runtime, "credential_profile_name", "") or "").strip() if runtime is not None else ""
         if not runtime_profile and runtime is not None:
@@ -14090,15 +14108,19 @@ class KlineAnalysisWindow(QMainWindow):
         selected_profile = self._api_profile_combo.currentText().strip() if hasattr(self, "_api_profile_combo") else profile_name
         if selected_profile and selected_profile != profile_name:
             raise RuntimeError("顶部选择的API profile尚未切换完成；请等待账户状态更新后重试")
-        if environment != "demo" or str(getattr(runtime, "environment", "") or "").strip().lower() != "demo":
-            raise RuntimeError("区域形态订单只允许OKX模拟盘；当前环境不是demo")
+        runtime_environment = str(getattr(runtime, "environment", "") or "").strip().lower()
+        if (expected_environment not in {"demo", "live"} or active_environment != expected_environment
+                or runtime_environment != expected_environment):
+            if expected_environment == "demo":
+                raise RuntimeError("区域形态订单只允许OKX模拟盘；当前运行环境不是demo")
+            raise RuntimeError("当前profile运行环境与所选区域执行环境不一致")
         if not self._ensure_profile_access(profile_name):
             raise PermissionError("当前API profile尚未解锁")
         return runtime, profile_name
 
     def _run_area_shape_demo_action(self, label: str, action: Callable[[], object]) -> None:
         if self._area_shape_demo_action_pending:
-            self._set_area_shape_demo_error("模拟盘对账/恢复仍在处理中，请等待完成。")
+            self._set_area_shape_demo_error("OKX执行对账/恢复仍在处理中，请等待完成。")
             return
         self._area_shape_demo_action_pending = True
         self._sync_area_shape_demo_actions()
@@ -14117,6 +14139,8 @@ class KlineAnalysisWindow(QMainWindow):
 
     @Slot(object)
     def _on_area_shape_demo_action_completed(self, session: object) -> None:
+        if bool(getattr(self, "_shutdown_requested", False)):
+            return
         self._area_shape_demo_action_pending = False
         self._area_shape_demo_ui_error = ""
         if isinstance(session, dict):
@@ -14127,9 +14151,11 @@ class KlineAnalysisWindow(QMainWindow):
 
     @Slot(str)
     def _on_area_shape_demo_action_failed(self, message: str) -> None:
+        if bool(getattr(self, "_shutdown_requested", False)):
+            return
         self._area_shape_demo_action_pending = False
         self._refresh_area_shape_execution_status()
-        self._set_area_shape_demo_error(f"模拟盘操作失败：{message}")
+        self._set_area_shape_demo_error(f"OKX执行操作失败：{message}")
         self._sync_area_shape_demo_actions()
 
     @Slot(object)
@@ -14152,7 +14178,7 @@ class KlineAnalysisWindow(QMainWindow):
         if not status:
             return
         symbol = self._selected_symbol().strip().upper()
-        is_arm_error = self._area_shape_demo_arm_pending and status.startswith("demo启用失败")
+        is_arm_error = self._area_shape_demo_arm_pending and "执行启用失败" in status
         if symbol not in status.upper() and not is_arm_error:
             return
         if symbol in status.upper() or is_arm_error:
@@ -14165,11 +14191,13 @@ class KlineAnalysisWindow(QMainWindow):
     def _on_area_shape_mode_changed(self, _index: int) -> None:
         if not hasattr(self, "_area_shape_mode_combo"):
             return
-        self._area_shape_summary.setText(
-            "直接价格触发按方向穿越触发：做多下穿支撑、做空上穿压力，纸面按画线价模拟入场；形态确认模式按下一根1H开盘价推演。纸面不发送订单。"
-            if self._area_shape_mode_combo.currentData() == "paper"
-            else "OKX模拟盘默认同时挂入场线GTC限价单，并由本地触线+1H形态确认后提交价格受限FOK；任一路径成交后取消另一入场。"
-        )
+        mode = self._area_shape_mode_combo.currentData()
+        if mode == "paper":
+            summary = "直接价格触发按方向穿越触发：做多下穿支撑、做空上穿压力，纸面按画线价模拟入场；形态确认模式按下一根1H开盘价推演。纸面不发送订单。"
+        else:
+            environment_label = "OKX实盘" if mode == "live" else "OKX模拟盘"
+            summary = f"{environment_label}按确认框显示的入场方式执行；入场成交后先核验并保护真实成交仓位。"
+        self._area_shape_summary.setText(summary)
         self._refresh_area_shape_execution_status()
 
     def _set_area_shape_demo_error(self, message: str) -> None:
@@ -14185,19 +14213,21 @@ class KlineAnalysisWindow(QMainWindow):
         sessions = self._area_shape_demo_sessions()
         target = session if isinstance(session, dict) else (sessions[-1] if sessions else None)
         if target is None:
-            label.setText(self._area_shape_demo_ui_error or "模拟盘执行：未启用")
+            label.setText(self._area_shape_demo_ui_error or "OKX执行：未启用")
             self._sync_area_shape_demo_actions()
             self._sync_area_shape_workflow_actions()
             self._refresh_rr_workspace_other_status()
             return
         mode_combo = getattr(self, "_area_shape_mode_combo", None)
         if mode_combo is not None and str(target.get("status", "")) not in {"closed", "cancelled", "expired"}:
-            demo_index = mode_combo.findData("demo")
+            session_mode = str(target.get("environment", "demo")).lower()
+            demo_index = mode_combo.findData(session_mode)
             if demo_index >= 0 and mode_combo.currentIndex() != demo_index:
                 mode_combo.blockSignals(True)
                 mode_combo.setCurrentIndex(demo_index)
                 mode_combo.blockSignals(False)
-                self._area_shape_summary.setText("OKX模拟盘默认同时挂入场线GTC限价单，并由本地触线+1H形态确认后提交价格受限FOK；任一路径成交后取消另一入场。")
+                environment_text = "OKX实盘" if session_mode == "live" else "OKX模拟盘"
+                self._area_shape_summary.setText(f"{environment_text}按冻结计划的入场方式执行；交易所执行已挂止盈止损，本程序持续管理动态保护及成交对账。")
         intent = target.get("pending_intent") if isinstance(target.get("pending_intent"), dict) else {}
         position = target.get("position") if isinstance(target.get("position"), dict) else {}
         resting = target.get("resting_entry_intent") if isinstance(target.get("resting_entry_intent"), dict) else {}
@@ -14229,10 +14259,14 @@ class KlineAnalysisWindow(QMainWindow):
         if isinstance(events, list) and events and isinstance(events[-1], dict):
             event_message = str(events[-1].get("message", "") or "")
         error = str(target.get("last_error", "") or "")
+        environment_label = "实盘" if str(target.get("environment", "")).lower() == "live" else "模拟盘"
+        status_text = "平仓对账中" if target.get("status") == "closing_pending" else str(target.get("status", "unknown"))
         pieces = [
-            f"模拟盘 {target.get('status', 'unknown')} | {target.get('profile_name', '-')}/{target.get('environment', '-')} | UID {target.get('account_uid', '-')}",
+            f"{environment_label} {status_text} | {target.get('profile_name', '-')}/{target.get('environment', '-')} | UID {target.get('account_uid', '-')}",
             f"{entry} | SL {stop} | TP {take_profit}",
         ]
+        if position.get("pending_amend_intent"):
+            pieces.append(f"动态止损待核验：目标 {position.get('pending_stop_price', '-')}；以上SL仍为上次确认价")
         if error:
             pieces.append(f"预检/执行错误：{error}")
         if event_message:
@@ -14255,18 +14289,18 @@ class KlineAnalysisWindow(QMainWindow):
             sessions = self._area_shape_demo_sessions()
             target = sessions[-1] if sessions else None
         status = str(target.get("status", "")) if isinstance(target, dict) else ""
-        selected_demo = getattr(self, "_area_shape_mode_combo", None) is not None and self._area_shape_mode_combo.currentData() == "demo"
+        selected_demo = getattr(self, "_area_shape_mode_combo", None) is not None and self._area_shape_mode_combo.currentData() in {"demo", "live"}
         available = selected_demo and not self._area_shape_demo_action_pending
         combo = getattr(self, "_area_shape_mode_combo", None)
         if combo is not None:
-            busy_statuses = {"arming", "armed", "signal_pending", "entry_intent", "position_unprotected", "tp_pending", "protected", "manual_control", "needs_manual_rearm", "manual_review", "paused"}
+            busy_statuses = {"arming", "armed", "signal_pending", "entry_intent", "position_unprotected", "tp_pending", "protected", "closing_pending", "manual_control", "needs_manual_rearm", "manual_review", "paused"}
             combo.setEnabled(not self._area_shape_demo_arm_pending and status not in busy_statuses)
         start_button = getattr(self, "_area_shape_start_button", None)
         if start_button is not None:
             start_button.setEnabled(
                 not self._area_shape_demo_arm_pending
                 and not self._area_shape_demo_action_pending
-                and status not in {"arming", "armed", "signal_pending", "entry_intent", "position_unprotected", "tp_pending", "protected", "manual_control", "needs_manual_rearm", "manual_review"}
+                and status not in {"arming", "armed", "signal_pending", "entry_intent", "position_unprotected", "tp_pending", "protected", "closing_pending", "manual_control", "needs_manual_rearm", "manual_review"}
             )
         self._sync_area_shape_workflow_actions()
         reconcile.setEnabled(available and status in {"needs_manual_rearm", "manual_review"})
@@ -14277,7 +14311,7 @@ class KlineAnalysisWindow(QMainWindow):
         self._select_rr_workspace_mode("area")
         session = self._area_shape_demo_session_for_current_context()
         if session is None:
-            self._set_area_shape_demo_error("当前账户/合约没有待对账模拟盘会话。")
+            self._set_area_shape_demo_error("当前账户/合约没有待对账的OKX执行会话。")
             return
         try:
             runtime, _profile = self._require_area_shape_demo_access()
@@ -14293,17 +14327,17 @@ class KlineAnalysisWindow(QMainWindow):
         self._select_rr_workspace_mode("area")
         session = self._area_shape_demo_session_for_current_context()
         if session is None:
-            self._set_area_shape_demo_error("当前账户/合约没有可继续的模拟盘会话。")
+            self._set_area_shape_demo_error("当前账户/合约没有可继续的OKX执行会话。")
             return
         try:
             runtime, _profile = self._require_area_shape_demo_access()
             monitor = self._area_shape_execution_monitor
             self._run_area_shape_demo_action(
-                "恢复模拟盘保护",
+                "恢复OKX持仓保护",
                 lambda: monitor.rearm_session(str(session["session_id"]), runtime=runtime, unlocked=True),
             )
         except Exception as exc:
-            self._set_area_shape_demo_error(f"不能恢复模拟盘保护：{exc}")
+            self._set_area_shape_demo_error(f"不能恢复OKX持仓保护：{exc}")
 
     def _area_shape_demo_session_for_current_context(self) -> dict[str, object] | None:
         sessions = self._area_shape_demo_sessions()

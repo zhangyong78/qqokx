@@ -2676,8 +2676,8 @@ class StrategyEngineTest(TestCase):
         self.assertLess(close_index, reentry_index)
         self.assertIn("原开仓ordId=ord-1", messages[close_index])
         self.assertIn("clOrdId=cl-1", messages[close_index])
-        self.assertIn("开仓门禁已释放", messages[close_index])
-        self.assertIn("结算归因中", messages[close_index])
+        self.assertIn("开仓门禁保持关闭", messages[close_index])
+        self.assertIn("开始结算归因", messages[close_index])
 
     def test_dynamic_exchange_strategy_allows_third_entry_after_another_post_close_candle(self) -> None:
         attempted, accepted, evaluate_calls, waits, messages = self._run_dynamic_exchange_reentry_probe(

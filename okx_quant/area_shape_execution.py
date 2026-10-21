@@ -1,7 +1,7 @@
-"""Fail-closed OKX demo execution primitives for area-shape plans.
+"""Fail-closed OKX execution primitives for area-shape plans.
 
-The module never accepts a live runtime. It intentionally keeps execution
-records separate from the local paper-plan state and stores no credentials.
+Execution sessions bind one explicit demo or live runtime. The module keeps
+execution records separate from local paper-plan state and stores no credentials.
 """
 
 from __future__ import annotations
@@ -38,14 +38,17 @@ def _d(value: object, label: str) -> Decimal:
     return result
 
 
-def validate_demo_runtime(*, plan: Any, runtime: Any, unlocked: bool) -> tuple[str, str]:
+def validate_area_shape_runtime(*, plan: Any, runtime: Any, unlocked: bool, environment: str) -> tuple[str, str]:
     """Require explicit unlock and exact profile/environment binding."""
     if not unlocked:
         raise PermissionError("必须先在全局账户栏解锁计划绑定的API profile")
-    if str(getattr(plan, "environment", "")).lower() != "demo":
-        raise PermissionError("区域形态交易只允许OKX模拟盘；live已硬拒绝")
-    if runtime is None or str(getattr(runtime, "environment", "")).lower() != "demo":
-        raise PermissionError("当前profile不是模拟盘环境；禁止执行")
+    environment = str(environment).lower()
+    if environment not in {"demo", "live"}:
+        raise PermissionError("区域形态执行环境无效")
+    if str(getattr(plan, "environment", "")).lower() != environment:
+        raise PermissionError("计划冻结环境与执行环境不一致")
+    if runtime is None or str(getattr(runtime, "environment", "")).lower() != environment:
+        raise PermissionError("当前profile环境与计划冻结环境不一致")
     credentials = getattr(runtime, "credentials", None)
     runtime_profile = str(getattr(runtime, "credential_profile_name", "") or getattr(credentials, "profile_name", ""))
     if runtime_profile != str(plan.profile_name):
@@ -54,6 +57,13 @@ def validate_demo_runtime(*, plan: Any, runtime: Any, unlocked: bool) -> tuple[s
         raise PermissionError("凭证profile与计划不一致")
     key_hash = credential_fingerprint(str(getattr(credentials, "api_key", "")))
     return runtime_profile, key_hash
+
+
+def validate_demo_runtime(*, plan: Any, runtime: Any, unlocked: bool) -> tuple[str, str]:
+    """Compatibility entry point that can never authorize live execution."""
+    if str(getattr(plan, "environment", "")).lower() != "demo":
+        raise PermissionError("demo执行入口只接受demo计划")
+    return validate_area_shape_runtime(plan=plan, runtime=runtime, unlocked=unlocked, environment="demo")
 
 
 def validate_usdt_linear_swap(instrument: Instrument, symbol: str) -> tuple[Decimal, Decimal, Decimal, Decimal]:
@@ -133,12 +143,13 @@ def new_execution_client_order_id(plan_id: str, signal_key: str, leg: str) -> st
     return value
 
 
-def build_demo_execution_session(
+def build_area_shape_execution_session(
     *, plan: Any, runtime: Any, account_uid: str, instrument: Instrument,
     fee_rate: Decimal, slippage_rate: Decimal, baseline_candle_ts: int,
-    confirmed_at_ms: int, unlocked: bool,
+    confirmed_at_ms: int, unlocked: bool, environment: str,
 ) -> dict[str, Any]:
-    profile, key_hash = validate_demo_runtime(plan=plan, runtime=runtime, unlocked=unlocked)
+    environment = str(environment).lower()
+    profile, key_hash = validate_area_shape_runtime(plan=plan, runtime=runtime, unlocked=unlocked, environment=environment)
     if str(plan.status) not in {"monitoring", "touched"}:
         raise ValueError("需先启动区域监控；不能把历史纸面待入场/持仓直接转换为demo仓位")
     if plan.paper_position is not None or str(plan.status).startswith("paper_"):
@@ -148,24 +159,32 @@ def build_demo_execution_session(
     validate_usdt_linear_swap(instrument, plan.symbol)
     if str(plan.config.trigger_price_type) != "last":
         raise ValueError("当前K线与保护触发仅使用last，其他触发价源拒绝")
-    if not account_uid.strip():
+    frozen_account_uid = str(account_uid or "").strip()
+    if not frozen_account_uid:
         raise ValueError("OKX账户身份UID缺失，无法隔离同账户profile")
+    trade_mode = str(getattr(runtime, "trade_mode", "") or "").lower()
+    position_mode = str(getattr(runtime, "position_mode", "") or "").lower()
+    if environment == "live" and (trade_mode not in {"cross", "isolated"}
+                                   or position_mode not in {"net", "long_short"}):
+        raise ValueError("live session必须冻结有效的trade_mode与position_mode")
     if not fee_rate.is_finite() or fee_rate < 0 or not slippage_rate.is_finite() or slippage_rate < 0:
         raise ValueError("有效taker成本或滑点预算缺失")
     # Store a complete frozen plan/config snapshot and signal baseline. Startup
     # never restores the write-enabled state; it always becomes manual review.
     return {
         "version": AREA_SHAPE_EXECUTION_RULE_VERSION,
-        "mode": "demo_exchange",
+        "mode": f"{environment}_exchange",
         "session_id": f"{plan.plan_id}-{secrets.token_hex(4)}",
         "plan_id": plan.plan_id,
         "plan_snapshot": plan.to_dict(),
         "profile_name": profile,
-        "environment": "demo",
-        "account_uid": account_uid.strip(),
+        "environment": environment,
+        "account_uid": frozen_account_uid,
         "api_key_sha256": key_hash,
         "symbol": plan.symbol,
         "direction": plan.config.direction,
+        "trade_mode": trade_mode,
+        "position_mode": position_mode,
         "trigger_price_type": "last",
         "instrument": {
             "ct_val": str(instrument.ct_val), "ct_mult": str(instrument.ct_mult),
@@ -186,14 +205,24 @@ def build_demo_execution_session(
         "resting_entry_intent": None,
         "pending_intent": None,
         "position": None,
-        "events": [{"kind": "armed", "ts": int(confirmed_at_ms), "message": "demo已启用；仅消费启用后的新信号，重启后必须人工重新启用"}],
+        "events": [{"kind": "armed", "ts": int(confirmed_at_ms), "message": f"{environment}已启用；仅消费启用后的新信号，重启后必须人工重新启用"}],
     }
+
+
+def build_demo_execution_session(**kwargs: Any) -> dict[str, Any]:
+    """Compatibility entry point that cannot silently upgrade a demo plan."""
+    if str(getattr(kwargs.get("plan"), "environment", "")).lower() != "demo":
+        raise PermissionError("demo session builder只接受demo计划")
+    return build_area_shape_execution_session(**kwargs, environment="demo")
 
 
 def restore_execution_session_for_readonly(session: dict[str, Any]) -> dict[str, Any]:
     """A process restart is never permission to continue order writes."""
     restored = dict(session)
-    if restored.get("mode") != "demo_exchange" or restored.get("version") != AREA_SHAPE_EXECUTION_RULE_VERSION:
+    expected_mode = f"{str(restored.get('environment') or 'demo').lower()}_exchange"
+    if (restored.get("mode") not in {"demo_exchange", "live_exchange"}
+            or restored.get("mode") != expected_mode
+            or restored.get("version") != AREA_SHAPE_EXECUTION_RULE_VERSION):
         restored["status"] = "manual_review"
         restored["write_disabled"] = True
         return restored
@@ -204,9 +233,9 @@ def restore_execution_session_for_readonly(session: dict[str, Any]) -> dict[str,
     return restored
 
 
-def check_demo_execution_conflicts(client: Any, credentials: Any, *, environment: str, inst_id: str, own_ids: set[str] | None = None) -> None:
-    if environment != "demo":
-        raise PermissionError("冲突检查只允许demo环境")
+def check_area_shape_execution_conflicts(client: Any, credentials: Any, *, environment: str, inst_id: str, own_ids: set[str] | None = None) -> None:
+    if environment not in {"demo", "live"}:
+        raise PermissionError("冲突检查环境无效")
     own_ids = own_ids or set()
     positions = client.get_positions(credentials, environment=environment, inst_type="SWAP", prefer_cache=False)
     if any(str(item.inst_id).upper() == inst_id.upper() and item.position != 0 for item in positions):
@@ -215,6 +244,12 @@ def check_demo_execution_conflicts(client: Any, credentials: Any, *, environment
     orders = client.get_area_shape_pending_orders(credentials, environment=environment, inst_id=inst_id)
     if any((str(getattr(item, "client_order_id", "") or "") not in own_ids) for item in orders):
         raise RuntimeError("同账户同合约已有活动普通/算法委托；拒绝区域开仓")
+
+
+def check_demo_execution_conflicts(client: Any, credentials: Any, *, environment: str, inst_id: str, own_ids: set[str] | None = None) -> None:
+    if environment != "demo":
+        raise PermissionError("demo冲突检查入口只允许demo环境")
+    check_area_shape_execution_conflicts(client, credentials, environment="demo", inst_id=inst_id, own_ids=own_ids)
 
 
 def create_persisted_entry_intent(session: dict[str, Any], *, signal_key: str, side: str, size: Decimal, price: Decimal, stop: Decimal) -> dict[str, Any]:

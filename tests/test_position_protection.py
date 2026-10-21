@@ -1,6 +1,10 @@
-﻿from decimal import Decimal
+from dataclasses import replace
+from decimal import Decimal
 from datetime import timedelta
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from threading import Event
+from types import SimpleNamespace
 from time import sleep
 from unittest import TestCase
 from unittest.mock import patch
@@ -323,11 +327,14 @@ class _SimulatedProtectionClient:
         *,
         environment: str,
         inst_type: str | None = None,
+        prefer_cache: bool = True,
     ) -> list[OkxPosition]:
         assert credentials.passphrase
         assert environment == "live"
         if inst_type is not None:
             assert inst_type == "OPTION"
+        if not prefer_cache:
+            assert environment in {"live", "demo"}
         if self.current_position == 0:
             return []
         return [
@@ -382,6 +389,7 @@ class _StaleFilledPositionClient(_SimulatedProtectionClient):
         *,
         environment: str,
         inst_type: str | None = None,
+        prefer_cache: bool = True,
     ) -> list[OkxPosition]:
         if self.current_position == 0 and self._stale_reads_after_flat > 0:
             self._stale_reads_after_flat -= 1
@@ -524,6 +532,198 @@ class _OrderStatusClient:
 
 
 class PositionProtectionTest(TestCase):
+    def test_persisted_option_protection_snapshot_excludes_credentials(self) -> None:
+        position = replace(_make_option_position(), raw={"posId": "position-1", "cTime": "1710000000000"})
+        protection = OptionProtectionConfig(
+            option_inst_id=position.inst_id,
+            trigger_inst_id=position.inst_id,
+            trigger_price_type="mark",
+            direction="long",
+            pos_side="long",
+            take_profit_trigger=Decimal("0.02"),
+            stop_loss_trigger=Decimal("0.01"),
+            take_profit_order_mode="fixed_price",
+            take_profit_order_price=Decimal("0.019"),
+            take_profit_slippage=Decimal("0"),
+            stop_loss_order_mode="fixed_price",
+            stop_loss_order_price=Decimal("0.011"),
+            stop_loss_slippage=Decimal("0"),
+            poll_seconds=1,
+            trigger_label="option mark",
+            position_id="position-1",
+            position_created_at="1710000000000",
+        )
+        credentials = _make_credentials_for_profile("persist-test")
+
+        with TemporaryDirectory() as temp_dir:
+            state_path = Path(temp_dir) / "tasks.json"
+            manager = PositionProtectionManager(object(), lambda _message: None, state_path=state_path)
+            worker = protection_module._ProtectionWorker(
+                session_id="P-TEST",
+                credentials=credentials,
+                config=_make_strategy_config(),
+                protection=protection,
+                api_name=credentials.profile_name,
+                pending_close_reason="止损",
+                active_close_cl_ord_id="close-intent-1",
+            )
+            manager._persist_worker(worker)
+
+            payload = state_path.read_text(encoding="utf-8")
+            self.assertNotIn(credentials.api_key, payload)
+            self.assertNotIn(credentials.secret_key, payload)
+            self.assertNotIn(credentials.passphrase, payload)
+            self.assertIn("credential_fingerprint", payload)
+            self.assertIn("close-intent-1", payload)
+            self.assertIn("position-1", payload)
+
+    def test_restore_option_protection_requires_manual_review_and_never_places_order(self) -> None:
+        position = replace(_make_option_position(), raw={"posId": "position-1", "cTime": "1710000000000"})
+        credentials = _make_credentials_for_profile("restore-test")
+        queried: list[dict[str, object]] = []
+        placed: list[object] = []
+
+        def get_positions(_credentials: Credentials, **kwargs: object) -> list[OkxPosition]:
+            queried.append(kwargs)
+            return [position]
+
+        client = SimpleNamespace(get_positions=get_positions, place_simple_order=lambda *args, **kwargs: placed.append(args))
+        with TemporaryDirectory() as temp_dir:
+            state_path = Path(temp_dir) / "tasks.json"
+            manager = PositionProtectionManager(client, lambda _message: None, state_path=state_path)
+            protection = OptionProtectionConfig(
+                option_inst_id=position.inst_id,
+                trigger_inst_id=position.inst_id,
+                trigger_price_type="mark",
+                direction="long",
+                pos_side="long",
+                take_profit_trigger=Decimal("0.02"),
+                stop_loss_trigger=None,
+                take_profit_order_mode="fixed_price",
+                take_profit_order_price=Decimal("0.019"),
+                take_profit_slippage=Decimal("0"),
+                stop_loss_order_mode="fixed_price",
+                stop_loss_order_price=None,
+                stop_loss_slippage=Decimal("0"),
+                poll_seconds=1,
+                trigger_label="option mark",
+                position_id="position-1",
+                position_created_at="1710000000000",
+            )
+            worker = protection_module._ProtectionWorker(
+                session_id="P-RESTORE",
+                credentials=credentials,
+                config=_make_strategy_config(),
+                protection=protection,
+                api_name=credentials.profile_name,
+            )
+            manager._persist_worker(worker)
+
+            restore_thread = manager.restore_for_profile(credentials, environment="live")
+            self.assertIsNotNone(restore_thread)
+            assert restore_thread is not None
+            restore_thread.join(timeout=3)
+
+            sessions = manager.list_sessions()
+            self.assertEqual(len(sessions), 1)
+            self.assertEqual(sessions[0].status, "恢复待人工核对")
+            self.assertIn("未补查触发源历史", sessions[0].last_message)
+            self.assertEqual(queried, [{"environment": "live", "inst_type": "OPTION", "prefer_cache": False}])
+            self.assertEqual(placed, [])
+            self.assertIsNone(manager._workers["P-RESTORE"].thread)
+            manager.stop_all()
+            self.assertEqual(manager.list_sessions()[0].status, "恢复待人工核对")
+
+            restarted_manager = PositionProtectionManager(client, lambda _message: None, state_path=state_path)
+            restarted_thread = restarted_manager.restore_for_profile(credentials, environment="live")
+            self.assertIsNotNone(restarted_thread)
+            assert restarted_thread is not None
+            restarted_thread.join(timeout=3)
+            restarted_sessions = restarted_manager.list_sessions()
+            self.assertEqual(len(restarted_sessions), 1)
+            self.assertEqual(restarted_sessions[0].status, "恢复待人工核对")
+            self.assertEqual(len(queried), 2)
+            self.assertEqual(placed, [])
+
+    def test_restore_pending_option_close_intent_never_resubmits_order(self) -> None:
+        position = replace(_make_option_position(), raw={"posId": "position-1", "cTime": "1710000000000"})
+        credentials = _make_credentials_for_profile("pending-close-test")
+        placed: list[object] = []
+        client = SimpleNamespace(
+            get_positions=lambda *_args, **_kwargs: [position],
+            place_simple_order=lambda *args, **kwargs: placed.append((args, kwargs)),
+        )
+
+        with TemporaryDirectory() as temp_dir:
+            state_path = Path(temp_dir) / "tasks.json"
+            manager = PositionProtectionManager(client, lambda _message: None, state_path=state_path)
+            protection = OptionProtectionConfig(
+                option_inst_id=position.inst_id,
+                trigger_inst_id=position.inst_id,
+                trigger_price_type="mark",
+                direction="long",
+                pos_side="long",
+                take_profit_trigger=Decimal("0.02"),
+                stop_loss_trigger=None,
+                take_profit_order_mode="fixed_price",
+                take_profit_order_price=Decimal("0.019"),
+                take_profit_slippage=Decimal("0"),
+                stop_loss_order_mode="fixed_price",
+                stop_loss_order_price=None,
+                stop_loss_slippage=Decimal("0"),
+                poll_seconds=1,
+                trigger_label="option mark",
+                position_id="position-1",
+                position_created_at="1710000000000",
+            )
+            manager._persist_worker(protection_module._ProtectionWorker(
+                session_id="P-PENDING-CLOSE",
+                credentials=credentials,
+                config=_make_strategy_config(),
+                protection=protection,
+                api_name=credentials.profile_name,
+                pending_close_reason="止损",
+                active_close_cl_ord_id="close-intent-1",
+            ))
+
+            restore_thread = manager.restore_for_profile(credentials, environment="live")
+            self.assertIsNotNone(restore_thread)
+            assert restore_thread is not None
+            restore_thread.join(timeout=3)
+
+            session = manager.list_sessions()[0]
+            self.assertEqual(session.status, "恢复待人工核对")
+            self.assertIn("未完成的平仓意图", session.last_message)
+            self.assertEqual(manager._workers["P-PENDING-CLOSE"].active_close_cl_ord_id, "close-intent-1")
+            self.assertEqual(placed, [])
+
+    def test_manager_start_allows_same_option_for_different_profiles(self) -> None:
+        manager = PositionProtectionManager(object(), lambda _message: None)
+        config = _make_strategy_config()
+        protection = OptionProtectionConfig(
+            option_inst_id="BTC-USD-20260327-70000-C",
+            trigger_inst_id="BTC-USD-20260327-70000-C",
+            trigger_price_type="mark",
+            direction="long",
+            pos_side="long",
+            take_profit_trigger=Decimal("0.02"),
+            stop_loss_trigger=None,
+            take_profit_order_mode="fixed_price",
+            take_profit_order_price=Decimal("0.019"),
+            take_profit_slippage=Decimal("0"),
+            stop_loss_order_mode="fixed_price",
+            stop_loss_order_price=None,
+            stop_loss_slippage=Decimal("0"),
+            poll_seconds=1,
+            trigger_label="option mark",
+        )
+
+        with patch.object(protection_module.threading.Thread, "start"):
+            first = manager.start(_make_credentials_for_profile("api-a"), config, protection)
+            second = manager.start(_make_credentials_for_profile("api-b"), config, protection)
+
+        self.assertNotEqual(first, second)
+
     def test_manager_allows_same_option_protection_for_different_api_profiles(self) -> None:
         manager = PositionProtectionManager(object(), lambda _message: None)
         protection = OptionProtectionConfig(
@@ -547,6 +747,73 @@ class PositionProtectionTest(TestCase):
         self.assertFalse(manager._protection_key_conflicts("api-a", protection, []))
         self.assertFalse(manager._protection_key_conflicts("api-b", protection, [("api-a", protection)]))
         self.assertTrue(manager._protection_key_conflicts("api-a", protection, [("api-a", protection)]))
+
+    def test_manager_isolates_same_profile_protection_by_environment(self) -> None:
+        manager = PositionProtectionManager(object(), lambda _message: None)
+        protection = OptionProtectionConfig(
+            option_inst_id="BTC-USD-20260327-70000-C",
+            trigger_inst_id="BTC-USD-20260327-70000-C",
+            trigger_price_type="mark",
+            direction="long",
+            pos_side="long",
+            take_profit_trigger=Decimal("0.02"),
+            stop_loss_trigger=None,
+            take_profit_order_mode="fixed_price",
+            take_profit_order_price=Decimal("0.019"),
+            take_profit_slippage=Decimal("0"),
+            stop_loss_order_mode="fixed_price",
+            stop_loss_order_price=None,
+            stop_loss_slippage=Decimal("0"),
+            poll_seconds=1,
+            trigger_label="option mark",
+        )
+        live_config = _make_strategy_config()
+        demo_config = replace(live_config, environment="demo")
+
+        with patch.object(protection_module.threading.Thread, "start"):
+            manager.start(_make_credentials_for_profile("api-a"), live_config, protection)
+            manager.start(_make_credentials_for_profile("api-a"), demo_config, protection)
+            self.assertEqual(
+                {item.environment for item in manager.list_sessions()},
+                {"demo", "live"},
+            )
+            with self.assertRaisesRegex(RuntimeError, "已经有一个运行中的保护任务"):
+                manager.start(_make_credentials_for_profile("api-a"), live_config, protection)
+
+    def test_manager_rejects_replacement_position_with_different_identity_before_close(self) -> None:
+        position = replace(_make_option_position(), raw={"posId": "position-1", "cTime": "1710000000000"})
+        client = SimpleNamespace(
+            get_positions=lambda *_args, **kwargs: [position]
+        )
+        manager = PositionProtectionManager(client, lambda _message: None)
+        protection = OptionProtectionConfig(
+            option_inst_id=position.inst_id,
+            trigger_inst_id=position.inst_id,
+            trigger_price_type="mark",
+            direction="long",
+            pos_side="long",
+            take_profit_trigger=Decimal("0.02"),
+            stop_loss_trigger=None,
+            take_profit_order_mode="fixed_price",
+            take_profit_order_price=Decimal("0.019"),
+            take_profit_slippage=Decimal("0"),
+            stop_loss_order_mode="fixed_price",
+            stop_loss_order_price=None,
+            stop_loss_slippage=Decimal("0"),
+            position_id="position-1",
+            position_created_at="1710000000000",
+        )
+        worker = SimpleNamespace(
+            credentials=_make_credentials(),
+            config=_make_strategy_config(),
+            protection=protection,
+        )
+
+        self.assertIs(manager._find_matching_position(worker), position)
+        replacement = replace(position, raw={"posId": "position-2", "cTime": "1710000001000"})
+        client.get_positions = lambda *_args, **kwargs: [replacement]
+        with self.assertRaisesRegex(RuntimeError, "仓位身份不一致"):
+            manager._find_matching_position(worker)
 
     def test_manager_treats_remote_end_closed_as_transient_error(self) -> None:
         manager = PositionProtectionManager(

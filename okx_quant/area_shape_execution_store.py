@@ -1,4 +1,4 @@
-"""Versioned execution-only persistence for area-shape demo sessions."""
+"""Versioned execution-only persistence for area-shape sessions."""
 
 from __future__ import annotations
 
@@ -45,6 +45,13 @@ def save_area_shape_execution_records(records: list[dict[str, Any]], path: Path 
         # Secret material is never allowed into this separate execution ledger.
         for key in ("api_key", "secret_key", "passphrase", "secret", "apiSecret"):
             record.pop(key, None)
-        record["mode"] = "demo_exchange"
+        environment = str(record.get("environment") or "demo").lower()
+        mode = str(record.get("mode") or "demo_exchange")
+        # Historical records did not carry an environment. They remain demo
+        # records and can never be upgraded merely by loading/saving them.
+        if environment not in {"demo", "live"} or mode != f"{environment}_exchange":
+            raise ValueError("区域执行记录环境与mode不一致")
+        record["environment"] = environment
+        record["mode"] = mode
         safe.append(record)
     return _write_json_atomic(target, {"version": AREA_SHAPE_EXECUTION_STORE_VERSION, "sessions": safe})

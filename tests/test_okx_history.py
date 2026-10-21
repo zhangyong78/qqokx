@@ -215,6 +215,32 @@ class OkxHistoryParsingTest(TestCase):
         self.assertTrue(config.auto_loan)
         self.assertEqual(config.greeks_type, "PA")
 
+    def test_get_order_fill_history_filters_by_order_and_returns_first_fill(self) -> None:
+        client = OkxRestClient()
+        captured: list[dict[str, str]] = []
+
+        def _stub_request(method: str, path: str, params=None, **kwargs):
+            self.assertEqual(method, "GET")
+            self.assertEqual(path, "/api/v5/trade/fills-history")
+            captured.append(dict(params or {}))
+            return {"data": [
+                {"instId": "BTC-USDT-SWAP", "instType": "SWAP", "ordId": "order-1", "tradeId": "2", "fillPx": "60002", "fillSz": "2", "fillTime": "1710000000200"},
+                {"instId": "BTC-USDT-SWAP", "instType": "SWAP", "ordId": "order-1", "tradeId": "1", "fillPx": "60001", "fillSz": "1", "fillTime": "1710000000100"},
+                {"instId": "BTC-USDT-SWAP", "instType": "SWAP", "ordId": "other-order", "tradeId": "3", "fillPx": "60003", "fillSz": "1", "fillTime": "1710000000300"},
+            ]}
+
+        client._request = _stub_request  # type: ignore[method-assign]
+        items = client.get_order_fill_history(
+            Credentials(api_key="", secret_key="", passphrase=""),
+            environment="demo",
+            inst_id="BTC-USDT-SWAP",
+            order_id="order-1",
+        )
+
+        self.assertEqual([item.trade_id for item in items], ["1", "2"])
+        self.assertEqual(captured[0]["ordId"], "order-1")
+        self.assertEqual(captured[0]["instType"], "SWAP")
+
     def test_get_fills_history_merges_and_sorts_items(self) -> None:
         client = OkxRestClient()
 
@@ -1154,7 +1180,7 @@ class OkxHistoryParsingTest(TestCase):
         )
         self.assertIn("开仓均价：0.02", detail)
         self.assertIn("平仓均价：0.03", detail)
-        self.assertIn("盈亏：0.001", detail)
+        self.assertIn("盈亏：+0.001", detail)
         self.assertIn("已实现盈亏：+0.0005", detail)
 
         self.assertIn("平仓数量：0.1 BTC", detail)

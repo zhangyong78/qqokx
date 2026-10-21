@@ -4057,6 +4057,7 @@ class StrategyTradeTrackingTest(TestCase):
             ended_reason="",
             runtime_status="待恢复",
             status="待恢复",
+            runtime_state={},
             recovery_supported=True,
             recovery_root_dir=None,
             log_file_path=None,
@@ -4066,6 +4067,9 @@ class StrategyTradeTrackingTest(TestCase):
 
     def _make_app_for_tracking(self) -> SimpleNamespace:
         app = SimpleNamespace()
+        app._update_session_continuity_state = lambda session, message, observed_at: QuantApp._update_session_continuity_state(
+            session, message, observed_at=observed_at
+        )
         app._ensure_session_trade_runtime = lambda session, observed_at, signal_bar_at=None: QuantApp._ensure_session_trade_runtime(
             app,
             session,
@@ -7727,6 +7731,7 @@ class StrategyTradeTrackingTest(TestCase):
             log_file_path=None,
             recovery_root_dir=Path("D:/qqokx/recovery/S01"),
             config_snapshot=_serialize_strategy_config_snapshot(config),
+            runtime_state={},
             updated_at=datetime(2026, 6, 20, 15, 10, 0),
         )
         ledger_record = StrategyTradeLedgerRecord(
@@ -7762,6 +7767,9 @@ class StrategyTradeTrackingTest(TestCase):
             _upsert_session_row=MagicMock(),
             _refresh_selected_session_details=MagicMock(),
             _sync_strategy_history_from_session=MagicMock(),
+        )
+        app._update_session_continuity_state = lambda session, message, observed_at: QuantApp._update_session_continuity_state(
+            session, message, observed_at=observed_at
         )
         app._apply_financial_totals = lambda target, records: QuantApp._apply_financial_totals(app, target, records)
         app._refresh_session_financials_from_trade_ledger = (

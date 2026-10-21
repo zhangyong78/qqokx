@@ -96,6 +96,9 @@ class AreaShapeMonitor(QObject):
                 pass
         self._clients.clear()
 
+    def is_running(self) -> bool:
+        return self._worker is not None and self._worker.is_alive()
+
     def plans(self) -> list[AreaShapePlan]:
         with self._lock:
             return [AreaShapePlan.from_dict(item.to_dict()) for item in self._plans.values()]
@@ -129,14 +132,14 @@ class AreaShapeMonitor(QObject):
         self, plan_id: str, *, last_closed_candle_ts: int, profile_name: str, environment: str,
         execution_mode: str = "paper",
     ) -> AreaShapePlan:
-        if execution_mode not in {"paper", "demo_exchange"}:
+        if execution_mode not in {"paper", "demo_exchange", "live_exchange"}:
             raise ValueError("unsupported area execution mode")
         with self._lock:
             self._require_writable_store()
             plan = self._plans[plan_id]
             plan.activate(last_closed_candle_ts=last_closed_candle_ts, profile_name=profile_name, environment=environment)
             # Persist the routing mode atomically with activation.  A candle
-            # already queued for the paper worker must observe demo_exchange
+            # already queued for the paper worker must observe the exchange mode
             # and skip paper mutations while asynchronous demo preflight runs.
             plan.execution_mode = execution_mode
             self._persist_locked()
@@ -148,20 +151,29 @@ class AreaShapeMonitor(QObject):
             self.status_changed.emit("区域形态行情队列已满，监控稍后重建")
         return snapshot
 
-    def mark_demo_execution(self, plan_id: str) -> AreaShapePlan:
+    def mark_area_shape_execution(self, plan_id: str, execution_mode: str) -> AreaShapePlan:
         """Route an already monitoring plan away from paper state mutation."""
+        if execution_mode not in {"demo_exchange", "live_exchange"}:
+            raise ValueError("unsupported area exchange execution mode")
         with self._lock:
             self._require_writable_store()
             plan = self._plans[plan_id]
-            if plan.execution_mode == "demo_exchange" and plan.status in {"monitoring", "touched"} and plan.paper_position is None:
+            if plan.execution_mode == execution_mode and plan.status in {"monitoring", "touched"} and plan.paper_position is None:
                 return AreaShapePlan.from_dict(plan.to_dict())
             if plan.status not in {"monitoring", "touched"} or plan.paper_position is not None:
-                raise ValueError("只有无纸面持仓/待入场的监控计划能切换到独立demo执行")
-            plan.execution_mode = "demo_exchange"
+                raise ValueError("只有无纸面持仓/待入场的监控计划能切换到独立交易所执行")
+            expected_environment = "live" if execution_mode == "live_exchange" else "demo"
+            if plan.environment != expected_environment:
+                raise ValueError("计划冻结环境与交易所执行模式不一致")
+            plan.execution_mode = execution_mode
             self._persist_locked()
             snapshot = AreaShapePlan.from_dict(plan.to_dict())
         self.plan_updated.emit(snapshot.to_dict())
         return snapshot
+
+    def mark_demo_execution(self, plan_id: str) -> AreaShapePlan:
+        """Legacy demo-only route; this method never authorizes live."""
+        return self.mark_area_shape_execution(plan_id, "demo_exchange")
 
     def pause_plan(self, plan_id: str) -> None:
         with self._lock:
@@ -325,7 +337,7 @@ class AreaShapeMonitor(QObject):
             for plan in self._plans.values():
                 if plan.symbol != symbol or plan.environment != environment or plan.status not in _ACTIVE_STATUSES:
                     continue
-                if plan.execution_mode == "demo_exchange":
+                if plan.execution_mode in {"demo_exchange", "live_exchange"}:
                     continue
                 baseline = self._plan_cursor(plan)
                 if self._history_has_gap(candles, baseline):
@@ -391,7 +403,7 @@ class AreaShapeMonitor(QObject):
         with self._lock:
             for plan in self._plans.values():
                 if plan.symbol == symbol and plan.environment == environment and plan.status in _ACTIVE_STATUSES:
-                    if plan.execution_mode == "demo_exchange":
+                    if plan.execution_mode in {"demo_exchange", "live_exchange"}:
                         continue
                     cursor = self._plan_cursor(plan)
                     if candle.ts > cursor + 3_600_000:
@@ -418,7 +430,7 @@ class AreaShapeMonitor(QObject):
         updated: list[AreaShapePlan] = []
         with self._lock:
             for plan in self._plans.values():
-                if plan.symbol != symbol or plan.environment != environment or plan.execution_mode == "demo_exchange":
+                if plan.symbol != symbol or plan.environment != environment or plan.execution_mode in {"demo_exchange", "live_exchange"}:
                     continue
                 price_key = (symbol, environment, plan.plan_id)
                 previous_price = self._last_live_prices.get(price_key)

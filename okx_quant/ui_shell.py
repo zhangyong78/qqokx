@@ -135,6 +135,7 @@ from okx_quant.persistence import (
     load_credentials_profiles_snapshot,
     load_notification_snapshot,
     load_position_notes_snapshot,
+    option_protection_tasks_file_path,
     load_strategy_parameter_drafts,
     load_strategy_history_snapshot,
     load_strategy_trade_ledger_snapshot,
@@ -3679,6 +3680,7 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
             self._make_system_logger("持仓保护"),
             notifier=None,
             on_change=self._schedule_protection_window_refresh,
+            state_path=option_protection_tasks_file_path(),
         )
 
         self._strategy_name_to_id = {item.name: item.strategy_id for item in STRATEGY_DEFINITIONS}
@@ -10243,12 +10245,18 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         passphrase = self.passphrase.get().strip()
         if not api_key or not secret_key or not passphrase:
             return None
-        return Credentials(
+        credentials = Credentials(
             api_key=api_key,
             secret_key=secret_key,
             passphrase=passphrase,
             profile_name=self._current_credential_profile(),
         )
+        try:
+            environment = self._environment_value_from_label(self.environment_label.get())
+            self._protection_manager.restore_for_profile(credentials, environment=environment)
+        except Exception:
+            pass
+        return credentials
 
 
 
@@ -14405,6 +14413,7 @@ def _format_position_history_filter_stats(
     filtered_items: list[tuple[int, OkxPositionHistoryItem]],
     usdt_prices: dict[str, Decimal],
 ) -> str:
+    pnl_totals: dict[str, Decimal] = {}
     realized_totals: dict[str, Decimal] = {}
     profit_totals: dict[str, Decimal] = {}
     loss_totals: dict[str, Decimal] = {}
@@ -14419,6 +14428,9 @@ def _format_position_history_filter_stats(
 
     for _, item in filtered_items:
         currency = _infer_position_history_pnl_currency(item)
+        pnl = item.pnl
+        if pnl is not None:
+            pnl_totals[currency] = pnl_totals.get(currency, Decimal("0")) + pnl
         realized_pnl = item.realized_pnl
         if realized_pnl is not None:
             valid_count += 1
@@ -14482,7 +14494,8 @@ def _format_position_history_filter_stats(
         else "-"
     )
     return (
-        f"\u5df2\u5b9e\u73b0\u6536\u76ca\u5408\u8ba1 { _format_position_history_currency_totals(realized_totals) } | "
+        f"\u76c8\u4e8f\u5408\u8ba1 {_format_position_history_currency_totals(pnl_totals)} | "
+        f"\u5df2\u5b9e\u73b0\u5408\u8ba1 {_format_position_history_currency_totals(realized_totals)} | "
         f"\u6298\u5408USDT\u5408\u8ba1 {realized_usdt_text} | "
         f"\u76c8\u5229 {profit_count}\u7b14/{profit_amount_text} | "
         f"\u4e8f\u635f {loss_count}\u7b14/{loss_amount_text} | "
@@ -14977,7 +14990,7 @@ def _build_position_history_detail_text(
         f"平仓数量：{_format_position_history_size(item, instruments)}\n"
         f"{incremental_close_line}"
         f"手续费：{_format_position_history_fee_cell(item, upl_usdt_prices)}\n"
-        f"\u5df2\u5b9e\u73b0\u6536\u76ca?{_format_position_history_pnl(item.realized_pnl, item, with_sign=True, usdt_prices=upl_usdt_prices)}\n"
+        f"\u5df2\u5b9e\u73b0\u76c8\u4e8f\uff1a{_format_position_history_pnl(item.realized_pnl, item, with_sign=True, usdt_prices=upl_usdt_prices)}\n"
         f"结算盈亏：{_format_optional_decimal(item.settle_pnl)}"
     )
 
@@ -15013,7 +15026,8 @@ def _build_position_history_detail_text(
         f"平仓数量：{_format_position_history_size(item, instruments)}\n"
         f"{incremental_close_line}"
         f"手续费：{_format_position_history_fee_cell(item, upl_usdt_prices)}\n"
-        f"\u5df2\u5b9e\u73b0\u6536\u76ca?{_format_position_history_pnl(item.realized_pnl, item, with_sign=True, usdt_prices=upl_usdt_prices)}\n"
+        f"盈亏：{_format_position_history_pnl(item.pnl, item, with_sign=True, usdt_prices=upl_usdt_prices)}\n"
+        f"\u5df2\u5b9e\u73b0\u76c8\u4e8f\uff1a{_format_position_history_pnl(item.realized_pnl, item, with_sign=True, usdt_prices=upl_usdt_prices)}\n"
         f"结算盈亏：{_format_optional_decimal(item.settle_pnl)}"
     )
 

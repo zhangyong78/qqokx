@@ -468,6 +468,20 @@ class DynamicStopMonitorStepResult:
     trend_ema_close_exit_last_candle_ts: int | None = None
 
 
+@dataclass
+class DynamicStopHistoryState:
+    inst_id: str
+    trigger_type: str
+    direction: Literal["long", "short"]
+    entry_price: Decimal
+    entry_ts: int
+    trigger_state: DynamicStopTriggerState
+    history_enabled: bool
+    history_restored: bool = False
+    last_minute_candle_ts: int | None = None
+    last_minute_scan_bucket: int | None = None
+
+
 class OrderSizeTooSmallError(RuntimeError):
     pass
 
@@ -4020,6 +4034,22 @@ class StrategyEngine:
                 f"时间保本={config.time_stop_break_even_enabled_label()}/{config.resolved_time_stop_break_even_bars()}根"
             )
         self._logger(" | ".join(monitor_parts))
+        dynamic_history = (
+            self._start_local_dynamic_stop_history(
+                inst_id=protection.trigger_inst_id,
+                trigger_type=protection.trigger_price_type,
+                direction=protection.direction,
+                entry_price=position.entry_price,
+                entry_ts=position.entry_ts,
+            )
+            if dynamic_take_profit_enabled
+            else None
+        )
+        fixed_exit_history_enabled = not dynamic_take_profit_enabled and 0 < position.entry_ts <= int(time.time() * 1000)
+        fixed_exit_history_cursor: int | None = None
+        fixed_exit_history_hit: tuple[str, int] | None = None
+        fixed_exit_review_reported = False
+        fixed_exit_next_scan_ts = 0
         while not self._stop_event.is_set():
             manual_control = self.get_manual_trade_control()
             if (
@@ -4043,7 +4073,32 @@ class StrategyEngine:
                 protection.trigger_price_type,
                 environment=config.environment,
             )
+            if dynamic_take_profit_enabled:
+                assert dynamic_history is not None
+                dynamic_history.trigger_state.observe(current_price, protection.direction)
+                self._refresh_local_dynamic_stop_history(dynamic_history)
             self._emit_runtime_heartbeat("本地止盈止损")
+            now_ms = int(time.time() * 1000)
+            if fixed_exit_history_enabled and now_ms >= fixed_exit_next_scan_ts:
+                fixed_exit_next_scan_ts = now_ms + max(int(config.poll_seconds * 1000), 60_000)
+                try:
+                    history_hit, history_cursor = self._scan_local_fixed_exit_history(
+                        inst_id=protection.trigger_inst_id,
+                        trigger_type=protection.trigger_price_type,
+                        direction=protection.direction,
+                        entry_ts=position.entry_ts,
+                        stop_loss=protection.stop_loss,
+                        take_profit=None if uses_flat_exit else protection.take_profit,
+                        last_checked_candle_ts=fixed_exit_history_cursor,
+                    )
+                    fixed_exit_history_cursor = history_cursor or fixed_exit_history_cursor
+                    if fixed_exit_history_hit is None and history_hit is not None:
+                        fixed_exit_history_hit = history_hit
+                except Exception as exc:
+                    self._logger(
+                        f"本地固定止盈止损历史补查失败，保留实时监控并重试 | "
+                        f"触发标的={protection.trigger_inst_id} | 错误={exc}"
+                    )
             manual_mode = manual_control.management_mode == "manual"
             if manual_mode and manual_control.stop_loss is not None:
                 current_stop_loss = manual_control.stop_loss
@@ -4068,6 +4123,7 @@ class StrategyEngine:
                     separate_break_even_enabled=_live_dynamic_separate_break_even_enabled(config),
                     dynamic_fee_offset_enabled=dynamic_fee_offset_enabled,
                     dynamic_protection_rules=_live_dynamic_protection_rules(config),
+                    favorable_price=dynamic_history.trigger_state.favorable_price if dynamic_history is not None else current_price,
                     holding_bars=holding_bars,
                     time_stop_break_even_enabled=config.time_stop_break_even_enabled,
                     time_stop_break_even_bars=config.resolved_time_stop_break_even_bars(),
@@ -4093,6 +4149,22 @@ class StrategyEngine:
                     stop_loss=current_stop_loss,
                     take_profit=current_take_profit,
                 )
+            if fixed_exit_history_hit is not None and not fixed_exit_review_reported:
+                hit_kind, hit_candle_ts = fixed_exit_history_hit
+                history_reason = "止损" if hit_kind == "stop" else "止盈"
+                still_triggered = stop_hit if hit_kind == "stop" else take_hit
+                if hit_kind == "ambiguous":
+                    review_message = "历史同一根K线同时触及止盈和止损，先后顺序不明"
+                elif still_triggered:
+                    review_message = "历史曾触发，当前价仍满足阈值，待当前轮实时执行分支确认"
+                else:
+                    review_message = f"历史曾触发{history_reason}，当前价格已回到阈值外，需人工复核"
+                self._logger(
+                    f"本地固定保护补查 | 结果={review_message} | K线={_fmt_ts(hit_candle_ts)} | "
+                    f"触发源={protection.trigger_price_type}/{protection.trigger_inst_id} | "
+                    f"当前价={format_decimal(current_price)}"
+                )
+                fixed_exit_review_reported = True
             if trend_ema_close_exit_enabled:
                 trend_ema_close_exit_armed = trend_ema_close_exit_armed or _live_dynamic_trigger_r_reached(
                     direction=protection.direction,
@@ -4134,7 +4206,15 @@ class StrategyEngine:
                     f"当前价={format_decimal(current_price)} | "
                     f"止损={format_decimal(current_stop_loss)} | 止盈={format_decimal(current_take_profit)}"
                 )
-                self._close_position(credentials, config, trade_instrument, position, reason)
+                if not self._submit_close_for_confirmed_position(
+                    credentials,
+                    config,
+                    trade_instrument,
+                    position,
+                    reason,
+                ):
+                    self._stop_event.wait(config.poll_seconds)
+                    continue
                 self.resume_automatic_trade_management()
                 return
             if trend_ema_close_exit_enabled and trend_ema_close_exit_armed:
@@ -4194,6 +4274,22 @@ class StrategyEngine:
                 f"时间保本={config.time_stop_break_even_enabled_label()}/{config.resolved_time_stop_break_even_bars()}根"
             )
         self._logger(" | ".join(monitor_parts))
+        dynamic_history = (
+            self._start_local_dynamic_stop_history(
+                inst_id=protection.trigger_inst_id,
+                trigger_type=protection.trigger_price_type,
+                direction=protection.direction,
+                entry_price=position.entry_price,
+                entry_ts=position.entry_ts,
+            )
+            if dynamic_take_profit_enabled
+            else None
+        )
+        fixed_exit_history_enabled = not dynamic_take_profit_enabled and 0 < position.entry_ts <= int(time.time() * 1000)
+        fixed_exit_history_cursor: int | None = None
+        fixed_exit_history_hit: tuple[str, int] | None = None
+        fixed_exit_review_reported = False
+        fixed_exit_next_scan_ts = 0
 
         while not self._stop_event.is_set():
             manual_control = self.get_manual_trade_control()
@@ -4214,7 +4310,31 @@ class StrategyEngine:
                 protection.trigger_price_type,
                 environment=config.environment,
             )
+            if dynamic_history is not None:
+                dynamic_history.trigger_state.observe(current_price, protection.direction)
+                self._refresh_local_dynamic_stop_history(dynamic_history)
             self._emit_runtime_heartbeat("本地止盈止损")
+            now_ms = int(time.time() * 1000)
+            if fixed_exit_history_enabled and now_ms >= fixed_exit_next_scan_ts:
+                fixed_exit_next_scan_ts = now_ms + max(int(config.poll_seconds * 1000), 60_000)
+                try:
+                    history_hit, history_cursor = self._scan_local_fixed_exit_history(
+                        inst_id=protection.trigger_inst_id,
+                        trigger_type=protection.trigger_price_type,
+                        direction=protection.direction,
+                        entry_ts=position.entry_ts,
+                        stop_loss=protection.stop_loss,
+                        take_profit=None if uses_flat_exit else protection.take_profit,
+                        last_checked_candle_ts=fixed_exit_history_cursor,
+                    )
+                    fixed_exit_history_cursor = history_cursor or fixed_exit_history_cursor
+                    if fixed_exit_history_hit is None and history_hit is not None:
+                        fixed_exit_history_hit = history_hit
+                except Exception as exc:
+                    self._logger(
+                        f"本地固定止盈止损历史补查失败，保留实时监控并重试 | "
+                        f"触发标的={protection.trigger_inst_id} | 错误={exc}"
+                    )
             manual_mode = manual_control.management_mode == "manual"
             if manual_mode and manual_control.stop_loss is not None:
                 current_stop_loss = manual_control.stop_loss
@@ -4239,6 +4359,7 @@ class StrategyEngine:
                     separate_break_even_enabled=_live_dynamic_separate_break_even_enabled(config),
                     dynamic_fee_offset_enabled=dynamic_fee_offset_enabled,
                     dynamic_protection_rules=_live_dynamic_protection_rules(config),
+                    favorable_price=dynamic_history.trigger_state.favorable_price if dynamic_history is not None else current_price,
                     holding_bars=holding_bars,
                     time_stop_break_even_enabled=config.time_stop_break_even_enabled,
                     time_stop_break_even_bars=config.resolved_time_stop_break_even_bars(),
@@ -4264,6 +4385,22 @@ class StrategyEngine:
                     stop_loss=current_stop_loss,
                     take_profit=current_take_profit,
                 )
+            if fixed_exit_history_hit is not None and not fixed_exit_review_reported:
+                hit_kind, hit_candle_ts = fixed_exit_history_hit
+                history_reason = "止损" if hit_kind == "stop" else "止盈"
+                still_triggered = stop_hit if hit_kind == "stop" else take_hit
+                if hit_kind == "ambiguous":
+                    review_message = "历史同一根K线同时触及止盈和止损，先后顺序不明"
+                elif still_triggered:
+                    review_message = "历史曾触发，当前价仍满足阈值，待当前轮实时执行分支确认"
+                else:
+                    review_message = f"历史曾触发{history_reason}，当前价格已回到阈值外，需人工复核"
+                self._logger(
+                    f"本地固定保护补查 | 结果={review_message} | K线={_fmt_ts(hit_candle_ts)} | "
+                    f"触发源={protection.trigger_price_type}/{protection.trigger_inst_id} | "
+                    f"当前价={format_decimal(current_price)}"
+                )
+                fixed_exit_review_reported = True
             if stop_hit or take_hit:
                 reason = "止盈"
                 if stop_hit:
@@ -4299,7 +4436,15 @@ class StrategyEngine:
                     config,
                     candle_ts=last_checked_candle_ts or protection.candle_ts,
                 )
-                self._close_position(credentials, config, trade_instrument, position, reason)
+                if not self._submit_close_for_confirmed_position(
+                    credentials,
+                    config,
+                    trade_instrument,
+                    position,
+                    reason,
+                ):
+                    self._stop_event.wait(config.poll_seconds)
+                    continue
                 self.resume_automatic_trade_management()
                 return
 
@@ -4326,6 +4471,33 @@ class StrategyEngine:
                         return
 
             self._stop_event.wait(config.poll_seconds)
+
+    def _submit_close_for_confirmed_position(
+        self,
+        credentials: Credentials,
+        config: StrategyConfig,
+        trade_instrument: Instrument,
+        position: FilledPosition,
+        reason: str,
+    ) -> bool:
+        try:
+            live_position = self._find_managed_position(credentials, config, trade_instrument, position)
+        except Exception as exc:
+            self._logger(f"本地{reason}请求未发送：读取当前持仓失败 | 错误={exc}")
+            return False
+        if live_position is None:
+            self._logger(f"本地{reason}请求未发送：未能确认对应的当前持仓。")
+            return False
+        available = getattr(live_position, "avail_position", None)
+        if available in {None, Decimal("0")}:
+            available = getattr(live_position, "position", None)
+        close_size = min(position.size, abs(available or Decimal("0")))
+        close_size = snap_to_increment(close_size, trade_instrument.lot_size, "down")
+        if close_size < trade_instrument.min_size:
+            self._logger(f"本地{reason}请求未发送：当前可平数量小于最小下单量。")
+            return False
+        self._close_position(credentials, config, trade_instrument, replace(position, size=close_size), reason)
+        return True
 
     def _close_position(
         self,
@@ -4616,6 +4788,160 @@ class StrategyEngine:
             cutoff_ts=now_minute_ts,
         )
         return favorable, cursor
+
+    def _scan_local_fixed_exit_history(
+        self,
+        *,
+        inst_id: str,
+        trigger_type: str,
+        direction: Literal["long", "short"],
+        entry_ts: int,
+        stop_loss: Decimal,
+        take_profit: Decimal | None,
+        last_checked_candle_ts: int | None,
+    ) -> tuple[tuple[str, int] | None, int | None]:
+        """Find the earliest confirmed post-entry fixed-exit threshold touch."""
+        if entry_ts <= 0:
+            raise ValueError("Fixed-exit history requires the actual position entry timestamp")
+        now_minute_ts = int(time.time() * 1000) // 60_000 * 60_000
+        first_eligible_ts = (entry_ts + 59_999) // 60_000 * 60_000
+        overlap_ms = 5 * 60_000
+        minimum_ts = max(
+            first_eligible_ts,
+            last_checked_candle_ts - overlap_ms if last_checked_candle_ts is not None else first_eligible_ts,
+        )
+        page = self._dynamic_stop_candle_page(inst_id, trigger_type, "1m", limit=300)
+        if not page:
+            raise RuntimeError("trigger source returned no minute candles")
+        collected: dict[int, Candle] = {candle.ts: candle for candle in page}
+        while min(candle.ts for candle in page) > minimum_ts:
+            oldest_ts = min(candle.ts for candle in page)
+            older = self._dynamic_stop_candle_page(
+                inst_id,
+                trigger_type,
+                "1m",
+                before_ts=oldest_ts,
+                limit=300,
+            )
+            if not older or min(candle.ts for candle in older) >= oldest_ts:
+                raise RuntimeError("minute candle pagination did not reach the entry/recovery cursor")
+            collected.update((candle.ts, candle) for candle in older)
+            page = older
+
+        eligible = sorted(
+            (
+                candle
+                for candle in collected.values()
+                if candle.confirmed
+                and minimum_ts <= candle.ts < now_minute_ts
+                and (last_checked_candle_ts is None or candle.ts > last_checked_candle_ts - overlap_ms)
+            ),
+            key=lambda candle: candle.ts,
+        )
+        if not eligible:
+            return None, last_checked_candle_ts
+        cursor = max(candle.ts for candle in eligible)
+        for candle in eligible:
+            stop_hit = (
+                candle.low <= stop_loss
+                if direction == "long"
+                else candle.high >= stop_loss
+            )
+            take_hit = False
+            if take_profit is not None:
+                take_hit = (
+                    candle.high >= take_profit
+                    if direction == "long"
+                    else candle.low <= take_profit
+                )
+            if stop_hit and take_hit:
+                return ("ambiguous", candle.ts), cursor
+            if stop_hit:
+                return ("stop", candle.ts), cursor
+            if take_hit:
+                return ("take", candle.ts), cursor
+        return None, cursor
+
+    def _start_local_dynamic_stop_history(
+        self,
+        *,
+        inst_id: str,
+        trigger_type: str,
+        direction: Literal["long", "short"],
+        entry_price: Decimal,
+        entry_ts: int,
+    ) -> DynamicStopHistoryState:
+        state = DynamicStopHistoryState(
+            inst_id=inst_id,
+            trigger_type=trigger_type,
+            direction=direction,
+            entry_price=entry_price,
+            entry_ts=entry_ts,
+            trigger_state=DynamicStopTriggerState(entry_price),
+            history_enabled=0 < entry_ts <= int(time.time() * 1000),
+        )
+        if not state.history_enabled:
+            self._logger("本地动态止盈缺少有效入场时间，跳过历史回补并继续实时监控")
+            return state
+        try:
+            favorable, cursor, hour_count = self._restore_dynamic_stop_favorable_price(
+                inst_id=inst_id,
+                trigger_type=trigger_type,
+                direction=direction,
+                entry_price=entry_price,
+                entry_ts=entry_ts,
+            )
+            state.trigger_state.observe(favorable, direction)
+            state.last_minute_candle_ts = cursor
+            state.history_restored = True
+            self._logger(
+                f"本地动态止盈历史触发价回补完成 | 1小时K线={hour_count}根 | "
+                f"有利极值={format_decimal(favorable)} | 分钟游标={cursor or '-'}"
+            )
+        except Exception as exc:
+            self._logger(f"本地动态止盈历史回补失败，继续实时监控并重试 | {exc}")
+        return state
+
+    def _refresh_local_dynamic_stop_history(self, state: DynamicStopHistoryState) -> None:
+        if not state.history_enabled:
+            return
+        scan_bucket = int(time.time()) // 60
+        if scan_bucket == state.last_minute_scan_bucket:
+            return
+        state.last_minute_scan_bucket = scan_bucket
+        if not state.history_restored:
+            try:
+                favorable, cursor, hour_count = self._restore_dynamic_stop_favorable_price(
+                    inst_id=state.inst_id,
+                    trigger_type=state.trigger_type,
+                    direction=state.direction,
+                    entry_price=state.entry_price,
+                    entry_ts=state.entry_ts,
+                )
+                state.trigger_state.observe(favorable, state.direction)
+                state.last_minute_candle_ts = cursor
+                state.history_restored = True
+                self._logger(
+                    f"本地动态止盈历史回补重试成功 | 1小时K线={hour_count}根 | "
+                    f"有利极值={format_decimal(state.trigger_state.favorable_price)}"
+                )
+            except Exception as exc:
+                self._logger(f"本地动态止盈历史回补仍失败，将继续实时监控 | {exc}")
+        if not state.history_restored:
+            return
+        try:
+            favorable, cursor = self._scan_dynamic_stop_minute_candles(
+                inst_id=state.inst_id,
+                trigger_type=state.trigger_type,
+                last_candle_ts=state.last_minute_candle_ts,
+                minimum_candle_ts=(state.entry_ts + 59_999) // 60_000 * 60_000,
+                direction=state.direction,
+            )
+            if favorable is not None:
+                state.trigger_state.observe(favorable, state.direction)
+            state.last_minute_candle_ts = cursor
+        except Exception as exc:
+            self._logger(f"本地动态止盈分钟补扫失败，保留游标并重试 | {exc}")
 
     def _monitor_exchange_dynamic_stop(
         self,
@@ -7027,6 +7353,21 @@ class StrategyEngine:
         else:
             monitor_parts.append(f"固定止盈={format_decimal(take_profit)}")
         self._logger(" | ".join(monitor_parts))
+        virtual_dynamic_history = (
+            self._start_local_dynamic_stop_history(
+                inst_id=trade_instrument.inst_id,
+                trigger_type=config.tp_sl_trigger_type,
+                direction=direction,
+                entry_price=position.entry_price,
+                entry_ts=position.entry_ts,
+            )
+            if dynamic_take_profit_enabled
+            else None
+        )
+        virtual_fixed_history_cursor: int | None = None
+        virtual_fixed_history_hit: tuple[str, int] | None = None
+        virtual_fixed_review_reported = False
+        virtual_fixed_next_scan_ts = 0
 
         while not self._stop_event.is_set():
             live_position = self._find_managed_position(credentials, config, trade_instrument, position)
@@ -7039,6 +7380,26 @@ class StrategyEngine:
                 config.tp_sl_trigger_type,
                 environment=config.environment,
             )
+            if virtual_dynamic_history is not None:
+                virtual_dynamic_history.trigger_state.observe(current_price, direction)
+                self._refresh_local_dynamic_stop_history(virtual_dynamic_history)
+            elif int(time.time() * 1000) >= virtual_fixed_next_scan_ts:
+                virtual_fixed_next_scan_ts = int(time.time() * 1000) + max(int(config.poll_seconds * 1000), 60_000)
+                try:
+                    history_hit, history_cursor = self._scan_local_fixed_exit_history(
+                        inst_id=trade_instrument.inst_id,
+                        trigger_type=config.tp_sl_trigger_type,
+                        direction=direction,
+                        entry_ts=position.entry_ts,
+                        stop_loss=initial_stop_loss,
+                        take_profit=take_profit,
+                        last_checked_candle_ts=virtual_fixed_history_cursor,
+                    )
+                    virtual_fixed_history_cursor = history_cursor or virtual_fixed_history_cursor
+                    if virtual_fixed_history_hit is None and history_hit is not None:
+                        virtual_fixed_history_hit = history_hit
+                except Exception as exc:
+                    self._logger(f"交易员虚拟保护历史补查失败，保留实时监控并重试 | 错误={exc}")
             if dynamic_take_profit_enabled:
                 holding_bars = _holding_bars_live(position.entry_ts, int(time.time() * 1000), config.bar)
                 updated_stop_loss, next_trigger_price, updated_trigger_r, moved = _advance_dynamic_stop_live(
@@ -7057,6 +7418,11 @@ class StrategyEngine:
                     separate_break_even_enabled=_live_dynamic_separate_break_even_enabled(config),
                     dynamic_fee_offset_enabled=_live_ema55_slope_dynamic_fee_offset_enabled(config),
                     dynamic_protection_rules=_live_dynamic_protection_rules(config),
+                    favorable_price=(
+                        virtual_dynamic_history.trigger_state.favorable_price
+                        if virtual_dynamic_history is not None
+                        else current_price
+                    ),
                     holding_bars=holding_bars,
                     time_stop_break_even_enabled=config.time_stop_break_even_enabled,
                     time_stop_break_even_bars=config.resolved_time_stop_break_even_bars(),
@@ -7094,8 +7460,38 @@ class StrategyEngine:
                         f"交易员固定止盈已触发 | 当前价={format_decimal(current_price)} | "
                         f"止盈={format_decimal(current_take_profit)} | 开始平仓释放额度"
                     )
-                    self._close_position(credentials, config, trade_instrument, position, "止盈")
-                    return
+                    if self._submit_close_for_confirmed_position(credentials, config, trade_instrument, position, "止盈"):
+                        return
+                    self._stop_event.wait(config.poll_seconds)
+                    continue
+
+            if virtual_fixed_history_hit is not None and not virtual_fixed_review_reported:
+                hit_kind, hit_candle_ts = virtual_fixed_history_hit
+                if hit_kind == "stop":
+                    review_message = "历史触及虚拟止损；按虚拟止损规则不自动平仓"
+                    if not virtual_loss_logged:
+                        self._logger(
+                            f"交易员虚拟止损补查 | {review_message} | K线={_fmt_ts(hit_candle_ts)} | "
+                            f"当前价={format_decimal(current_price)}"
+                        )
+                        virtual_loss_logged = True
+                elif hit_kind == "take":
+                    take_still_triggered = current_price >= take_profit if direction == "long" else current_price <= take_profit
+                    review_message = (
+                        "历史曾触发固定止盈，当前价仍满足阈值，待实时分支确认"
+                        if take_still_triggered
+                        else "历史曾触发固定止盈但当前价已回落，需人工复核"
+                    )
+                    self._logger(
+                        f"交易员虚拟保护补查 | {review_message} | K线={_fmt_ts(hit_candle_ts)} | "
+                        f"当前价={format_decimal(current_price)}"
+                    )
+                else:
+                    self._logger(
+                        f"交易员虚拟保护补查 | 同一根K线同时触及止盈和止损，先后顺序不明，需人工复核 | "
+                        f"K线={_fmt_ts(hit_candle_ts)} | 当前价={format_decimal(current_price)}"
+                    )
+                virtual_fixed_review_reported = True
 
             if trend_ema_close_exit_enabled and trend_ema_close_exit_armed:
                 exit_ready, trend_ema_close_exit_last_candle_ts, exit_candle, trend_ema_value = (
@@ -8031,6 +8427,7 @@ def _advance_dynamic_stop_live(
     *,
     direction: Literal["long", "short"],
     current_price: Decimal,
+    favorable_price: Decimal | None = None,
     entry_price: Decimal,
     risk_per_unit: Decimal,
     current_stop_loss: Decimal,
@@ -8117,7 +8514,12 @@ def _advance_dynamic_stop_live(
                 taker_fee_rate=taker_fee_rate,
                 dynamic_fee_offset_enabled=dynamic_fee_offset_enabled,
             )
-            reached = current_price >= trigger_price if direction == "long" else current_price <= trigger_price
+            trigger_price_reference = favorable_price if favorable_price is not None else current_price
+            reached = (
+                trigger_price_reference >= trigger_price
+                if direction == "long"
+                else trigger_price_reference <= trigger_price
+            )
             if not reached:
                 return updated_stop, trigger_price, trigger_r, moved
 

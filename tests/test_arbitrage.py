@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import threading
 import unittest
+from datetime import datetime, timezone
 from decimal import Decimal
 import time
 from types import SimpleNamespace
@@ -884,7 +885,10 @@ class ArbitrageScannerFilterTest(unittest.TestCase):
     def test_scan_can_filter_only_futures(self) -> None:
         scanner = ArbitrageScanner(_FakeScannerClient())
 
-        rows = scanner.scan(include_swap=False, include_futures=True)
+        with patch("okx_quant.arbitrage.arbitrage_scanner.datetime") as scanner_datetime:
+            scanner_datetime.now.return_value = datetime(2026, 1, 1, tzinfo=timezone.utc)
+            scanner_datetime.strptime.side_effect = datetime.strptime
+            rows = scanner.scan(include_swap=False, include_futures=True)
 
         self.assertEqual(len(rows), 5)
         self.assertTrue(all(item.pair_kind in {"spot_quarter", "spot_next_quarter", "spot_future"} for item in rows))

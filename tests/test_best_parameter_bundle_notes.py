@@ -192,7 +192,7 @@ class BestParameterBundleNotesTest(TestCase):
 
         html = _strategy_detail_note_html(spec, run)
 
-        self.assertIn("BTC&#x505A;&#x7A7A;&#x5F53;&#x524D;&#x9ED8;&#x8BA4;&#x91C7;&#x7528;", html)
+        self.assertIn("BTC &#x8BF4;&#x660E;&#x3002;", html)
         self.assertIn('class="note-meta"', html)
         self.assertIn("2019-12-16 14:00 -&gt; 2026-06-14 19:00", html)
 

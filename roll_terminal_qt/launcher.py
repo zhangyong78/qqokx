@@ -628,6 +628,8 @@ class LauncherWindow(QMainWindow):
 
     @Slot()
     def _start_background_history_sync(self) -> None:
+        if self._shutdown_in_progress:
+            return
         profile_name = str(self._active_profile_name or "").strip()
         runtime = load_runtime(profile_name) if profile_name else None
         if runtime is None:
@@ -772,13 +774,13 @@ class LauncherWindow(QMainWindow):
         if any(summary.values()):
             message = "检测到本地任务仍在运行：" + " | ".join(
                 f"{label} {count}"
-                for label, count in (("RR", summary["rr"]), ("条件单", summary["line_conditions"]), ("套利", summary["arbitrage"]), ("区域demo执行", summary["area_demo"]))
+                for label, count in (("RR", summary["rr"]), ("条件单", summary["line_conditions"]), ("套利", summary["arbitrage"]), ("智能辅助交易", summary["area_demo"]))
                 if count
             )
             answer = QMessageBox.question(
                 self,
                 "确认关闭",
-                f"{message}\n\n关闭将停止本机新入场与保护管理；交易所已有保护单不会被撤销。区域形态模拟盘会话重启后只读，需人工核对后继续保护。是否继续？",
+                f"{message}\n\n关闭将停止本机新入场、动态保护升级与平仓对账；交易所已有保护单继续生效。智能辅助交易的实盘和模拟盘会话重启后均为只读，需人工核对后继续保护。是否继续？",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 QMessageBox.StandardButton.No,
             )
@@ -810,7 +812,7 @@ class LauncherWindow(QMainWindow):
         demo_getter = getattr(self._area_shape_execution_monitor, "sessions", None)
         if callable(demo_getter):
             try:
-                summary["area_demo"] = sum(1 for item in demo_getter() if item.get("status") in {"arming", "armed", "signal_pending", "entry_intent", "position_unprotected", "tp_pending", "protected", "manual_control", "needs_manual_rearm", "manual_review", "paused"})
+                summary["area_demo"] = sum(1 for item in demo_getter() if item.get("status") in {"arming", "armed", "signal_pending", "entry_intent", "position_unprotected", "tp_pending", "protected", "closing_pending", "manual_control", "needs_manual_rearm", "manual_review", "paused"})
             except Exception:
                 pass
         return summary
@@ -846,9 +848,13 @@ class LauncherWindow(QMainWindow):
         legacy_text = " | ".join(part for part in legacy_parts if part)
         if legacy_text:
             text = f"{text}｜{legacy_text}" if text else legacy_text
-        demo_count = sum(1 for item in self._area_shape_execution_monitor.sessions() if item.get("status") in {"arming", "armed", "signal_pending", "entry_intent", "position_unprotected", "tp_pending", "protected", "manual_control", "needs_manual_rearm", "manual_review", "paused"})
-        if demo_count:
-            text = f"{text}｜区域demo {demo_count}" if text else f"区域demo {demo_count}"
+        sessions = [item for item in self._area_shape_execution_monitor.sessions()
+                    if item.get("status") in {"arming", "armed", "signal_pending", "entry_intent", "position_unprotected", "tp_pending", "protected", "closing_pending", "manual_control", "needs_manual_rearm", "manual_review", "paused"}]
+        for environment, label in (("live", "实盘"), ("demo", "模拟盘")):
+            count = sum(1 for item in sessions if item.get("environment", "demo") == environment)
+            if count:
+                part = f"智能辅助{label} {count}"
+                text = f"{text}｜{part}" if text else part
         self._workspace_header.set_task_text(text)
         self._local_task_status.setText(text)
 
@@ -940,6 +946,23 @@ class LauncherWindow(QMainWindow):
         self._finish_shutdown()
 
     def _finish_shutdown(self) -> None:
+        if bool(getattr(self, "_shutdown_services_complete", False)):
+            return
+        if not bool(getattr(self, "_shutdown_services_requested", False)):
+            self._shutdown_services_requested = True
+            self._shape_signal_monitor.stop()
+            self._area_shape_monitor.stop()
+            self._area_shape_execution_monitor.stop()
+            self._history_sync_manager.shutdown()
+        history_running = getattr(self._history_sync_manager, "has_running_threads", lambda: False)
+        monitors = (self._shape_signal_monitor, self._area_shape_monitor, self._area_shape_execution_monitor)
+        monitors_running = any(getattr(monitor, "is_running", lambda: False)() for monitor in monitors)
+        if history_running() or monitors_running:
+            # Keep Qt and its owner objects alive after the bounded stop wait.
+            # A slow REST response must not cause a running QThread to be deleted.
+            QTimer.singleShot(50, self._finish_shutdown)
+            return
+        self._shutdown_services_complete = True
         finished_at = datetime.now()
         started_at = self._shutdown_started_at or finished_at
         elapsed = (finished_at - started_at).total_seconds()
@@ -953,10 +976,6 @@ class LauncherWindow(QMainWindow):
             )
         except Exception:
             pass
-        self._shape_signal_monitor.stop()
-        self._area_shape_monitor.stop()
-        self._area_shape_execution_monitor.stop()
-        self._history_sync_manager.shutdown()
         self.deleteLater()
         app = QApplication.instance()
         if app is not None:

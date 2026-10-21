@@ -6,8 +6,8 @@ from unittest.mock import Mock, patch
 
 import pytest
 
-from okx_quant.engine import DynamicStopTriggerState, FilledPosition, StrategyEngine
-from okx_quant.models import Candle, Credentials, DynamicProtectionRule, Instrument, StrategyConfig
+from okx_quant.engine import DynamicStopTriggerState, FilledPosition, StrategyEngine, _advance_dynamic_stop_live
+from okx_quant.models import Candle, Credentials, DynamicProtectionRule, Instrument, ProtectionPlan, StrategyConfig
 from okx_quant.okx_client import OkxApiError, OkxRestClient
 
 
@@ -138,6 +138,180 @@ def test_restore_excludes_pre_entry_and_unfinished_bars_and_covers_first_hour(di
     assert extreme == D(expected)
     assert cursor <= NOW - MINUTE
     assert count == 1
+
+
+def test_local_dynamic_stop_uses_recovered_high_after_price_retraces():
+    entry_ts = HOUR + 10 * MINUTE + 30_000
+    client = CandleClient(
+        minutes=[
+            candle(HOUR + 10 * MINUTE, "999", "1"),
+            candle(2 * HOUR, "145", "95"),
+        ],
+    )
+    engine = StrategyEngine(client, lambda _text: None)
+    with patch("okx_quant.engine.time.time", return_value=NOW / 1000):
+        state = engine._start_local_dynamic_stop_history(
+            inst_id=INSTRUMENT.inst_id,
+            trigger_type="mark",
+            direction="long",
+            entry_price=D("100"),
+            entry_ts=entry_ts,
+        )
+    assert state.trigger_state.favorable_price == D("145")
+
+    stop, _target, next_trigger_r, moved = _advance_dynamic_stop_live(
+        direction="long",
+        current_price=D("109"),
+        favorable_price=state.trigger_state.favorable_price,
+        entry_price=D("100"),
+        risk_per_unit=D("10"),
+        current_stop_loss=D("90"),
+        next_trigger_r=2,
+        tick_size=D("1"),
+        dynamic_fee_offset_enabled=False,
+    )
+
+    assert moved
+    assert stop > D("90")
+    assert next_trigger_r > 2
+
+
+def test_local_fixed_exit_history_excludes_entry_minute_and_uses_first_confirmed_touch():
+    entry_ts = HOUR + 10 * MINUTE + 30_000
+    client = CandleClient(minutes=[
+        candle(HOUR + 10 * MINUTE, "120", "80"),
+        candle(HOUR + 11 * MINUTE, "105", "89"),
+        candle(HOUR + 12 * MINUTE, "111", "95"),
+        candle(NOW - MINUTE, "120", "80", confirmed=False),
+    ])
+    engine = StrategyEngine(client, lambda _text: None)
+    with patch("okx_quant.engine.time.time", return_value=NOW / 1000):
+        hit, cursor = engine._scan_local_fixed_exit_history(
+            inst_id=INSTRUMENT.inst_id,
+            trigger_type="mark",
+            direction="long",
+            entry_ts=entry_ts,
+            stop_loss=D("90"),
+            take_profit=D("110"),
+            last_checked_candle_ts=None,
+        )
+    assert hit == ("stop", HOUR + 11 * MINUTE)
+    assert cursor == HOUR + 12 * MINUTE
+    assert client.calls[0][0] == "mark"
+
+
+def test_local_fixed_exit_history_marks_same_candle_tp_sl_order_ambiguous():
+    entry_ts = HOUR + 10 * MINUTE
+    client = CandleClient(minutes=[candle(HOUR + 10 * MINUTE, "111", "89")])
+    engine = StrategyEngine(client, lambda _text: None)
+    with patch("okx_quant.engine.time.time", return_value=NOW / 1000):
+        hit, _cursor = engine._scan_local_fixed_exit_history(
+            inst_id=INSTRUMENT.inst_id,
+            trigger_type="last",
+            direction="long",
+            entry_ts=entry_ts,
+            stop_loss=D("90"),
+            take_profit=D("110"),
+            last_checked_candle_ts=None,
+        )
+    assert hit == ("ambiguous", HOUR + 10 * MINUTE)
+
+
+@pytest.mark.parametrize("current_price,should_close", [("100", False), ("89", True)])
+def test_local_fixed_exit_recovery_requires_current_threshold_for_execution(current_price, should_close):
+    client = CandleClient(minutes=[
+        candle(HOUR + 10 * MINUTE, "105", "95"),
+        candle(HOUR + 11 * MINUTE, "105", "89"),
+    ])
+    messages = []
+    engine = StrategyEngine(client, messages.append)
+    engine._stop_event = Event()
+    engine._stop_event.wait = Mock(side_effect=lambda *_args, **_kwargs: engine._stop_event.set())
+    engine._get_trigger_price_with_retry = Mock(return_value=D(current_price))
+    engine._emit_runtime_heartbeat = Mock()
+    engine._find_managed_position = Mock(return_value=SimpleNamespace(avail_position=D("1"), position=D("1")))
+    engine._close_position = Mock()
+    engine.resume_automatic_trade_management = Mock()
+    with patch("okx_quant.engine.time.time", return_value=NOW / 1000):
+        engine._monitor_local_exit(
+            CREDS,
+            config(),
+            INSTRUMENT,
+            replace(position(), entry_ts=HOUR + 10 * MINUTE),
+            ProtectionPlan(
+                trigger_inst_id=INSTRUMENT.inst_id,
+                trigger_price_type="mark",
+                take_profit=D("110"),
+                stop_loss=D("90"),
+                entry_reference=D("100"),
+                atr_value=D("10"),
+                direction="long",
+                candle_ts=HOUR,
+            ),
+        )
+    assert bool(engine._close_position.called) is should_close
+    assert any("历史曾触发" in message for message in messages), messages
+
+
+def test_ema55_local_fixed_exit_monitor_reports_recovered_touch_without_current_trigger():
+    client = CandleClient(minutes=[
+        candle(HOUR + 10 * MINUTE, "105", "95"),
+        candle(HOUR + 11 * MINUTE, "105", "89"),
+    ])
+    messages = []
+    engine = StrategyEngine(client, messages.append)
+    engine._stop_event = Event()
+    engine._stop_event.wait = Mock(side_effect=lambda *_args, **_kwargs: engine._stop_event.set())
+    engine._get_trigger_price_with_retry = Mock(return_value=D("100"))
+    engine._emit_runtime_heartbeat = Mock()
+    engine._close_position = Mock()
+    with patch("okx_quant.engine.time.time", return_value=NOW / 1000):
+        engine._monitor_ema55_slope_short_local_exit(
+            CREDS,
+            config(),
+            signal_instrument=INSTRUMENT,
+            trade_instrument=INSTRUMENT,
+            position=replace(position(), entry_ts=HOUR + 10 * MINUTE),
+            protection=ProtectionPlan(
+                trigger_inst_id=INSTRUMENT.inst_id,
+                trigger_price_type="mark",
+                take_profit=D("110"),
+                stop_loss=D("90"),
+                entry_reference=D("100"),
+                atr_value=D("10"),
+                direction="long",
+                candle_ts=HOUR,
+            ),
+            lookback=20,
+        )
+    assert not engine._close_position.called
+    assert any("历史曾触发" in message for message in messages)
+
+
+def test_trader_virtual_stop_history_reports_without_automatically_closing():
+    client = CandleClient(minutes=[
+        candle(HOUR + 10 * MINUTE, "105", "95"),
+        candle(HOUR + 11 * MINUTE, "105", "89"),
+    ])
+    messages = []
+    engine = StrategyEngine(client, messages.append)
+    engine._stop_event = Event()
+    engine._stop_event.wait = Mock(side_effect=lambda *_args, **_kwargs: engine._stop_event.set())
+    engine._find_managed_position = Mock(return_value=SimpleNamespace(position=D("1"), avail_position=D("1")))
+    engine._get_trigger_price_with_retry = Mock(return_value=D("100"))
+    engine._close_position = Mock()
+    with patch("okx_quant.engine.time.time", return_value=NOW / 1000):
+        engine._monitor_trader_virtual_position(
+            CREDS,
+            config(),
+            trade_instrument=INSTRUMENT,
+            position=replace(position(), entry_ts=HOUR + 10 * MINUTE),
+            initial_stop_loss=D("90"),
+            take_profit=D("110"),
+            dynamic_take_profit_enabled=False,
+        )
+    assert not engine._close_position.called
+    assert any("历史触及虚拟止损" in message for message in messages)
 
 
 @pytest.mark.parametrize("source,index_id", [("last", "BTC-USDT-SWAP"), ("mark", "BTC-USDT-SWAP"), ("index", "BTC-USDT")])

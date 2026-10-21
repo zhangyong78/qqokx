@@ -661,6 +661,7 @@ class RollTerminalQtWindowHelperTests(QtWidgetTestCase):
             _rr_monitor_timer=MagicMock(),
             _realtime_candle_unsubscribe=None,
             _loader=loader,
+            _retired_loaders=set(),
             _secondary_loader=None,
             _secondary_volatility_loader=None,
             _deferred_chart_render_timer=MagicMock(),
@@ -818,6 +819,7 @@ class RollTerminalQtWindowHelperTests(QtWidgetTestCase):
             },
             _workspace_header=header,
             _local_task_status=status_label,
+            _area_shape_execution_monitor=SimpleNamespace(sessions=lambda: []),
         )
 
         LauncherWindow._refresh_local_task_status(app)
@@ -1012,8 +1014,16 @@ class RollTerminalQtWindowHelperTests(QtWidgetTestCase):
             "moni": SimpleNamespace(credential_profile_name="moni", environment="demo"),
             "api2": SimpleNamespace(credential_profile_name="api2", environment="live"),
         }
+        history_sync_stub = SimpleNamespace(
+            status_changed=SimpleNamespace(connect=lambda *_args: None),
+            sync_failed=SimpleNamespace(connect=lambda *_args: None),
+            request_sync=lambda **_kwargs: None,
+            stop=lambda **_kwargs: None,
+            shutdown=lambda: None,
+        )
         with (
             patch("roll_terminal_qt.launcher.KlineAnalysisWindow", Kline),
+            patch("roll_terminal_qt.launcher.get_history_sync_manager", return_value=history_sync_stub),
             patch(
                 "roll_terminal_qt.launcher.load_profile_snapshots",
                 return_value=({"api2": {}, "moni": {}}, "api2"),
@@ -1178,14 +1188,20 @@ class RollTerminalQtWindowHelperTests(QtWidgetTestCase):
                 self.__class__.dispose_widget(launcher)
 
     def test_hiding_chart_keeps_rr_monitor_running(self) -> None:
-        chart_host = MagicMock()
+        chart_frame = MagicMock()
         button = MagicMock()
         rr_timer = MagicMock()
-        app = SimpleNamespace(_chart_host=chart_host, _hide_chart_btn=button, _rr_monitor_timer=rr_timer)
+        app = SimpleNamespace(
+            _chart_frame=chart_frame,
+            _chart_account_splitter=None,
+            _account_drawer=None,
+            _hide_chart_btn=button,
+            _rr_monitor_timer=rr_timer,
+        )
 
         KlineAnalysisWindow._toggle_chart_visibility(app, True)
 
-        chart_host.setVisible.assert_called_once_with(False)
+        chart_frame.setVisible.assert_called_once_with(False)
         button.setText.assert_called_once_with("显示图表")
         rr_timer.stop.assert_not_called()
 
@@ -1358,6 +1374,7 @@ class RollTerminalQtWindowHelperTests(QtWidgetTestCase):
         app = SimpleNamespace(
             _pending_payload=payload,
             _loaded_primary_request_key=("primary",),
+            _page_active=True,
             _primary_payload_cache={},
             _remember_payload_cache=MagicMock(),
             _apply_realtime_candle_to_chart=MagicMock(),
@@ -1385,45 +1402,37 @@ class RollTerminalQtWindowHelperTests(QtWidgetTestCase):
         self.assertIn("elapsed_ms=", messages[0])
         self.assertIn("rows=3", messages[0])
 
-    def test_kline_account_drawer_load_thread_fetches_positions_and_orders_in_parallel(self) -> None:
-        barrier = threading.Barrier(2)
-
+    def test_kline_account_drawer_load_thread_fetches_positions_and_emits_snapshot(self) -> None:
         class FakeClient:
             def get_positions(self, credentials, *, environment):  # noqa: ANN001
-                self._touch(credentials, environment)
-                barrier.wait(timeout=0.5)
-                time.sleep(0.02)
+                self.position_call = (credentials, environment)
                 return ["position-1"]
 
-            def get_pending_orders(self, credentials, *, environment, limit, include_algo):  # noqa: ANN001
-                self._touch(credentials, environment, limit, include_algo)
-                barrier.wait(timeout=0.5)
-                time.sleep(0.02)
-                return ["order-1"]
-
-            @staticmethod
-            def _touch(*_args, **_kwargs) -> None:
-                return
-
         runtime = SimpleNamespace(credentials=object(), environment="demo")
+        client = FakeClient()
         thread = AccountDrawerLoadThread(
             request_generation=7,
             runtime=runtime,
-            client=FakeClient(),
+            client=client,
         )
         completed: list[tuple[int, object]] = []
         failed: list[tuple[int, str]] = []
         thread.completed.connect(lambda generation, snapshot: completed.append((generation, snapshot)))
         thread.failed.connect(lambda generation, message: failed.append((generation, message)))
 
-        thread.run()
+        with (
+            patch("roll_terminal_qt.kline_account_drawer._build_upl_usdt_price_map", return_value={}),
+            patch("roll_terminal_qt.kline_account_drawer._build_position_instrument_map", return_value={}),
+            patch("roll_terminal_qt.kline_account_drawer._build_position_ticker_map", return_value={}),
+        ):
+            thread.run()
 
         self.assertEqual(failed, [])
         self.assertEqual(len(completed), 1)
         generation, snapshot = completed[0]
         self.assertEqual(generation, 7)
         self.assertEqual(tuple(snapshot.positions), ("position-1",))
-        self.assertEqual(tuple(snapshot.orders), ("order-1",))
+        self.assertEqual(client.position_call, (runtime.credentials, "demo"))
 
     def test_launcher_waits_for_open_child_windows_before_home_shutdown(self) -> None:
         class ShutdownHome(QWidget):
@@ -2764,7 +2773,7 @@ class RollTerminalQtWindowHelperTests(QtWidgetTestCase):
                     self.assertIsNone(action_mock.call_args)
                     self.assertTrue(error_mock.called)
                     error_message = str(error_mock.call_args.args[1] if len(error_mock.call_args.args) > 1 else "")
-                    self.assertIn("不能超过当前可平仓位", error_message)
+                    self.assertIn("\u5e73\u4ed3\u6570\u91cf\u4e0d\u80fd\u8d85\u8fc7\u5f53\u524d\u53ef\u5e73\u4ed3", error_message)
             finally:
                 self.__class__.dispose_widget(window)
 
@@ -2970,7 +2979,7 @@ class RollTerminalQtWindowHelperTests(QtWidgetTestCase):
 
                     self.assertIsNone(action_mock.call_args)
                     self.assertTrue(error_mock.called)
-                    self.assertIn("不能超过当前可平仓位", str(error_mock.call_args.args[1] if len(error_mock.call_args.args) > 1 else ""))
+                    self.assertIn("\u5e73\u4ed3\u6570\u91cf\u4e0d\u80fd\u8d85\u8fc7\u5f53\u524d\u53ef\u5e73\u4ed3", str(error_mock.call_args.args[1] if len(error_mock.call_args.args) > 1 else ""))
             finally:
                 self.__class__.dispose_widget(window)
 
@@ -3187,6 +3196,7 @@ class RollTerminalQtWindowHelperTests(QtWidgetTestCase):
                 "BNB-USDT-SWAP",
                 "OKB-USDT-SWAP",
                 "ETH-BTC",
+                "SOL-BTC",
             ),
         )
         self.assertEqual(_volatility_currency_for_symbol("BTC-USDT-SWAP"), "BTC")
@@ -4267,6 +4277,7 @@ class RollTerminalQtWindowHelperTests(QtWidgetTestCase):
             try:
                 ledger = SimpleNamespace(
                     status="protected",
+                    plan=SimpleNamespace(inst_id="BTC-USDT-SWAP"),
                     stop_loss_order=SimpleNamespace(algo_id="stop-algo-1", state="live", trigger_price=Decimal("59000")),
                     take_profit_order=SimpleNamespace(algo_id="take-algo-1", state="live", trigger_price=Decimal("62000")),
                     events=(),
@@ -4469,14 +4480,29 @@ class RollTerminalQtWindowHelperTests(QtWidgetTestCase):
                     self.assertIn("接口超时", window._rr_action_status.text())
                     self.assertTrue(button.isEnabled())
 
-                    callbacks["on_success"](SimpleNamespace(status="cancelled"))
-                    self.assertIn("最终订单状态", window._rr_action_status.text())
-                    callbacks["on_success"](SimpleNamespace(status="protected_cancelled_remainder"))
-                    self.assertIn("已成交仓位和止盈止损保护保留", window._rr_action_status.text())
-                    with patch("roll_terminal_qt.kline_analysis_window.QMessageBox.question", return_value=QMessageBox.StandardButton.No):
-                        callbacks["on_success"](SimpleNamespace(status="cancel_confirmation_required"))
-                    self.assertIn("已取消撤单确认", window._rr_action_status.text())
-                    self.assertTrue(button.isEnabled())
+                    fake_order_store = MagicMock()
+                    with patch(
+                        "roll_terminal_qt.kline_analysis_window.get_shared_order_store",
+                        return_value=fake_order_store,
+                    ):
+                        callbacks["on_success"](
+                            SimpleNamespace(status="cancelled", plan=SimpleNamespace(profile_name="demo"), events=[])
+                        )
+                        self.assertIn("最终订单状态", window._rr_action_status.text())
+                        callbacks["on_success"](
+                            SimpleNamespace(
+                                status="protected_cancelled_remainder",
+                                plan=SimpleNamespace(profile_name="demo"),
+                                events=[],
+                            )
+                        )
+                        self.assertIn("已成交仓位和止盈止损保护保留", window._rr_action_status.text())
+                        with patch("roll_terminal_qt.kline_analysis_window.QMessageBox.question", return_value=QMessageBox.StandardButton.No):
+                            callbacks["on_success"](
+                                SimpleNamespace(status="cancel_confirmation_required", plan=entry.plan, events=[])
+                            )
+                        self.assertIn("已取消撤单确认", window._rr_action_status.text())
+                        self.assertTrue(button.isEnabled())
             finally:
                 self.__class__.dispose_widget(window)
 
@@ -4882,7 +4908,7 @@ class RollTerminalQtWindowHelperTests(QtWidgetTestCase):
             "price_entry": "60000", "price_stop": "59000", "price_tp": "65000", "r_multiple": "5", "locked": False,
         }
         ledger_entry = SimpleNamespace(
-            plan=SimpleNamespace(plan_id="moni:BTC-USDT-SWAP:rr-1"),
+            plan=SimpleNamespace(plan_id="moni:BTC-USDT-SWAP:rr-1", inst_id="BTC-USDT-SWAP"),
             status="protected_trailing",
             filled_size=Decimal("10"),
             remaining_size=Decimal("0"),
@@ -4899,8 +4925,8 @@ class RollTerminalQtWindowHelperTests(QtWidgetTestCase):
                     window._rr_table.setCurrentCell(0, 0)
                 summary = window._rr_tracking_summary.text()
                 self.assertIn("锁盈中", summary)
-                self.assertIn("成交 10张", summary)
-                self.assertIn("剩余 0张", summary)
+                self.assertIn("成交 0.1 BTC", summary)
+                self.assertIn("剩余 0", summary)
                 self.assertIn("当前止损 62000", summary)
             finally:
                 self.__class__.dispose_widget(window)
@@ -7058,8 +7084,8 @@ class RollTerminalQtWindowHelperTests(QtWidgetTestCase):
                 self.assertEqual(
                     sync_range.call_args_list,
                     [
-                        call(target="secondary", start_x=100.0, end_x=200.0),
-                        call(target="tertiary", start_x=100.0, end_x=200.0),
+                        call(target="secondary", start_x=100.0, end_x=200.0, source="primary"),
+                        call(target="tertiary", start_x=100.0, end_x=200.0, source="primary"),
                     ],
                 )
             finally:
@@ -7156,6 +7182,7 @@ class RollTerminalQtWindowHelperTests(QtWidgetTestCase):
             window = KlineAnalysisWindow()
             try:
                 window._page_ready = True
+                window._page_active = True
                 payload = KlineChartPayload(
                     candles=[{"time": 1, "open": 1.0, "high": 1.0, "low": 1.0, "close": 1.0, "volume": 1.0}],
                     ema_9=[],
@@ -7572,7 +7599,7 @@ class RollTerminalQtWindowHelperTests(QtWidgetTestCase):
             self.assertTrue(_prefer_native_chart_backend())
 
     def test_default_native_visible_range_focuses_latest_bars(self) -> None:
-        self.assertEqual(_default_native_visible_range(1200), (960.0, 1199.0))
+        self.assertEqual(_default_native_visible_range(1200), (950.0, 1199.0))
         self.assertEqual(_default_native_visible_range(100), (0.0, 99.0))
 
     def test_default_kline_splitter_sizes_follow_requested_ratio(self) -> None:

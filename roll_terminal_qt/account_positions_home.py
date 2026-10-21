@@ -428,6 +428,7 @@ from okx_quant.okx_client import (
 from okx_quant.persistence import (
     load_account_positions_home_view_prefs,
     load_notification_snapshot,
+    option_protection_tasks_file_path,
     load_position_notes_snapshot,
     save_account_positions_home_view_prefs,
     save_position_notes_snapshot,
@@ -1804,6 +1805,12 @@ def _current_position_kline_time_markers(
         return ()
     raw = position.raw if isinstance(position.raw, dict) else {}
     markers: list[tuple[str, int]] = []
+    history_markers = [
+        marker
+        for item in history_items
+        if str(item.inst_id or "").strip().upper() == inst_id
+        for marker in _position_history_kline_time_markers(item)
+    ]
     opened_at = _position_kline_timestamp(
         raw.get("openTime"),
         raw.get("openTs"),
@@ -1813,11 +1820,10 @@ def _current_position_kline_time_markers(
     if opened_at is not None:
         direction = "short" if _position_is_short(position) else "long"
         marker = PositionPriceMarker("entry", opened_at, Decimal("1"), direction)
-        markers.append((position_marker_action_label(marker), opened_at))
-    for item in history_items:
-        if str(item.inst_id or "").strip().upper() != inst_id:
-            continue
-        markers.extend(_position_history_kline_time_markers(item))
+        entry_marker = (position_marker_action_label(marker), opened_at)
+        if not any(timestamp == opened_at for _label, timestamp in history_markers):
+            markers.append(entry_marker)
+    markers.extend(history_markers)
     seen: set[tuple[str, int]] = set()
     unique_markers: list[tuple[str, int]] = []
     for marker in markers:
@@ -2549,6 +2555,7 @@ class PositionProtectionDialog(QDialog):
         sessions_layout.addWidget(self._session_status_label)
         session_headers = (
             "API",
+            "环境",
             "期权合约",
             "触发条件",
             "触发标的",
@@ -2593,15 +2600,16 @@ class PositionProtectionDialog(QDialog):
         header.setStretchLastSection(False)
         for column in range(column_count):
             header.setSectionResizeMode(column, QHeaderView.ResizeMode.ResizeToContents)
-        for column in (1, 2, 3, 9, 12):
+        for column in (2, 3, 4, 10, 13):
             header.setSectionResizeMode(column, QHeaderView.ResizeMode.Interactive)
         default_widths = {
             0: 120,
-            1: 210,
-            2: 170,
-            3: 120,
-            9: 230,
-            12: 96,
+            1: 90,
+            2: 210,
+            3: 170,
+            4: 120,
+            10: 230,
+            13: 96,
         }
         for column, width in default_widths.items():
             self._sessions_table.setColumnWidth(column, width)
@@ -2860,6 +2868,10 @@ class PositionProtectionDialog(QDialog):
         if take_profit_trigger is None and stop_loss_trigger is None:
             raise ValueError("止盈触发价和止损触发价至少要填写一个。")
 
+        position_raw = position.raw if isinstance(position.raw, dict) else {}
+        position_id = str(position_raw.get("posId") or "").strip() or None
+        position_created_at = str(position_raw.get("cTime") or "").strip() or None
+
         direction = derive_position_direction(position)
         _validate_protection_price_relationship(
             option_inst_id=position.inst_id,
@@ -2890,6 +2902,8 @@ class PositionProtectionDialog(QDialog):
             stop_loss_slippage=self._parse_nonnegative_decimal(self._sl_slippage_edit.text(), "止损滑点"),
             poll_seconds=float(self._parse_positive_decimal(self._poll_seconds_edit.text(), "轮询秒数")),
             trigger_label=trigger_label,
+            position_id=position_id,
+            position_created_at=position_created_at,
         )
 
     def _build_strategy_config(self, *, runtime: object, position: OkxPosition, protection: OptionProtectionConfig) -> StrategyConfig:
@@ -2938,6 +2952,7 @@ class PositionProtectionDialog(QDialog):
             )
             values = (
                 item.api_name or "-",
+                item.environment or "-",
                 item.option_inst_id,
                 item.trigger_label,
                 item.trigger_inst_id,
@@ -2953,7 +2968,7 @@ class PositionProtectionDialog(QDialog):
             )
             for column, value in enumerate(values):
                 cell = QTableWidgetItem(str(value))
-                if column in {0, 4, 5, 6, 7, 8, 10, 11, 12}:
+                if column in {0, 1, 5, 6, 7, 8, 9, 11, 12, 13}:
                     cell.setTextAlignment(Qt.AlignmentFlag.AlignCenter | Qt.AlignmentFlag.AlignVCenter)
                 self._sessions_table.setItem(row, column, cell)
         target_row = -1
@@ -2980,6 +2995,7 @@ class PositionProtectionDialog(QDialog):
         detail_lines = [
             f"任务：{session.session_id}",
             f"API配置：{session.api_name or '-'}",
+            f"运行环境：{session.environment or '-'}",
             f"期权合约：{session.option_inst_id}",
             f"触发条件：{session.trigger_label}",
             f"触发标的：{session.trigger_inst_id}",
@@ -3172,7 +3188,11 @@ class AccountPositionsHomeWidget(QWidget):
         self._realtime_store = get_shared_realtime_account_store(client=self._shared_client)
         self._realtime_store.snapshot_ready.connect(self._apply_realtime_snapshot)
         self._realtime_store.status_changed.connect(self._set_realtime_status)
-        self._protection_manager = PositionProtectionManager(self._shared_client, lambda _message: None)
+        self._protection_manager = PositionProtectionManager(
+            self._shared_client,
+            lambda _message: None,
+            state_path=option_protection_tasks_file_path(),
+        )
         self._protection_dialog: PositionProtectionDialog | None = None
         self._legacy_option_tools = LegacyOptionToolsHost(parent=self, runtime_provider=lambda: self._runtime)
         self._instrument_kline_dialog: InstrumentKlineDialog | None = None
@@ -3623,7 +3643,11 @@ class AccountPositionsHomeWidget(QWidget):
         self._visible_column_ids: set[str] = set(DEFAULT_VISIBLE_COLUMNS)
         self._expanded_row_keys: set[str] = set()
         self._shared_client = OkxRestClient()
-        self._protection_manager = PositionProtectionManager(self._shared_client, lambda _message: None)
+        self._protection_manager = PositionProtectionManager(
+            self._shared_client,
+            lambda _message: None,
+            state_path=option_protection_tasks_file_path(),
+        )
         self._protection_dialog: PositionProtectionDialog | None = None
         self._legacy_option_tools = LegacyOptionToolsHost(parent=self, runtime_provider=lambda: self._runtime)
 
@@ -6767,8 +6791,8 @@ class AccountPositionsHomeWidget(QWidget):
             time_markers=_position_history_kline_time_markers(item),
             position_price_markers=_position_history_kline_price_markers(
                 item,
-                usdt_prices=self._position_history_usdt_prices,
-                instrument=self._position_history_instruments.get(item.inst_id),
+                usdt_prices=getattr(self, "_position_history_usdt_prices", {}),
+                instrument=getattr(self, "_position_history_instruments", {}).get(item.inst_id),
             ),
         )
 
@@ -7313,6 +7337,13 @@ class AccountPositionsHomeWidget(QWidget):
     def _start_private_threads(self, *, force_restart: bool = False, start_history: bool = True) -> None:
         if self._runtime is None:
             return
+        protection_manager = getattr(self, "_protection_manager", None)
+        credentials = getattr(self._runtime, "credentials", None)
+        if protection_manager is not None and credentials is not None:
+            protection_manager.restore_for_profile(
+                credentials,
+                environment=str(getattr(self._runtime, "environment", "") or ""),
+            )
         if force_restart:
             self._stop_private_threads()
         self._private_thread_generation += 1

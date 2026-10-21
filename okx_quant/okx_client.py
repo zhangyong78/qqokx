@@ -1548,12 +1548,12 @@ class OkxRestClient:
         not identify one unambiguous group, the caller must not guess a fee.
         Positive values are rebates; risk sizing only credits no more than zero.
         """
-        if environment != "demo":
-            raise PermissionError("区域形态费用查询只允许demo环境")
+        if environment not in {"demo", "live"}:
+            raise PermissionError("区域形态费用查询环境无效")
         payload = self._request(
             "GET", "/api/v5/account/trade-fee",
             params={"instType": "SWAP", "instFamily": str(inst_family).upper()},
-            auth=True, credentials=credentials, simulated=True,
+            auth=True, credentials=credentials, simulated=(environment == "demo"),
         )
         rows = payload.get("data")
         if not isinstance(rows, list) or len(rows) != 1 or not isinstance(rows[0], dict):
@@ -1576,14 +1576,14 @@ class OkxRestClient:
         view as proof of no conflict. A non-empty first page already blocks the
         new entry; a saturated response is therefore safely a conflict too.
         """
-        if environment != "demo":
-            raise PermissionError("区域形态委托冲突查询只允许demo环境")
+        if environment not in {"demo", "live"}:
+            raise PermissionError("区域形态委托冲突查询环境无效")
         normalized = str(inst_id).strip().upper()
         rows: list[OkxTradeOrderItem] = []
         normal = self._request(
             "GET", "/api/v5/trade/orders-pending",
             params={"instType": "SWAP", "instId": normalized, "limit": "100"},
-            auth=True, credentials=credentials, simulated=True,
+            auth=True, credentials=credentials, simulated=(environment == "demo"),
         ).get("data")
         if not isinstance(normal, list):
             raise OkxApiError("合约定向普通委托响应结构无效")
@@ -1602,7 +1602,7 @@ class OkxRestClient:
             payload = self._request(
                 "GET", "/api/v5/trade/orders-algo-pending",
                 params={"ordType": ord_type, "instId": normalized, "instType": "SWAP", "limit": "100"},
-                auth=True, credentials=credentials, simulated=True,
+                auth=True, credentials=credentials, simulated=(environment == "demo"),
             )
             data = payload.get("data")
             if not isinstance(data, list):
@@ -1617,7 +1617,27 @@ class OkxRestClient:
                 rows.append(self._parse_algo_order_item(raw, default_inst_type="SWAP"))
         return rows
 
-    def place_area_shape_demo_fok_entry(
+    def place_area_shape_demo_fok_entry(self, credentials: Credentials, config: StrategyConfig, **kwargs: Any) -> OkxOrderResult:
+        if config.environment != "demo":
+            raise PermissionError("demo FOK入口只允许OKX模拟盘")
+        return self.place_area_shape_fok_entry(credentials, config, **kwargs)
+
+    def place_area_shape_demo_limit_entry(self, credentials: Credentials, config: StrategyConfig, **kwargs: Any) -> OkxOrderResult:
+        if config.environment != "demo":
+            raise PermissionError("demo限价入口只允许OKX模拟盘")
+        return self.place_area_shape_limit_entry(credentials, config, **kwargs)
+
+    def place_area_shape_demo_trigger_entry(self, credentials: Credentials, config: StrategyConfig, **kwargs: Any) -> OkxOrderResult:
+        if config.environment != "demo":
+            raise PermissionError("demo触发入口只允许OKX模拟盘")
+        return self.place_area_shape_trigger_entry(credentials, config, **kwargs)
+
+    def place_area_shape_demo_protection_algo(self, credentials: Credentials, config: StrategyConfig, **kwargs: Any) -> OkxOrderResult:
+        if config.environment != "demo":
+            raise PermissionError("demo保护入口只允许OKX模拟盘")
+        return self.place_area_shape_protection_algo(credentials, config, **kwargs)
+
+    def place_area_shape_fok_entry(
         self, credentials: Credentials, config: StrategyConfig, *, inst_id: str,
         side: str, size: Decimal, limit_price: Decimal, stop_price: Decimal,
         client_order_id: str, stop_algo_client_order_id: str,
@@ -1628,8 +1648,8 @@ class OkxRestClient:
         The attachment is NOT considered active protection on acknowledgement;
         callers must query the child algo after actual fill and fail closed.
         """
-        if config.environment != "demo":
-            raise PermissionError("区域形态订单写入仅允许OKX模拟盘")
+        if config.environment not in {"demo", "live"}:
+            raise PermissionError("区域形态执行环境无效")
         if side not in {"buy", "sell"} or not client_order_id or not stop_algo_client_order_id:
             raise ValueError("区域形态demo FOK订单参数无效")
         instrument = self.get_area_shape_instrument(inst_id)
@@ -1661,13 +1681,13 @@ class OkxRestClient:
         try:
             payload = self._request(
                 "POST", "/api/v5/trade/order", body=order, auth=True,
-                credentials=credentials, simulated=True,
+                credentials=credentials, simulated=(config.environment == "demo"),
             )
             return self._parse_order_result(payload, empty_message="OKX未返回区域demo入场订单", fallback_cl_ord_id=client_order_id)
         except OkxApiError as exc:
             _raise_order_error_with_request(exc, order)
 
-    def place_area_shape_demo_limit_entry(
+    def place_area_shape_limit_entry(
         self, credentials: Credentials, config: StrategyConfig, *, inst_id: str,
         side: str, size: Decimal, limit_price: Decimal, stop_price: Decimal,
         client_order_id: str, stop_algo_client_order_id: str,
@@ -1678,8 +1698,8 @@ class OkxRestClient:
         The entry price is never rounded or improved. Attached last-price
         protection is only requested here; callers must verify it after fill.
         """
-        if config.environment != "demo":
-            raise PermissionError("区域形态限价委托只允许OKX模拟盘")
+        if config.environment not in {"demo", "live"}:
+            raise PermissionError("区域形态执行环境无效")
         valid_id = lambda value: bool(re.fullmatch(r"[A-Za-z0-9]{1,32}", str(value or "")))
         if side not in {"buy", "sell"}:
             raise ValueError("区域形态demo限价委托方向无效")
@@ -1724,7 +1744,7 @@ class OkxRestClient:
         try:
             payload = self._request(
                 "POST", "/api/v5/trade/order", body=order, auth=True,
-                credentials=credentials, simulated=True,
+                credentials=credentials, simulated=(config.environment == "demo"),
             )
             return self._parse_order_result(
                 payload, empty_message="OKX未返回区域demo限价入场订单", fallback_cl_ord_id=client_order_id,
@@ -1732,15 +1752,15 @@ class OkxRestClient:
         except OkxApiError as exc:
             _raise_order_error_with_request(exc, order)
 
-    def place_area_shape_demo_trigger_entry(
+    def place_area_shape_trigger_entry(
         self, credentials: Credentials, config: StrategyConfig, *, inst_id: str,
         side: str, size: Decimal, trigger_price: Decimal, limit_price: Decimal,
         stop_price: Decimal, client_order_id: str, stop_algo_client_order_id: str,
         take_profit_price: Decimal | None = None,
     ) -> OkxOrderResult:
         """Submit a demo-only bounded trigger entry with attached TP/SL."""
-        if config.environment != "demo":
-            raise PermissionError("区域形态触发委托仅允许OKX模拟盘")
+        if config.environment not in {"demo", "live"}:
+            raise PermissionError("区域形态执行环境无效")
         if side not in {"buy", "sell"} or not client_order_id or not stop_algo_client_order_id:
             raise ValueError("区域形态demo触发委托参数无效")
         instrument = self.get_area_shape_instrument(inst_id)
@@ -1773,21 +1793,21 @@ class OkxRestClient:
         self._maybe_isolated_margin_ccy(order, instrument=instrument, config=config)
         try:
             payload = self._request("POST", "/api/v5/trade/order-algo", body=order,
-                                    auth=True, credentials=credentials, simulated=True)
+                                    auth=True, credentials=credentials, simulated=(config.environment == "demo"))
             return self._parse_algo_order_result(
                 payload, empty_message="OKX未返回区域demo触发委托", fallback_algo_cl_ord_id=client_order_id,
             )
         except OkxApiError as exc:
             _raise_order_error_with_request(exc, order)
 
-    def place_area_shape_demo_protection_algo(
+    def place_area_shape_protection_algo(
         self, credentials: Credentials, config: StrategyConfig, *, inst_id: str, side: str,
         size: Decimal, pos_side: str | None, trigger_price: Decimal, client_order_id: str,
         protection_kind: str,
     ) -> OkxOrderResult:
         """Submit one reduce-only last-price demo TP or SL algorithm order."""
-        if config.environment != "demo":
-            raise PermissionError("区域形态保护单只允许OKX模拟盘")
+        if config.environment not in {"demo", "live"}:
+            raise PermissionError("区域形态执行环境无效")
         if protection_kind not in {"sl", "tp"} or side not in {"buy", "sell"}:
             raise ValueError("区域形态保护单参数无效")
         instrument = self.get_area_shape_instrument(inst_id)
@@ -1820,7 +1840,7 @@ class OkxRestClient:
         self._maybe_isolated_margin_ccy(order, instrument=instrument, config=config)
         try:
             payload = self._request("POST", "/api/v5/trade/order-algo", body=order,
-                                    auth=True, credentials=credentials, simulated=True)
+                                    auth=True, credentials=credentials, simulated=(config.environment == "demo"))
             return self._parse_algo_order_result(payload, empty_message="OKX未返回区域demo保护单", fallback_algo_cl_ord_id=client_order_id)
         except OkxApiError as exc:
             _raise_order_error_with_request(exc, order)
@@ -2544,6 +2564,72 @@ class OkxRestClient:
         )
         items.sort(key=lambda item: item.fill_time or 0, reverse=True)
         return items[:limit]
+
+    def get_order_fill_history(
+        self,
+        credentials: Credentials,
+        *,
+        environment: str,
+        inst_id: str,
+        order_id: str,
+        limit: int = 100,
+    ) -> list[OkxFillHistoryItem]:
+        """Return individual fills for one order, ordered from first to last."""
+        if not inst_id.strip() or not order_id.strip():
+            return []
+        items: list[OkxFillHistoryItem] = []
+        after: str | None = None
+        target = max(1, min(int(limit), 1000))
+        while len(items) < target:
+            request_limit = min(100, target - len(items))
+            params = {
+                "instType": "SWAP" if inst_id.upper().endswith("-SWAP") else "",
+                "instId": inst_id,
+                "ordId": order_id,
+                "limit": str(request_limit),
+            }
+            params = {key: value for key, value in params.items() if value}
+            if after:
+                params["after"] = after
+            payload = self._request(
+                "GET",
+                "/api/v5/trade/fills-history",
+                params=params,
+                auth=True,
+                credentials=credentials,
+                simulated=environment == "demo",
+            )
+            batch = payload.get("data", [])
+            if not batch:
+                break
+            for item in batch:
+                items.append(
+                    OkxFillHistoryItem(
+                        fill_time=_to_int(item.get("fillTime"), item.get("ts"), item.get("cTime")),
+                        inst_id=item.get("instId", ""),
+                        inst_type=item.get("instType", "SWAP"),
+                        side=item.get("side"),
+                        pos_side=item.get("posSide"),
+                        fill_price=_to_decimal(item.get("fillPx")),
+                        fill_size=_to_decimal(item.get("fillSz")),
+                        fill_fee=_first_decimal(item.get("fee"), item.get("fillFee")),
+                        fee_currency=item.get("feeCcy") or item.get("fillFeeCcy"),
+                        pnl=_to_decimal(item.get("fillPnl")),
+                        order_id=item.get("ordId"),
+                        trade_id=item.get("tradeId"),
+                        exec_type=item.get("execType"),
+                        raw=item,
+                    )
+                )
+            after = str(batch[-1].get("billId") or batch[-1].get("ts") or "")
+            if not after or len(batch) < request_limit:
+                break
+        if len(items) >= target:
+            # The earliest fill cannot be certified when the bounded history was exhausted.
+            return []
+        items = [item for item in items if item.order_id == order_id and item.inst_id.upper() == inst_id.upper()]
+        items.sort(key=lambda item: item.fill_time or 0)
+        return items
 
     def _merge_exercise_and_delivery_history(
         self,

@@ -33,6 +33,7 @@ SMART_ORDER_FAVORITES_FILE_NAME = "smart_order_favorites.json"
 ARBITRAGE_LEDGER_FILE_NAME = "arbitrage_ledger.json"
 ARBITRAGE_SETTINGS_FILE_NAME = "arbitrage_settings.json"
 OPTION_STRATEGIES_FILE_NAME = "option_strategies.json"
+OPTION_PROTECTION_TASKS_FILE_NAME = "option_protection_tasks.json"
 SIGNAL_OBSERVER_TEMPLATES_FILE_NAME = "signal_observer_templates.json"
 SIGNAL_OBSERVER_PRESETS_FILE_NAME = "signal_observer_presets.json"
 TRADER_DESK_FILE_NAME = "trader_desk.json"
@@ -244,6 +245,43 @@ def save_arbitrage_settings_snapshot(settings: dict[str, object], path: Path | N
 
 def option_strategies_file_path(base_dir: Path | None = None) -> Path:
     return Path(base_dir) / OPTION_STRATEGIES_FILE_NAME if base_dir is not None else state_dir_path() / OPTION_STRATEGIES_FILE_NAME
+
+
+def option_protection_tasks_file_path(base_dir: Path | None = None) -> Path:
+    return (
+        Path(base_dir) / OPTION_PROTECTION_TASKS_FILE_NAME
+        if base_dir is not None
+        else state_dir_path() / OPTION_PROTECTION_TASKS_FILE_NAME
+    )
+
+
+def load_option_protection_tasks_snapshot(path: Path | None = None) -> dict[str, object]:
+    target = path or option_protection_tasks_file_path()
+    if not target.exists():
+        return {"version": 1, "items": []}
+    try:
+        payload = json.loads(target.read_text(encoding="utf-8"))
+    except Exception:
+        return {"version": 1, "items": []}
+    if not isinstance(payload, dict):
+        return {"version": 1, "items": []}
+    items = payload.get("items")
+    return {"version": 1, "items": items if isinstance(items, list) else []}
+
+
+def save_option_protection_tasks_snapshot(
+    items: list[dict[str, object]],
+    path: Path | None = None,
+) -> Path:
+    target = path or option_protection_tasks_file_path()
+    return _write_json_atomic(
+        target,
+        {
+            "version": 1,
+            "items": items,
+            "updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
+        },
+    )
 
 
 def signal_observer_templates_file_path(base_dir: Path | None = None) -> Path:

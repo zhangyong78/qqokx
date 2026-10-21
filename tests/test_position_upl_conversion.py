@@ -818,6 +818,7 @@ class PositionUplConversionTest(TestCase):
                             "instId": "BTC-USD-260626-100000-C",
                             "instType": "OPTION",
                             "markPx": "0.0116421317242157",
+                        "ts": "1710000000200",
                         }
                     ]
                 }

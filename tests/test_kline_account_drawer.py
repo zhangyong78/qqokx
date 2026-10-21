@@ -686,7 +686,7 @@ class KlineAnalysisWindowAccountDrawerTests(QtWidgetTestCase):
         window._sync_account_drawer_context.assert_called_once_with(refresh_if_visible=False)
         realtime_store.request_reconcile.assert_called_once_with("kline-prefetch")
 
-    def test_kline_window_has_collapsed_account_drawer_and_two_entry_buttons(self) -> None:
+    def test_kline_window_has_collapsed_account_drawer_entry_button(self) -> None:
         with (
             patch("roll_terminal_qt.kline_analysis_window.QTimer.singleShot", return_value=None),
             patch("roll_terminal_qt.kline_analysis_window.load_kline_analysis_workspace_entries", return_value={}),
@@ -696,8 +696,7 @@ class KlineAnalysisWindowAccountDrawerTests(QtWidgetTestCase):
         try:
             self.assertEqual(window._chart_account_splitter.orientation(), Qt.Orientation.Vertical)
             self.assertTrue(window._account_drawer.isHidden())
-            self.assertEqual(window._orders_drawer_button.text(), "委托")
-            self.assertEqual(window._positions_drawer_button.text(), "持仓")
+            self.assertEqual(window._account_drawer_button.text(), "委托/持仓")
         finally:
             self.dispose_widget(window)
 

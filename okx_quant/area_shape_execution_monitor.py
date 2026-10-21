@@ -1,4 +1,4 @@
-"""Independent, explicitly armed OKX demo executor for area-shape plans."""
+"""Explicitly armed OKX demo/live executor for area-shape plans."""
 
 from __future__ import annotations
 
@@ -12,14 +12,14 @@ from PySide6.QtCore import QObject, Signal
 
 from okx_quant.area_shape_execution import (
     AREA_SHAPE_EXECUTION_RULE_VERSION,
-    build_demo_execution_session,
-    check_demo_execution_conflicts,
+    build_area_shape_execution_session,
+    check_area_shape_execution_conflicts,
     create_persisted_entry_intent,
     new_execution_client_order_id,
     price_for_net_r,
     restore_execution_session_for_readonly,
     size_usdt_linear_contracts,
-    validate_demo_runtime,
+    validate_area_shape_runtime,
     validate_usdt_linear_swap,
 )
 from okx_quant.area_shape_execution_store import load_area_shape_execution_records, save_area_shape_execution_records
@@ -34,7 +34,7 @@ from okx_quant.okx_client import OkxRestClient
 from okx_quant.pricing import snap_to_increment
 
 
-_ACTIVE = {"arming", "armed", "signal_pending", "entry_intent", "position_unprotected", "tp_pending", "protected", "manual_control"}
+_ACTIVE = {"arming", "armed", "signal_pending", "entry_intent", "position_unprotected", "tp_pending", "protected", "closing_pending", "manual_control"}
 _TERMINAL = {"closed", "cancelled", "expired"}
 
 
@@ -85,6 +85,7 @@ class AreaShapeDemoExecutionMonitor(QObject):
             self._persist_locked()
         self._stop = threading.Event()
         self._worker: threading.Thread | None = None
+        self._arm_workers: set[threading.Thread] = set()
 
     @staticmethod
     def _reservation_key(session: dict[str, Any]) -> tuple[str, str, str]:
@@ -102,19 +103,19 @@ class AreaShapeDemoExecutionMonitor(QObject):
         self._stop.set()
         if self._worker is not None:
             self._worker.join(timeout=3.0)
-            if self._worker.is_alive():
-                # Do not race a still-running monitor tick with a second REST
-                # cancel/reconcile sequence from the shutdown thread. The
-                # durable session is restored read-only on next launch.
-                with self._lock:
-                    for session in self._sessions.values():
-                        if session.get("status") in _ACTIVE:
-                            session.setdefault("events", []).append({
-                                "kind": "shutdown_worker_busy", "ts": int(time.time() * 1000),
-                                "message": "监控线程未在关机等待期内退出；为避免并发订单操作未重复撤单，重启后只读核对原委托/成交",
-                            })
-                    self._persist_locked()
-                return
+        if self.is_running():
+            # Do not race an active tick or arm worker with another REST
+            # cancel/reconcile sequence. The owner keeps this QObject alive
+            # until these workers finish; restart still restores read-only.
+            with self._lock:
+                for session in self._sessions.values():
+                    if session.get("status") in _ACTIVE:
+                        session.setdefault("events", []).append({
+                            "kind": "shutdown_worker_busy", "ts": int(time.time() * 1000),
+                            "message": "监控或启用线程尚未退出；为避免并发订单操作未重复撤单，重启后只读核对原委托/成交",
+                        })
+                self._persist_locked()
+            return
         with self._lock:
             resting = [key for key, session in self._sessions.items()
                        if isinstance(session.get("resting_entry_intent"), dict)]
@@ -146,11 +147,15 @@ class AreaShapeDemoExecutionMonitor(QObject):
                     session.setdefault("events", []).append({"kind": "shutdown_readonly", "message": "进程退出；OKX活动入场委托/保护单仍按交易所状态存在，重启后先只读对账"})
             self._persist_locked()
 
+    def is_running(self) -> bool:
+        with self._lock:
+            return bool(self._arm_workers) or (self._worker is not None and self._worker.is_alive())
+
     def pause_session(self, session_id: str) -> None:
         """Stop future entries while keeping exchange-hosted protection managed."""
         with self._lock:
             session = self._sessions[session_id]
-            if session.get("status") not in {"armed", "signal_pending", "entry_intent", "protected", "position_unprotected"}:
+            if session.get("status") not in {"armed", "signal_pending", "entry_intent", "protected", "position_unprotected", "tp_pending", "closing_pending"}:
                 raise ValueError("当前会话不能暂停")
             session["paused"] = True
             if isinstance(session.get("resting_entry_intent"), dict) and not isinstance(session.get("position"), dict):
@@ -215,7 +220,7 @@ class AreaShapeDemoExecutionMonitor(QObject):
         if client is None:
             created_client = self._client_factory()
             client = created_client
-        account = client.get_account_config(runtime.credentials, environment="demo")
+        account = client.get_account_config(runtime.credentials, environment=_session_environment(session))
         if str((account.raw or {}).get("uid") or "") != str(session.get("account_uid")):
             if created_client is not None:
                 created_client.close()
@@ -238,6 +243,13 @@ class AreaShapeDemoExecutionMonitor(QObject):
         baseline = 0
         baseline_candles: list[Any] = []
         if not has_position:
+            expires = int(session.get("expires_at_candle_ts") or 0)
+            if expires > 0 and int(time.time() * 1000) >= expires + 3_600_000:
+                self._finish_entry_cancel(session_id, "expire")
+                return copy.deepcopy(self._sessions[session_id])
+            check_area_shape_execution_conflicts(
+                client, runtime.credentials, environment=_session_environment(session), inst_id=session["symbol"],
+            )
             baseline_candles = [item for item in client.get_candles_history(session["symbol"], "1H", limit=240) if item.confirmed]
             if not baseline_candles:
                 if created_client is not None:
@@ -280,32 +292,53 @@ class AreaShapeDemoExecutionMonitor(QObject):
         with self._lock:
             return copy.deepcopy(list(self._sessions.values()))
 
-    def request_arm(self, *, plan: AreaShapePlan, runtime: Any, unlocked: bool, paper_monitor: Any) -> None:
+    def request_arm(self, *, plan: AreaShapePlan, runtime: Any, unlocked: bool, paper_monitor: Any, environment: str | None = None) -> None:
         """Preflight in a worker so REST/credential verification never blocks Qt."""
         if self._stop.is_set():
             self.status_changed.emit("应用正在关闭；拒绝启用demo执行")
             return
-        threading.Thread(
+        runtime_environment = str(getattr(runtime, "environment", "")).lower()
+        if runtime_environment == "live" and str(environment or "").lower() != "live":
+            self.status_changed.emit("live执行必须显式传入 environment='live'；未启动计划")
+            return
+        worker = threading.Thread(
             target=self._arm_worker, kwargs={"plan": plan, "runtime": runtime, "unlocked": unlocked,
-                                             "paper_monitor": paper_monitor},
+                                             "paper_monitor": paper_monitor,
+                                             "environment": environment or str(getattr(runtime, "environment", ""))},
             daemon=True, name=f"qqokx-area-demo-arm-{plan.plan_id[:8]}",
-        ).start()
+        )
+        with self._lock:
+            if self._stop.is_set():
+                return
+            self._arm_workers.add(worker)
+            try:
+                worker.start()
+            except Exception:
+                self._arm_workers.discard(worker)
+                raise
 
     def _arm_worker(self, **kwargs: Any) -> None:
+        environment = str(kwargs.get("environment") or getattr(kwargs.get("runtime"), "environment", "demo")).lower()
         try:
             self.arm_plan(**kwargs)
         except Exception as exc:
-            self.status_changed.emit(f"demo启用失败：{exc}")
+            self.status_changed.emit(f"{environment}执行启用失败：{exc}")
+        finally:
+            with self._lock:
+                self._arm_workers.discard(threading.current_thread())
 
-    def arm_plan(self, *, plan: AreaShapePlan, runtime: Any, unlocked: bool, paper_monitor: Any) -> dict[str, Any]:
-        profile, key_hash = validate_demo_runtime(plan=plan, runtime=runtime, unlocked=unlocked)
+    def arm_plan(self, *, plan: AreaShapePlan, runtime: Any, unlocked: bool, paper_monitor: Any, environment: str | None = None) -> dict[str, Any]:
+        if str(getattr(runtime, "environment", "")).lower() == "live" and str(environment or "").lower() != "live":
+            raise PermissionError("live执行必须显式传入 environment='live'")
+        environment = str(environment or getattr(runtime, "environment", "")).lower()
+        profile, key_hash = validate_area_shape_runtime(plan=plan, runtime=runtime, unlocked=unlocked, environment=environment)
         credentials = runtime.credentials
         client = self._client_factory()
-        account = client.get_account_config(credentials, environment="demo")
+        account = client.get_account_config(credentials, environment=environment)
         account_uid = str((account.raw or {}).get("uid") or "").strip()
         if not account_uid:
             raise RuntimeError("OKX账户配置未返回uid；无法按账户隔离，拒绝启用")
-        reservation = (account_uid, "demo", plan.symbol.upper())
+        reservation = (account_uid, environment, plan.symbol.upper())
         with self._lock:
             self._require_writable_store()
             if reservation in self._reservations:
@@ -322,7 +355,7 @@ class AreaShapeDemoExecutionMonitor(QObject):
             family = str(instrument.inst_family or "").upper()
             if not family:
                 raise RuntimeError("合约instFamily缺失，无法读取手续费")
-            fee_rate = client.get_area_shape_fee_rate(credentials, environment="demo", inst_family=family)
+            fee_rate = client.get_area_shape_fee_rate(credentials, environment=environment, inst_family=family)
             # Strategy preference must match the account's real position mode.
             actual_mode = str((account.raw or {}).get("posMode") or "")
             runtime_mode = str(getattr(runtime, "position_mode", ""))
@@ -330,17 +363,17 @@ class AreaShapeDemoExecutionMonitor(QObject):
                 raise RuntimeError("账户持仓模式未知，拒绝执行")
             if runtime_mode not in {"net", "long_short"} or (actual_mode == "net_mode") != (runtime_mode == "net"):
                 raise RuntimeError("runtime持仓模式与OKX账户posMode不一致")
-            check_demo_execution_conflicts(client, credentials, environment="demo", inst_id=plan.symbol)
+            check_area_shape_execution_conflicts(client, credentials, environment=environment, inst_id=plan.symbol)
             if self._stop.is_set():
                 raise RuntimeError("应用正在关闭；取消晚到的demo启用")
             candles = [item for item in client.get_candles_history(plan.symbol, "1H", limit=240) if item.confirmed]
             if not candles:
                 raise RuntimeError("缺少确认的1H基线K线")
-            session = build_demo_execution_session(
+            session = build_area_shape_execution_session(
                 plan=plan, runtime=runtime, account_uid=account_uid, instrument=instrument,
                 fee_rate=fee_rate, slippage_rate=plan.config.slippage_rate,
                 baseline_candle_ts=max(item.ts for item in candles), confirmed_at_ms=int(time.time() * 1000),
-                unlocked=unlocked,
+                unlocked=unlocked, environment=environment,
             )
             session["api_key_sha256"] = key_hash
             session["client_id_fingerprint"] = key_hash
@@ -352,7 +385,13 @@ class AreaShapeDemoExecutionMonitor(QObject):
                 self._sessions[session_id] = session
                 self._persist_locked()
             # After this marker the public paper worker will not mutate this plan.
-            paper_monitor.mark_demo_execution(plan.plan_id)
+            mark_execution = getattr(paper_monitor, "mark_area_shape_execution", None)
+            if callable(mark_execution):
+                mark_execution(plan.plan_id, f"{environment}_exchange")
+            elif environment == "demo" and callable(getattr(paper_monitor, "mark_demo_execution", None)):
+                paper_monitor.mark_demo_execution(plan.plan_id)
+            else:
+                raise RuntimeError("区域计划监控器不支持冻结环境的执行隔离")
             resting_reason = ""
             place_line_order = plan.config.entry_trigger_mode == "direct_touch" or plan.config.resting_entry_enabled
             if place_line_order:
@@ -365,9 +404,9 @@ class AreaShapeDemoExecutionMonitor(QObject):
                     session["events"].append({"kind": "resting_entry_skipped", "ts": int(time.time() * 1000),
                                               "message": resting_reason})
                 armed_message = (
-                    "直接价格触发已启用；正在向OKX提交入场线GTC限价单，成交后转入仓位保护"
+                    f"直接价格触发已启用；正在向OKX提交{environment}入场线GTC限价单，成交后转入仓位保护"
                     if plan.config.entry_trigger_mode == "direct_touch"
-                    else "demo执行已启用；GTC入场线挂单与形态确认入场并行，成交互斥"
+                    else f"{environment}执行已启用；GTC入场线挂单与形态确认入场并行，成交互斥"
                 )
                 session["events"].append({"kind": "armed", "ts": int(time.time() * 1000),
                                           "message": armed_message})
@@ -385,17 +424,20 @@ class AreaShapeDemoExecutionMonitor(QObject):
                     else f"{plan.symbol}直接入场状态：{current.get('status')}；请核对区域交易事件"
                 )
             else:
-                status_message = f"{plan.symbol} demo执行已启用，账户uid已绑定；等待新信号"
+                status_message = f"{plan.symbol} {environment}执行已启用，账户uid已绑定；等待新信号"
             self.status_changed.emit(status_message)
             return dict(session)
         except Exception:
             with self._lock:
-                self._reservations.discard(reservation)
                 if session_id and session_id in self._sessions:
                     self._sessions[session_id]["status"] = "manual_review"
                     self._sessions[session_id].setdefault("events", []).append({"kind": "arm_failed", "message": "启用预检/写入失败；需人工核对"})
                     self._persist_locked()
                 else:
+                    # No persisted session or order intent exists, so REST
+                    # writes could not have been attempted and the reservation
+                    # is safe to release.
+                    self._reservations.discard(reservation)
                     try:
                         client.close()
                     except Exception:
@@ -405,6 +447,9 @@ class AreaShapeDemoExecutionMonitor(QObject):
     def _prepare_resting_entry(
         self, session: dict[str, Any], plan: AreaShapePlan, candles: list[Any],
     ) -> tuple[dict[str, Any] | None, str]:
+        expires = int(session.get("expires_at_candle_ts") or 0)
+        if expires > 0 and int(time.time() * 1000) >= expires + 3_600_000:
+            return None, "计划已到期；禁止准备新的入场线GTC"
         if (plan.config.entry_trigger_mode != "direct_touch"
                 and plan.config.entry_mode != "next_open"):
             return None, "普通GTC与旧版OKX条件触发模式不并行；本次保留条件触发路径"
@@ -481,10 +526,15 @@ class AreaShapeDemoExecutionMonitor(QObject):
         if not isinstance(intent, dict):
             return
         runtime, client = self._runtime_client(session_id)
+        if int(intent.get("expires_at_ms") or 0) > 0 and int(time.time() * 1000) >= int(intent["expires_at_ms"]):
+            # The durable ID might already have been submitted before a crash;
+            # reconcile/cancel it rather than placing a late new order.
+            self._reconcile_resting_entry(session_id, force_cancel=True, cancel_mode="expire")
+            return
         self._assert_write_enabled(session_id)
         self._persist_session(session_id)  # stable clOrdId is durable before POST
         try:
-            client.place_area_shape_demo_limit_entry(
+            _place_area_shape_order(client, "limit",
                 runtime.credentials, _strategy_config(session, runtime), inst_id=session["symbol"],
                 side=intent["side"], size=Decimal(intent["size"]), limit_price=Decimal(intent["price"]),
                 stop_price=Decimal(intent["stop"]), client_order_id=intent["cl_ord_id"],
@@ -525,11 +575,14 @@ class AreaShapeDemoExecutionMonitor(QObject):
         if not cancel_mode and not force_cancel and now_ms >= int(intent.get("expires_at_ms") or 0):
             cancel_mode = "expire"
         if state in {"live", "partially_filled"} and (force_cancel or cancel_mode or Decimal(str(status.filled_size or 0)) > 0):
+            verified_before_cancel = copy.deepcopy(status)
             try:
                 client.cancel_order(runtime.credentials, config, inst_id=session["symbol"], cl_ord_id=intent["cl_ord_id"])
                 status = client.get_order(runtime.credentials, config, inst_id=session["symbol"], cl_ord_id=intent["cl_ord_id"])
                 state = str(status.state or "").lower()
             except Exception as exc:
+                if self._protect_uncertain_entry_cancel(session_id, verified_before_cancel, intent):
+                    return "filled"
                 self._set_status(session_id, "manual_review", f"GTC撤单后成交/终态未确认；停止FOK并需人工核对：{exc}")
                 return "error"
             raw = status.raw if isinstance(status.raw, dict) else {}
@@ -539,9 +592,13 @@ class AreaShapeDemoExecutionMonitor(QObject):
                     or str(raw.get("ordType") or "").lower() != "limit"
                     or Decimal(str(raw.get("sz") or "0")) != Decimal(str(intent["size"]))
                     or Decimal(str(raw.get("px") or "0")) != Decimal(str(intent["price"]))):
+                if self._protect_uncertain_entry_cancel(session_id, verified_before_cancel, intent):
+                    return "filled"
                 self._set_status(session_id, "manual_review", "GTC撤单后订单身份回读不符；停止FOK并需人工核对")
                 return "error"
             if state in {"live", "partially_filled"}:
+                if self._protect_uncertain_entry_cancel(session_id, status, intent):
+                    return "filled"
                 self._set_status(session_id, "manual_review", "GTC撤单后仍显示活动；停止FOK并需人工核对")
                 return "error"
         filled = Decimal(str(status.filled_size or 0))
@@ -551,9 +608,12 @@ class AreaShapeDemoExecutionMonitor(QObject):
                 return "error"
             fill_time = int((status.raw or {}).get("fillTime") or 0)
             if not fill_time and status.ord_id:
-                fills = client.get_fills_history(runtime.credentials, environment="demo", inst_types=("SWAP",), limit=100)
-                fill_time = max((int(item.fill_time or 0) for item in fills
-                                 if item.order_id == status.ord_id and item.inst_id.upper() == session["symbol"].upper()), default=0)
+                try:
+                    fills = client.get_fills_history(runtime.credentials, environment=_session_environment(session), inst_types=("SWAP",), limit=100)
+                    fill_time = max((int(item.fill_time or 0) for item in fills
+                                     if item.order_id == status.ord_id and item.inst_id.upper() == session["symbol"].upper()), default=0)
+                except Exception:
+                    fill_time = 0  # Protect first; unknown entry time disables stage management.
             self._protect_fill(session_id, status, fill_time, intent=intent)
             return "filled"
         if state in {"live", "partially_filled"}:
@@ -601,7 +661,7 @@ class AreaShapeDemoExecutionMonitor(QObject):
             self._verify_runtime_identity(session, runtime, unlocked)
         client = self._client_factory()
         try:
-            account = client.get_account_config(runtime.credentials, environment="demo")
+            account = client.get_account_config(runtime.credentials, environment=_session_environment(session))
             uid = str((account.raw or {}).get("uid") or "")
             if uid != str(session.get("account_uid")):
                 raise PermissionError("当前OKX UID与原会话不一致")
@@ -625,13 +685,13 @@ class AreaShapeDemoExecutionMonitor(QObject):
                         "filled_size": str(status.filled_size or 0), "average_price": str(status.avg_price or 0),
                     }
                 else:
-                    algo = client.get_order_algo(runtime.credentials, environment="demo", inst_id=session["symbol"],
+                    algo = client.get_order_algo(runtime.credentials, environment=_session_environment(session), inst_id=session["symbol"],
                                                  algo_cl_ord_id=intent["cl_ord_id"])
                     report["entry"] = None if algo is None else {
                         "state": algo.get("state"), "trigger": algo.get("triggerPx"),
                         "trigger_type": algo.get("triggerPxType"), "order_ids": list(algo.get("ordIdList") or []),
                     }
-            positions = client.get_positions(runtime.credentials, environment="demo", inst_type="SWAP", prefer_cache=False)
+            positions = client.get_positions(runtime.credentials, environment=_session_environment(session), inst_type="SWAP", prefer_cache=False)
             report["position"] = [
                 {"inst_id": p.inst_id, "position": str(p.position), "pos_side": str(p.pos_side)}
                 for p in positions if p.inst_id.upper() == str(session["symbol"]).upper()
@@ -643,7 +703,7 @@ class AreaShapeDemoExecutionMonitor(QObject):
             ):
                 client_id = position.get(id_key)
                 if client_id:
-                    raw = client.get_order_algo(runtime.credentials, environment="demo", inst_id=session["symbol"], algo_cl_ord_id=client_id)
+                    raw = client.get_order_algo(runtime.credentials, environment=_session_environment(session), inst_id=session["symbol"], algo_cl_ord_id=client_id)
                     report[leg] = None if raw is None else {
                         "state": raw.get("state"), "inst_id": raw.get("instId"), "trigger": raw.get(trigger_key),
                         "trigger_type": raw.get("slTriggerPxType" if kind == "sl" else "tpTriggerPxType"),
@@ -675,10 +735,10 @@ class AreaShapeDemoExecutionMonitor(QObject):
             self._verify_runtime_identity(session, runtime, unlocked)
         client = self._client_factory()
         try:
-            account = client.get_account_config(runtime.credentials, environment="demo")
+            account = client.get_account_config(runtime.credentials, environment=_session_environment(session))
             if str((account.raw or {}).get("uid") or "") != str(session.get("account_uid")):
                 raise PermissionError("当前OKX UID与原会话不一致")
-            positions = client.get_positions(runtime.credentials, environment="demo", inst_type="SWAP", prefer_cache=False)
+            positions = client.get_positions(runtime.credentials, environment=_session_environment(session), inst_type="SWAP", prefer_cache=False)
             matching = [p for p in positions if p.inst_id.upper() == str(session["symbol"]).upper() and Decimal(p.position) != 0]
             intent = session.get("pending_intent")
             intent_status = None
@@ -687,6 +747,8 @@ class AreaShapeDemoExecutionMonitor(QObject):
                 config = _strategy_config(session, runtime)
                 resting_status = client.get_order(runtime.credentials, config, inst_id=session["symbol"],
                                                  cl_ord_id=resting["cl_ord_id"])
+                if not _verified_entry_fill_order(resting_status, session, resting, order_type="limit"):
+                    raise RuntimeError("原GTC身份或冻结参数不符；保持只读")
                 state = str(resting_status.state or "").lower()
                 if state in {"live", "partially_filled"}:
                     client.cancel_order(runtime.credentials, config, inst_id=session["symbol"],
@@ -694,6 +756,8 @@ class AreaShapeDemoExecutionMonitor(QObject):
                     resting_status = client.get_order(runtime.credentials, config, inst_id=session["symbol"],
                                                      cl_ord_id=resting["cl_ord_id"])
                     state = str(resting_status.state or "").lower()
+                if not _verified_entry_fill_order(resting_status, session, resting, order_type="limit"):
+                    raise RuntimeError("撤单后原GTC身份或冻结参数不符；保持只读")
                 raw = resting_status.raw if isinstance(resting_status.raw, dict) else {}
                 if (state not in {"filled", "canceled", "partially_canceled", "order_failed"}
                         or str(raw.get("clOrdId") or "") != str(resting["cl_ord_id"])
@@ -714,6 +778,8 @@ class AreaShapeDemoExecutionMonitor(QObject):
                     expected_ord_type = "limit" if str(intent.get("entry_kind")) == "gtc" else "fok"
                     intent_status = client.get_order(runtime.credentials, config, inst_id=session["symbol"],
                                                      cl_ord_id=intent["cl_ord_id"])
+                    if not _verified_entry_fill_order(intent_status, session, intent, order_type=expected_ord_type):
+                        raise RuntimeError("原入场订单身份或冻结参数不符；保持只读")
                     entry_state = str(intent_status.state or "").lower()
                     if entry_state in {"live", "partially_filled"}:
                         client.cancel_order(runtime.credentials, config, inst_id=session["symbol"],
@@ -723,6 +789,8 @@ class AreaShapeDemoExecutionMonitor(QObject):
                         entry_state = str(intent_status.state or "").lower()
                     if entry_state not in {"filled", "canceled", "partially_canceled"}:
                         raise RuntimeError("原FOK订单终态未核实；保持只读且不重发")
+                    if not _verified_entry_fill_order(intent_status, session, intent, order_type=expected_ord_type):
+                        raise RuntimeError("撤单后原入场订单身份或冻结参数不符；保持只读")
                     raw = intent_status.raw if isinstance(intent_status.raw, dict) else {}
                     if (str(raw.get("instId") or "").upper() != str(session["symbol"]).upper()
                             or str(raw.get("clOrdId") or "") != str(intent["cl_ord_id"])
@@ -734,17 +802,21 @@ class AreaShapeDemoExecutionMonitor(QObject):
                         intent_status = None
                         session["pending_intent"] = None
                 else:
-                    entry_algo = client.get_order_algo(runtime.credentials, environment="demo", inst_id=session["symbol"],
+                    entry_algo = client.get_order_algo(runtime.credentials, environment=_session_environment(session), inst_id=session["symbol"],
                                                        algo_cl_ord_id=intent["cl_ord_id"])
                     if entry_algo is None:
                         raise RuntimeError("原触发委托不存在；保持只读且不重发")
+                    if not _verified_trigger_entry(entry_algo, session, intent):
+                        raise RuntimeError("原触发委托身份或冻结参数不符；保持只读")
                     entry_state = str(entry_algo.get("state") or "").lower()
                     if entry_state == "live":
-                        client.cancel_algo_order(runtime.credentials, environment="demo", inst_id=session["symbol"],
+                        client.cancel_algo_order(runtime.credentials, environment=_session_environment(session), inst_id=session["symbol"],
                                                  algo_cl_ord_id=intent["cl_ord_id"])
-                        entry_algo = client.get_order_algo(runtime.credentials, environment="demo", inst_id=session["symbol"],
+                        entry_algo = client.get_order_algo(runtime.credentials, environment=_session_environment(session), inst_id=session["symbol"],
                                                            algo_cl_ord_id=intent["cl_ord_id"])
                         entry_state = str((entry_algo or {}).get("state") or "").lower()
+                        if not _verified_trigger_entry(entry_algo, session, intent):
+                            raise RuntimeError("撤单后原触发委托身份或冻结参数不符；保持只读")
                     child_ids = (entry_algo or {}).get("ordIdList") if isinstance((entry_algo or {}).get("ordIdList"), list) else []
                     if not child_ids and (entry_algo or {}).get("ordId"):
                         child_ids = [(entry_algo or {}).get("ordId")]
@@ -753,6 +825,15 @@ class AreaShapeDemoExecutionMonitor(QObject):
                             raise RuntimeError("原触发委托已触发但成交子委托无法唯一确认；保持只读")
                         intent_status = client.get_order(runtime.credentials, config,
                                                          inst_id=session["symbol"], ord_id=str(child_ids[0]))
+                        if not _verified_entry_fill_order(intent_status, session, intent, order_id=str(child_ids[0])):
+                            raise RuntimeError("原触发成交子单身份或冻结参数不符；保持只读")
+                        if str(intent_status.state).lower() in {"live", "partially_filled"}:
+                            client.cancel_order(runtime.credentials, config, inst_id=session["symbol"], ord_id=str(child_ids[0]))
+                            intent_status = client.get_order(runtime.credentials, config,
+                                                             inst_id=session["symbol"], ord_id=str(child_ids[0]))
+                            if (not _verified_entry_fill_order(intent_status, session, intent, order_id=str(child_ids[0]))
+                                    or str(intent_status.state).lower() in {"live", "partially_filled"}):
+                                raise RuntimeError("触发子单余量未确认终结；保持只读")
                     elif entry_state == "canceled" and not child_ids:
                         intent_status = None
                         session["pending_intent"] = None
@@ -771,10 +852,10 @@ class AreaShapeDemoExecutionMonitor(QObject):
                     fill_time = int((intent_status.raw or {}).get("fillTime") or 0)
                     if (intent_status.state not in {"filled", "canceled", "partially_canceled"} or filled <= 0 or filled > requested
                             or avg_price <= 0 or len(matching) != 1
-                            or not _position_matches(matching[0], str(session["direction"]), filled, runtime.position_mode)):
+                            or not _position_matches(matching[0], str(session["direction"]), filled, _session_position_mode(session, runtime))):
                         raise RuntimeError("成交快照缺失且原委托/当前仓位无法精确归属；保持只读人工核对")
                     if fill_time <= 0:
-                        fills = client.get_fills_history(runtime.credentials, environment="demo", inst_types=("SWAP",), limit=100)
+                        fills = client.get_fills_history(runtime.credentials, environment=_session_environment(session), inst_types=("SWAP",), limit=100)
                         fill_time = max((int(item.fill_time or 0) for item in fills
                                          if item.order_id == intent_status.ord_id
                                          and item.inst_id.upper() == session["symbol"].upper()), default=0)
@@ -793,7 +874,7 @@ class AreaShapeDemoExecutionMonitor(QObject):
                         "entry": str(avg_price), "initial_stop": str(stop), "stop": str(stop),
                         "risk_distance": str(abs(avg_price - stop)), "size": str(filled),
                         "requested_size": str(requested), "direction": plan.config.direction,
-                        "pos_side": _position_side(plan.config.direction, runtime.position_mode),
+                        "pos_side": _position_side(plan.config.direction, _session_position_mode(session, runtime)),
                         "entry_ts": fill_time,
                         "entry_time": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(fill_time / 1000)),
                         "stop_algo_cl_ord_id": str(intent.get("stop_algo_cl_ord_id") or ""),
@@ -811,7 +892,7 @@ class AreaShapeDemoExecutionMonitor(QObject):
                         session["status"] = "needs_manual_rearm"
                         self._persist_locked()
                 if not isinstance(position, dict) or len(matching) != 1 or not _position_matches(
-                    matching[0], str(session["direction"]), Decimal(position["size"]), runtime.position_mode
+                    matching[0], str(session["direction"]), Decimal(position["size"]), _session_position_mode(session, runtime)
                 ):
                     raise RuntimeError("只读对账发现未能归属的活动仓位；禁止自动接管")
                 reconstructed_partial = bool(position.get("reconstructed_after_crash")
@@ -828,13 +909,24 @@ class AreaShapeDemoExecutionMonitor(QObject):
                 stop_id = str(position.get("stop_algo_cl_ord_id") or (session.get("protection_intent") or {}).get("cl_ord_id") or "")
                 if not stop_id:
                     raise RuntimeError("活动仓位缺少原保护编号；无法安全恢复")
-                raw = client.get_order_algo(runtime.credentials, environment="demo", inst_id=session["symbol"], algo_cl_ord_id=stop_id)
+                raw = client.get_order_algo(runtime.credentials, environment=_session_environment(session), inst_id=session["symbol"], algo_cl_ord_id=stop_id)
                 pending_amend = position.get("pending_amend_intent") or {}
                 expected_stop = Decimal(str(pending_amend.get("trigger") or position["stop"]))
                 expected_side = "sell" if session["direction"] == "long" else "buy"
+                # An interrupted amend may not have reached OKX. A verified old
+                # stop remains valid protection; keep the pending upgrade for
+                # the regular current-price checks instead of rejecting recovery.
+                amend_confirmed = bool(pending_amend)
+                if pending_amend and _verified_protection(
+                    raw, inst_id=session["symbol"], side=expected_side,
+                    size=Decimal(position["size"]), trigger=Decimal(position["stop"]), kind="sl",
+                    pos_side=position.get("pos_side"), position_mode=_session_position_mode(session, runtime),
+                ):
+                    expected_stop = Decimal(position["stop"])
+                    amend_confirmed = False
                 valid_stop = _verified_protection(raw, inst_id=session["symbol"], side=expected_side,
                                                   size=Decimal(position["size"]), trigger=expected_stop,
-                                                  kind="sl", pos_side=position.get("pos_side"), position_mode=runtime.position_mode)
+                                                  kind="sl", pos_side=position.get("pos_side"), position_mode=_session_position_mode(session, runtime))
                 if not valid_stop:
                     state = str((raw or {}).get("state", "")).lower()
                     if state not in {"", "canceled", "order_failed", "partially_failed"}:
@@ -847,24 +939,24 @@ class AreaShapeDemoExecutionMonitor(QObject):
                                                          "side": expected_side}
                         position["stop_algo_cl_ord_id"] = fallback_id
                         self._persist_locked()
-                    last = client.get_trigger_price(session["symbol"], "last", environment="demo", max_cached_age_seconds=5)
+                    last = client.get_trigger_price(session["symbol"], "last", environment=_session_environment(session), max_cached_age_seconds=5)
                     if not (expected_stop < last if session["direction"] == "long" else expected_stop > last):
                         raise RuntimeError("当前last已越过冻结止损；不挂可能立即触发的保护，保持人工接管")
-                    fallback = client.get_order_algo(runtime.credentials, environment="demo", inst_id=session["symbol"], algo_cl_ord_id=fallback_id)
+                    fallback = client.get_order_algo(runtime.credentials, environment=_session_environment(session), inst_id=session["symbol"], algo_cl_ord_id=fallback_id)
                     if fallback is None or str(fallback.get("state", "")).lower() in {"canceled", "order_failed", "partially_failed"}:
-                        client.place_area_shape_demo_protection_algo(
+                        _place_area_shape_order(client, "protection",
                             runtime.credentials, _strategy_config(session, runtime), inst_id=session["symbol"],
                             side=expected_side, size=Decimal(position["size"]), pos_side=position.get("pos_side"),
                             trigger_price=expected_stop, client_order_id=fallback_id, protection_kind="sl",
                         )
-                    raw = client.get_order_algo(runtime.credentials, environment="demo", inst_id=session["symbol"], algo_cl_ord_id=fallback_id)
+                    raw = client.get_order_algo(runtime.credentials, environment=_session_environment(session), inst_id=session["symbol"], algo_cl_ord_id=fallback_id)
                     if not _verified_protection(raw, inst_id=session["symbol"], side=expected_side,
                                                 size=Decimal(position["size"]), trigger=expected_stop, kind="sl",
-                                                pos_side=position.get("pos_side"), position_mode=runtime.position_mode):
+                                                pos_side=position.get("pos_side"), position_mode=_session_position_mode(session, runtime)):
                         raise RuntimeError("原止损不存在，fallback保护未能回读验证；保持未保护人工处置")
                     stop_id = fallback_id
                     position["stop_algo_cl_ord_id"] = fallback_id
-                if pending_amend:
+                if amend_confirmed:
                     position["stop"] = str(expected_stop)
                     position["stage"] = str(pending_amend.get("stage") or position.get("stage"))
                     position.pop("pending_amend_intent", None)
@@ -882,7 +974,7 @@ class AreaShapeDemoExecutionMonitor(QObject):
                     tp_id = str(position.get("take_profit_algo_cl_ord_id") or "")
                     if not tp_id:
                         raise RuntimeError("止盈保护编号缺失；活动仓位保持只读，不能恢复为受保护")
-                    tp_raw = client.get_order_algo(runtime.credentials, environment="demo",
+                    tp_raw = client.get_order_algo(runtime.credentials, environment=_session_environment(session),
                                                    inst_id=session["symbol"], algo_cl_ord_id=tp_id)
                     if str((tp_raw or {}).get("state", "")).lower() == "effective":
                         raise RuntimeError("止盈保护已触发/终态但账户仍有活动仓位；保持只读并人工核对成交")
@@ -897,7 +989,7 @@ class AreaShapeDemoExecutionMonitor(QObject):
                         tp_raw, inst_id=session["symbol"],
                         side="sell" if plan.config.direction == "long" else "buy",
                         size=Decimal(position["size"]), trigger=target, kind="tp",
-                        pos_side=position.get("pos_side"), position_mode=runtime.position_mode,
+                        pos_side=position.get("pos_side"), position_mode=_session_position_mode(session, runtime),
                     ):
                         raise RuntimeError("止盈保护未回读为live且参数一致；活动仓位保持只读")
                     position["take_profit"] = str(target)
@@ -927,18 +1019,32 @@ class AreaShapeDemoExecutionMonitor(QObject):
                 if not candles:
                     raise RuntimeError("恢复新入场监控缺少最新已收盘1H基线")
                 baseline = max(int(item.ts) for item in candles)
-                check_demo_execution_conflicts(client, runtime.credentials, environment="demo", inst_id=session["symbol"])
-                session["signal_cursor_ts"] = baseline
-                session["baseline_candle_ts"] = baseline
-                session["pending_intent"] = None
-                session["signal_pending"] = None
-                plan = AreaShapePlan.from_dict(session["plan_snapshot"])
-                if plan.config.resting_entry_enabled or plan.config.entry_trigger_mode == "direct_touch":
-                    session["resting_entry_intent"], reason = self._prepare_resting_entry(session, plan, candles)
-                    if reason:
-                        session.setdefault("events", []).append({"kind": "resting_entry_skipped", "ts": int(time.time() * 1000),
-                                                                  "message": reason})
-                new_status = "armed"
+                check_area_shape_execution_conflicts(client, runtime.credentials, environment=_session_environment(session), inst_id=session["symbol"])
+                if _session_environment(session) == "live":
+                    # Recovery is for reconciling and protecting an existing
+                    # position. It must never create a fresh live entry epoch.
+                    session["resting_entry_intent"] = None
+                    session["pending_intent"] = None
+                    session["signal_pending"] = None
+                    session["status"] = "cancelled"
+                    session.setdefault("events", []).append({
+                        "kind": "live_recovery_ended", "ts": int(time.time() * 1000),
+                        "message": "只读对账确认无可归属仓位/未成交委托；实盘旧会话安全结束，不恢复新开仓，请新建计划",
+                    })
+                    self._reservations.discard(self._reservation_key(session))
+                    new_status = "cancelled"
+                else:
+                    session["signal_cursor_ts"] = baseline
+                    session["baseline_candle_ts"] = baseline
+                    session["pending_intent"] = None
+                    session["signal_pending"] = None
+                    plan = AreaShapePlan.from_dict(session["plan_snapshot"])
+                    if plan.config.resting_entry_enabled or plan.config.entry_trigger_mode == "direct_touch":
+                        session["resting_entry_intent"], reason = self._prepare_resting_entry(session, plan, candles)
+                        if reason:
+                            session.setdefault("events", []).append({"kind": "resting_entry_skipped", "ts": int(time.time() * 1000),
+                                                                      "message": reason})
+                    new_status = "armed"
         except Exception:
             try:
                 client.close()
@@ -966,12 +1072,43 @@ class AreaShapeDemoExecutionMonitor(QObject):
 
     @staticmethod
     def _verify_runtime_identity(session: dict[str, Any], runtime: Any, unlocked: bool) -> None:
-        if not unlocked or runtime is None or str(getattr(runtime, "environment", "")).lower() != "demo":
-            raise PermissionError("操作必须显式解锁且绑定demo profile")
-        if str(getattr(runtime, "credential_profile_name", "")) != str(session.get("profile_name")):
+        environment = _session_environment(session)
+        if not unlocked or runtime is None or str(getattr(runtime, "environment", "")).lower() != environment:
+            raise PermissionError("操作必须显式解锁且绑定冻结的执行环境")
+        if environment == "live":
+            if not str(session.get("account_uid") or "").strip():
+                raise PermissionError("live session缺少冻结account_uid；禁止执行")
+            if str(session.get("mode") or "") != "live_exchange":
+                raise PermissionError("live session缺少或包含无效mode；禁止执行")
+            if str(session.get("trade_mode") or "").lower() not in {"cross", "isolated"}:
+                raise PermissionError("live session缺少有效冻结trade_mode；禁止执行")
+            if str(session.get("position_mode") or "").lower() not in {"net", "long_short"}:
+                raise PermissionError("live session缺少有效冻结position_mode；禁止执行")
+        runtime_profile = str(getattr(runtime, "credential_profile_name", "")
+                              or getattr(getattr(runtime, "credentials", None), "profile_name", ""))
+        credential_profile = str(getattr(getattr(runtime, "credentials", None), "profile_name", "") or runtime_profile)
+        if runtime_profile != str(session.get("profile_name")) or credential_profile != str(session.get("profile_name")):
             raise PermissionError("当前profile与原会话不一致")
         if credential_hash(runtime.credentials.api_key) != session.get("api_key_sha256"):
             raise PermissionError("API key指纹与原会话不同，须人工重新核对")
+        snapshot = session.get("plan_snapshot")
+        if not isinstance(snapshot, dict):
+            raise PermissionError("冻结计划快照缺失；禁止执行")
+        config = snapshot.get("config") if isinstance(snapshot.get("config"), dict) else {}
+        frozen_direction = str(session.get("direction") or (config.get("direction") if environment == "demo" else ""))
+        frozen_trigger = str(session.get("trigger_price_type") or ("last" if environment == "demo" else ""))
+        if (str(snapshot.get("plan_id", "")) != str(session.get("plan_id", ""))
+                or str(snapshot.get("profile_name", "")) != str(session.get("profile_name", ""))
+                or str(snapshot.get("environment", "")).lower() != environment
+                or str(snapshot.get("symbol", "")).upper() != str(session.get("symbol", "")).upper()
+                or str(config.get("direction", "")).lower() != frozen_direction.lower()
+                or str(config.get("trigger_price_type", "last" if environment == "demo" else "")).lower() != frozen_trigger.lower()
+                or frozen_trigger.lower() != "last"):
+            raise PermissionError("冻结session与plan快照的环境/产品/方向/触发价不一致")
+        if session.get("trade_mode") and str(getattr(runtime, "trade_mode", "")) != str(session["trade_mode"]):
+            raise PermissionError("运行时交易模式与冻结会话不同")
+        if session.get("position_mode") and str(getattr(runtime, "position_mode", "")) != str(session["position_mode"]):
+            raise PermissionError("运行时持仓模式与冻结会话不同")
 
     def _run(self) -> None:
         while not self._stop.wait(self._poll_seconds):
@@ -987,7 +1124,13 @@ class AreaShapeDemoExecutionMonitor(QObject):
                             current["last_error"] = str(exc)
                             current["last_error_at_ms"] = int(time.time() * 1000)
                             current["retry_count"] = int(current.get("retry_count", 0)) + 1
-                            self._persist_locked()
+                            if not self._store_write_blocked:
+                                try:
+                                    self._persist_locked()
+                                except Exception:
+                                    # _persist_locked latched write blocking and
+                                    # emitted the storage failure separately.
+                                    pass
                     self.status_changed.emit(f"demo执行暂时失败，已保留状态并重试：{exc}")
 
     def _tick(self, session_id: str, session: dict[str, Any]) -> None:
@@ -1021,6 +1164,13 @@ class AreaShapeDemoExecutionMonitor(QObject):
             self._ensure_take_profit(session_id)
         elif status == "protected":
             self._manage_filled_position(session_id)
+        elif status == "closing_pending":
+            runtime, client = self._runtime_client(session_id)
+            position = self._sessions[session_id].get("position")
+            if isinstance(position, dict):
+                self._confirm_if_position_closed(session_id, runtime, client, self._sessions[session_id], position)
+            else:
+                self._set_status(session_id, "manual_review", "平仓对账缺少本会话持仓快照")
 
     def _retry_initial_protection(self, session_id: str) -> None:
         session = self._sessions[session_id]
@@ -1042,16 +1192,16 @@ class AreaShapeDemoExecutionMonitor(QObject):
         stop = Decimal(position["stop"])
         size = Decimal(position["size"])
         closing_side = "sell" if plan.config.direction == "long" else "buy"
-        pos_side = _position_side(plan.config.direction, runtime.position_mode)
+        pos_side = _position_side(plan.config.direction, _session_position_mode(session, runtime))
         if stop_id:
-            raw = client.get_order_algo(runtime.credentials, environment="demo", inst_id=session["symbol"], algo_cl_ord_id=stop_id)
+            raw = client.get_order_algo(runtime.credentials, environment=_session_environment(session), inst_id=session["symbol"], algo_cl_ord_id=stop_id)
             if _verified_protection(raw, inst_id=session["symbol"], side=closing_side, size=size,
-                                    trigger=stop, kind="sl", pos_side=pos_side, position_mode=runtime.position_mode):
+                                    trigger=stop, kind="sl", pos_side=pos_side, position_mode=_session_position_mode(session, runtime)):
                 position["stop_algo_cl_ord_id"] = stop_id
                 position["stop_algo_id"] = str(raw.get("algoId") or "")
                 position["stop_verified_at_ms"] = int(time.time() * 1000)
                 self._ensure_take_profit(session_id)
-                if session.get("status") in {"tp_pending", "manual_review", "manual_control", "closed"}:
+                if session.get("status") in {"tp_pending", "manual_review", "manual_control", "closed", "closing_pending"}:
                     return
                 if position.get("partial_fill_requires_review") or position.get("account_position_mismatch"):
                     self._set_status(session_id, "manual_control", "已保护已知成交量，但部分成交/账户聚合不一致需人工接管；停止后续自动交易管理")
@@ -1060,7 +1210,7 @@ class AreaShapeDemoExecutionMonitor(QObject):
                 return
             state = str((raw or {}).get("state", "")).lower()
             if state == "effective":
-                if self._confirm_if_position_closed(session_id, runtime, client, session, position):
+                if self._confirm_if_position_closed(session_id, runtime, client, session, position) or session.get("status") == "closing_pending":
                     return
                 self._set_status(session_id, "manual_control", "保护单已触发但成交/平仓证据不完整；停止写入并需人工核对")
                 return
@@ -1082,23 +1232,23 @@ class AreaShapeDemoExecutionMonitor(QObject):
             with self._lock:
                 session["protection_intent"] = intent
                 self._persist_locked()
-        existing = client.get_order_algo(runtime.credentials, environment="demo", inst_id=session["symbol"], algo_cl_ord_id=stop_id)
+        existing = client.get_order_algo(runtime.credentials, environment=_session_environment(session), inst_id=session["symbol"], algo_cl_ord_id=stop_id)
         state = str((existing or {}).get("state", "")).lower()
         if existing is None or state in {"canceled", "order_failed", "partially_failed"}:
-            client.place_area_shape_demo_protection_algo(
+            _place_area_shape_order(client, "protection",
                 runtime.credentials, _strategy_config(session, runtime), inst_id=session["symbol"], side=closing_side,
                 size=size, pos_side=pos_side, trigger_price=stop, client_order_id=stop_id, protection_kind="sl",
             )
-            existing = client.get_order_algo(runtime.credentials, environment="demo", inst_id=session["symbol"], algo_cl_ord_id=stop_id)
+            existing = client.get_order_algo(runtime.credentials, environment=_session_environment(session), inst_id=session["symbol"], algo_cl_ord_id=stop_id)
         if not _verified_protection(existing, inst_id=session["symbol"], side=closing_side, size=size,
-                                    trigger=stop, kind="sl", pos_side=pos_side, position_mode=runtime.position_mode):
+                                    trigger=stop, kind="sl", pos_side=pos_side, position_mode=_session_position_mode(session, runtime)):
             self._set_status(session_id, "position_unprotected", "同一fallback保护编号回读未验证；保留成交和intent，持续重试/人工处置")
             return
         position["stop_algo_cl_ord_id"] = stop_id
         position["stop_algo_id"] = str(existing.get("algoId") or "")
         position["stop_verified_at_ms"] = int(time.time() * 1000)
         self._ensure_take_profit(session_id)
-        if session.get("status") in {"tp_pending", "manual_review", "closed"}:
+        if session.get("status") in {"tp_pending", "manual_review", "closed", "closing_pending"}:
             return
         if position.get("partial_fill_requires_review") or position.get("account_position_mismatch"):
             with self._lock:
@@ -1202,7 +1352,7 @@ class AreaShapeDemoExecutionMonitor(QObject):
             return
         trigger = Decimal(str(signal.get("entry_trigger") or "0"))
         if entry_kind == "trigger":
-            current_price = client.get_trigger_price(session["symbol"], "last", environment="demo", max_cached_age_seconds=5)
+            current_price = client.get_trigger_price(session["symbol"], "last", environment=_session_environment(session), max_cached_age_seconds=5)
             if trigger <= 0:
                 self._consume_signal(session_id, "形态信号缺少有效突破触发价；跳过")
                 return
@@ -1270,7 +1420,7 @@ class AreaShapeDemoExecutionMonitor(QObject):
             fee_rate=Decimal(session["fee_rate"]), slippage_rate=Decimal(session["slippage_rate"]),
             lot_size=lot, min_size=minimum, contract_multiplier=multiplier,
         )
-        check_demo_execution_conflicts(client, runtime.credentials, environment="demo", inst_id=session["symbol"])
+        check_area_shape_execution_conflicts(client, runtime.credentials, environment=_session_environment(session), inst_id=session["symbol"])
         intent = create_persisted_entry_intent(
             {**session, "plan_id": session["plan_id"]}, signal_key=str(signal["signal_key"]),
             side=side, size=size, price=limit, stop=stop,
@@ -1312,7 +1462,7 @@ class AreaShapeDemoExecutionMonitor(QObject):
         self._assert_write_enabled(session_id)
         try:
             if str(intent.get("entry_kind") or "trigger") == "fok":
-                client.place_area_shape_demo_fok_entry(
+                _place_area_shape_order(client, "fok",
                     runtime.credentials, config, inst_id=session["symbol"], side=intent["side"],
                     size=Decimal(intent["size"]), limit_price=Decimal(intent["price"]),
                     stop_price=Decimal(intent["stop"]), client_order_id=intent["cl_ord_id"],
@@ -1320,7 +1470,7 @@ class AreaShapeDemoExecutionMonitor(QObject):
                     take_profit_price=Decimal(intent["take_profit_price"]) if intent.get("take_profit_price") else None,
                 )
             else:
-                client.place_area_shape_demo_trigger_entry(
+                _place_area_shape_order(client, "trigger",
                     runtime.credentials, config, inst_id=session["symbol"], side=intent["side"],
                     size=Decimal(intent["size"]), trigger_price=Decimal(intent["trigger_px"]),
                     limit_price=Decimal(intent["price"]), stop_price=Decimal(intent["stop"]),
@@ -1348,14 +1498,14 @@ class AreaShapeDemoExecutionMonitor(QObject):
             "entry": str(entry), "initial_stop": str(stop), "stop": str(stop),
             "risk_distance": str(abs(entry - stop)), "size": str(size),
             "requested_size": str(intent["size"]), "direction": plan.config.direction,
-            "pos_side": _position_side(plan.config.direction, runtime.position_mode),
+            "pos_side": _position_side(plan.config.direction, _session_position_mode(session, runtime)),
             "entry_ts": int(fill_time or 0), "entry_time": "" if not fill_time else time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(fill_time / 1000)),
             "stop_algo_cl_ord_id": str(intent["stop_algo_cl_ord_id"]), "stop_algo_id": "",
             "stop_verified_at_ms": 0, "stage": "initial", "favorable_price": str(entry),
             "last_minute_cursor_ts": 0 if not fill_time else max(0, (fill_time + 59_999) // 60_000 * 60_000 - 60_000),
             "rule_version": session["rule_version"], "contract_multiplier": str(frozen_multiplier),
             "fee_rate": session["fee_rate"], "slippage_rate": session["slippage_rate"],
-            "partial_fill_requires_review": size != Decimal(intent["size"]),
+            "partial_fill_requires_review": size != Decimal(intent["size"]) or bool(intent.get("entry_cancel_unverified")),
         }
         if intent.get("take_profit_price") and intent.get("take_profit_algo_cl_ord_id"):
             position["take_profit_algo_cl_ord_id"] = str(intent["take_profit_algo_cl_ord_id"])
@@ -1379,11 +1529,11 @@ class AreaShapeDemoExecutionMonitor(QObject):
         unsafe_stop = (plan.config.direction == "long" and stop >= entry) or (plan.config.direction == "short" and stop <= entry)
         positions_flat = False
         try:
-            positions = client.get_positions(runtime.credentials, environment="demo", inst_type="SWAP", prefer_cache=False)
+            positions = client.get_positions(runtime.credentials, environment=_session_environment(session), inst_type="SWAP", prefer_cache=False)
             matching = [item for item in positions if item.inst_id.upper() == session["symbol"].upper()]
             positions_flat = not matching
             position_mismatch = (len(matching) != 1 or not _position_matches(
-                matching[0], plan.config.direction, size, runtime.position_mode))
+                matching[0], plan.config.direction, size, _session_position_mode(session, runtime)))
         except Exception:
             # A failed exposure read cannot erase a confirmed fill. Attempt
             # protection for the known fill, then require manual reconciliation.
@@ -1393,23 +1543,23 @@ class AreaShapeDemoExecutionMonitor(QObject):
         config = _strategy_config(session, runtime)
         closing_side = "sell" if plan.config.direction == "long" else "buy"
         stop_id = str(intent["stop_algo_cl_ord_id"])
-        algo = client.get_order_algo(runtime.credentials, environment="demo", inst_id=session["symbol"], algo_cl_ord_id=stop_id)
+        algo = client.get_order_algo(runtime.credentials, environment=_session_environment(session), inst_id=session["symbol"], algo_cl_ord_id=stop_id)
         if unsafe_stop:
             position["unsafe_initial_stop"] = True
             self._persist_session(session_id)
-            if str((algo or {}).get("state", "")).lower() == "effective" and positions_flat:
-                if self._confirm_if_position_closed(session_id, runtime, client, session, position):
+            if str((algo or {}).get("state", "")).lower() == "effective":
+                if self._confirm_if_position_closed(session_id, runtime, client, session, position) or session.get("status") == "closing_pending":
                     return
             self._set_status(session_id, "manual_control", "真实成交价已越过冻结初始止损；不重挂可能立即触发的错误保护，需人工立即处置")
             return
         if str((algo or {}).get("state", "")).lower() == "effective":
-            if positions_flat and self._confirm_if_position_closed(session_id, runtime, client, session, position):
+            if self._confirm_if_position_closed(session_id, runtime, client, session, position) or session.get("status") == "closing_pending":
                 return
             self._set_status(session_id, "manual_control", "初始保护已触发；成交/仓位尚未完整核实，需人工接管")
             return
         if not _verified_protection(algo, inst_id=session["symbol"], side=closing_side, size=size,
-                                    trigger=stop, kind="sl", pos_side=_position_side(plan.config.direction, runtime.position_mode),
-                                    position_mode=runtime.position_mode):
+                                    trigger=stop, kind="sl", pos_side=_position_side(plan.config.direction, _session_position_mode(session, runtime)),
+                                    position_mode=_session_position_mode(session, runtime)):
             if algo is None or str(algo.get("state", "")).lower() in {"canceled", "order_failed", "partially_failed"}:
                 fallback_id = new_execution_client_order_id(session["plan_id"], str(intent["signal_key"]), "stopfallback")
                 with self._lock:
@@ -1417,22 +1567,22 @@ class AreaShapeDemoExecutionMonitor(QObject):
                     current["protection_intent"] = {"kind": "sl", "cl_ord_id": fallback_id,
                                                      "trigger": str(stop), "size": str(size), "side": closing_side}
                     self._persist_locked()
-                prior = client.get_order_algo(runtime.credentials, environment="demo", inst_id=session["symbol"], algo_cl_ord_id=fallback_id)
+                prior = client.get_order_algo(runtime.credentials, environment=_session_environment(session), inst_id=session["symbol"], algo_cl_ord_id=fallback_id)
                 if prior is None or str(prior.get("state", "")).lower() in {"canceled", "order_failed", "partially_failed"}:
                     try:
-                        client.place_area_shape_demo_protection_algo(
+                        _place_area_shape_order(client, "protection",
                             runtime.credentials, config, inst_id=session["symbol"], side=closing_side,
-                            size=size, pos_side=_position_side(plan.config.direction, runtime.position_mode),
+                            size=size, pos_side=_position_side(plan.config.direction, _session_position_mode(session, runtime)),
                             trigger_price=stop, client_order_id=fallback_id, protection_kind="sl",
                         )
                     except Exception:
                         # Keep the intent and only inspect that same identifier on retry.
                         raise
                 stop_id = fallback_id
-                algo = client.get_order_algo(runtime.credentials, environment="demo", inst_id=session["symbol"], algo_cl_ord_id=stop_id)
+                algo = client.get_order_algo(runtime.credentials, environment=_session_environment(session), inst_id=session["symbol"], algo_cl_ord_id=stop_id)
             if not _verified_protection(algo, inst_id=session["symbol"], side=closing_side, size=size,
-                                        trigger=stop, kind="sl", pos_side=_position_side(plan.config.direction, runtime.position_mode),
-                                        position_mode=runtime.position_mode):
+                                        trigger=stop, kind="sl", pos_side=_position_side(plan.config.direction, _session_position_mode(session, runtime)),
+                                        position_mode=_session_position_mode(session, runtime)):
                 self._set_status(session_id, "position_unprotected", "初始止损未被交易所回读验证；停止新开仓并需人工立即处置")
                 return
         position["stop_algo_cl_ord_id"] = stop_id
@@ -1458,7 +1608,7 @@ class AreaShapeDemoExecutionMonitor(QObject):
             self._set_status(session_id, "manual_review", "成交事实与初始保护已保存，但交易所成交时间未能核实；保护保留，停止阶段管理需人工核对")
             return
         self._ensure_take_profit(session_id)
-        if session.get("status") in {"tp_pending", "manual_review", "closed"}:
+        if session.get("status") in {"tp_pending", "manual_review", "closed", "closing_pending"}:
             return
         if size != Decimal(intent["size"]):
             self._set_status(session_id, "manual_control", "入场单出现部分成交；已先保护已知成交数量，余量/竞态需人工核对")
@@ -1508,9 +1658,9 @@ class AreaShapeDemoExecutionMonitor(QObject):
                 position["take_profit_intent"] = {"trigger": str(target), "size": str(position["size"]),
                                                    "side": closing_side, "rule_version": session["rule_version"]}
                 self._persist_locked()
-            existing = client.get_order_algo(runtime.credentials, environment="demo", inst_id=session["symbol"], algo_cl_ord_id=tp_id)
+            existing = client.get_order_algo(runtime.credentials, environment=_session_environment(session), inst_id=session["symbol"], algo_cl_ord_id=tp_id)
             if str((existing or {}).get("state", "")).lower() == "effective":
-                if self._confirm_if_position_closed(session_id, runtime, client, session, position):
+                if self._confirm_if_position_closed(session_id, runtime, client, session, position) or session.get("status") == "closing_pending":
                     return
                 self._set_status(session_id, "manual_control", "止盈单已触发但成交/平仓证据不完整；停止写入并需人工核对")
                 return
@@ -1518,32 +1668,32 @@ class AreaShapeDemoExecutionMonitor(QObject):
                     and position.get("stop_algo_cl_ord_id") == tp_id
                     and not _verified_protection(existing, inst_id=session["symbol"], side=closing_side,
                                                  size=Decimal(position["size"]), trigger=target, kind="tp",
-                                                 pos_side=position.get("pos_side"), position_mode=runtime.position_mode)):
+                                                 pos_side=position.get("pos_side"), position_mode=_session_position_mode(session, runtime))):
                 # A partially filled parent may expose only its SL child. Keep
                 # that protection and give the standalone TP its own stable ID.
                 tp_id = new_execution_client_order_id(session["plan_id"], tp_id, "tpfallback")
                 with self._lock:
                     position["take_profit_algo_cl_ord_id"] = tp_id
                     self._persist_locked()
-                existing = client.get_order_algo(runtime.credentials, environment="demo",
+                existing = client.get_order_algo(runtime.credentials, environment=_session_environment(session),
                                                  inst_id=session["symbol"], algo_cl_ord_id=tp_id)
             if not _verified_protection(existing, inst_id=session["symbol"], side=closing_side,
                                         size=Decimal(position["size"]), trigger=target, kind="tp",
-                                        pos_side=position.get("pos_side"), position_mode=runtime.position_mode):
+                                        pos_side=position.get("pos_side"), position_mode=_session_position_mode(session, runtime)):
                 if existing is None or str(existing.get("state", "")).lower() in {"canceled", "order_failed", "partially_failed"}:
                     self._assert_write_enabled(session_id)
-                    client.place_area_shape_demo_protection_algo(
+                    _place_area_shape_order(client, "protection",
                         runtime.credentials, config, inst_id=session["symbol"], side=closing_side,
                         size=Decimal(position["size"]), pos_side=position.get("pos_side"),
                         trigger_price=target, client_order_id=tp_id, protection_kind="tp",
                     )
-            algo = client.get_order_algo(runtime.credentials, environment="demo", inst_id=session["symbol"], algo_cl_ord_id=tp_id)
+            algo = client.get_order_algo(runtime.credentials, environment=_session_environment(session), inst_id=session["symbol"], algo_cl_ord_id=tp_id)
         except Exception as exc:
             self._set_status(session_id, "tp_pending", f"止盈保护请求/回读暂未确认；已保留止损，将按原ID核对：{exc}")
             return
         if not _verified_protection(algo, inst_id=session["symbol"], side=closing_side,
                                     size=Decimal(position["size"]), trigger=target, kind="tp",
-                                    pos_side=position.get("pos_side"), position_mode=runtime.position_mode):
+                                    pos_side=position.get("pos_side"), position_mode=_session_position_mode(session, runtime)):
             self._set_status(session_id, "tp_pending", "止盈保护单未回读到live/精确参数；已保留止损，将继续按原ID核对")
             return
         position["take_profit"] = str(target)
@@ -1568,20 +1718,32 @@ class AreaShapeDemoExecutionMonitor(QObject):
             self._set_status(session_id, "manual_review", "活动保护状态缺少成交仓位记录")
             return
         plan = AreaShapePlan.from_dict(session["plan_snapshot"])
-        positions = client.get_positions(runtime.credentials, environment="demo", inst_type="SWAP", prefer_cache=False)
-        matching = [item for item in positions if item.inst_id.upper() == session["symbol"].upper()]
-        if not matching and self._confirm_exchange_closed(session_id, runtime, client, session, position):
-            return
-        if len(matching) != 1 or not _position_matches(matching[0], plan.config.direction, Decimal(position["size"]), runtime.position_mode):
+        positions = client.get_positions(runtime.credentials, environment=_session_environment(session), inst_type="SWAP", prefer_cache=False)
+        matching = [item for item in positions if item.inst_id.upper() == session["symbol"].upper() and Decimal(item.position) != 0]
+        if not matching:
+            if self._confirm_exchange_closed(session_id, runtime, client, session, position) or session.get("status") == "closing_pending":
+                return
+        if len(matching) != 1 or not _position_matches(matching[0], plan.config.direction, Decimal(position["size"]), _session_position_mode(session, runtime)):
             self._set_status(session_id, "manual_control", "账户仓位数量/方向已变化；暂停自动改单，不自动平仓")
             return
-        algo = client.get_order_algo(runtime.credentials, environment="demo", inst_id=session["symbol"],
+        algo = client.get_order_algo(runtime.credentials, environment=_session_environment(session), inst_id=session["symbol"],
                                      algo_id=position.get("stop_algo_id") or None,
                                      algo_cl_ord_id=position.get("stop_algo_cl_ord_id") or None)
-        trigger_key = "slTriggerPx"
-        current_stop = _decimal_or_none((algo or {}).get(trigger_key))
-        if str((algo or {}).get("state", "")).lower() != "live" or str((algo or {}).get("slTriggerPxType", "")).lower() != "last" or current_stop is None:
-            self._set_status(session_id, "position_unprotected", "交易所止损未处于live等待触发态/last价源；停止新开仓，需人工处置")
+        if str((algo or {}).get("state", "")).lower() == "effective":
+            if self._confirm_exchange_closed(session_id, runtime, client, session, position) or session.get("status") == "closing_pending":
+                return
+        if algo is None and position.get("pending_amend_intent"):
+            # A delayed read after an amend is not proof that the old stop has
+            # disappeared. Keep the same identifiers and retry; never fall back
+            # to creating an initial stop from this path.
+            self.status_changed.emit("动态止损改单待回读；保留原编号，继续核对交易所状态")
+            return
+        current_stop = _decimal_or_none((algo or {}).get("slTriggerPx"))
+        if current_stop is None or not _verified_protection(
+                algo, inst_id=session["symbol"], side="sell" if plan.config.direction == "long" else "buy",
+                size=Decimal(position["size"]), trigger=current_stop, kind="sl",
+                pos_side=position.get("pos_side"), position_mode=_session_position_mode(session, runtime)):
+            self._set_status(session_id, "manual_control", "已核验的交易所止损被撤销、变更或已触发；停止自动覆盖，需核对仓位与保护")
             return
         if current_stop != Decimal(position["stop"]):
             pending_price = _decimal_or_none(position.get("pending_stop_price"))
@@ -1601,22 +1763,26 @@ class AreaShapeDemoExecutionMonitor(QObject):
         if not tp_id or not position.get("take_profit_verified_at_ms"):
             self._set_status(session_id, "tp_pending", "止盈保护尚未完成回读核验；保留止损并按原ID恢复")
             return
-        tp = client.get_order_algo(runtime.credentials, environment="demo", inst_id=session["symbol"], algo_cl_ord_id=tp_id)
+        tp = client.get_order_algo(runtime.credentials, environment=_session_environment(session), inst_id=session["symbol"], algo_cl_ord_id=tp_id)
+        if str((tp or {}).get("state", "")).lower() == "effective":
+            if self._confirm_exchange_closed(session_id, runtime, client, session, position) or session.get("status") == "closing_pending":
+                return
         if not _verified_protection(tp, inst_id=session["symbol"], side="sell" if plan.config.direction == "long" else "buy",
                                     size=Decimal(position["size"]), trigger=Decimal(position["take_profit"]), kind="tp",
-                                    pos_side=position.get("pos_side"), position_mode=runtime.position_mode):
+                                    pos_side=position.get("pos_side"), position_mode=_session_position_mode(session, runtime)):
             self._set_status(session_id, "manual_control", "已核验止盈单发生变化/终态；视为手动接管，保留现有止损")
             return
         if plan.config.exit_template == "fixed_1r" and not plan.config.break_even_enabled:
             return
-        price = client.get_trigger_price(session["symbol"], "last", environment="demo", max_cached_age_seconds=5)
+        price = client.get_trigger_price(session["symbol"], "last", environment=_session_environment(session), max_cached_age_seconds=5)
         engine = StrategyEngine(client, lambda _message: None)
-        cursor = int(position.get("last_minute_cursor_ts", 0)) or None
+        first_minute = (int(position["entry_ts"]) + 59_999) // 60_000 * 60_000
+        cursor = int(position.get("last_minute_cursor_ts", 0)) or first_minute - 60_000
         scan_error = ""
         try:
             favorable, new_cursor = engine._scan_dynamic_stop_minute_candles(
                 inst_id=session["symbol"], trigger_type="last", last_candle_ts=cursor,
-                minimum_candle_ts=(int(position["entry_ts"]) + 59_999) // 60_000 * 60_000,
+                minimum_candle_ts=first_minute,
                 direction=plan.config.direction,
             )
             if new_cursor is None or (cursor is not None and new_cursor < cursor):
@@ -1624,7 +1790,10 @@ class AreaShapeDemoExecutionMonitor(QObject):
             now_minute = int(time.time() * 1000) // 60_000 * 60_000
             expected_closed_minute = now_minute - 60_000
             if new_cursor < expected_closed_minute - 60_000:
-                raise RuntimeError("分钟历史存在未补齐区间")
+                # The helper returns only a contiguous confirmed cursor, but
+                # favorable prices elsewhere in the valid holding interval
+                # are still evidence of a reached stage. Retain both facts.
+                scan_error = "分钟历史存在未补齐区间，将从连续确认游标继续补查"
         except Exception as exc:
             favorable, new_cursor = None, cursor
             scan_error = str(exc)
@@ -1635,8 +1804,9 @@ class AreaShapeDemoExecutionMonitor(QObject):
         # closed-minute history remains the catch-up source after missed polls.
         prior_favorable = max(prior_favorable, price) if plan.config.direction == "long" else min(prior_favorable, price)
         position["favorable_price"] = str(prior_favorable)
-        if not scan_error:
-            position["last_minute_cursor_ts"] = int(new_cursor or cursor or 0)
+        position["last_minute_cursor_ts"] = int(new_cursor or cursor or 0)
+        if scan_error:
+            self.status_changed.emit(f"分钟补查未完成，继续保留已确认档位和交易所保护：{scan_error}")
         entry, stop0 = Decimal(position["entry"]), Decimal(position["initial_stop"])
         protection_fee = Decimal(session["fee_rate"]) if plan.config.fee_offset_enabled else Decimal("0")
         progress = area_shape_net_progress_r(
@@ -1686,28 +1856,29 @@ class AreaShapeDemoExecutionMonitor(QObject):
         self._persist_session(session_id)
         # Read current state and current last immediately before amend; manual
         # price changes above stop this branch before overwrite.
-        latest = client.get_trigger_price(session["symbol"], "last", environment="demo")
+        latest = client.get_trigger_price(session["symbol"], "last", environment=_session_environment(session))
         if not (candidate < latest if plan.config.direction == "long" else candidate > latest):
             position["pending_stage"] = stage
             position["pending_stop_price"] = str(candidate)
             self._persist_session(session_id)
             return
-        final_positions = client.get_positions(runtime.credentials, environment="demo", inst_type="SWAP", prefer_cache=False)
-        final_matching = [item for item in final_positions if item.inst_id.upper() == session["symbol"].upper()]
+        final_positions = client.get_positions(runtime.credentials, environment=_session_environment(session), inst_type="SWAP", prefer_cache=False)
+        final_matching = [item for item in final_positions
+                          if item.inst_id.upper() == session["symbol"].upper() and Decimal(item.position) != 0]
         if len(final_matching) != 1 or not _position_matches(final_matching[0], plan.config.direction,
-                                                              Decimal(position["size"]), runtime.position_mode):
+                                                              Decimal(position["size"]), _session_position_mode(session, runtime)):
             self._set_status(session_id, "manual_control", "改单前账户仓位发生变化；保留交易所止损并停止覆盖")
             return
-        final_algo = client.get_order_algo(runtime.credentials, environment="demo", inst_id=session["symbol"],
+        final_algo = client.get_order_algo(runtime.credentials, environment=_session_environment(session), inst_id=session["symbol"],
                                            algo_id=position.get("stop_algo_id") or None,
                                            algo_cl_ord_id=position.get("stop_algo_cl_ord_id") or None)
         if not _verified_protection(final_algo, inst_id=session["symbol"],
                                     side="sell" if plan.config.direction == "long" else "buy",
                                     size=Decimal(position["size"]), trigger=old_stop, kind="sl",
-                                    pos_side=position.get("pos_side"), position_mode=runtime.position_mode):
+                                    pos_side=position.get("pos_side"), position_mode=_session_position_mode(session, runtime)):
             self._set_status(session_id, "manual_control", "改单前保护单回读与上次确认值不同；视为人工接管")
             return
-        latest = client.get_trigger_price(session["symbol"], "last", environment="demo", max_cached_age_seconds=5)
+        latest = client.get_trigger_price(session["symbol"], "last", environment=_session_environment(session), max_cached_age_seconds=5)
         if not (candidate < latest if plan.config.direction == "long" else candidate > latest):
             position["pending_stage"] = stage
             position["pending_stop_price"] = str(candidate)
@@ -1723,7 +1894,7 @@ class AreaShapeDemoExecutionMonitor(QObject):
         self._persist_session(session_id)
         try:
             client.amend_algo_order(
-                runtime.credentials, environment="demo", inst_id=session["symbol"],
+                runtime.credentials, environment=_session_environment(session), inst_id=session["symbol"],
                 algo_id=position.get("stop_algo_id") or None, algo_cl_ord_id=position.get("stop_algo_cl_ord_id") or None,
                 new_stop_loss_trigger_price=candidate, new_stop_loss_order_price=Decimal("-1"),
                 new_stop_loss_trigger_price_type="last",
@@ -1733,13 +1904,18 @@ class AreaShapeDemoExecutionMonitor(QObject):
                                                       "new_stop": str(candidate), "error": str(exc)})
             self._persist_session(session_id)
             raise
-        updated = client.get_order_algo(runtime.credentials, environment="demo", inst_id=session["symbol"],
+        updated = client.get_order_algo(runtime.credentials, environment=_session_environment(session), inst_id=session["symbol"],
                                         algo_id=position.get("stop_algo_id") or None,
                                         algo_cl_ord_id=position.get("stop_algo_cl_ord_id") or None)
         if not _verified_protection(updated, inst_id=session["symbol"], side="sell" if plan.config.direction == "long" else "buy",
                                     size=Decimal(position["size"]), trigger=candidate, kind="sl",
-                                    pos_side=position.get("pos_side"), position_mode=runtime.position_mode):
-            self._set_status(session_id, "position_unprotected", "止损改单ack后回读未验证，停止后续写入并需人工处理")
+                                    pos_side=position.get("pos_side"), position_mode=_session_position_mode(session, runtime)):
+            # ACK is not effective-state confirmation. Reconcile this same
+            # pending amend on subsequent ticks, never use initial SL fallback.
+            session.setdefault("events", []).append({"kind": "stop_amend_readback_pending",
+                "ts": int(time.time()*1000), "new_stop": str(candidate)})
+            self._persist_session(session_id)
+            self.status_changed.emit("动态止损改单待核验；保留原保护编号，下一轮继续对账")
             return
         position["stop"] = str(candidate)
         position["stage"] = stage
@@ -1751,7 +1927,7 @@ class AreaShapeDemoExecutionMonitor(QObject):
             if not _verified_protection(updated, inst_id=session["symbol"],
                                         side="sell" if plan.config.direction == "long" else "buy",
                                         size=Decimal(position["size"]), trigger=Decimal(position["take_profit"]),
-                                        kind="tp", pos_side=position.get("pos_side"), position_mode=runtime.position_mode):
+                                        kind="tp", pos_side=position.get("pos_side"), position_mode=_session_position_mode(session, runtime)):
                 self._set_status(session_id, "manual_control", "止损已收紧，但共用附单的冻结止盈回读不符；停止覆盖并需人工核对")
                 return
         session.setdefault("events", []).append({"kind": "stop_amend_verified", "ts": int(time.time()*1000),
@@ -1763,15 +1939,38 @@ class AreaShapeDemoExecutionMonitor(QObject):
 
     def _confirm_exchange_closed(self, session_id: str, runtime: Any, client: Any,
                                  session: dict[str, Any], position: dict[str, Any]) -> bool:
-        """Release only with algo-triggered closing order and matching fills evidence."""
+        """Confirm real closing fills, then retire this session's remaining algos."""
         target_order_ids: set[str] = set()
-        for key in ("stop_algo_cl_ord_id", "take_profit_algo_cl_ord_id"):
+        owned_algos: dict[str, tuple[str, Decimal]] = {}
+        direction = str(position.get("direction") or session["direction"])
+        expected_side = "sell" if direction == "long" else "buy"
+        expected_size = Decimal(position["size"])
+        terminal_seen = False
+        for key, kind, price_key in (("stop_algo_cl_ord_id", "sl", "stop"),
+                                     ("take_profit_algo_cl_ord_id", "tp", "take_profit")):
             order_id = position.get(key)
             if not order_id:
                 continue
-            raw = client.get_order_algo(runtime.credentials, environment="demo", inst_id=session["symbol"], algo_cl_ord_id=order_id)
+            trigger = _decimal_or_none(position.get(price_key))
+            if trigger is None and kind == "tp":
+                trigger = _decimal_or_none((position.get("take_profit_intent") or {}).get("trigger"))
+            if trigger is None:
+                continue
+            owned_algos[str(order_id)] = (kind, trigger)
+            raw = client.get_order_algo(runtime.credentials, environment=_session_environment(session), inst_id=session["symbol"], algo_cl_ord_id=order_id)
             if str((raw or {}).get("state", "")).lower() != "effective":
                 continue
+            actual_trigger = _decimal_or_none(raw.get("slTriggerPx" if kind == "sl" else "tpTriggerPx"))
+            allowed_triggers = {trigger}
+            if kind == "sl" and position.get("pending_stop_price"):
+                allowed_triggers.add(Decimal(position["pending_stop_price"]))
+            if actual_trigger not in allowed_triggers or not _verified_protection(
+                    {**raw, "state": "live"}, inst_id=session["symbol"], side=expected_side,
+                    size=expected_size, trigger=actual_trigger, kind=kind,
+                    pos_side=position.get("pos_side"), position_mode=_session_position_mode(session, runtime)):
+                self._set_status(session_id, "manual_control", "保护单终态身份或冻结参数不符；不采用其平仓记录")
+                return False
+            terminal_seen = True
             for field in ("ordId", "actualOrdId"):
                 if raw.get(field):
                     target_order_ids.add(str(raw[field]))
@@ -1780,15 +1979,29 @@ class AreaShapeDemoExecutionMonitor(QObject):
                     target_order_ids.add(str(value["ordId"]))
                 elif value:
                     target_order_ids.add(str(value))
+        if not terminal_seen:
+            return False
+        # Fills and flat positions can be visible on different API polls. Keep
+        # the reservation and continue reconciling without creating protection.
+        with self._lock:
+            current = self._sessions[session_id]
+            if not current.get("write_disabled"):
+                current["status"] = "closing_pending"
+            current["closing_order_ids"] = sorted(target_order_ids)
+            if not current.get("close_reconciliation_started_at_ms"):
+                current["close_reconciliation_started_at_ms"] = int(time.time() * 1000)
+                current.setdefault("events", []).append({"kind": "close_reconciliation_pending",
+                    "ts": current["close_reconciliation_started_at_ms"],
+                    "message": "保护单已触发，等待真实平仓成交与残留保护单核对"})
+            self._persist_locked()
         if not target_order_ids:
             return False
-        config = _strategy_config(session, runtime)
-        expected_side = "sell" if position["direction"] == "long" else "buy"
-        order_ids_with_fills: set[str] = set()
-        expected_size = Decimal(position["size"])
+        positions = client.get_positions(runtime.credentials, environment=_session_environment(session), inst_type="SWAP", prefer_cache=False)
+        if any(item.inst_id.upper() == str(session["symbol"]).upper() and Decimal(item.position) != 0 for item in positions):
+            return False
         entry_ts = int(position.get("entry_ts") or 0)
         try:
-            fills = client.get_fills_history(runtime.credentials, environment="demo", inst_types=("SWAP",), limit=100)
+            fills = client.get_fills_history(runtime.credentials, environment=_session_environment(session), inst_types=("SWAP",), limit=100)
         except Exception:
             return False
         matched_fills = [item for item in fills if str(item.order_id or "") in target_order_ids
@@ -1799,11 +2012,38 @@ class AreaShapeDemoExecutionMonitor(QObject):
         if not matched_fills:
             return False
         total_closed = sum((Decimal(item.fill_size or 0) for item in matched_fills), Decimal("0"))
-        if total_closed < expected_size:
+        if total_closed != expected_size:
             return False
         close_px_notional = sum((Decimal(item.fill_size or 0) * Decimal(item.fill_price or 0) for item in matched_fills), Decimal("0"))
         avg_close = close_px_notional / total_closed if total_closed else Decimal("0")
         fees = sum((Decimal(item.fill_fee or 0) for item in matched_fills), Decimal("0"))
+        # Standalone SL/TP fallbacks are not OCO siblings. A surviving order
+        # must not remain armed against a later position after this one closes.
+        for client_id, (kind, trigger) in owned_algos.items():
+            raw = client.get_order_algo(runtime.credentials, environment=_session_environment(session),
+                                        inst_id=session["symbol"], algo_cl_ord_id=client_id)
+            state = str((raw or {}).get("state", "")).lower()
+            if raw is None or state in {"canceled", "order_failed", "partially_failed", "effective"}:
+                continue
+            if not _verified_protection(raw, inst_id=session["symbol"], side=expected_side,
+                                        size=expected_size, trigger=trigger, kind=kind,
+                                        pos_side=position.get("pos_side"), position_mode=_session_position_mode(session, runtime)):
+                self._set_status(session_id, "manual_control", "平仓后本会话残留保护参数发生变化；停止自动覆盖并人工核对")
+                return False
+            if self._stop.is_set():
+                return False
+            self._require_writable_store()
+            session["closing_cleanup_intent"] = {"algo_cl_ord_id": client_id, "kind": kind}
+            self._persist_session(session_id)
+            client.cancel_algo_order(runtime.credentials, environment=_session_environment(session),
+                                     inst_id=session["symbol"], algo_cl_ord_id=client_id)
+            updated = client.get_order_algo(runtime.credentials, environment=_session_environment(session),
+                                            inst_id=session["symbol"], algo_cl_ord_id=client_id)
+            if updated is not None and str(updated.get("state") or "").lower() not in {
+                    "canceled", "order_failed", "partially_failed", "effective"}:
+                return False
+            session.setdefault("events", []).append({"kind": "closed_protection_cleanup_verified",
+                "ts": int(time.time() * 1000), "algo_cl_ord_id": client_id})
         with self._lock:
             current = self._sessions[session_id]
             current["status"] = "closed"
@@ -1812,6 +2052,7 @@ class AreaShapeDemoExecutionMonitor(QObject):
             position["actual_close_fees"] = str(fees)
             position["actual_close_filled_size"] = str(total_closed)
             current["closed_evidence"] = "terminal_protective_algo+matching_order_fills"
+            current.pop("closing_cleanup_intent", None)
             current.setdefault("events", []).append({"kind": "closed", "ts": current["closed_at_ms"],
                                                        "message": "保护单终态且交易所仓位历史确认已平；释放合约会话占用"})
             self._reservations.discard(self._reservation_key(current))
@@ -1821,9 +2062,6 @@ class AreaShapeDemoExecutionMonitor(QObject):
 
     def _confirm_if_position_closed(self, session_id: str, runtime: Any, client: Any,
                                     session: dict[str, Any], position: dict[str, Any]) -> bool:
-        current_positions = client.get_positions(runtime.credentials, environment="demo", inst_type="SWAP", prefer_cache=False)
-        if any(p.inst_id.upper() == str(session["symbol"]).upper() and Decimal(p.position) != 0 for p in current_positions):
-            return False
         return self._confirm_exchange_closed(session_id, runtime, client, session, position)
 
     def _reconcile_entry_intent(self, session_id: str) -> None:
@@ -1837,13 +2075,16 @@ class AreaShapeDemoExecutionMonitor(QObject):
             self._reconcile_fok_entry_intent(session_id, session, runtime, client, intent)
             return
         try:
-            algo = client.get_order_algo(runtime.credentials, environment="demo", inst_id=session["symbol"],
+            algo = client.get_order_algo(runtime.credentials, environment=_session_environment(session), inst_id=session["symbol"],
                                          algo_cl_ord_id=intent["cl_ord_id"])
         except Exception as exc:
             self._set_status(session_id, "manual_review", f"原algoClOrdId回查未确认；禁止重新提交：{exc}")
             return
         if algo is None:
             self._set_status(session_id, "manual_review", "OKX未返回原触发委托；结果不明，禁止重新提交")
+            return
+        if not _verified_trigger_entry(algo, session, intent):
+            self._set_status(session_id, "manual_review", "触发委托身份、方向、数量或冻结触发/限价回读不符；禁止采用其成交记录")
             return
         state = str(algo.get("state") or "").lower()
         cancel_mode = str(session.get("cancel_requested") or "")
@@ -1855,12 +2096,15 @@ class AreaShapeDemoExecutionMonitor(QObject):
                     self._persist_locked()
         if state == "live" and cancel_mode:
             try:
-                client.cancel_algo_order(runtime.credentials, environment="demo", inst_id=session["symbol"],
+                client.cancel_algo_order(runtime.credentials, environment=_session_environment(session), inst_id=session["symbol"],
                                          algo_cl_ord_id=intent["cl_ord_id"])
-                algo = client.get_order_algo(runtime.credentials, environment="demo", inst_id=session["symbol"],
+                algo = client.get_order_algo(runtime.credentials, environment=_session_environment(session), inst_id=session["symbol"],
                                              algo_cl_ord_id=intent["cl_ord_id"])
             except Exception as exc:
                 self._set_status(session_id, "manual_review", f"撤销OKX触发委托后状态未确认：{exc}")
+                return
+            if not _verified_trigger_entry(algo, session, intent):
+                self._set_status(session_id, "manual_review", "撤单后触发委托身份或冻结参数回读不符；保持人工核对")
                 return
             state = str((algo or {}).get("state") or "").lower()
             if state == "live":
@@ -1875,74 +2119,69 @@ class AreaShapeDemoExecutionMonitor(QObject):
         if state == "canceled" and not spawned:
             self._finish_entry_cancel(session_id, cancel_mode)
             return
-        if state != "effective" or not spawned:
+        if state not in {"effective", "canceled"} or not spawned:
             self._set_status(session_id, "manual_review", f"触发委托终态为{state or 'unknown'}，未取得唯一成交委托；人工核对")
             return
         if len(spawned) != 1:
             self._set_status(session_id, "manual_review", "触发委托返回多个成交子委托；需人工核对")
             return
-        try:
-            status = client.get_order(runtime.credentials, _strategy_config(session, runtime),
-                                      inst_id=session["symbol"], ord_id=str(spawned[0]))
-        except Exception as exc:
-            self._set_status(session_id, "manual_review", f"OKX触发后的成交委托回查失败：{exc}")
-            return
-        filled = Decimal(str(status.filled_size or 0))
-        if filled > 0 and status.avg_price and Decimal(str(status.avg_price)) > 0:
-            fill_time = int(status.raw.get("fillTime") or 0)
-            if not fill_time and status.ord_id:
-                try:
-                    fills = client.get_fills_history(runtime.credentials, environment="demo", inst_types=("SWAP",), limit=100)
-                    fill_time = max((int(item.fill_time or 0) for item in fills
-                                     if item.order_id == status.ord_id and item.inst_id.upper() == session["symbol"].upper()), default=0)
-                except Exception:
-                    fill_time = 0
-            self._protect_fill(session_id, status, fill_time)
-            return
-        if str(status.state).lower() == "canceled" and filled == 0:
-            if cancel_mode:
-                self._finish_entry_cancel(session_id, cancel_mode)
-            else:
-                self._consume_signal(session_id, "OKX触发后FOK未成交；信号已消费，不重复发送")
-            return
-        self._set_status(session_id, "manual_review", f"触发后的成交委托状态为{status.state}且没有可确认成交；人工对账")
+        # A cancelled parent can still have spawned a filled/partial child.
+        # Reuse the regular FOK reconciliation, targeting that exact child ID.
+        self._reconcile_fok_entry_intent(session_id, session, runtime, client, intent, order_id=str(spawned[0]))
+
+    def _protect_uncertain_entry_cancel(self, session_id: str, status: Any, intent: dict[str, Any]) -> bool:
+        """A failed remainder cancel cannot discard a previously verified fill."""
+        filled, average = _decimal_or_none(status.filled_size), _decimal_or_none(status.avg_price)
+        if filled is None or filled <= 0 or average is None or average <= 0:
+            return False
+        snapshot = {**intent, "entry_cancel_unverified": True}
+        self._protect_fill(session_id, status, int((status.raw or {}).get("fillTime") or 0), intent=snapshot)
+        return True
 
     def _reconcile_fok_entry_intent(
         self, session_id: str, session: dict[str, Any], runtime: Any, client: Any,
-        intent: dict[str, Any],
+        intent: dict[str, Any], *, order_id: str | None = None,
     ) -> None:
         """Reconcile the same durable regular-order client ID; never resend a FOK."""
         config = _strategy_config(session, runtime)
+        order_lookup = {"ord_id": order_id} if order_id else {"cl_ord_id": intent["cl_ord_id"]}
         try:
             status = client.get_order(
-                runtime.credentials, config, inst_id=session["symbol"], cl_ord_id=intent["cl_ord_id"],
+                runtime.credentials, config, inst_id=session["symbol"], **order_lookup,
             )
         except Exception as exc:
             self._set_status(session_id, "manual_review", f"原FOK clOrdId回查未确认；禁止重发：{exc}")
             return
+        if not _verified_entry_fill_order(status, session, intent, order_id=order_id):
+            self._set_status(session_id, "manual_review", "FOK成交委托身份、方向、类型、数量或冻结限价回读不符")
+            return
         order_state = str(status.state or "").strip().lower()
         cancel_mode = str(session.get("cancel_requested") or "")
         if order_state in {"live", "partially_filled"}:
+            verified_before_cancel = copy.deepcopy(status)
             try:
                 client.cancel_order(runtime.credentials, config, inst_id=session["symbol"],
-                                    cl_ord_id=intent["cl_ord_id"])
+                                    **order_lookup)
                 status = client.get_order(
-                    runtime.credentials, config, inst_id=session["symbol"], cl_ord_id=intent["cl_ord_id"],
+                    runtime.credentials, config, inst_id=session["symbol"], **order_lookup,
                 )
                 order_state = str(status.state or "").strip().lower()
             except Exception as exc:
+                if self._protect_uncertain_entry_cancel(session_id, verified_before_cancel, intent):
+                    return
                 self._set_status(session_id, "manual_review", f"FOK撤单后状态未确认：{exc}")
                 return
+            if not _verified_entry_fill_order(status, session, intent, order_id=order_id):
+                if self._protect_uncertain_entry_cancel(session_id, verified_before_cancel, intent):
+                    return
+                self._set_status(session_id, "manual_review", "FOK撤单后身份回读不符；停止采用该记录")
+                return
             if order_state in {"live", "partially_filled"}:
+                if self._protect_uncertain_entry_cancel(session_id, status, intent):
+                    return
                 self._set_status(session_id, "manual_review", "FOK订单余量撤单后仍活动；需人工核对")
                 return
-        raw = status.raw if isinstance(status.raw, dict) else {}
-        expected_size = Decimal(str(intent.get("size") or "0"))
-        if (str(raw.get("instId") or "").upper() != str(session["symbol"]).upper()
-                or str(raw.get("clOrdId") or "") != str(intent["cl_ord_id"])
-                or str(raw.get("side") or "").lower() != str(intent.get("side") or "").lower()
-                or str(raw.get("ordType") or "").lower() != "fok"
-                or Decimal(str(raw.get("sz") or "0")) != expected_size):
+        if not _verified_entry_fill_order(status, session, intent, order_id=order_id):
             self._set_status(session_id, "manual_review", "FOK订单回读合约、编号、方向、类型或数量与持久化意图不符")
             return
         filled = Decimal(str(status.filled_size or 0))
@@ -1950,7 +2189,7 @@ class AreaShapeDemoExecutionMonitor(QObject):
             fill_time = int(status.raw.get("fillTime") or 0)
             if not fill_time and status.ord_id:
                 try:
-                    fills = client.get_fills_history(runtime.credentials, environment="demo", inst_types=("SWAP",), limit=100)
+                    fills = client.get_fills_history(runtime.credentials, environment=_session_environment(session), inst_types=("SWAP",), limit=100)
                     fill_time = max((int(item.fill_time or 0) for item in fills
                                      if item.order_id == status.ord_id and item.inst_id.upper() == session["symbol"].upper()), default=0)
                 except Exception:
@@ -2032,13 +2271,22 @@ class AreaShapeDemoExecutionMonitor(QObject):
 
     def _persist_locked(self) -> None:
         self._require_writable_store()
-        self._store_save([dict(item) for item in self._sessions.values()])
+        try:
+            self._store_save([dict(item) for item in self._sessions.values()])
+        except Exception as exc:
+            # A durable intent is a prerequisite for every later order write.
+            # In-memory mutations after a failed save cannot authorize trading.
+            self._store_write_blocked = True
+            self._load_errors.append(f"执行状态保存失败：{exc}")
+            self.status_changed.emit(f"执行状态保存失败，已禁止交易写入并保留交易所现有保护：{exc}")
+            raise
 
     def _require_writable_store(self) -> None:
         if self._store_write_blocked:
             raise RuntimeError("demo执行存储损坏或schema未知；为保护原文件禁止写入")
 
     def _runtime_client(self, session_id: str, *, protective: bool = False) -> tuple[Any, Any]:
+        self._require_writable_store()
         runtime = self._runtimes.get(session_id)
         client = self._clients.get(session_id)
         if runtime is None or client is None:
@@ -2047,8 +2295,8 @@ class AreaShapeDemoExecutionMonitor(QObject):
         self._verify_runtime_identity(session, runtime, True)
         if int(session.get("rule_version") or 0) != AREA_SHAPE_EXECUTION_RULE_VERSION:
             raise PermissionError("执行规则版本已变化；旧会话保持只读，禁止套用新保护规则")
-        if str(getattr(runtime, "environment", "")).lower() != "demo":
-            raise PermissionError("运行时环境已变化；live写入硬拒绝")
+        if str(getattr(runtime, "environment", "")).lower() != _session_environment(session):
+            raise PermissionError("运行时环境已变化；拒绝跨环境写入")
         blocked = {"closed", "cancelled", "expired"}
         if not protective:
             blocked.update({"paused", "needs_manual_rearm", "manual_review"})
@@ -2057,11 +2305,33 @@ class AreaShapeDemoExecutionMonitor(QObject):
         return runtime, client
 
     def _assert_write_enabled(self, session_id: str) -> None:
+        self._require_writable_store()
         if self._stop.is_set():
             raise PermissionError("应用关闭中；禁止新的demo交易写入")
         session = self._sessions[session_id]
         if session.get("write_disabled") or session.get("status") in {"needs_manual_rearm", "manual_review", "closed", "cancelled", "expired", "paused"}:
             raise PermissionError("会话只读/终止，禁止交易写入")
+
+
+def _place_area_shape_order(client: Any, kind: str, credentials: Any, config: StrategyConfig, **kwargs: Any) -> Any:
+    method_name = {
+        "limit": "place_area_shape_limit_entry",
+        "fok": "place_area_shape_fok_entry",
+        "trigger": "place_area_shape_trigger_entry",
+        "protection": "place_area_shape_protection_algo",
+    }.get(kind)
+    if method_name is None:
+        raise ValueError("区域执行订单类型无效")
+    method = getattr(client, method_name, None)
+    if not callable(method) and config.environment == "demo":
+        # Older demo-only test doubles and external adapters remain compatible.
+        method = getattr(client, f"place_area_shape_demo_{kind}_entry" if kind != "protection"
+                         else "place_area_shape_demo_protection_algo", None)
+    if not callable(method):
+        raise RuntimeError(f"client缺少{config.environment}区域{kind}执行适配器")
+    if str(config.environment).lower() not in {"demo", "live"}:
+        raise PermissionError("区域执行配置环境无效")
+    return method(credentials, config, **kwargs)
 
 
 def _take_profit_r(plan: AreaShapePlan) -> Decimal:
@@ -2072,9 +2342,26 @@ def _strategy_config(session: dict[str, Any], runtime: Any) -> StrategyConfig:
     return StrategyConfig(
         inst_id=str(session["symbol"]), bar="1H", ema_period=21, atr_period=14,
         atr_stop_multiplier=Decimal("1"), atr_take_multiplier=Decimal("1"), order_size=Decimal("1"),
-        trade_mode=runtime.trade_mode, signal_mode="both", position_mode=runtime.position_mode,
-        environment="demo", tp_sl_trigger_type="last", strategy_id="area_shape_demo",
+        trade_mode=str(session.get("trade_mode") or runtime.trade_mode), signal_mode="both",
+        position_mode=_session_position_mode(session, runtime),
+        environment=_session_environment(session), tp_sl_trigger_type="last", strategy_id="area_shape_execution",
     )
+
+
+def _session_environment(session: dict[str, Any]) -> str:
+    environment = str(session.get("environment") or "demo").lower()
+    if environment not in {"demo", "live"}:
+        raise PermissionError("session环境无效；拒绝REST请求")
+    if str(session.get("mode") or f"{environment}_exchange") != f"{environment}_exchange":
+        raise PermissionError("session mode与环境不一致；拒绝REST请求")
+    return environment
+
+
+def _session_position_mode(session: dict[str, Any], runtime: Any) -> str:
+    frozen = str(session.get("position_mode") or getattr(runtime, "position_mode", ""))
+    if frozen not in {"net", "long_short"}:
+        raise PermissionError("冻结持仓模式无效；拒绝REST请求")
+    return frozen
 
 
 def _position_side(direction: str, position_mode: str) -> str | None:
@@ -2087,6 +2374,49 @@ def _position_matches(position: Any, direction: str, size: Decimal, position_mod
         return str(getattr(position, "pos_side", "")).lower() == direction and abs(raw) == size
     actual_direction = "long" if raw > 0 else "short" if raw < 0 else ""
     return actual_direction == direction and abs(raw) == size
+
+
+def _verified_trigger_entry(raw: Any, session: dict[str, Any], intent: dict[str, Any]) -> bool:
+    if not isinstance(raw, dict):
+        return False
+    size, cap, trigger = (_decimal_or_none(intent.get(field)) for field in ("size", "price", "trigger_px"))
+    if any(value is None or value <= 0 for value in (size, cap, trigger)):
+        return False
+    direction = str(session.get("direction") or session["plan_snapshot"]["config"]["direction"])
+    if intent.get("side") != ("buy" if direction == "long" else "sell"):
+        return False
+    return (
+        str(raw.get("instId") or "").upper() == str(session["symbol"]).upper()
+        and str(raw.get("algoClOrdId") or "") == str(intent.get("cl_ord_id") or "")
+        and str(raw.get("side") or "").lower() == str(intent.get("side") or "").lower()
+        and str(raw.get("ordType") or "").lower() == "trigger"
+        and str(raw.get("triggerPxType") or "").lower() == "last"
+        and _decimal_or_none(raw.get("sz")) == _decimal_or_none(intent.get("size"))
+        and _decimal_or_none(raw.get("triggerPx")) == _decimal_or_none(intent.get("trigger_px"))
+        and _decimal_or_none(raw.get("ordPx") or raw.get("orderPx")) == _decimal_or_none(intent.get("price"))
+        and str(raw.get("advanceOrdType") or "fok").lower() == "fok"
+    )
+
+
+def _verified_entry_fill_order(status: Any, session: dict[str, Any], intent: dict[str, Any], *, order_id: str | None = None, order_type: str = "fok") -> bool:
+    raw = status.raw if isinstance(status.raw, dict) else {}
+    expected_size = _decimal_or_none(intent.get("size"))
+    cap = _decimal_or_none(intent.get("price"))
+    direction = str(session.get("direction") or session["plan_snapshot"]["config"]["direction"])
+    if cap is None or cap <= 0 or intent.get("side") != ("buy" if direction == "long" else "sell"):
+        return False
+    filled = _decimal_or_none(status.filled_size)
+    return (
+        str(raw.get("instId") or "").upper() == str(session["symbol"]).upper()
+        and (str(raw.get("ordId") or "") == order_id and str(status.ord_id or "") == order_id if order_id
+             else str(raw.get("clOrdId") or "") == str(intent.get("cl_ord_id") or ""))
+        and str(raw.get("side") or "").lower() == str(intent.get("side") or "").lower()
+        and str(raw.get("ordType") or "").lower() == order_type
+        and expected_size is not None and expected_size > 0
+        and _decimal_or_none(raw.get("sz")) == expected_size
+        and _decimal_or_none(raw.get("px")) == _decimal_or_none(intent.get("price"))
+        and filled is not None and 0 <= filled <= expected_size
+    )
 
 
 def _verified_protection(

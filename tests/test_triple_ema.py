@@ -14,6 +14,7 @@ from okx_quant.backtest import (
 )
 from okx_quant.models import Candle, Instrument, StrategyConfig
 from okx_quant.strategy_catalog import (
+    ALL_STRATEGY_DEFINITIONS,
     BACKTEST_STRATEGY_DEFINITIONS,
     STRATEGY_TRIPLE_EMA_ID,
 )
@@ -125,12 +126,13 @@ def _live_candles(closes: list[str]) -> list[Candle]:
 
 
 class TripleEmaStrategyTest(TestCase):
-    def test_catalog_exposes_real_and_backtest_strategy(self) -> None:
-        definition = next(item for item in BACKTEST_STRATEGY_DEFINITIONS if item.strategy_id == STRATEGY_TRIPLE_EMA_ID)
+    def test_catalog_exposes_live_strategy_but_keeps_it_out_of_backtest(self) -> None:
+        definition = next(item for item in ALL_STRATEGY_DEFINITIONS if item.strategy_id == STRATEGY_TRIPLE_EMA_ID)
 
         self.assertTrue(definition.supports_trade)
         self.assertTrue(definition.supports_signal_only)
         self.assertTrue(definition.supports_backtest)
+        self.assertNotIn(definition, BACKTEST_STRATEGY_DEFINITIONS)
 
     def test_signal_generation_only_enters_when_trend_first_forms(self) -> None:
         frame = pd.DataFrame(

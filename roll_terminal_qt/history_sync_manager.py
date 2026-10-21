@@ -371,6 +371,10 @@ class HistorySyncManager(QObject):
             if thread.isRunning():
                 thread.wait(2500)
 
+    def has_running_threads(self) -> bool:
+        """A stop request / bounded wait is not proof that workers have exited."""
+        return any(thread.isRunning() for thread in self._threads.values())
+
     def _clear_thread(self, key: tuple[str, str], thread: HistorySyncThread) -> None:
         if self._threads.get(key) is not thread:
             return

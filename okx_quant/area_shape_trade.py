@@ -277,7 +277,7 @@ class AreaShapePlan:
             raise ValueError("support must be positive and below pressure")
         if self.execution_enabled:
             raise ValueError("area shape exchange execution is disabled")
-        if self.execution_mode not in {"paper", "demo_exchange"}:
+        if self.execution_mode not in {"paper", "demo_exchange", "live_exchange"}:
             raise ValueError("unsupported area execution mode")
 
     @classmethod
