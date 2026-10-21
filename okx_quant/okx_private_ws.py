@@ -10,7 +10,11 @@ from decimal import Decimal, InvalidOperation
 from typing import Any, Callable
 
 from okx_quant.models import Credentials
-from okx_quant.websockets_compat import connect_okx_websocket
+from okx_quant.websockets_compat import (
+    connect_okx_websocket,
+    receive_okx_websocket,
+    wait_for_websocket_retry,
+)
 
 try:
     import websockets
@@ -249,9 +253,11 @@ class OkxPrivateWsConnection:
                 await self._run_connection_once()
                 reconnect_delay = 1.0
             except Exception as exc:  # noqa: BLE001
+                if self._stop_event.is_set():
+                    break
                 self._set_last_error(str(exc).strip() or exc.__class__.__name__)
                 self._log_error_once(f"OKX 私有 WS 断开，准备重连：{self._last_error}")
-                await asyncio.sleep(reconnect_delay)
+                await wait_for_websocket_retry(self._stop_event, reconnect_delay)
                 reconnect_delay = min(reconnect_delay * 2, 15.0)
 
     async def _run_connection_once(self) -> None:
@@ -268,23 +274,28 @@ class OkxPrivateWsConnection:
             "max_queue": 1000,
         }
         socket_context = connect_okx_websocket(url, headers=headers or None, **connect_kwargs)
-        async with socket_context as socket:
+        try:
+            async with socket_context as socket:
+                with self._lock:
+                    self._socket = socket
+                await self._login(socket)
+                await self._subscribe(socket)
+                with self._lock:
+                    self._connected = True
+                    self._last_error = ""
+                    self._last_error_logged = ""
+                    self._lock.notify_all()
+                self._notify_update("reconnected", self._version)
+                while not self._stop_event.is_set():
+                    message = await receive_okx_websocket(socket)
+                    if isinstance(message, bytes):
+                        message = message.decode("utf-8", errors="replace")
+                    await self._handle_message(socket, message)
+        finally:
             with self._lock:
-                self._socket = socket
-                self._connected = True
-                self._last_error = ""
-                self._last_error_logged = ""
+                self._connected = False
+                self._socket = None
                 self._lock.notify_all()
-            await self._login(socket)
-            await self._subscribe(socket)
-            while not self._stop_event.is_set():
-                message = await socket.recv()
-                if isinstance(message, bytes):
-                    message = message.decode("utf-8", errors="replace")
-                await self._handle_message(socket, message)
-        with self._lock:
-            self._connected = False
-            self._socket = None
 
     async def _login(self, socket) -> None:  # noqa: ANN001
         timestamp = _ws_timestamp_seconds()
@@ -314,12 +325,17 @@ class OkxPrivateWsConnection:
         await socket.send(json.dumps(payload, separators=(",", ":")))
         await self._expect_event(socket, "subscribe")
 
-    async def _expect_event(self, socket, expected: str) -> None:  # noqa: ANN001
-        deadline = time.monotonic() + 10.0
+    async def _expect_event(self, socket, expected: str, *, timeout_seconds: float = 10.0) -> None:  # noqa: ANN001
+        deadline = time.monotonic() + timeout_seconds
         while time.monotonic() < deadline:
-            message = await socket.recv()
+            try:
+                message = await asyncio.wait_for(socket.recv(), timeout=max(0.01, deadline - time.monotonic()))
+            except asyncio.TimeoutError:
+                break
             if isinstance(message, bytes):
                 message = message.decode("utf-8", errors="replace")
+            if message == "pong":
+                continue
             if message == "ping":
                 await socket.send("pong")
                 continue
@@ -333,6 +349,8 @@ class OkxPrivateWsConnection:
         raise OkxPrivateWsConnectionUnavailable(f"OKX 私有 WS 未在超时内返回 {expected} 事件。")
 
     async def _handle_message(self, socket, message: str) -> None:  # noqa: ANN001
+        if message == "pong":
+            return
         if message == "ping":
             await socket.send("pong")
             return

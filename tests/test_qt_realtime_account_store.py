@@ -160,6 +160,44 @@ def test_reconcile_interval_can_be_changed_without_restarting_store() -> None:
         store.stop()
 
 
+def test_account_recovery_retry_preserves_snapshot_and_resets_after_success() -> None:
+    app = QApplication.instance() or QApplication([])
+    store = RealtimeAccountStore(client=_FakeRealtimeClient(), reconcile_seconds=300)
+    store._runtime = _runtime()
+    previous_account = object()
+    store._account = previous_account
+    try:
+        for expected_delay in (5000, 10000, 20000, 30000, 30000):
+            store._apply_reconcile_result(store._generation, "safety", OSError("proxy offline"))
+            assert store._reconcile_retry_timer.isActive()
+            assert store._reconcile_retry_timer.interval() == expected_delay
+            assert store._account is previous_account
+        restored_account = object()
+        store._apply_reconcile_result(store._generation, "recovery", {"account": restored_account})
+        assert not store._reconcile_retry_timer.isActive()
+        assert store._reconcile_retry_delay == 5
+        assert store._account is restored_account
+    finally:
+        store.stop()
+        app.processEvents()
+
+
+def test_account_ws_reconnect_requests_full_reconcile_only_for_current_generation() -> None:
+    app = QApplication.instance() or QApplication([])
+    store = RealtimeAccountStore(client=_FakeRealtimeClient())
+    store._runtime = _runtime()
+    try:
+        with patch.object(store, "request_reconcile") as reconcile:
+            store._queue_cache_refresh(store._generation - 1, "reconnected", 0)
+            reconcile.assert_not_called()
+            store._queue_cache_refresh(store._generation, "reconnected", 0)
+            reconcile.assert_called_once_with("ws-reconnected")
+        assert not store._cache_in_flight
+    finally:
+        store.stop()
+        app.processEvents()
+
+
 def test_profile_switch_detaches_slow_websockets_without_blocking_ui_thread() -> None:
     stopped = threading.Event()
     release = threading.Event()

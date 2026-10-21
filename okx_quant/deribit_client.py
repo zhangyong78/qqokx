@@ -6,6 +6,8 @@ from decimal import Decimal
 from typing import Any
 from urllib import error, parse, request
 
+from okx_quant.network_transport import refresh_http_proxy_settings
+
 
 DEFAULT_HEADERS = {
     "Accept": "application/json",
@@ -118,6 +120,7 @@ class DeribitRestClient:
         url = f"{self.base_url}{path}?{query}"
         req = request.Request(url, headers=DEFAULT_HEADERS, method="GET")
         try:
+            refresh_http_proxy_settings()
             with request.urlopen(req, timeout=20) as response:
                 content = response.read().decode("utf-8")
         except error.HTTPError as exc:

@@ -7,7 +7,11 @@ import time
 from dataclasses import dataclass
 from typing import Any, Callable
 
-from okx_quant.websockets_compat import connect_okx_websocket
+from okx_quant.websockets_compat import (
+    connect_okx_websocket,
+    receive_okx_websocket,
+    wait_for_websocket_retry,
+)
 
 try:
     import websockets
@@ -171,9 +175,11 @@ class OkxPublicWsConnection:
                 await self._run_connection_once()
                 reconnect_delay = 1.0
             except Exception as exc:  # noqa: BLE001
+                if self._stop_event.is_set():
+                    break
                 self._set_last_error(str(exc).strip() or exc.__class__.__name__)
                 self._log_error_once(f"OKX 公共 WS 断开，准备重连：{self._last_error}")
-                await asyncio.sleep(reconnect_delay)
+                await wait_for_websocket_retry(self._stop_event, reconnect_delay)
                 reconnect_delay = min(reconnect_delay * 2, 15.0)
 
     async def _run_connection_once(self) -> None:
@@ -190,25 +196,32 @@ class OkxPublicWsConnection:
             "max_queue": 1000,
         }
         socket_context = connect_okx_websocket(url, headers=headers or None, **connect_kwargs)
-        async with socket_context as socket:
+        try:
+            async with socket_context as socket:
+                with self._lock:
+                    self._socket = socket
+                    self._subscribed_channels.clear()
+                await self._ensure_all_subscriptions()
+                with self._lock:
+                    self._connected = True
+                    self._last_error = ""
+                    self._last_error_logged = ""
+                    self._lock.notify_all()
+                while not self._stop_event.is_set():
+                    message = await receive_okx_websocket(socket)
+                    if isinstance(message, bytes):
+                        message = message.decode("utf-8", errors="replace")
+                    await self._handle_message(message)
+        finally:
             with self._lock:
-                self._socket = socket
-                self._connected = True
-                self._last_error = ""
-                self._last_error_logged = ""
+                self._connected = False
+                self._socket = None
                 self._subscribed_channels.clear()
                 self._lock.notify_all()
-            await self._ensure_all_subscriptions()
-            while not self._stop_event.is_set():
-                message = await socket.recv()
-                if isinstance(message, bytes):
-                    message = message.decode("utf-8", errors="replace")
-                await self._handle_message(message)
-        with self._lock:
-            self._connected = False
-            self._socket = None
 
     async def _handle_message(self, message: str) -> None:
+        if message == "pong":
+            return
         if message == "ping":
             socket = self._socket
             if socket is not None:

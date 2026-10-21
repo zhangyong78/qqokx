@@ -16,6 +16,8 @@ from decimal import Decimal
 from typing import Any, Callable
 from urllib import error, parse, request
 
+from okx_quant.network_transport import refresh_http_proxy_settings
+
 from okx_quant.candle_cache import (
     DEFAULT_CANDLE_CACHE_CAPACITY,
     load_candle_cache,
@@ -3862,6 +3864,7 @@ class OkxRestClient:
         req = request.Request(url, data=data or None, headers=headers, method=method.upper())
 
         try:
+            refresh_http_proxy_settings()
             with request.urlopen(req, timeout=max(float(timeout_seconds or 20), 0.1)) as response:
                 content = response.read().decode("utf-8")
                 payload = json.loads(content)

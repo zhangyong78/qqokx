@@ -75,6 +75,10 @@ class RealtimeAccountStore(QObject):
         self._reconcile_timer = QTimer(self)
         self._reconcile_timer.setInterval(max(1, int(reconcile_seconds)) * 1000)
         self._reconcile_timer.timeout.connect(lambda: self.request_reconcile("safety"))
+        self._reconcile_retry_delay = 5
+        self._reconcile_retry_timer = QTimer(self)
+        self._reconcile_retry_timer.setSingleShot(True)
+        self._reconcile_retry_timer.timeout.connect(lambda: self.request_reconcile("recovery"))
         self._reconcile_completed.connect(self._apply_reconcile_result)
         self._cache_completed.connect(self._apply_cache_result)
         self._event_received.connect(self._queue_cache_refresh)
@@ -109,6 +113,8 @@ class RealtimeAccountStore(QObject):
         runtime = self._runtime
         self._generation += 1
         self._reconcile_timer.stop()
+        self._reconcile_retry_timer.stop()
+        self._reconcile_retry_delay = 5
         self._emit_timer.stop()
         self._cache_refresh_timer.stop()
         self._reconcile_in_flight = False
@@ -195,6 +201,7 @@ class RealtimeAccountStore(QObject):
     def request_reconcile(self, reason: str) -> None:
         if self._runtime is None or self._reconcile_in_flight:
             return
+        self._reconcile_retry_timer.stop()
         self._reconcile_in_flight = True
         generation = self._generation
         runtime = self._runtime
@@ -302,10 +309,15 @@ class RealtimeAccountStore(QObject):
             return
         self._reconcile_in_flight = False
         if isinstance(result, Exception):
-            self.status_changed.emit(f"账户 REST 校验失败：{result}")
+            self.status_changed.emit(f"账户 REST 校验失败，{self._reconcile_retry_delay}秒后自动重试：{result}")
+            if self._runtime is not None:
+                self._reconcile_retry_timer.start(self._reconcile_retry_delay * 1000)
+                self._reconcile_retry_delay = min(self._reconcile_retry_delay * 2, 30)
             return
         if not isinstance(result, dict):
             return
+        self._reconcile_retry_timer.stop()
+        self._reconcile_retry_delay = 5
         if int(result.get("started_ws_revision", self._ws_revision)) != self._ws_revision:
             self.status_changed.emit(f"账户 REST {reason} 校验结果已过期，保留较新的 WS 状态")
             return
@@ -325,6 +337,9 @@ class RealtimeAccountStore(QObject):
     @Slot(int, str, int)
     def _queue_cache_refresh(self, generation: int, _channel: str, _version: int) -> None:
         if generation != self._generation or self._runtime is None:
+            return
+        if _channel == "reconnected":
+            self.request_reconcile("ws-reconnected")
             return
         self._pending_cache_refresh = True
         self._schedule_cache_refresh()

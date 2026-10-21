@@ -1,7 +1,9 @@
-"""Compatibility helpers for the websockets 14/15 client API."""
+"""Proxy-aware WebSocket connections and bounded OKX heartbeat waits."""
 
 from __future__ import annotations
 
+import asyncio
+import inspect
 from typing import Any
 
 try:
@@ -14,11 +16,26 @@ try:
 except Exception:  # noqa: BLE001
     _legacy_connect = None
 
+try:
+    from websockets.asyncio.client import connect as _modern_connect
+except Exception:  # noqa: BLE001
+    _modern_connect = None
+
+_modern_proxy_supported = _modern_connect is not None and "proxy" in inspect.signature(_modern_connect).parameters
+
 
 def connect_okx_websocket(url: str, *, headers: dict[str, str] | None = None, **kwargs: Any):
     """Create an OKX WebSocket context safely across supported versions."""
     if websockets is None:
         raise RuntimeError("websockets dependency is unavailable")
+    if _modern_proxy_supported:
+        modern_kwargs = dict(kwargs)
+        if headers:
+            modern_kwargs["additional_headers"] = headers
+        # True makes the library re-read system / environment proxies on each
+        # connection attempt, including after the local proxy has restarted.
+        modern_kwargs.setdefault("proxy", True)
+        return _modern_connect(url, **modern_kwargs)
     if _legacy_connect is not None:
         legacy_kwargs = dict(kwargs)
         if headers:
@@ -28,3 +45,22 @@ def connect_okx_websocket(url: str, *, headers: dict[str, str] | None = None, **
     if headers:
         modern_kwargs["additional_headers"] = headers
     return websockets.connect(url, **modern_kwargs)
+
+
+async def receive_okx_websocket(socket: Any, *, idle_timeout: float = 20, pong_timeout: float = 10) -> Any:
+    """Detect half-open tunnels with OKX's application-level ping / pong."""
+    try:
+        return await asyncio.wait_for(socket.recv(), timeout=idle_timeout)
+    except asyncio.TimeoutError:
+        await asyncio.wait_for(socket.send("ping"), timeout=pong_timeout)
+        return await asyncio.wait_for(socket.recv(), timeout=pong_timeout)
+
+
+async def wait_for_websocket_retry(stop_event: Any, seconds: float) -> None:
+    """Back off without delaying shutdown for the entire reconnect interval."""
+    deadline = asyncio.get_running_loop().time() + seconds
+    while not stop_event.is_set():
+        remaining = deadline - asyncio.get_running_loop().time()
+        if remaining <= 0:
+            return
+        await asyncio.sleep(min(0.25, remaining))

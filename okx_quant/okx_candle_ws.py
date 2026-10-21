@@ -8,7 +8,11 @@ from decimal import Decimal
 from typing import Any, Callable
 
 from okx_quant.models import Candle
-from okx_quant.websockets_compat import connect_okx_websocket
+from okx_quant.websockets_compat import (
+    connect_okx_websocket,
+    receive_okx_websocket,
+    wait_for_websocket_retry,
+)
 
 try:
     import websockets
@@ -144,20 +148,23 @@ class OkxCandleWsConnection:
 
     async def _run_forever_async(self) -> None:
         self._loop = asyncio.get_running_loop()
+        reconnect_delay = 1.0
         while not self._stop_event.is_set():
             try:
                 await self._run_connection_once()
+                reconnect_delay = 1.0
             except Exception as exc:  # noqa: BLE001
                 if self._stop_event.is_set():
                     break
                 self._logger(f"OKX candle WS reconnect: {exc}")
-                await asyncio.sleep(1)
+                await wait_for_websocket_retry(self._stop_event, reconnect_delay)
+                reconnect_delay = min(reconnect_delay * 2, 15.0)
 
     async def _run_connection_once(self) -> None:
         assert websockets is not None
         url = self._DEMO_BUSINESS_URL if self._environment == "demo" else self._BUSINESS_URL
         headers = {"x-simulated-trading": "1"} if self._environment == "demo" else None
-        kwargs: dict[str, Any] = {"ping_interval": 20, "ping_timeout": 20, "open_timeout": 20}
+        kwargs: dict[str, Any] = {"ping_interval": 20, "ping_timeout": 20, "open_timeout": 20, "close_timeout": 5}
         context = connect_okx_websocket(url, headers=headers, **kwargs)
         try:
             async with context as socket:
@@ -169,7 +176,7 @@ class OkxCandleWsConnection:
                 for key in keys:
                     await self._ensure_subscription(key)
                 while not self._stop_event.is_set():
-                    await self._handle_message(await socket.recv())
+                    await self._handle_message(await receive_okx_websocket(socket))
         finally:
             with self._lock:
                 self._connected = False
