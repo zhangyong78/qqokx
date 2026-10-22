@@ -7014,6 +7014,14 @@ class KlineAnalysisWindow(QMainWindow):
         if runtime is None:
             return
         self._invalidate_profile_loaders()
+        if hasattr(self, "_api_profile_combo"):
+            index = self._api_profile_combo.findText(target)
+            if index >= 0 and self._api_profile_combo.currentIndex() != index:
+                self._suppress_api_profile_change = True
+                try:
+                    self._api_profile_combo.setCurrentIndex(index)
+                finally:
+                    self._suppress_api_profile_change = False
         self._runtime = runtime
         self._last_profile_name = target
         self._sync_account_context()
