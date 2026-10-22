@@ -3697,6 +3697,7 @@ if QChartView is not None:
             self._dragging = False
             self._interaction_locked = False
             self._external_hover_time: int | None = None
+            self._external_hover_price: float | None = None
             self._suppress_x_range_signal = False
             self._price_badge = self._create_hover_label(multiline=False, center=True)
             self._time_badge = self._create_hover_label(multiline=False, center=True)
@@ -3741,10 +3742,38 @@ if QChartView is not None:
             }
             self.viewport().setCursor(cursor_map.get(mode, Qt.CursorShape.ArrowCursor))
 
-        def set_external_hover_time(self, candle_time: int | None) -> None:
+        def set_external_hover_time(self, candle_time: int | None, price: float | None = None) -> None:
             self._external_hover_time = int(candle_time) if candle_time is not None else None
+            self._external_hover_price = (
+                float(price)
+                if candle_time is not None and price is not None and math.isfinite(price)
+                else None
+            )
             if self._hover_pos is None:
                 self.viewport().update()
+
+        def hover_price_for_link(self) -> float | None:
+            context = self._resolve_hover_context()
+            if context is None:
+                return None
+            _candle, index, price, hover_y = context
+            atr_geometry = self._atr_overlay_geometry(self.chart().plotArea())
+            if (
+                atr_geometry is not None
+                and atr_geometry[0] <= hover_y <= atr_geometry[1]
+                and index < len(self._atr_values)
+                and self._atr_values[index] is not None
+            ):
+                return None  # ATR has its own units, not the chart's price units.
+            return price
+
+        def _external_hover_y(self, plot_area: QRectF) -> float | None:
+            price = self._external_hover_price
+            if price is None or self._axis_y is None:
+                return None
+            if not float(self._axis_y.min()) <= price <= float(self._axis_y.max()):
+                return None  # Do not clamp an off-screen price to the chart edge.
+            return self._y_for_value(price, plot_area)
 
         def set_latest_price(self, price: float | None) -> None:
             """Set the paint-only latest-price marker without changing the axis."""
@@ -3985,6 +4014,7 @@ if QChartView is not None:
             self._right_padding_drag = None
             self._dragging = False
             self._external_hover_time = None
+            self._external_hover_price = None
             self._hide_hover_overlays()
             self.viewport().update()
 
@@ -4241,20 +4271,22 @@ if QChartView is not None:
                         self._draw_chart_header(painter, plot_area, candle, hover_index)
                         candle_color = QColor(_CHART_UP_COLOR if float(candle["close"]) >= float(candle["open"]) else _CHART_DOWN_COLOR)
                         marker_y = self._y_for_value(float(candle["close"]), plot_area)
+                        crosshair_y = self._external_hover_y(plot_area)
                         cross_pen = QPen(QColor(_CHART_CROSSHAIR_COLOR), 1)
                         cross_pen.setStyle(Qt.PenStyle.DashLine)
                         painter.setPen(cross_pen)
                         painter.drawLine(QPointF(snapped_x, plot_area.top()), QPointF(snapped_x, plot_area.bottom()))
-                        painter.drawLine(QPointF(plot_area.left(), marker_y), QPointF(plot_area.right(), marker_y))
+                        if crosshair_y is not None:
+                            painter.drawLine(QPointF(plot_area.left(), crosshair_y), QPointF(plot_area.right(), crosshair_y))
                         painter.setPen(QPen(candle_color, 2))
                         painter.setBrush(QColor("#ffffff"))
                         painter.drawEllipse(QPointF(snapped_x, marker_y), 4.0, 4.0)
                         painter.end()
                         self._update_hover_overlays(
                             bounds=plot_area,
-                            anchor=QPointF(snapped_x, marker_y),
+                            anchor=QPointF(snapped_x, crosshair_y if crosshair_y is not None else marker_y),
                             candle_color=candle_color,
-                            price_text=self._format_hover_value(float(candle["close"])),
+                            price_text=self._format_hover_value(self._external_hover_price) if crosshair_y is not None else "",
                             time_text=_format_chart_time(int(candle["time"])),
                             tooltip_lines=(
                                 f"联动定位 {_format_chart_time(int(candle_time))}",
@@ -6000,7 +6032,7 @@ if QChartView is not None:
             price_y = float(overlay_layout["price_y"])
             self._price_badge.move(int(round(price_x)), int(round(price_y)))
             self._price_badge.raise_()
-            self._price_badge.show()
+            self._price_badge.setVisible(bool(price_text))
 
             self._time_badge.setText(time_text)
             self._time_badge.adjustSize()
@@ -8824,9 +8856,24 @@ class KlineAnalysisWindow(QMainWindow):
         if self._quad_chart_enabled():
             targets["quaternary"] = self._quaternary_native_chart_view
         value = None if candle_time is None else int(candle_time)
+        source_view = targets.get(source)
+        price = (
+            source_view.hover_price_for_link()
+            if value is not None and isinstance(source_view, InteractiveKlineChartView)
+            else None
+        )
         for target, view in targets.items():
-            if target != source and isinstance(view, InteractiveKlineChartView):
-                view.set_external_hover_time(value)
+            if not isinstance(view, InteractiveKlineChartView):
+                continue
+            if target == source:
+                view.set_external_hover_time(None)
+            else:
+                same_symbol = (
+                    isinstance(source_view, InteractiveKlineChartView)
+                    and bool(source_view._symbol)
+                    and source_view._symbol.upper() == view._symbol.upper()
+                )
+                view.set_external_hover_time(value, price if same_symbol else None)
 
     def _sync_secondary_chart_range_from_primary(self) -> None:
         if not self._secondary_chart_check.isChecked():
@@ -12385,12 +12432,21 @@ class KlineAnalysisWindow(QMainWindow):
         ]
         return candidates[-1] if candidates else None
 
-    def _area_line_is_frozen(self, line_id: str) -> bool:
-        return any(
-            line_id in {plan.support_line_id, plan.pressure_line_id}
-            and plan.status in {"monitoring", "touched", "paper_pending", "paper_position", "paper_break_even", "paper_locked", "paused", "manual_review"}
+    def _frozen_area_plans_for_line(self, line_id: str) -> list[AreaShapePlan]:
+        return [
+            plan
             for plan in self._area_shape_plans()
-        )
+            if (
+                line_id in {plan.support_line_id, plan.pressure_line_id}
+                and plan.status in {
+                    "monitoring", "touched", "paper_pending", "paper_position",
+                    "paper_break_even", "paper_locked", "paused", "manual_review",
+                }
+            )
+        ]
+
+    def _area_line_is_frozen(self, line_id: str) -> bool:
+        return bool(self._frozen_area_plans_for_line(line_id))
 
     def _area_line_price(self, line_id: str) -> Decimal:
         entry = self._workspace_entry(symbol=self._selected_symbol(), period="1H")
@@ -14250,14 +14306,19 @@ class KlineAnalysisWindow(QMainWindow):
         currently_protected = str(target.get("status", "")) == "protected"
         stop_verified = int(position.get("stop_verified_at_ms", 0) or 0) if position else 0
         tp_verified = int(position.get("take_profit_verified_at_ms", 0) or 0) if position else 0
+        waiting_for_entry_protection = not position and not intent and not resting
         stop_state = (
             f"最近核验 {datetime.fromtimestamp(stop_verified / 1000).strftime('%H:%M:%S')}"
-            if currently_protected and stop_verified else "当前未确认/需对账"
+            if currently_protected and stop_verified else (
+                "等待入场成交后生成" if waiting_for_entry_protection else "当前未确认/需对账"
+            )
         )
         tp_state = (
             f"最近核验 {datetime.fromtimestamp(tp_verified / 1000).strftime('%H:%M:%S')}"
             if currently_protected and tp_verified else (
-                "请求待核验" if position and position.get("take_profit_intent") else "未设置/当前未确认"
+                "请求待核验" if position and position.get("take_profit_intent") else (
+                    "等待入场成交后生成" if waiting_for_entry_protection else "未设置/当前未确认"
+                )
             )
         )
         stop = f"{position.get('stop', '-')}（{stop_state}）" if position else f"-（{stop_state}）"
@@ -16526,8 +16587,23 @@ class KlineAnalysisWindow(QMainWindow):
         if not isinstance(lines, list) or self._selected_line_index >= len(lines):
             return
         selected_line = lines[self._selected_line_index]
-        if isinstance(selected_line, dict) and self._area_line_is_frozen(str(selected_line.get("id", ""))):
-            self._set_area_shape_status("监控中的区域线不能删除。")
+        frozen_plans = (
+            self._frozen_area_plans_for_line(str(selected_line.get("id", "")))
+            if isinstance(selected_line, dict) else []
+        )
+        if frozen_plans:
+            plan = frozen_plans[-1]
+            status_names = {
+                "monitoring": "监控中", "touched": "已触区", "paper_pending": "等待入场",
+                "paper_position": "纸面持仓中", "paper_break_even": "纸面保本中",
+                "paper_locked": "纸面锁盈中", "paused": "已暂停（仍可恢复）", "manual_review": "待人工核对",
+            }
+            status_text = status_names.get(plan.status, plan.status)
+            self._set_area_shape_status(
+                f"无法删除：该线仍绑定 {plan.profile_name}/{plan.environment} 区域计划（{status_text}）。"
+                "切换账户不会解除绑定。请先在智能辅助交易中取消计划并核对 OKX 未成交委托；"
+                "已有实盘持仓不会因取消计划而平仓，交易所保护会继续运行。计划结束后再删除线条。"
+            )
             return
         deleted_index = self._selected_line_index
         del lines[deleted_index]

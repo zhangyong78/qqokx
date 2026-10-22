@@ -143,6 +143,23 @@ class AreaShapeDemoUiTests(QtWidgetTestCase):
         self.assertIn("下方支撑：90", self.window._area_shape_lines.text())
         self.assertIn("上方压力：110", self.window._area_shape_lines.text())
 
+    def test_delete_frozen_area_line_explains_bound_account_and_safe_next_step(self) -> None:
+        plan = self._create_demo_draft()
+        self.paper_monitor.start_plan(
+            plan.plan_id, last_closed_candle_ts=20 * HOUR,
+            profile_name=plan.profile_name, environment=plan.environment,
+        )
+        lines_before = list(self.window._workspace_entry()["lines"])
+        self.window._populate_line_table(selected_index=0)
+
+        self.window._delete_selected_line()
+
+        self.assertEqual(self.window._workspace_entry()["lines"], lines_before)
+        status = self.window._area_shape_status.text()
+        self.assertIn("ui-test/demo", status)
+        self.assertIn("切换账户不会解除绑定", status)
+        self.assertIn("先在智能辅助交易中取消计划", status)
+
     def test_manual_area_prices_reject_invalid_support_pressure_order(self) -> None:
         plan = self._create_demo_draft()
         original_prices = plan.support_price, plan.pressure_price
@@ -1133,6 +1150,22 @@ class AreaShapeDemoUiTests(QtWidgetTestCase):
         self.assertEqual(self.demo_monitor.calls[1][0], "rearm")
         self.assertNotEqual(self.demo_monitor.calls[1][1], threading.current_thread().name)
         self.assertIn("模拟盘 armed", self.window._area_shape_demo_status.text())
+
+    def test_armed_session_without_position_explains_protection_is_created_after_fill(self) -> None:
+        plan = self._create_demo_draft()
+        self.demo_monitor._sessions.append({
+            "session_id": "session-armed", "plan_id": plan.plan_id, "profile_name": "ui-test",
+            "environment": "demo", "symbol": "BTC-USDT-SWAP", "status": "armed",
+            "account_uid": "uid-demo", "events": [], "position": None,
+            "pending_intent": None, "resting_entry_intent": None,
+        })
+
+        self.window._refresh_area_shape_execution_status()
+
+        status = self.window._area_shape_demo_status.text()
+        self.assertIn("等待新信号", status)
+        self.assertIn("SL -（等待入场成交后生成）", status)
+        self.assertIn("TP -（等待入场成交后生成）", status)
 
     def _assert_area_controls_fit_viewport(self) -> None:
         self.window.resize(1440, 920)
