@@ -1756,6 +1756,22 @@ def _build_display_times_ms(candles: list[dict[str, Any]], period: str) -> list[
     return [start_display_ms + (index * step_ms) for index in range(len(candles))]
 
 
+def _build_trading_day_spans(candles: list[dict[str, Any]], period: str) -> list[tuple[str, int, int]]:
+    """Group real candle opening dates, using the same local timezone as chart tooltips."""
+    if period.strip().upper() not in {"1H", "4H"}:
+        return []
+    spans: list[tuple[str, int, int]] = []
+    for index, candle in enumerate(candles):
+        moment = datetime.fromtimestamp(int(candle["time"]))
+        weekday = ("周一", "周二", "周三", "周四", "周五", "周六", "周日")[moment.weekday()]
+        day = f"{moment:%m-%d} {weekday}"
+        if spans and spans[-1][0] == day:
+            spans[-1] = (day, spans[-1][1], index + 1)
+        else:
+            spans.append((day, index, index + 1))
+    return spans
+
+
 def _prefer_native_chart_backend() -> bool:
     if os.environ.get("QQOKX_KLINE_NATIVE", "").strip() == "1":
         return True
@@ -3676,6 +3692,9 @@ if QChartView is not None:
             self._signal_markers: list[dict[str, Any]] = []
             self._history_trade_markers: list[dict[str, Any]] = []
             self._area_shape_replay_trades: list[dict[str, Any]] = []
+            self._trading_day_spans: list[tuple[str, int, int]] = []
+            self._area_replay_label_rects: list[QRectF] = []
+            self._area_replay_label_pressed = False
             self._box_overlays: list[dict[str, Any]] = []
             self._channel_overlays: list[dict[str, Any]] = []
             self._future_projection: dict[str, Any] | None = None
@@ -3861,6 +3880,7 @@ if QChartView is not None:
             self._overlay_values = [list(item) for item in overlay_values]
             self._display_times_ms = list(display_times_ms)
             self._period = period.strip() or "15m"
+            self._trading_day_spans = _build_trading_day_spans(self._candles, self._period)
             if self._period.strip().upper() == "1H" and restore_state is None:
                 self._right_padding_bars = _one_hour_right_padding_bars(len(candles))
             elif self._period.strip().upper() == "1H" and restore_state is not None:
@@ -3956,9 +3976,10 @@ if QChartView is not None:
             self.viewport().update()
 
         def set_area_shape_replay_trades(
-            self, rows: list[dict[str, Any]] | None, *, focus: bool = False,
+            self, rows: list[dict[str, Any]] | None, *, focus: bool = False, fit: bool = False,
         ) -> None:
             self._area_shape_replay_trades = [dict(item) for item in (rows or []) if isinstance(item, dict)]
+            self._area_replay_label_rects = []
             if focus and self._area_shape_replay_trades and self._display_times_ms:
                 indices: list[int] = []
                 for item in self._area_shape_replay_trades:
@@ -3970,12 +3991,20 @@ if QChartView is not None:
                         if timestamp > 0:
                             indices.append(self._index_for_candle_time(timestamp // 1000))
                 if indices:
-                    left = max(0, min(indices) - 5)
-                    right = min(len(self._display_times_ms) - 1, max(indices) + 7)
+                    # Keep enough surrounding candles to inspect the setup without
+                    # magnifying a short trade into a handful of oversized bars.
+                    candle_count = len(self._display_times_ms)
+                    trade_span = max(indices) - min(indices) + 1
+                    visible_count = min(candle_count, max(240, math.ceil(trade_span * 1.7)))
+                    left = max(0, min(
+                        min(indices) - (visible_count - trade_span) // 2,
+                        candle_count - visible_count,
+                    ))
+                    right = left + visible_count - 1
                     target_start = float(self._display_times_ms[left])
                     target_end = float(self._display_times_ms[right]) + self._display_step_ms
                     current_start, current_end = self.current_x_range()
-                    if target_start < current_start or target_end > current_end:
+                    if fit or target_start < current_start or target_end > current_end:
                         self._apply_x_range(target_start, target_end, emit_signal=True)
                         self._fit_y_axis_to_visible_range()
             self.viewport().update()
@@ -3989,6 +4018,9 @@ if QChartView is not None:
             self.viewport().update()
 
         def clear_chart_context(self) -> None:
+            self._trading_day_spans = []
+            self._area_replay_label_rects = []
+            self._area_replay_label_pressed = False
             self._axis_x = None
             self._axis_y = None
             self._candles = []
@@ -4104,7 +4136,16 @@ if QChartView is not None:
             self.viewport().update()
             event.accept()
 
+        def _area_replay_label_at(self, position: QPointF) -> bool:
+            return any(rect.contains(position) for rect in self._area_replay_label_rects)
+
         def mousePressEvent(self, event) -> None:  # noqa: ANN001
+            if event.button() == Qt.MouseButton.LeftButton and self._area_replay_label_at(event.position()):
+                # Painted report labels are read-only: do not select/drag live drawings beneath them.
+                self._area_replay_label_pressed = True
+                event.accept()
+                return
+            self._area_replay_label_pressed = False
             plot_area = self.chart().plotArea()
             if event.button() == Qt.MouseButton.LeftButton and plot_area.contains(event.position()):
                 self.chartActivated.emit()
@@ -4126,6 +4167,9 @@ if QChartView is not None:
             super().mousePressEvent(event)
 
         def mouseMoveEvent(self, event) -> None:  # noqa: ANN001
+            if self._area_replay_label_pressed:
+                event.accept()
+                return
             plot_area = self.chart().plotArea()
             if plot_area.contains(event.position()) and self._right_padding_drag is None:
                 self._last_pointer_pos = QPointF(event.position())
@@ -4196,6 +4240,10 @@ if QChartView is not None:
             super().mouseMoveEvent(event)
 
         def mouseReleaseEvent(self, event) -> None:  # noqa: ANN001
+            if event.button() == Qt.MouseButton.LeftButton and self._area_replay_label_pressed:
+                self._area_replay_label_pressed = False
+                event.accept()
+                return
             plot_area = self.chart().plotArea()
             was_padding_drag = self._right_padding_drag is not None
             if event.button() == Qt.MouseButton.LeftButton:
@@ -4215,6 +4263,10 @@ if QChartView is not None:
             super().mouseReleaseEvent(event)
 
         def mouseDoubleClickEvent(self, event) -> None:  # noqa: ANN001
+            if event.button() == Qt.MouseButton.LeftButton and self._area_replay_label_at(event.position()):
+                self._area_replay_label_pressed = True
+                event.accept()
+                return
             plot_area = self.chart().plotArea()
             if plot_area.contains(event.position()):
                 point = self.chart().mapToValue(event.position())
@@ -4252,6 +4304,7 @@ if QChartView is not None:
                 self._draw_latest_price_indicator(painter, plot_area)
                 self._draw_atr_overlay(painter, plot_area)
                 self._draw_volume_overlay(painter, plot_area)
+                self._draw_trading_day_separators(painter, plot_area)
                 self._draw_channel_overlays(painter, plot_area)
                 self._draw_box_overlays(painter, plot_area)
                 self._draw_workspace_ray_extensions(painter, plot_area)
@@ -4714,6 +4767,26 @@ if QChartView is not None:
                 if price > 0.0:
                     lows.append(price)
                     highs.append(price)
+            if len(self._area_shape_replay_trades) == 1:
+                record = self._area_shape_replay_trades[0]
+                record_visible = False
+                for key in ("signal_ts", "entry_ts", "exit_ts"):
+                    try:
+                        timestamp = int(record.get(key, 0) or 0)
+                    except (TypeError, ValueError):
+                        continue
+                    if timestamp > 0 and left_index <= self._index_for_candle_time(timestamp // 1000) <= right_index:
+                        record_visible = True
+                        break
+                if record_visible:
+                    for key in ("entry", "stop", "exit"):
+                        try:
+                            price = float(record.get(key, 0) or 0)
+                        except (TypeError, ValueError):
+                            continue
+                        if math.isfinite(price) and price > 0:
+                            lows.append(price)
+                            highs.append(price)
             min_price = min(lows) if lows else self._full_y_min
             max_price = max(highs) if highs else self._full_y_max
             top_padding, bottom_padding = _compute_axis_y_padding(min_price, max_price, show_atr=self._show_atr)
@@ -4726,6 +4799,53 @@ if QChartView is not None:
             left_index = self._index_for_display_x(start_x, mode="floor")
             right_index = self._index_for_display_x(end_x, mode="ceil")
             return left_index, right_index
+
+        def _draw_trading_day_separators(self, painter: QPainter, plot_area: QRectF) -> None:
+            if not self._trading_day_spans or not self._display_times_ms:
+                return
+            start_x, end_x = self.current_x_range()
+            span = max(end_x - start_x, 1.0)
+            painter.save()
+            painter.setClipRect(plot_area)
+            pen = QPen(QColor("#7189a6"), 1.2)
+            pen.setStyle(Qt.PenStyle.DashLine)
+            painter.setPen(pen)
+            font = painter.font()
+            font.setPointSize(9)
+            font.setBold(True)
+            painter.setFont(font)
+            metrics = painter.fontMetrics()
+            for day, first, end in self._trading_day_spans:
+                # Candles are centred on their opening time; split between 23:00
+                # and 00:00 (20:00 and 00:00 on 4H), never through a candle body.
+                boundary = self._display_times_ms[first] - self._display_step_ms / 2
+                day_end = self._display_times_ms[end - 1] + self._display_step_ms / 2
+                if day_end < start_x or boundary > end_x:
+                    continue
+                x = plot_area.left() + (boundary - start_x) / span * plot_area.width()
+                right = plot_area.left() + (day_end - start_x) / span * plot_area.width()
+                if start_x <= boundary <= end_x:
+                    painter.setPen(pen)
+                    painter.drawLine(QPointF(x, plot_area.top()), QPointF(x, plot_area.bottom()))
+                if end == len(self._candles) and start_x <= day_end <= end_x:
+                    last_open = int(self._candles[-1]["time"])
+                    if datetime.fromtimestamp(last_open + self._display_step_ms / 1000).date() != datetime.fromtimestamp(last_open).date():
+                        painter.setPen(pen)
+                        painter.drawLine(QPointF(right, plot_area.top()), QPointF(right, plot_area.bottom()))
+                label_width = metrics.horizontalAdvance(day) + 12
+                left = max(x, plot_area.left())
+                right = min(right, plot_area.right())
+                if right - left < label_width + 6:
+                    continue  # Keep every boundary; omit labels that would overlap.
+                rect = QRectF((left + right - label_width) / 2,
+                              plot_area.bottom() - metrics.height() - 5,
+                              label_width, metrics.height() + 4)
+                painter.setPen(QPen(QColor("#7189a6"), 1))
+                painter.setBrush(QColor("#111c2a"))
+                painter.drawRoundedRect(rect, 3, 3)
+                painter.setPen(QColor("#dbeafe"))
+                painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, day)
+            painter.restore()
 
         def _draw_volume_overlay(self, painter: QPainter, plot_area: QRectF) -> None:
             if not self._candles:
@@ -5190,6 +5310,7 @@ if QChartView is not None:
                     )
 
         def _draw_area_shape_replay_trades(self, painter: QPainter, plot_area: QRectF) -> None:
+            self._area_replay_label_rects = []
             if not self._area_shape_replay_trades or not self._candles:
                 return
             start_x, end_x = self.current_x_range()
@@ -5273,6 +5394,7 @@ if QChartView is not None:
                                 float(plot_area.bottom()) - label_height - 2.0,
                             )
                             stop_rect = QRectF(label_x, label_y, label_width, label_height)
+                            self._area_replay_label_rects.append(stop_rect)
                             painter.setPen(QPen(stop_color, 1))
                             painter.setBrush(QColor("#111827"))
                             painter.drawRoundedRect(stop_rect, 3.0, 3.0)
@@ -5317,6 +5439,7 @@ if QChartView is not None:
                         float(plot_area.bottom()) - label_height - 2.0,
                     )
                     rect = QRectF(label_x, label_y, label_width, label_height)
+                    self._area_replay_label_rects.append(rect)
                     painter.setPen(QPen(replay_color, 1))
                     painter.setBrush(QColor("#111827"))
                     painter.drawRoundedRect(rect, 3.0, 3.0)
@@ -5361,6 +5484,7 @@ if QChartView is not None:
                         float(plot_area.bottom()) - label_height - 2.0,
                     )
                     label_rect = QRectF(label_x, label_y, label_width, label_height)
+                    self._area_replay_label_rects.append(label_rect)
                     painter.setPen(QPen(replay_color, 1))
                     painter.setBrush(QColor("#111827"))
                     painter.drawRoundedRect(label_rect, 3.0, 3.0)
@@ -6766,6 +6890,7 @@ class KlineAnalysisWindow(QMainWindow):
         self._area_shape_replay_thread: QThread | None = None
         self._area_shape_replay_context: tuple[AreaShapePlan, int, tuple[str, ...], str, dict[str, int]] | None = None
         self._area_shape_replay_overlay: dict[str, Any] | None = None
+        self._area_shape_replay_dialog: QDialog | None = None
         self._weekly_cache_backfill_loader: WeeklyCacheBackfillLoader | None = None
         self._history_trade_request_id = 0
         self._active_history_trade_request_id = 0
@@ -7198,6 +7323,9 @@ class KlineAnalysisWindow(QMainWindow):
                 callback()
             return
         self._shutdown_requested = True
+        replay_dialog = getattr(self, "_area_shape_replay_dialog", None)
+        if replay_dialog is not None:
+            replay_dialog.close()
         # Signal preview charts belong to this page, rather than launcher's
         # separately registered windows. Keep their workers alive until joined.
         finder = getattr(self, "findChildren", None)
@@ -7976,8 +8104,8 @@ class KlineAnalysisWindow(QMainWindow):
         area_layout.addWidget(self._area_shape_edit_button)
         self._area_shape_replay_button = QPushButton("复盘交易")
         self._area_shape_replay_button.setToolTip(
-            "一次回放多空两侧，列出模拟交易及持仓期间出现的潜在机会。"
-            "计划参数和射线未变时，点击直接打开已保存结果；要更新行情结果，请在窗口中点‘重新复盘’。"
+            "打开当前账户、币种和周期已保存的多空复盘与潜在机会；首次没有结果时才计算。"
+            "调整参数、射线或行情刷新不会自动重算；要更新结果，请在窗口中点‘重新复盘’。"
         )
         self._area_shape_replay_button.clicked.connect(self._run_area_shape_replay)
         self._area_shape_replay_button.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
@@ -12814,10 +12942,64 @@ class KlineAnalysisWindow(QMainWindow):
         record = records.get(str(plan_id))
         return dict(record) if isinstance(record, dict) else None
 
+    def _saved_area_shape_replay(self, *, symbol: str, period: str) -> tuple[AreaShapePlan, dict[str, Any]] | None:
+        """Saved reports outlive their editable plan, rays and calculation version."""
+        current = self._current_area_plan()
+        candidates = []
+        for plan_id, record in self._workspace_entry(symbol=symbol, period=period)["area_replays"].items():
+            snapshot = record.get("plan_snapshot")
+            try:
+                if isinstance(snapshot, dict):
+                    plan = AreaShapePlan.from_dict(snapshot)
+                elif current is not None and current.plan_id == plan_id:
+                    # Compatibility with older saved reports without a plan snapshot.
+                    plan = copy.deepcopy(current)
+                else:
+                    continue
+                if (
+                    plan.symbol.strip().upper() != symbol.strip().upper()
+                    or plan.period.strip().upper() != period.strip().upper()
+                    or plan.profile_name.strip() != self._active_profile_name().strip()
+                    or plan.environment.strip().lower() != self._active_environment().strip().lower()
+                ):
+                    continue
+                candidates.append((plan, dict(record)))
+            except (TypeError, ValueError, KeyError):
+                continue
+        return max(reversed(candidates), key=lambda item: str(item[1].get("saved_at", "")), default=None)
+
+    def _area_shape_saved_overlay(self, plan: AreaShapePlan, record: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "symbol": plan.symbol, "period": plan.period,
+            "profile_name": plan.profile_name, "environment": plan.environment,
+            "input_signature": record.get("input_signature", ""),
+            "rows": list(record.get("rows", [])),
+            "filters": dict(record.get("filters", {})),
+        }
+
+    def _open_saved_area_shape_replay(self, plan: AreaShapePlan, record: dict[str, Any]) -> None:
+        self._area_shape_replay_overlay = self._area_shape_saved_overlay(plan, record)
+        self._restore_area_shape_replay(
+            self._native_chart_view, symbol=self._selected_symbol(),
+            period=self._period_combo.currentText(), focus=True,
+        )
+        self._show_area_shape_replay_results(
+            plan, int(record.get("start_seconds", 0)), list(record.get("rows", [])),
+            sides=("long", "short"), replay_record={**record, "_cache_hit": True},
+        )
+        self._set_area_shape_status("已打开保存的复盘结果；行情、参数和射线变化不会自动更新，仅点击“重新复盘”后替换。")
+
     def _run_area_shape_replay(self, _checked: bool = False, *, force: bool = False) -> None:
         if self._area_shape_replay_thread is not None and self._area_shape_replay_thread.isRunning():
             self._set_area_shape_status("区域复盘正在运行，请等待当前结果。")
             return
+        if not force:
+            saved = self._saved_area_shape_replay(
+                symbol=self._selected_symbol(), period=self._period_combo.currentText(),
+            )
+            if saved is not None:
+                self._open_saved_area_shape_replay(*saved)
+                return
         plan = self._current_area_plan()
         if plan is None or self._pending_payload is None:
             self._set_area_shape_status("请先生成两条射线和区域计划，再运行复盘。")
@@ -12854,29 +13036,17 @@ class KlineAnalysisWindow(QMainWindow):
             and str(overlay.get("input_signature", "")) == signature
         ):
             cached = {
+                "version": 1,
                 "input_signature": signature,
+                "plan_snapshot": replay_plan.to_dict(),
+                "start_seconds": start_seconds,
                 "rows": list(overlay.get("rows", [])),
                 "filters": dict(overlay.get("filters", {})) if isinstance(overlay.get("filters"), dict) else {},
             }
-        if not force and cached is not None and str(cached.get("input_signature", "")) == signature:
-            self._area_shape_replay_overlay = {
-                "symbol": replay_plan.symbol, "period": replay_plan.period,
-                "input_signature": signature,
-                "rows": list(cached.get("rows", [])),
-                "filters": dict(cached.get("filters", {})) if isinstance(cached.get("filters"), dict) else {},
-            }
-            self._restore_area_shape_replay(
-                self._native_chart_view, symbol=self._selected_symbol(),
-                period=self._period_combo.currentText(), focus=True,
-            )
-            self._set_area_shape_status("正在载入已保存复盘结果，不会重新扫描K线。")
-            display_record = dict(cached)
-            display_record["_cache_hit"] = True
-            self._show_area_shape_replay_results(
-                replay_plan, start_seconds, list(cached.get("rows", [])),
-                sides=("long", "short"), replay_record=display_record,
-            )
-            self._set_area_shape_status("已载入保存的多空复盘与潜在机会；筛选器会同步控制图上标记。")
+            self._workspace_entry(symbol=plan.symbol, period=plan.period)["area_replays"][plan.plan_id] = cached
+            self._save_workspace_snapshot()
+        if not force and cached is not None:
+            self._open_saved_area_shape_replay(replay_plan, cached)
             return
 
         candles = [item for item in self._pending_payload.raw_candles if item.confirmed]
@@ -12889,10 +13059,8 @@ class KlineAnalysisWindow(QMainWindow):
         self._area_shape_replay_button.setEnabled(False)
         if force:
             replay_status = "正在按当前行情重新复盘"
-        elif cached is None:
-            replay_status = "未找到已保存结果，正在首次计算并保存"
         else:
-            replay_status = "计划参数或射线已变化，正在重新复盘"
+            replay_status = "当前账户、币种和周期尚无保存结果，正在首次计算并保存"
         self._set_area_shape_status(
             f"{replay_status}：多空两侧 {len(candles)} 根已收盘K线，并扫描持仓期间的潜在机会；"
             f"本次射线价：支撑 {replay_plan.support_price}，压力 {replay_plan.pressure_price}。"
@@ -12924,7 +13092,7 @@ class KlineAnalysisWindow(QMainWindow):
     @Slot(str)
     def _area_shape_replay_failed(self, error: str) -> None:
         if not bool(getattr(self, "_shutdown_requested", False)):
-            self._set_area_shape_status(f"区域复盘失败：{error}")
+            self._set_area_shape_status(f"区域复盘失败，已有保存结果保持不变：{error}")
 
     @Slot(object)
     def _on_area_shape_replay_worker_completed(self, rows: object) -> None:
@@ -12964,13 +13132,14 @@ class KlineAnalysisWindow(QMainWindow):
         }
         workspace["area_replays"] = replay_records
         self._save_workspace_snapshot()
-        self._area_shape_replay_overlay = {
-            "symbol": plan.symbol.strip().upper(),
-            "period": plan.period.strip().upper(),
-            "input_signature": signature,
-            "rows": stored_rows,
-            "filters": filters,
-        }
+        if (
+            self._selected_symbol().strip().upper() != plan.symbol.strip().upper()
+            or self._period_combo.currentText().strip().upper() != plan.period.strip().upper()
+            or self._active_profile_name().strip() != plan.profile_name.strip()
+            or self._active_environment().strip().lower() != plan.environment.strip().lower()
+        ):
+            return  # Saved in its own context; never replace another account's chart.
+        self._area_shape_replay_overlay = self._area_shape_saved_overlay(plan, replay_records[plan.plan_id])
         self._restore_area_shape_replay(
             self._native_chart_view,
             symbol=self._selected_symbol(),
@@ -12993,69 +13162,28 @@ class KlineAnalysisWindow(QMainWindow):
         setter = getattr(chart_view, "set_area_shape_replay_trades", None)
         if not callable(setter):
             return
-        if overlay is None:
-            plan = self._current_area_plan()
-            if plan is not None and plan.symbol == str(symbol).strip().upper() and plan.period.upper() == str(period).strip().upper():
-                records = self._workspace_entry(symbol=symbol, period=period).get("lines", [])
-                lines = [item for item in records if isinstance(item, dict)] if isinstance(records, list) else []
-                support = next((item for item in lines if item.get("id") == plan.support_line_id), None)
-                pressure = next((item for item in lines if item.get("id") == plan.pressure_line_id), None)
-                if support is not None and pressure is not None:
-                    try:
-                        start_seconds = int(support.get("time_a", 0) or 0)
-                        if start_seconds == int(pressure.get("time_a", 0) or 0):
-                            replay_plan = copy.deepcopy(plan)
-                            replay_plan.support_price = Decimal(str(support.get("price_a", plan.support_price)))
-                            replay_plan.pressure_price = Decimal(str(pressure.get("price_a", plan.pressure_price)))
-                            cached = self._area_shape_replay_record(plan.plan_id, symbol=symbol, period=period)
-                            if cached is not None and cached.get("input_signature") == self._area_shape_replay_signature(replay_plan, start_seconds):
-                                overlay = {
-                                    "symbol": plan.symbol, "period": plan.period,
-                                    "input_signature": str(cached.get("input_signature", "")),
-                                    "rows": list(cached.get("rows", [])),
-                                    "filters": dict(cached.get("filters", {})) if isinstance(cached.get("filters"), dict) else {},
-                                }
-                                self._area_shape_replay_overlay = overlay
-                    except (TypeError, ValueError):
-                        overlay = None
-        if overlay is None:
-            setter(None)
-            return
-        if (
+        if overlay is not None and (
             str(overlay.get("symbol", "")).strip().upper() != str(symbol).strip().upper()
             or str(overlay.get("period", "")).strip().upper() != str(period).strip().upper()
+            or str(overlay.get("profile_name", self._active_profile_name())).strip() != self._active_profile_name().strip()
+            or str(overlay.get("environment", self._active_environment())).strip().lower() != self._active_environment().strip().lower()
         ):
+            overlay = None
+        if overlay is None:
+            saved = self._saved_area_shape_replay(symbol=symbol, period=period)
+            if saved is not None:
+                overlay = self._area_shape_saved_overlay(*saved)
+        self._area_shape_replay_overlay = overlay
+        if overlay is None:
             setter(None)
-            self._area_shape_replay_overlay = None
             return
-        plan = self._current_area_plan()
-        if plan is not None:
-            entry = self._workspace_entry(symbol=symbol, period=period)
-            lines = entry.get("lines", [])
-            lines = [item for item in lines if isinstance(item, dict)] if isinstance(lines, list) else []
-            support = next((item for item in lines if item.get("id") == plan.support_line_id), None)
-            pressure = next((item for item in lines if item.get("id") == plan.pressure_line_id), None)
-            try:
-                if support is None or pressure is None:
-                    raise ValueError("associated rays missing")
-                start_seconds = int(support.get("time_a", 0) or 0)
-                if start_seconds != int(pressure.get("time_a", 0) or 0):
-                    raise ValueError("ray start times differ")
-                current_plan = copy.deepcopy(plan)
-                current_plan.support_price = Decimal(str(support.get("price_a", plan.support_price)))
-                current_plan.pressure_price = Decimal(str(pressure.get("price_a", plan.pressure_price)))
-                if overlay.get("input_signature") != self._area_shape_replay_signature(current_plan, start_seconds):
-                    raise ValueError("replay inputs changed")
-            except (TypeError, ValueError):
-                self._area_shape_replay_overlay = None
-                setter(None)
-                return
-        setter(
-            self._area_shape_replay_filtered_rows(
-                list(overlay.get("rows", [])), overlay.get("filters", {}),
-            ),
-            focus=focus,
+        visible = self._area_shape_replay_filtered_rows(
+            list(overlay.get("rows", [])), overlay.get("filters", {}),
         )
+        focused_row = overlay.get("focused_row")
+        if isinstance(focused_row, dict) and focused_row in visible:
+            visible = [focused_row]
+        setter(visible, focus=focus)
 
     @staticmethod
     def _area_shape_replay_filtered_rows(rows: list[dict[str, Any]], filters: object) -> list[dict[str, Any]]:
@@ -13302,7 +13430,20 @@ class KlineAnalysisWindow(QMainWindow):
         self, plan: AreaShapePlan, start_seconds: int, rows: list[dict[str, object]], *,
         sides: tuple[str, ...] = (), replay_record: dict[str, Any] | None = None,
     ) -> None:
+        previous_dialog = self._area_shape_replay_dialog
+        if previous_dialog is not None:
+            previous_dialog.close()
+        self._set_draw_tool("none")
         dialog = QDialog(self)
+        self._area_shape_replay_dialog = dialog
+        dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        dialog.setWindowModality(Qt.WindowModality.NonModal)
+        dialog.setWindowFlag(Qt.WindowType.WindowMinMaxButtonsHint, True)
+
+        def release_dialog(_result: int) -> None:
+            if self._area_shape_replay_dialog is dialog:
+                self._area_shape_replay_dialog = None
+        dialog.finished.connect(release_dialog)
         dialog.setWindowTitle("区域计划复盘结果")
         dialog.resize(1220, 620)
         layout = QVBoxLayout(dialog)
@@ -13351,10 +13492,22 @@ class KlineAnalysisWindow(QMainWindow):
         ), 1)
         layout.addLayout(filter_layout)
 
+        chart_controls = QHBoxLayout()
+        focus_note = QLabel("复盘查看时区域线锁定，主图可拖动缩放；双击记录单独定位。", dialog)
+        focus_note.setWordWrap(True)
+        show_all_button = QPushButton("显示全部标记", dialog)
+        show_all_button.setObjectName("areaReplayShowAll")
+        show_all_button.setToolTip("恢复当前类型和方向筛选范围内的全部复盘标记")
+        show_all_button.setEnabled(False)
+        chart_controls.addWidget(focus_note, 1)
+        chart_controls.addWidget(show_all_button)
+        layout.addLayout(chart_controls)
+
         table = QTableWidget(0, 11, dialog)
         table.setHorizontalHeaderLabels(["记录", "方向", "形态", "评分", "信号时间", "入场时间", "入场价", "止损", "退出/目标参考", "净R/空间R", "估算U/说明"])
         table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
         table.verticalHeader().setVisible(False)
         header = table.horizontalHeader()
         header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
@@ -13363,10 +13516,31 @@ class KlineAnalysisWindow(QMainWindow):
         table.horizontalHeader().setStretchLastSection(True)
         layout.addWidget(table)
 
+        display_overlay = self._area_shape_replay_overlay
+        visible_rows: list[dict[str, object]] = []
+
+        def chart_overlay() -> dict[str, Any] | None:
+            if (
+                display_overlay is not None
+                and self._selected_symbol().strip().upper() == plan.symbol.strip().upper()
+                and self._period_combo.currentText().strip().upper() == plan.period.strip().upper()
+                and self._active_profile_name().strip() == plan.profile_name.strip()
+                and self._active_environment().strip().lower() == plan.environment.strip().lower()
+            ):
+                if self._area_shape_replay_overlay is None:
+                    self._restore_area_shape_replay(self._native_chart_view, symbol=plan.symbol, period=plan.period)
+                current_overlay = self._area_shape_replay_overlay
+                if current_overlay is not None and current_overlay.get("input_signature") == display_overlay.get("input_signature"):
+                    return current_overlay
+            focus_note.setText("图表账户、币种、周期或复盘内容已切换；请返回对应图表后重新打开复盘结果。")
+            return None
+
         def populate_table() -> list[dict[str, object]]:
+            nonlocal visible_rows
             visible = self._area_shape_replay_filtered_rows(
                 rows, {"kind": kind_filter.currentData(), "side": side_filter.currentData()},
             )
+            visible_rows = visible
             table.setRowCount(len(visible))
             for row_index, item in enumerate(visible):
                 opportunity = str(item.get("record_type", "trade")) == "opportunity"
@@ -13414,15 +13588,41 @@ class KlineAnalysisWindow(QMainWindow):
                     continue
             return visible
 
+        def show_all_markers(*_args: object) -> None:
+            overlay = chart_overlay()
+            if overlay is None:
+                return
+            overlay.pop("focused_row", None)
+            setter = getattr(self._native_chart_view, "set_area_shape_replay_trades", None)
+            if callable(setter):
+                setter(visible_rows, focus=True, fit=True)
+            show_all_button.setEnabled(False)
+            focus_note.setText(
+                f"已显示并定位当前筛选内 {len(visible_rows)} 条记录；查看时区域线锁定。"
+                if visible_rows else f"当前筛选为 0 条（共 {len(rows)} 条记录），请调整类型或方向筛选。"
+            )
+
+        def focus_record(row_index: int, _column: int) -> None:
+            if not 0 <= row_index < len(visible_rows):
+                return
+            overlay = chart_overlay()
+            if overlay is None:
+                return
+            record = visible_rows[row_index]
+            overlay["focused_row"] = record
+            setter = getattr(self._native_chart_view, "set_area_shape_replay_trades", None)
+            if callable(setter):
+                setter([record], focus=True, fit=True)
+            show_all_button.setEnabled(True)
+            focus_note.setText(f"图上仅显示第 {row_index + 1} 条记录及其关联标记；列表保留全部记录。")
+
         def apply_filters(*_args: object) -> None:
             filters = {"kind": str(kind_filter.currentData()), "side": str(side_filter.currentData())}
-            if self._area_shape_replay_overlay is not None:
-                self._area_shape_replay_overlay["filters"] = filters
-            visible = populate_table()
-            chart = self._native_chart_view
-            setter = getattr(chart, "set_area_shape_replay_trades", None)
-            if callable(setter):
-                setter(visible)
+            overlay = chart_overlay()
+            if overlay is not None:
+                overlay["filters"] = filters
+            populate_table()
+            show_all_markers()
             cache = self._area_shape_replay_record(plan.plan_id, symbol=plan.symbol, period=plan.period)
             if cache is not None:
                 cache["filters"] = filters
@@ -13432,6 +13632,8 @@ class KlineAnalysisWindow(QMainWindow):
         populate_table()
         kind_filter.currentIndexChanged.connect(apply_filters)
         side_filter.currentIndexChanged.connect(apply_filters)
+        table.cellDoubleClicked.connect(focus_record)
+        show_all_button.clicked.connect(show_all_markers)
         if not rows:
             empty_state = QLabel(
                 "起点之后没有符合条件的回测交易或潜在机会；触线、所选形态、止损关系与最低目标空间均按当前计划检查。数据共 "
@@ -13450,16 +13652,34 @@ class KlineAnalysisWindow(QMainWindow):
             "射线起点后的首次触线仅作参考、不计入回测；之后只统计已收盘K线。同一根K线同时触及止盈止损时按止损先发生。结果为纸面估算，不代表真实成交。"
         )
         layout.addWidget(QLabel(range_note, dialog))
+        saved_at = str(replay_record.get("saved_at", "")) if isinstance(replay_record, dict) else ""
+        report_note = QLabel(
+            (f"保存时间 {saved_at}；" if saved_at else "")
+            + "本报告保留复盘时的参数和价格；调整参数、射线或行情刷新不会自动更新，仅“重新复盘”成功后替换。",
+            dialog,
+        )
+        report_note.setWordWrap(True)
+        layout.addWidget(report_note)
         buttons = QHBoxLayout()
         rerun_button = QPushButton("重新复盘", dialog)
         close_button = QPushButton("关闭", dialog)
-        rerun_button.clicked.connect(lambda _checked=False: (dialog.accept(), self._run_area_shape_replay(force=True)))
+        # Enter in a table/filter must not implicitly activate recalculation.
+        for button in (rerun_button, close_button, show_all_button):
+            button.setAutoDefault(False)
+            button.setDefault(False)
+
+        def rerun() -> None:
+            if chart_overlay() is None:
+                return
+            self._run_area_shape_replay(force=True)
+
+        rerun_button.clicked.connect(rerun)
         close_button.clicked.connect(dialog.accept)
         buttons.addStretch(1)
         buttons.addWidget(rerun_button)
         buttons.addWidget(close_button)
         layout.addLayout(buttons)
-        dialog.exec()
+        dialog.show()
 
     def _toggle_area_shape_future_projection(self) -> None:
         chart = self._native_chart_view
@@ -15679,7 +15899,7 @@ class KlineAnalysisWindow(QMainWindow):
             return self._native_chart_view.last_pointer_scene_pos()
         return None
 
-    def _rr_drag_threshold_crossed(self, state: dict[str, object]) -> bool:
+    def _chart_drag_threshold_crossed(self, state: dict[str, object]) -> bool:
         press_x = state.get("press_scene_x")
         press_y = state.get("press_scene_y")
         current_pos = self._current_chart_pointer_scene_pos()
@@ -15688,6 +15908,10 @@ class KlineAnalysisWindow(QMainWindow):
         delta_x = float(current_pos.x()) - float(press_x)
         delta_y = float(current_pos.y()) - float(press_y)
         return math.hypot(delta_x, delta_y) >= _RR_DRAG_ACTIVATION_DISTANCE_PX
+
+    def _area_shape_replay_inspection_active(self) -> bool:
+        dialog = getattr(self, "_area_shape_replay_dialog", None)
+        return dialog is not None and dialog.isVisible()
 
     def _set_hovered_line_interaction(self, index: int = -1, drag_mode: str | None = None) -> None:
         normalized_mode = str(drag_mode or "").strip().lower() or None
@@ -15700,6 +15924,8 @@ class KlineAnalysisWindow(QMainWindow):
 
     @Slot(float, float)
     def _on_chart_pointer_pressed(self, x_value: float, y_value: float) -> None:
+        if self._area_shape_replay_inspection_active():
+            return
         if self._draw_tool in {"rr_long", "rr_short"} and self._pending_payload is not None:
             if self._pending_rr_start is None:
                 resolved = self._resolve_primary_chart_click(x_value=x_value, y_value=y_value)
@@ -15725,11 +15951,16 @@ class KlineAnalysisWindow(QMainWindow):
             self._populate_line_table(selected_index=index)
             self._line_drag_state = {
                 "index": index,
+                "active": False,
                 "drag_mode": str(hit["drag_mode"]),
                 "anchor_candle_time": candle_time,
                 "anchor_price": price,
                 "anchor_line": dict(hit["line"]),
             }
+            press_scene_pos = self._current_chart_pointer_scene_pos()
+            if press_scene_pos is not None:
+                self._line_drag_state["press_scene_x"] = float(press_scene_pos.x())
+                self._line_drag_state["press_scene_y"] = float(press_scene_pos.y())
             self._set_hovered_line_interaction(index, str(hit["drag_mode"]))
         else:
             rr_hit = self._rr_hit_test(candle_time=candle_time, price=price)
@@ -15764,6 +15995,9 @@ class KlineAnalysisWindow(QMainWindow):
 
     @Slot(float, float)
     def _on_chart_pointer_moved(self, x_value: float, y_value: float) -> None:
+        if self._area_shape_replay_inspection_active():
+            self._set_hovered_line_interaction()
+            return
         if self._draw_tool != "none":
             self._set_hovered_line_interaction()
             resolved_preview = self._resolve_primary_chart_click(x_value=x_value, y_value=y_value)
@@ -15801,10 +16035,14 @@ class KlineAnalysisWindow(QMainWindow):
         candle_time, price = resolved
         updated = False
         if self._line_drag_state is not None:
+            if not bool(self._line_drag_state.get("active", False)):
+                if not self._chart_drag_threshold_crossed(self._line_drag_state):
+                    return
+                self._line_drag_state["active"] = True
             updated = self._apply_line_drag_update(candle_time=candle_time, price=price)
         elif self._rr_drag_state is not None:
             if not bool(self._rr_drag_state.get("active", False)):
-                if not self._rr_drag_threshold_crossed(self._rr_drag_state):
+                if not self._chart_drag_threshold_crossed(self._rr_drag_state):
                     return
                 self._rr_drag_state["active"] = True
             updated = self._apply_rr_drag_update(candle_time=candle_time, price=price)
@@ -15831,18 +16069,18 @@ class KlineAnalysisWindow(QMainWindow):
             return
         if self._line_drag_state is None and self._rr_drag_state is None:
             return
-        line_drag_in_progress = self._line_drag_state is not None
+        line_drag_active = bool(isinstance(self._line_drag_state, dict) and self._line_drag_state.get("active", False))
         rr_drag_active = bool(isinstance(self._rr_drag_state, dict) and self._rr_drag_state.get("active", False))
         resolved = self._resolve_primary_chart_click(x_value=x_value, y_value=y_value)
         if resolved is not None:
             candle_time, price = resolved
-            if line_drag_in_progress:
+            if line_drag_active:
                 self._apply_line_drag_update(candle_time=candle_time, price=price)
             elif rr_drag_active:
                 self._apply_rr_drag_update(candle_time=candle_time, price=price)
-        if line_drag_in_progress or rr_drag_active:
+        if line_drag_active or rr_drag_active:
             self._save_workspace_snapshot()
-            if line_drag_in_progress:
+            if line_drag_active:
                 self._sync_area_shape_draft_lines()
                 self._refresh_area_shape_status()
                 if self._line_drag_state is not None and self._line_drag_state.get("area_price_error"):
@@ -15869,6 +16107,8 @@ class KlineAnalysisWindow(QMainWindow):
 
     @Slot(float, float)
     def _on_native_chart_clicked(self, x_value: float, y_value: float) -> None:
+        if self._area_shape_replay_inspection_active():
+            return
         if self._suppress_next_chart_click:
             self._suppress_next_chart_click = False
             return
@@ -15957,6 +16197,12 @@ class KlineAnalysisWindow(QMainWindow):
 
     @Slot(float, float)
     def _on_native_chart_double_clicked(self, x_value: float, y_value: float) -> None:
+        chart = self._native_chart_view
+        if self._draw_tool == "none" and isinstance(chart, InteractiveKlineChartView) and chart._area_shape_replay_trades:
+            self._clear_line_drag_state(unlock_view=True)
+            chart.set_area_shape_replay_trades(chart._area_shape_replay_trades, focus=True, fit=True)
+            self._set_status("已定位当前复盘标记；点击标记文字不会修改交易或区域线。")
+            return
         if self._pending_payload is None or self._draw_tool != "none":
             if isinstance(self._native_chart_view, InteractiveKlineChartView):
                 self._native_chart_view.reset_view()
@@ -16822,6 +17068,9 @@ class KlineAnalysisWindow(QMainWindow):
         current_entry = self._workspace_entry()
         updated_entry = normalize_workspace_entry(snapshot.workspace_entry)
         updated_entry["rr"] = [dict(item) for item in current_entry.get("rr", []) if isinstance(item, dict)]
+        # The worker snapshot predates foreground replay runs and filter changes.
+        # Alert evaluation must not roll back these UI-owned saved results.
+        updated_entry["area_replays"].update(copy.deepcopy(current_entry.get("area_replays", {})))
         new_events = list(snapshot.new_events)
         structure = dict(snapshot.structure)
         self._workspace_entries[self._current_workspace_key()] = updated_entry
