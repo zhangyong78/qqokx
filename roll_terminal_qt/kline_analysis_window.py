@@ -3670,6 +3670,7 @@ if QChartView is not None:
             self._draw_mode_enabled = False
             self._axis_x: QDateTimeAxis | None = None
             self._axis_y: QValueAxis | None = None
+            self._horizontal_grid_visible = True
             self._candles: list[dict[str, Any]] = []
             self._overlay_values: list[list[float]] = []
             self._trend_indicators: list[dict[str, Any]] = []
@@ -3692,6 +3693,7 @@ if QChartView is not None:
             self._signal_markers: list[dict[str, Any]] = []
             self._history_trade_markers: list[dict[str, Any]] = []
             self._area_shape_replay_trades: list[dict[str, Any]] = []
+            self._trading_day_separators_visible = True
             self._trading_day_spans: list[tuple[str, int, int]] = []
             self._area_replay_label_rects: list[QRectF] = []
             self._area_replay_label_pressed = False
@@ -3876,6 +3878,7 @@ if QChartView is not None:
         ) -> None:
             self._axis_x = axis_x
             self._axis_y = axis_y
+            self._axis_y.setGridLineVisible(self._horizontal_grid_visible)
             self._candles = list(candles)
             self._overlay_values = [list(item) for item in overlay_values]
             self._display_times_ms = list(display_times_ms)
@@ -4800,19 +4803,29 @@ if QChartView is not None:
             right_index = self._index_for_display_x(end_x, mode="ceil")
             return left_index, right_index
 
+        def set_trading_day_separators_visible(self, visible: bool) -> None:
+            self._trading_day_separators_visible = bool(visible)
+            self.viewport().update()
+
+        def set_horizontal_grid_visible(self, visible: bool) -> None:
+            self._horizontal_grid_visible = bool(visible)
+            if self._axis_y is not None:
+                self._axis_y.setGridLineVisible(self._horizontal_grid_visible)
+            self.viewport().update()
+
         def _draw_trading_day_separators(self, painter: QPainter, plot_area: QRectF) -> None:
-            if not self._trading_day_spans or not self._display_times_ms:
+            if not self._trading_day_separators_visible or not self._trading_day_spans or not self._display_times_ms:
                 return
             start_x, end_x = self.current_x_range()
             span = max(end_x - start_x, 1.0)
             painter.save()
             painter.setClipRect(plot_area)
-            pen = QPen(QColor("#7189a6"), 1.2)
+            pen = QPen(QColor(113, 137, 166, 75), 0.8)
             pen.setStyle(Qt.PenStyle.DashLine)
             painter.setPen(pen)
             font = painter.font()
-            font.setPointSize(9)
-            font.setBold(True)
+            font.setPointSize(7)
+            font.setBold(False)
             painter.setFont(font)
             metrics = painter.fontMetrics()
             for day, first, end in self._trading_day_spans:
@@ -4832,7 +4845,7 @@ if QChartView is not None:
                     if datetime.fromtimestamp(last_open + self._display_step_ms / 1000).date() != datetime.fromtimestamp(last_open).date():
                         painter.setPen(pen)
                         painter.drawLine(QPointF(right, plot_area.top()), QPointF(right, plot_area.bottom()))
-                label_width = metrics.horizontalAdvance(day) + 12
+                label_width = metrics.horizontalAdvance(day) + 8
                 left = max(x, plot_area.left())
                 right = min(right, plot_area.right())
                 if right - left < label_width + 6:
@@ -4840,10 +4853,10 @@ if QChartView is not None:
                 rect = QRectF((left + right - label_width) / 2,
                               plot_area.bottom() - metrics.height() - 5,
                               label_width, metrics.height() + 4)
-                painter.setPen(QPen(QColor("#7189a6"), 1))
+                painter.setPen(QPen(QColor("#354354"), 0.8))
                 painter.setBrush(QColor("#111c2a"))
                 painter.drawRoundedRect(rect, 3, 3)
-                painter.setPen(QColor("#dbeafe"))
+                painter.setPen(QColor("#afbed0"))
                 painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, day)
             painter.restore()
 
@@ -7873,6 +7886,16 @@ class KlineAnalysisWindow(QMainWindow):
         self._reverse_kline_check.setToolTip("开启后，将当前主图及副图K线按价格镜像反转显示；波动率副图不参与反转。")
         self._reverse_kline_check.toggled.connect(self._load_data)
 
+        self._trading_day_separators_check = QCheckBox("交易日分隔")
+        self._trading_day_separators_check.setChecked(True)
+        self._trading_day_separators_check.setToolTip("显示或关闭1小时、4小时图的每日分隔线及日期标签")
+        self._trading_day_separators_check.toggled.connect(self._on_trading_day_separators_toggled)
+
+        self._horizontal_grid_check = QCheckBox("水平网格")
+        self._horizontal_grid_check.setChecked(True)
+        self._horizontal_grid_check.setToolTip("显示或隐藏 K 线图背景中的价格水平横线")
+        self._horizontal_grid_check.toggled.connect(self._on_horizontal_grid_toggled)
+
         # 这三个选项使用频率较高，直接放到主工具栏；数量、本地优先等
         # 低频设置仍保留在“视图选项”菜单中，避免每次操作都要展开菜单。
         kline_display_group = QFrame()
@@ -7894,6 +7917,8 @@ class KlineAnalysisWindow(QMainWindow):
             self._secondary_average_kline_check,
             self._primary_average_secondary_normal_check,
             self._reverse_kline_check,
+            self._trading_day_separators_check,
+            self._horizontal_grid_check,
         ):
             kline_display_layout.addWidget(display_widget)
 
@@ -8567,6 +8592,14 @@ class KlineAnalysisWindow(QMainWindow):
 
         self._refresh_timer = QTimer(self)
         self._refresh_timer.timeout.connect(self._load_data)
+
+    def _on_trading_day_separators_toggled(self, visible: bool) -> None:
+        for view in self.findChildren(InteractiveKlineChartView):
+            view.set_trading_day_separators_visible(visible)
+
+    def _on_horizontal_grid_toggled(self, visible: bool) -> None:
+        for view in self.findChildren(InteractiveKlineChartView):
+            view.set_horizontal_grid_visible(visible)
 
     def _on_control_tab_changed(self, index: int) -> None:
         panel = getattr(self, "_control_panel", None)
@@ -12466,6 +12499,7 @@ class KlineAnalysisWindow(QMainWindow):
         symbol = (display_symbol or self._selected_symbol()).strip().upper()
         chart.setTitle("")
         if isinstance(chart_view, InteractiveKlineChartView):
+            chart_view.set_trading_day_separators_visible(self._trading_day_separators_check.isChecked())
             chart_view.set_chart_context(
                 axis_x=axis_x,
                 axis_y=axis_y,
