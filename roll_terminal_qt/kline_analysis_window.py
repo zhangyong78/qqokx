@@ -6940,6 +6940,7 @@ class KlineAnalysisWindow(QMainWindow):
         self._tertiary_payload_cache: dict[tuple[Any, ...], KlineChartPayload] = {}
         self._quaternary_payload_cache: dict[tuple[Any, ...], KlineChartPayload] = {}
         self._workspace_entries = load_kline_analysis_workspace_entries()
+        self._normalized_workspace_entries: dict[str, dict[str, object]] = {}
         self._selected_line_index = -1
         self._selected_rr_index = -1
         self._hovered_line_index = -1
@@ -10209,10 +10210,22 @@ class KlineAnalysisWindow(QMainWindow):
         self._sync_account_drawer_context(refresh_if_visible=False)
         self._account_drawer._realtime_store.request_reconcile("kline-prefetch")
 
-    def _instrument_for_symbol(self, symbol: str | None = None) -> object | None:
+    def _instrument_for_symbol(self, symbol: str | None = None, *, cached_only: bool = False) -> object | None:
         normalized = (symbol or self._selected_symbol()).strip().upper()
         if not normalized:
             return None
+        if cached_only:
+            instrument = self._instrument_cache.get(normalized)
+            if instrument is not None:
+                return instrument
+            getter = getattr(self._market_client, "get_cached_instrument", None)
+            try:
+                instrument = getter(normalized) if callable(getter) else None
+            except Exception:
+                instrument = None
+            if instrument is not None:
+                self._instrument_cache[normalized] = instrument
+            return instrument
         if normalized in self._instrument_cache:
             return self._instrument_cache[normalized]
         try:
@@ -12566,8 +12579,15 @@ class KlineAnalysisWindow(QMainWindow):
 
     def _workspace_entry(self, *, symbol: str | None = None, period: str | None = None) -> dict[str, object]:
         key = self._current_workspace_key(symbol=symbol, period=period)
-        entry = normalize_workspace_entry(self._workspace_entries.get(key))
+        raw = self._workspace_entries.get(key)
+        normalized = self._normalized_workspace_entries
+        if isinstance(raw, dict) and normalized.get(key) is raw:
+            return raw
+        # Normalize loaded/replaced data once. Repeated reads must keep the live
+        # object so edits held by another UI handler are not silently detached.
+        entry = normalize_workspace_entry(raw)
         self._workspace_entries[key] = entry
+        normalized[key] = entry
         return entry
 
     def _save_workspace_snapshot(self) -> None:
@@ -13009,6 +13029,7 @@ class KlineAnalysisWindow(QMainWindow):
             "input_signature": record.get("input_signature", ""),
             "rows": list(record.get("rows", [])),
             "filters": dict(record.get("filters", {})),
+            "markers_hidden": bool(record.get("markers_hidden", False)),
         }
 
     def _open_saved_area_shape_replay(self, plan: AreaShapePlan, record: dict[str, Any]) -> None:
@@ -13076,6 +13097,7 @@ class KlineAnalysisWindow(QMainWindow):
                 "start_seconds": start_seconds,
                 "rows": list(overlay.get("rows", [])),
                 "filters": dict(overlay.get("filters", {})) if isinstance(overlay.get("filters"), dict) else {},
+                "markers_hidden": bool(overlay.get("markers_hidden", False)),
             }
             self._workspace_entry(symbol=plan.symbol, period=plan.period)["area_replays"][plan.plan_id] = cached
             self._save_workspace_snapshot()
@@ -13143,6 +13165,7 @@ class KlineAnalysisWindow(QMainWindow):
         replay_rows = [dict(item) for item in rows if isinstance(item, dict)]
         previous = self._area_shape_replay_record(plan.plan_id, symbol=plan.symbol, period=plan.period)
         filters = dict(previous.get("filters", {})) if previous and isinstance(previous.get("filters"), dict) else {"kind": "all", "side": "all"}
+        markers_hidden = bool(previous.get("markers_hidden", False)) if previous else False
         stored_rows = [
             {key: str(value) if isinstance(value, Decimal) else value for key, value in item.items()}
             for item in replay_rows
@@ -13161,6 +13184,7 @@ class KlineAnalysisWindow(QMainWindow):
             "data_range": dict(range_snapshot),
             "sides": list(sides),
             "filters": filters,
+            "markers_hidden": markers_hidden,
             "rows": stored_rows,
             "saved_at": datetime.now().astimezone().isoformat(timespec="seconds"),
         }
@@ -13210,6 +13234,9 @@ class KlineAnalysisWindow(QMainWindow):
         self._area_shape_replay_overlay = overlay
         if overlay is None:
             setter(None)
+            return
+        if bool(overlay.get("markers_hidden", False)):
+            setter([])
             return
         visible = self._area_shape_replay_filtered_rows(
             list(overlay.get("rows", [])), overlay.get("filters", {}),
@@ -13526,6 +13553,7 @@ class KlineAnalysisWindow(QMainWindow):
         ), 1)
         layout.addLayout(filter_layout)
 
+        display_overlay = self._area_shape_replay_overlay
         chart_controls = QHBoxLayout()
         focus_note = QLabel("复盘查看时区域线锁定，主图可拖动缩放；双击记录单独定位。", dialog)
         focus_note.setWordWrap(True)
@@ -13535,6 +13563,15 @@ class KlineAnalysisWindow(QMainWindow):
         show_all_button.setEnabled(False)
         chart_controls.addWidget(focus_note, 1)
         chart_controls.addWidget(show_all_button)
+        toggle_markers_button = QPushButton(dialog)
+        toggle_markers_button.setObjectName("areaReplayToggleMarkers")
+        initially_hidden = bool(display_overlay.get("markers_hidden", False)) if isinstance(display_overlay, dict) else bool(
+            replay_record.get("markers_hidden", False) if isinstance(replay_record, dict) else False
+        )
+        toggle_markers_button.setText("显示复盘标记" if initially_hidden else "隐藏复盘标记")
+        toggle_markers_button.setToolTip("只控制K线图上的复盘标记，不删除复盘结果或表格记录")
+        toggle_markers_button.setEnabled(display_overlay is not None)
+        chart_controls.addWidget(toggle_markers_button)
         layout.addLayout(chart_controls)
 
         table = QTableWidget(0, 11, dialog)
@@ -13550,7 +13587,6 @@ class KlineAnalysisWindow(QMainWindow):
         table.horizontalHeader().setStretchLastSection(True)
         layout.addWidget(table)
 
-        display_overlay = self._area_shape_replay_overlay
         visible_rows: list[dict[str, object]] = []
 
         def chart_overlay() -> dict[str, Any] | None:
@@ -13622,18 +13658,47 @@ class KlineAnalysisWindow(QMainWindow):
                     continue
             return visible
 
+        def save_marker_visibility(hidden: bool) -> None:
+            cache = self._area_shape_replay_record(plan.plan_id, symbol=plan.symbol, period=plan.period)
+            if cache is not None:
+                cache["markers_hidden"] = bool(hidden)
+                self._workspace_entry(symbol=plan.symbol, period=plan.period).setdefault("area_replays", {})[plan.plan_id] = cache
+                self._save_workspace_snapshot()
+
+        def toggle_replay_markers(*_args: object) -> None:
+            overlay = chart_overlay()
+            if overlay is None:
+                return
+            hidden = not bool(overlay.get("markers_hidden", False))
+            overlay["markers_hidden"] = hidden
+            overlay.pop("focused_row", None)
+            setter = getattr(self._native_chart_view, "set_area_shape_replay_trades", None)
+            if callable(setter):
+                setter([] if hidden else visible_rows, focus=not hidden, fit=not hidden)
+            toggle_markers_button.setText("显示复盘标记" if hidden else "隐藏复盘标记")
+            show_all_button.setEnabled(False)
+            save_marker_visibility(hidden)
+            focus_note.setText(
+                "已隐藏K线图上的复盘标记；复盘结果和表格记录已保留。"
+                if hidden else f"已恢复当前筛选内 {len(visible_rows)} 条复盘标记。"
+            )
+
         def show_all_markers(*_args: object) -> None:
             overlay = chart_overlay()
             if overlay is None:
                 return
             overlay.pop("focused_row", None)
+            hidden = bool(overlay.get("markers_hidden", False))
             setter = getattr(self._native_chart_view, "set_area_shape_replay_trades", None)
             if callable(setter):
-                setter(visible_rows, focus=True, fit=True)
+                setter([] if hidden else visible_rows, focus=not hidden, fit=not hidden)
             show_all_button.setEnabled(False)
             focus_note.setText(
-                f"已显示并定位当前筛选内 {len(visible_rows)} 条记录；查看时区域线锁定。"
-                if visible_rows else f"当前筛选为 0 条（共 {len(rows)} 条记录），请调整类型或方向筛选。"
+                "已隐藏K线图上的复盘标记；复盘结果和表格记录已保留。"
+                if hidden else (
+                    f"已显示并定位当前筛选内 {len(visible_rows)} 条记录；查看时区域线锁定。"
+                    if visible_rows else f"当前筛选为 0 条（共 {len(rows)} 条记录），请调整类型或方向筛选。"
+                )
             )
 
         def focus_record(row_index: int, _column: int) -> None:
@@ -13644,10 +13709,13 @@ class KlineAnalysisWindow(QMainWindow):
                 return
             record = visible_rows[row_index]
             overlay["focused_row"] = record
+            overlay["markers_hidden"] = False
             setter = getattr(self._native_chart_view, "set_area_shape_replay_trades", None)
             if callable(setter):
                 setter([record], focus=True, fit=True)
+            toggle_markers_button.setText("隐藏复盘标记")
             show_all_button.setEnabled(True)
+            save_marker_visibility(False)
             focus_note.setText(f"图上仅显示第 {row_index + 1} 条记录及其关联标记；列表保留全部记录。")
 
         def apply_filters(*_args: object) -> None:
@@ -13660,6 +13728,10 @@ class KlineAnalysisWindow(QMainWindow):
             cache = self._area_shape_replay_record(plan.plan_id, symbol=plan.symbol, period=plan.period)
             if cache is not None:
                 cache["filters"] = filters
+                cache["markers_hidden"] = (
+                    bool(overlay.get("markers_hidden", False))
+                    if overlay is not None else bool(cache.get("markers_hidden", False))
+                )
                 self._workspace_entry(symbol=plan.symbol, period=plan.period).setdefault("area_replays", {})[plan.plan_id] = cache
                 self._save_workspace_snapshot()
 
@@ -13668,6 +13740,7 @@ class KlineAnalysisWindow(QMainWindow):
         side_filter.currentIndexChanged.connect(apply_filters)
         table.cellDoubleClicked.connect(focus_record)
         show_all_button.clicked.connect(show_all_markers)
+        toggle_markers_button.clicked.connect(toggle_replay_markers)
         if not rows:
             empty_state = QLabel(
                 "起点之后没有符合条件的回测交易或潜在机会；触线、所选形态、止损关系与最低目标空间均按当前计划检查。数据共 "
@@ -14299,7 +14372,9 @@ class KlineAnalysisWindow(QMainWindow):
         ))
 
     def _format_area_shape_price(self, value: Decimal, symbol: str) -> str:
-        instrument = self._instrument_for_symbol(symbol)
+        # Display formatting must not wait for a public REST request on the UI
+        # thread. Execution still obtains and validates its instrument normally.
+        instrument = self._instrument_for_symbol(symbol, cached_only=True)
         tick_size = getattr(instrument, "tick_size", None)
         if isinstance(tick_size, Decimal) and tick_size > 0:
             return format_decimal_by_increment(value, tick_size)
@@ -17104,16 +17179,25 @@ class KlineAnalysisWindow(QMainWindow):
         updated_entry["rr"] = [dict(item) for item in current_entry.get("rr", []) if isinstance(item, dict)]
         # The worker snapshot predates foreground replay runs and filter changes.
         # Alert evaluation must not roll back these UI-owned saved results.
-        updated_entry["area_replays"].update(copy.deepcopy(current_entry.get("area_replays", {})))
+        updated_entry["area_replays"].update(current_entry.get("area_replays", {}))
         new_events = list(snapshot.new_events)
         structure = dict(snapshot.structure)
-        self._workspace_entries[self._current_workspace_key()] = updated_entry
-        email_sent_count = self._dispatch_line_alert_emails(new_events, updated_entry) if new_events else 0
-        self._save_workspace_snapshot()
         self._structure_hint.setText(str(structure.get("note", "") or ""))
+        context = (self._current_workspace_key(), self._active_profile_name(), self._active_environment())
+        unchanged = not new_events and updated_entry == current_entry
+        if unchanged and getattr(self, "_last_applied_alert_context", None) == context:
+            # Price refreshes usually leave alert state unchanged. Avoid copying
+            # saved reports, rewriting JSON and rebuilding two tables each time.
+            return
+        if not unchanged:
+            self._workspace_entries[self._current_workspace_key()] = updated_entry
+        email_sent_count = self._dispatch_line_alert_emails(new_events, updated_entry) if new_events else 0
+        if not unchanged:
+            self._save_workspace_snapshot()
         self._refresh_event_log()
         self._populate_line_table()
         self._populate_rr_table(selected_index=self._selected_rr_index)
+        self._last_applied_alert_context = context
         if new_events:
             self._enqueue_line_trade_events(new_events)
             latest = str(new_events[0].get("message", "") or "")

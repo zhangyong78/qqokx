@@ -6337,11 +6337,13 @@ class RollTerminalQtWindowHelperTests(QtWidgetTestCase):
                 window._pending_payload = chart_payload
                 window._populate_line_table(selected_index=0)
                 with (
-                    patch.object(window, "_resolve_primary_chart_click", side_effect=[(1, 100.0), (1, 98.0)]),
+                    patch.object(window, "_resolve_primary_chart_click", side_effect=[(1, 100.0), (1, 98.0), (1, 98.0)]),
+                    patch.object(window, "_current_chart_pointer_scene_pos", side_effect=[QPointF(10.0, 10.0), QPointF(22.0, 10.0)]),
                     patch.object(window, "_save_workspace_snapshot") as save_snapshot,
                     patch.object(window, "_render_to_chart") as render_to_chart,
                 ):
                     window._on_chart_pointer_pressed(0.0, 0.0)
+                    window._on_chart_pointer_moved(0.0, 0.0)
                     window._on_chart_pointer_released(0.0, 0.0)
                 entry = window._workspace_entry()
                 saved = entry["lines"][0]

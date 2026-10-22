@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import threading
 import time
 from dataclasses import replace
@@ -399,6 +400,7 @@ class AreaShapeDemoUiTests(QtWidgetTestCase):
         support_line = lines[support_index]
         self.window._line_drag_state = {
             "index": support_index,
+            "active": True,
             "drag_mode": "move",
             "anchor_line": dict(support_line),
             "anchor_candle_time": support_line["time_a"],
@@ -924,7 +926,7 @@ class AreaShapeDemoUiTests(QtWidgetTestCase):
         simulate.assert_not_called()
         self.assertEqual(show_results.call_args.args[2], rows)
 
-    def test_replay_recomputes_results_saved_under_old_pattern_rules(self) -> None:
+    def test_old_replay_reopens_without_calculation_until_explicit_rerun(self) -> None:
         plan = self._create_demo_draft()
         lines = self.window._workspace_entry(symbol=plan.symbol, period=plan.period)["lines"]
         support = next(item for item in lines if item["id"] == plan.support_line_id)
@@ -948,6 +950,8 @@ class AreaShapeDemoUiTests(QtWidgetTestCase):
         with patch.object(self.window, "_simulate_area_shape_replay", return_value=[]) as simulate:
             with patch.object(self.window, "_show_area_shape_replay_results"):
                 self.window._run_area_shape_replay()
+                simulate.assert_not_called()
+                self.window._run_area_shape_replay(force=True)
                 deadline = time.monotonic() + 5
                 while self.window._area_shape_replay_thread is not None and time.monotonic() < deadline:
                     self._app.processEvents()
@@ -955,6 +959,82 @@ class AreaShapeDemoUiTests(QtWidgetTestCase):
                 self._app.processEvents()
 
         simulate.assert_called_once()
+
+    def test_workspace_reads_keep_edits_and_normalize_replaced_data(self) -> None:
+        entry = self.window._workspace_entry()
+        self.window._workspace_entry()["visuals"]["auto_box_visible"] = True
+        entry["events"].append({"message": "local edit"})
+        self.assertIs(self.window._workspace_entry(), entry)
+        self.assertEqual(self.window._workspace_entry()["events"][0]["message"], "local edit")
+        key = self.window._current_workspace_key()
+        self.window._workspace_entries[key] = {"lines": [], "visuals": {"auto_box_visible": False}}
+        replaced = self.window._workspace_entry()
+        self.assertIsNot(replaced, entry)
+        self.assertFalse(replaced["visuals"]["auto_box_visible"])
+        self.assertIn("area_replays", replaced)
+
+    def test_unchanged_alert_snapshot_skips_writes_but_changed_state_is_saved(self) -> None:
+        entry = self.window._workspace_entry()
+        saved = {"rows": [{"entry": "100"}], "markers_hidden": True}
+        entry["area_replays"] = {"report": saved}
+        snapshot_entry = copy.deepcopy(entry)
+        snapshot_entry.pop("area_replays")
+        snapshot = self._kline_module.KlineAlertSnapshot(
+            workspace_entry=snapshot_entry, new_events=[], structure={"note": "updated structure"},
+        )
+        with (
+            patch.object(self.window, "_save_workspace_snapshot") as save,
+            patch.object(self.window, "_populate_line_table") as lines,
+            patch.object(self.window, "_populate_rr_table") as rr,
+        ):
+            self.window._apply_alert_snapshot(snapshot)
+            self.window._apply_alert_snapshot(snapshot)
+            save.assert_not_called()
+            lines.assert_called_once()
+            rr.assert_called_once()
+            self.assertEqual(self.window._structure_hint.text(), "updated structure")
+            # The same saved data still needs binding when an account changes.
+            with patch.object(self.window, "_active_profile_name", return_value="other-account"):
+                self.window._apply_alert_snapshot(snapshot)
+            self.assertEqual(lines.call_count, 2)
+            self.assertEqual(rr.call_count, 2)
+            save.assert_not_called()
+            snapshot_entry["alerts"]["ma_cross"]["enabled"] = False
+            self.window._apply_alert_snapshot(snapshot)
+            save.assert_called_once()
+            self.assertEqual(lines.call_count, 3)
+            self.assertEqual(rr.call_count, 3)
+        self.assertEqual(self.window._workspace_entry()["area_replays"]["report"], saved)
+
+    def test_new_alert_events_still_dispatch_and_save(self) -> None:
+        entry = self.window._workspace_entry()
+        event = {"message": "触线", "candle_time": 123}
+        snapshot = self._kline_module.KlineAlertSnapshot(
+            workspace_entry=copy.deepcopy(entry), new_events=[event], structure={},
+        )
+        with (
+            patch.object(self.window, "_save_workspace_snapshot") as save,
+            patch.object(self.window, "_dispatch_line_alert_emails", return_value=0) as emails,
+            patch.object(self.window, "_enqueue_line_trade_events") as trades,
+            patch.object(self.window, "_populate_line_table"),
+            patch.object(self.window, "_populate_rr_table"),
+        ):
+            self.window._apply_alert_snapshot(snapshot)
+            save.assert_called_once()
+            emails.assert_called_once()
+            trades.assert_called_once_with([event])
+
+    def test_display_price_cache_miss_never_fetches_network_or_poisons_cache(self) -> None:
+        self.window._instrument_cache.clear()
+        with (
+            patch.object(self.window._market_client, "get_cached_instrument", return_value=None) as cached,
+            patch.object(self.window._market_client, "get_instrument", side_effect=AssertionError("network on UI")) as network,
+        ):
+            self.assertEqual(self.window._format_area_shape_price(Decimal("100.123456789"), "BTC-USDT-SWAP"), "100.12345679")
+            self.assertNotIn("BTC-USDT-SWAP", self.window._instrument_cache)
+            cached.return_value = SimpleNamespace(tick_size=Decimal("0.1"))
+            self.assertEqual(self.window._format_area_shape_price(Decimal("100.123456789"), "BTC-USDT-SWAP"), "100.1")
+            network.assert_not_called()
 
     def test_replay_filters_table_and_chart_and_saves_filter_selection(self) -> None:
         plan = self._create_demo_draft()
@@ -971,7 +1051,7 @@ class AreaShapeDemoUiTests(QtWidgetTestCase):
             "rows": rows, "filters": {"kind": "all", "side": "all"},
         }
         class _ChartStub:
-            def set_area_shape_replay_trades(self, visible) -> None:
+            def set_area_shape_replay_trades(self, visible, **_kwargs) -> None:
                 self.trades = list(visible or [])
 
         chart = _ChartStub()
@@ -997,6 +1077,14 @@ class AreaShapeDemoUiTests(QtWidgetTestCase):
             self.window._area_shape_replay_record(plan.plan_id, symbol=plan.symbol, period=plan.period)["filters"]["kind"],
             "opportunity",
         )
+        toggle_markers = dialog.findChild(self._kline_module.QPushButton, "areaReplayToggleMarkers")
+        self.assertIsNotNone(toggle_markers)
+        toggle_markers.click()
+        self.assertEqual(chart.trades, [])
+        saved_record = self.window._area_shape_replay_record(plan.plan_id, symbol=plan.symbol, period=plan.period)
+        self.assertTrue(saved_record["markers_hidden"])
+        self.window._restore_area_shape_replay(chart, symbol=plan.symbol, period=plan.period)
+        self.assertEqual(chart.trades, [])
 
     def test_replay_result_dialog_rounds_values_and_fits_all_columns(self) -> None:
         plan = self._create_demo_draft()
