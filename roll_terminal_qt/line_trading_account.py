@@ -39,8 +39,10 @@ def build_runtime_from_profile_payload(
             profile_name=profile_name,
         ),
         environment=environment,
-        trade_mode=_trade_mode_from_settings(notification_snapshot.get("trade_mode_label")),
-        position_mode=_position_mode_from_settings(notification_snapshot.get("position_mode_label")),
+        trade_mode=_trade_mode_from_settings(payload.get("trade_mode") or notification_snapshot.get("trade_mode_label")),
+        position_mode=_position_mode_from_settings(
+            payload.get("position_mode") or notification_snapshot.get("position_mode_label")
+        ),
         credential_profile_name=profile_name,
     )
 

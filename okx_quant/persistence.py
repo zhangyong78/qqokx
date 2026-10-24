@@ -1180,6 +1180,10 @@ def _normalize_credentials_profile(payload: object) -> dict[str, str]:
         "secret_key": _decrypt_credential_text(payload.get("secret_key", "")),
         "passphrase": _decrypt_credential_text(payload.get("passphrase", "")),
         "environment": _normalize_credentials_environment(payload),
+        **({"trade_mode": str(payload["trade_mode"]).strip().lower()}
+           if str(payload.get("trade_mode", "")).strip().lower() in {"cross", "isolated"} else {}),
+        **({"position_mode": str(payload["position_mode"]).strip().lower()}
+           if str(payload.get("position_mode", "")).strip().lower() in {"net", "long_short"} else {}),
         "spot_maker_fee_rate": str(payload.get("spot_maker_fee_rate", "") or "").strip(),
         "spot_taker_fee_rate": str(payload.get("spot_taker_fee_rate", "") or "").strip(),
         "futures_maker_fee_rate": str(payload.get("futures_maker_fee_rate", "") or "").strip(),
@@ -1197,6 +1201,8 @@ def _serialize_credentials_profile(payload: object) -> dict[str, str]:
         "secret_key": _encrypt_credential_text(normalized.get("secret_key", "")),
         "passphrase": _encrypt_credential_text(normalized.get("passphrase", "")),
         "environment": str(normalized.get("environment", "") or "").strip().lower(),
+        **({"trade_mode": normalized["trade_mode"]} if "trade_mode" in normalized else {}),
+        **({"position_mode": normalized["position_mode"]} if "position_mode" in normalized else {}),
         "spot_maker_fee_rate": str(normalized.get("spot_maker_fee_rate", "") or "").strip(),
         "spot_taker_fee_rate": str(normalized.get("spot_taker_fee_rate", "") or "").strip(),
         "futures_maker_fee_rate": str(normalized.get("futures_maker_fee_rate", "") or "").strip(),
@@ -1308,6 +1314,8 @@ def save_credentials_snapshot(
         "secret_key": secret_key.strip(),
         "passphrase": passphrase.strip(),
         "environment": existing.get("environment", ""),
+        **({"trade_mode": existing["trade_mode"]} if "trade_mode" in existing else {}),
+        **({"position_mode": existing["position_mode"]} if "position_mode" in existing else {}),
         "spot_maker_fee_rate": existing.get("spot_maker_fee_rate", ""),
         "spot_taker_fee_rate": existing.get("spot_taker_fee_rate", ""),
         "futures_maker_fee_rate": existing.get("futures_maker_fee_rate", ""),

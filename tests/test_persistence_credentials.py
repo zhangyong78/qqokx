@@ -76,6 +76,24 @@ class CredentialProfilesPersistenceTest(TestCase):
             self.assertEqual(load_credentials_snapshot(path, profile_name="api1")["api_key"], "key-1")
             self.assertEqual(load_credentials_snapshot(path, profile_name="api2")["api_key"], "key-2")
 
+    def test_position_mode_is_saved_per_profile_and_survives_credential_update(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "credentials.json"
+            save_credentials_profiles_snapshot(
+                selected_profile="first",
+                profiles={
+                    "first": {"api_key": "a", "secret_key": "b", "passphrase": "c", "trade_mode": "isolated", "position_mode": "long_short"},
+                    "second": {"api_key": "d", "secret_key": "e", "passphrase": "f", "trade_mode": "cross", "position_mode": "net"},
+                },
+                path=path,
+            )
+            save_credentials_snapshot("new-a", "new-b", "new-c", path, profile_name="first")
+            profiles = load_credentials_profiles_snapshot(path)["profiles"]
+            self.assertEqual(profiles["first"]["position_mode"], "long_short")
+            self.assertEqual(profiles["second"]["position_mode"], "net")
+            self.assertEqual(profiles["first"]["trade_mode"], "isolated")
+            self.assertEqual(profiles["second"]["trade_mode"], "cross")
+
     def test_save_credentials_snapshot_updates_selected_profile(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / ".okx_quant_credentials.json"

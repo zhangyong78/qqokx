@@ -106,6 +106,17 @@ class LineTradingAccountFormattingTests(unittest.TestCase):
         self.assertEqual(runtime.trade_mode, "isolated")
         self.assertEqual(runtime.position_mode, "long_short")
 
+    def test_build_runtime_from_profile_payload_prefers_account_position_mode(self) -> None:
+        runtime = build_runtime_from_profile_payload(
+            profile_name="net-account",
+            payload={
+                "api_key": "k", "secret_key": "s", "passphrase": "p",
+                "position_mode": "net",
+            },
+            notification_snapshot={"position_mode_label": "双向 long_short"},
+        )
+        self.assertEqual(runtime.position_mode, "net")
+
     def test_build_runtime_from_profile_payload_requires_complete_credentials(self) -> None:
         with self.assertRaisesRegex(ValueError, "API"):
             build_runtime_from_profile_payload(

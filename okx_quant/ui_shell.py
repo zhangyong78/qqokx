@@ -8530,6 +8530,8 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         self._loaded_credential_profile_name = target
         self.api_profile_name.set(target)
         self._set_credentials_fields(snapshot)
+        if hasattr(self, "trade_mode_label") and hasattr(self, "position_mode_label"):
+            QuantApp._apply_profile_trade_mode_labels(self, snapshot)
         self._sync_current_api_sender_email_override(target)
         self._update_current_api_profile_password_status(target)
         self._last_saved_credentials = (
@@ -8622,6 +8624,9 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
 
         self.trade_mode_label.set(str(snapshot["trade_mode_label"]))
         self.position_mode_label.set(str(snapshot["position_mode_label"]))
+        self._default_trade_mode_label = self.trade_mode_label.get()
+        self._default_position_mode_label = self.position_mode_label.get()
+        self._apply_profile_trade_mode_labels(self._credential_profiles.get(self._current_credential_profile(), {}))
         self.trigger_type_label.set(str(snapshot["trigger_type_label"]))
         self.notify_enabled.set(bool(snapshot["enabled"]))
         self.smtp_host.set(str(snapshot["smtp_host"]))
@@ -8798,8 +8803,8 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         self.option_maker_fee_rate.trace_add("write", self._on_credentials_changed)
         self.option_taker_fee_rate.trace_add("write", self._on_credentials_changed)
         self.environment_label.trace_add("write", self._on_environment_label_changed)
-        self.trade_mode_label.trace_add("write", self._on_settings_changed)
-        self.position_mode_label.trace_add("write", self._on_settings_changed)
+        self.trade_mode_label.trace_add("write", self._on_profile_trade_settings_changed)
+        self.position_mode_label.trace_add("write", self._on_profile_trade_settings_changed)
         self.trigger_type_label.trace_add("write", self._on_settings_changed)
         self._credential_watch_enabled = True
 
@@ -8857,6 +8862,41 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
     def _on_settings_changed(self, *_: str) -> None:
         self._update_settings_summary()
 
+    def _apply_profile_trade_mode_labels(self, snapshot: dict[str, str]) -> None:
+        was_enabled = self._credential_watch_enabled
+        self._credential_watch_enabled = False
+        try:
+            if snapshot.get("trade_mode") in {"cross", "isolated"}:
+                self.trade_mode_label.set(next(label for label, value in TRADE_MODE_OPTIONS.items() if value == snapshot["trade_mode"]))
+            elif hasattr(self, "_default_trade_mode_label"):
+                self.trade_mode_label.set(self._default_trade_mode_label)
+            if snapshot.get("position_mode") in {"net", "long_short"}:
+                self.position_mode_label.set(next(label for label, value in POSITION_MODE_OPTIONS.items() if value == snapshot["position_mode"]))
+            elif hasattr(self, "_default_position_mode_label"):
+                self.position_mode_label.set(self._default_position_mode_label)
+        finally:
+            self._credential_watch_enabled = was_enabled
+
+    def _on_profile_trade_settings_changed(self, *_: str) -> None:
+        self._on_settings_changed()
+        if not self._credential_watch_enabled:
+            return
+        profile_name = self._editing_credential_profile()
+        if self._credential_profile_is_locked(profile_name):
+            return
+        self._save_credentials_now(silent=True)
+        snapshot = load_credentials_profiles_snapshot()
+        profiles = snapshot.get("profiles", {})
+        if not isinstance(profiles, dict) or profile_name not in profiles:
+            return
+        profiles[profile_name] = {
+            **profiles[profile_name],
+            "trade_mode": TRADE_MODE_OPTIONS.get(self.trade_mode_label.get(), "cross"),
+            "position_mode": POSITION_MODE_OPTIONS.get(self.position_mode_label.get(), "net"),
+        }
+        save_credentials_profiles_snapshot(selected_profile=str(snapshot.get("selected_profile") or profile_name), profiles=profiles)
+        self._credential_profiles[profile_name] = profiles[profile_name]
+
     def _on_environment_label_changed(self, *_: str) -> None:
         self._default_environment_label = self._normalized_environment_label(self.environment_label.get())
         self._positions_effective_environment = None
@@ -8900,12 +8940,31 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
                 option_maker_fee_rate,
                 option_taker_fee_rate,
             ) = current
-            existing_snapshot = self._credential_profiles.get(profile_name, {})
+            disk_snapshot = load_credentials_profiles_snapshot()
+            disk_profiles = disk_snapshot.get("profiles", {})
+            if not isinstance(disk_profiles, dict):
+                raise ValueError("API 配置文件格式无效")
+            disk_profile = disk_profiles.get(profile_name, {})
+            if profile_name in disk_profiles and self._last_saved_credentials is not None:
+                disk_state = (
+                    profile_name,
+                    *(str(disk_profile.get(key, "") or "").strip() for key in (
+                        "api_key", "secret_key", "passphrase", "environment",
+                        "spot_maker_fee_rate", "spot_taker_fee_rate",
+                        "futures_maker_fee_rate", "futures_taker_fee_rate",
+                        "option_maker_fee_rate", "option_taker_fee_rate",
+                    )),
+                )
+                if disk_state != self._last_saved_credentials:
+                    raise ValueError("当前 API 配置已被另一窗口修改，请重新打开设置后再保存")
+            existing_snapshot = disk_profile or self._credential_profiles.get(profile_name, {})
             self._credential_profiles[profile_name] = {
                 "api_key": api_key,
                 "secret_key": secret_key,
                 "passphrase": passphrase,
                 "environment": environment,
+                **({"trade_mode": existing_snapshot["trade_mode"]} if "trade_mode" in existing_snapshot else {}),
+                **({"position_mode": existing_snapshot["position_mode"]} if "position_mode" in existing_snapshot else {}),
                 "spot_maker_fee_rate": spot_maker_fee_rate,
                 "spot_taker_fee_rate": spot_taker_fee_rate,
                 "futures_maker_fee_rate": futures_maker_fee_rate,
@@ -8916,10 +8975,12 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
                 "switch_password_salt": str(existing_snapshot.get("switch_password_salt", "") or ""),
                 "switch_password_iterations": str(existing_snapshot.get("switch_password_iterations", "") or ""),
             }
+            disk_profiles[profile_name] = self._credential_profiles[profile_name]
             save_credentials_profiles_snapshot(
                 selected_profile=profile_name,
-                profiles=self._credential_profiles,
+                profiles=disk_profiles,
             )
+            self._credential_profiles = disk_profiles
         except Exception as exc:
             if not silent:
                 self._enqueue_log(f"自动保存凭证失败：{exc}")

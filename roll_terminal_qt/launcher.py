@@ -33,6 +33,7 @@ from okx_quant.ai_snapshot import load_ai_watchlist, normalize_watchlist, save_a
 from okx_quant.app_paths import ai_snapshots_dir_path, config_dir_path, data_root, logs_dir_path, state_dir_path
 from okx_quant.log_utils import append_log_line
 from roll_terminal_qt.account_positions_home import AccountPositionsHomeWidget
+from roll_terminal_qt.account_settings_dialog import AccountSettingsDialog
 from roll_terminal_qt.history_sync_manager import HISTORY_SYNC_SOURCES, get_history_sync_manager
 from roll_terminal_qt.daily_trade_report_window import DailyTradeReportWidget
 from roll_terminal_qt.app_icon import apply_qt_application_identity, apply_qt_window_icon
@@ -887,7 +888,7 @@ class LauncherWindow(QMainWindow):
         elif private_online:
             account_text = "私有WS在线"
         else:
-            account_text = private_status or "账户待加载"
+            account_text = private_status or "私有WS未连接"
         healthy = public_online and (private_online or not self._active_profile_name)
         self._workspace_header.set_connection_text(f"{market_text} · {account_text}", healthy)
 
@@ -1191,6 +1192,23 @@ class LauncherWindow(QMainWindow):
             return
         if normalized == "paths":
             self._show_shared_data_dialog()
+            return
+        if normalized == "position-mode":
+            dialog = AccountSettingsDialog(profile_name=self._active_profile_name, parent=self)
+            dialog.exec()
+            self._profile_snapshots, selected = load_profile_snapshots()
+            runtime = load_runtime(self._active_profile_name)
+            if runtime is not None:
+                self._workspace_header.set_profiles(
+                    list(self._profile_snapshots), self._active_profile_name,
+                    str(getattr(runtime, "environment", "") or ""),
+                )
+                page = self._pages.get("kline")
+                if isinstance(page, KlineAnalysisWindow):
+                    page._runtime = runtime
+                    page._sync_account_context()
+            elif selected in self._profile_snapshots:
+                self._initialize_workspace_profiles()
             return
         if normalized == "history-sync":
             self._show_history_sync_dialog()

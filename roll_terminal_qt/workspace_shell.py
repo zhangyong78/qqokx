@@ -91,6 +91,7 @@ class WorkspaceHeader(QFrame):
         ("tool:eth-dvol-overview", "ETH × DVOL 总览"),
         ("tool:sample-prediction", "样本预测"),
         ("settings:paths", "数据目录与路径"),
+        ("settings:position-mode", "API 与通知设置"),
         ("settings:history-sync", "历史数据同步"),
         ("settings:logs", "日志"),
         ("settings:version", "版本信息"),
@@ -269,6 +270,10 @@ class WorkspaceHeader(QFrame):
 
     def set_connection_text(self, text: str, healthy: bool) -> None:
         self.connection_label.setText(text)
+        self.connection_label.setToolTip(
+            "此状态显示行情和私有 WebSocket 连接情况；不代表 REST 下单是否可用。"
+            "订单提交与成交状态请以委托和持仓列表为准。"
+        )
         self.connection_label.setStyleSheet("color: #9edfcf;" if healthy else "color: #f0b36a;")
 
     def set_task_text(self, text: str) -> None:
