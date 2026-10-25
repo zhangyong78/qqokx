@@ -14098,8 +14098,7 @@ class KlineAnalysisWindow(QMainWindow):
                 execution_text = "入场线触发 GTC 限价单"
             else:
                 signal_entry = "形态确认 FOK" if plan.config.entry_mode == "next_open" else "形态确认条件限价单"
-                execution_text = (f"入场线 GTC + {signal_entry}" if plan.config.resting_entry_enabled
-                                 else signal_entry)
+                execution_text = f"触线并确认形态后：{signal_entry}"
             confirmation_text = (
                 f"账户：{profile_text} / {mode if mode in {'demo', 'live'} else plan.environment}\n方向：{direction_text}\n"
                 f"风险预算：{plan.config.risk_amount} USDT\n执行方式：{execution_text}\n"
@@ -14107,8 +14106,6 @@ class KlineAnalysisWindow(QMainWindow):
                 f"盈亏比校验：{target_line}（最低 {plan.config.min_space_r}R）\n"
                 f"执行：{mode_text}\n\n确认启用此计划？"
             )
-            if mode in {"demo", "live"} and plan.config.resting_entry_enabled:
-                confirmation_text += f"\n\n{mode_text}会同时挂入场线 GTC；它可能在 1H 形态确认前成交。"
             accepted = QMessageBox.question(
                 self, "启用区域计划", confirmation_text,
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
@@ -14341,9 +14338,7 @@ class KlineAnalysisWindow(QMainWindow):
         stop_text += f" | ATR周期 {config.atr_period}" if config.requires_atr() else " | 当前组合不需ATR"
         if config.entry_trigger_mode == "pattern" and config.entry_mode == "breakout":
             stop_text += f" | 突破入场偏移 {entry_offset} ATR"
-        gtc_text = "直接入场自动挂单" if config.entry_trigger_mode == "direct_touch" else (
-            "开" if config.resting_entry_enabled and config.entry_mode == "next_open" else "关"
-        )
+        gtc_text = "直接价格触发时挂单" if config.entry_trigger_mode == "direct_touch" else "关闭（触线并确认形态后入场）"
         return "\n".join((
             "当前计划参数",
             f"方向：{direction} | 入场参考：{entry_name} {self._format_area_shape_price(entry_price, plan.symbol)}",

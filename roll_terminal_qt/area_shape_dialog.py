@@ -133,14 +133,8 @@ class AreaShapeConfigDialog(QDialog):
         self.fee_offset_enabled = QCheckBox("计入双边 Taker 手续费")
         self.fee_offset_enabled.setChecked(self._initial.fee_offset_enabled)
         self.fee_offset_enabled.setToolTip("勾选后，保本和锁盈触发R按扣除入场与退出两侧手续费后的净R判断，保护止损价也按双边手续费计算。纸面估算使用固定Taker费率，OKX实盘/模拟盘使用对应账户费率。")
-        self.resting_entry_enabled = QCheckBox("形态模式：并行挂入场线 GTC 限价单")
-        self.resting_entry_enabled.setChecked(self._initial.resting_entry_enabled)
-        self.resting_entry_enabled.setToolTip("形态模式下，GTC订单可能在1H形态确认前成交；成交后会停止后续形态入场并直接保护该笔成交。暂停、取消、到期或退出时会撤单并核实成交。")
-        self.parallel_entry_note = QLabel("开启后，形态信号和入场线 GTC 限价单并行等待；任一路成交后停止另一路。")
-        self.parallel_entry_note.setWordWrap(True)
         self.entry_trigger_mode.currentIndexChanged.connect(self._refresh_entry_mode)
         self.entry_mode.currentIndexChanged.connect(self._refresh_entry_mode)
-        self.resting_entry_enabled.toggled.connect(self._refresh_entry_mode)
         self.exit_template = QComboBox()
         self.exit_template.addItem("固定止盈", "fixed_1r")
         self.exit_template.addItem("动态止盈", "lock_2r_at_3r")
@@ -202,8 +196,6 @@ class AreaShapeConfigDialog(QDialog):
         form.addRow("止损再上移（R）", self.lock_trail_add_r)
         self._main_form = form
         self._refresh_exit_controls()
-        form.addRow("并行限价入场", self.resting_entry_enabled)
-        form.addRow("", self.parallel_entry_note)
 
         self.advanced_toggle = QToolButton()
         self.advanced_toggle.setText("展开高级参数")
@@ -258,7 +250,6 @@ class AreaShapeConfigDialog(QDialog):
             field.valueChanged.connect(self._refresh_validation)
         self.patterns.itemChanged.connect(self._refresh_validation)
         self.break_even_enabled.toggled.connect(self._refresh_validation)
-        self.resting_entry_enabled.toggled.connect(self._refresh_validation)
         self.fee_offset_enabled.toggled.connect(self._refresh_exit_controls)
         for field in (self.lock_trigger_r, self.lock_profit_r, self.lock_trail_every_r, self.lock_trail_add_r):
             field.valueChanged.connect(self._refresh_exit_controls)
@@ -359,7 +350,9 @@ class AreaShapeConfigDialog(QDialog):
             return
         dynamic = self.exit_template.currentData() != "fixed_1r"
         pattern = self.entry_trigger_mode.currentData() == "pattern"
-        gtc = not pattern or (self.entry_mode.currentData() == "next_open" and self.resting_entry_enabled.isChecked())
+        # Direct-touch mode is the only mode that pre-submits a line-price GTC.
+        # Pattern mode must wait for both the touch and a confirmed pattern.
+        gtc = not pattern
         error = ""
         if pattern and not self._selected_patterns():
             error = "请至少选择一种1H形态，或改用价格触发。"
@@ -420,9 +413,7 @@ class AreaShapeConfigDialog(QDialog):
             stop_basis=str(self.stop_basis.currentData()),
             fixed_stop_distance=Decimal(str(self.fixed_stop_distance.value())),
             fee_offset_enabled=self.fee_offset_enabled.isChecked(),
-            resting_entry_enabled=(self.resting_entry_enabled.isChecked()
-                                   and self.entry_trigger_mode.currentData() == "pattern"
-                                   and self.entry_mode.currentData() == "next_open"),
+            resting_entry_enabled=False,
             exit_template=str(self.exit_template.currentData()),
             trigger_price_type="last",
             valid_for_bars=self.valid_bars.value(),
@@ -453,23 +444,18 @@ class AreaShapeConfigDialog(QDialog):
 
     def _refresh_entry_mode(self) -> None:
         direct = self.entry_trigger_mode.currentData() == "direct_touch"
-        parallel_supported = not direct and self.entry_mode.currentData() == "next_open"
         self.patterns.setVisible(not direct)
         self.direct_touch_note.setVisible(direct)
         self.trigger_content_label.setText("价格触发" if direct else "1H形态（可多选）")
         self.patterns.setEnabled(not direct)
-        self.resting_entry_enabled.setEnabled(parallel_supported)
         self.entry_mode.setEnabled(not direct)
-        self._set_row_visible(self._main_form, self.resting_entry_enabled, parallel_supported)
-        self.parallel_entry_note.setVisible(parallel_supported)
         self._set_row_visible(self._advanced_form, self.entry_mode, not direct)
-        self._set_row_visible(self._advanced_form, self.entry_offset, not direct and not parallel_supported)
+        self._set_row_visible(
+            self._advanced_form, self.entry_offset,
+            not direct and self.entry_mode.currentData() == "breakout",
+        )
         self._set_row_visible(self._advanced_form, self.target_buffer, self._show_target_buffer)
         self._set_row_visible(self._advanced_form, self.slippage, self._show_legacy_slippage)
-        if self.resting_entry_enabled.isChecked():
-            self.parallel_entry_note.setText("形态信号与GTC并行等待；GTC可在形态出现前成交，任一路成交后停止另一路入场。")
-        else:
-            self.parallel_entry_note.setText("仅等待实际触线与所选形态确认，不会预挂入场线GTC限价单。")
         self._refresh_stop_controls()
         self._refresh_validation()
 

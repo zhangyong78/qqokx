@@ -176,7 +176,9 @@ class AreaShapeConfig:
             fixed_stop_distance=_required_decimal(raw, "fixed_stop_distance") if "fixed_stop_distance" in raw else Decimal("1000"),
             # Older plans did not expose a fee-offset switch; preserve their behavior.
             fee_offset_enabled=bool(raw.get("fee_offset_enabled", False)),
-            resting_entry_enabled=bool(raw.get("resting_entry_enabled", True)),
+            # Kept in the serialized schema for compatibility with older
+            # snapshots, but pattern mode no longer supports a pre-hung GTC.
+            resting_entry_enabled=False,
             exit_template=exit_template,
             trigger_price_type=str(raw.get("trigger_price_type", "last")),
             valid_for_bars=max(1, int(raw.get("valid_for_bars", 240) or 240)),

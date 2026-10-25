@@ -60,10 +60,7 @@ class AreaShapeDialogTests(QtWidgetTestCase):
             self.assertFalse(dialog.direct_touch_note.isHidden())
             self.assertEqual(dialog.trigger_content_label.text(), "价格触发")
             self.assertIn("启用交易时立即向 OKX 提交", dialog.direct_touch_note.text())
-            self.assertFalse(dialog.resting_entry_enabled.isEnabled())
-            self.assertTrue(dialog.resting_entry_enabled.isHidden())
             self.assertTrue(dialog.entry_mode.isHidden())
-            self.assertTrue(dialog.parallel_entry_note.isHidden())
             self.assertEqual(dialog.config().entry_trigger_mode, "direct_touch")
             self.assertFalse(dialog.config().resting_entry_enabled)
             dialog.entry_trigger_mode.setCurrentIndex(dialog.entry_trigger_mode.findData("pattern"))
@@ -86,14 +83,12 @@ class AreaShapeDialogTests(QtWidgetTestCase):
         finally:
             self.dispose_widget(dialog)
 
-    def test_pattern_entry_defaults_to_waiting_for_shape_and_gtc_is_opt_in(self) -> None:
+    def test_pattern_entry_waits_for_touch_and_shape_without_parallel_gtc_option(self) -> None:
         dialog = AreaShapeConfigDialog(AreaShapeConfig())
         try:
-            self.assertFalse(dialog.resting_entry_enabled.isChecked())
-            self.assertFalse(dialog.resting_entry_enabled.isHidden())
-            dialog.resting_entry_enabled.setChecked(True)
-            self.assertIn("GTC可在形态出现前成交", dialog.parallel_entry_note.text())
-            self.assertTrue(dialog.config().resting_entry_enabled)
+            self.assertFalse(dialog.patterns.isHidden())
+            self.assertFalse(dialog.config().resting_entry_enabled)
+            self.assertEqual(dialog.entry_mode.currentData(), "next_open")
         finally:
             self.dispose_widget(dialog)
 
@@ -195,13 +190,13 @@ class AreaShapeDialogTests(QtWidgetTestCase):
     def test_combination_matrix_preserves_values_and_only_shows_relevant_controls(self) -> None:
         dialog = AreaShapeConfigDialog(AreaShapeConfig())
         try:
-            for direction, trigger, entry, exit_mode, be, time_be, fee, stop, gtc, advanced in product(
+            for direction, trigger, entry, exit_mode, be, time_be, fee, stop, advanced in product(
                 ("long", "short"), ("pattern", "direct_touch"), ("next_open", "breakout"),
                 ("fixed_1r", "lock_2r_at_3r"), (False, True), (False, True), (False, True),
-                ("signal_candle", "three_candle", "fixed_distance"), (False, True), (False, True),
+                ("signal_candle", "three_candle", "fixed_distance"), (False, True),
             ):
                 with self.subTest(direction=direction, trigger=trigger, entry=entry, exit=exit_mode,
-                                  be=be, time_be=time_be, fee=fee, stop=stop, gtc=gtc, advanced=advanced):
+                                  be=be, time_be=time_be, fee=fee, stop=stop, advanced=advanced):
                     for widget, value in ((dialog.direction, direction), (dialog.entry_trigger_mode, trigger),
                                           (dialog.entry_mode, entry), (dialog.exit_template, exit_mode),
                                           (dialog.stop_basis, stop)):
@@ -209,16 +204,12 @@ class AreaShapeDialogTests(QtWidgetTestCase):
                     dialog.break_even_enabled.setChecked(be)
                     dialog.time_break_even_enabled.setChecked(time_be)
                     dialog.fee_offset_enabled.setChecked(fee)
-                    dialog.resting_entry_enabled.setChecked(gtc)
                     dialog.advanced_toggle.setChecked(advanced)
                     direct = trigger == "direct_touch"
-                    parallel = not direct and entry == "next_open"
                     dynamic = exit_mode != "fixed_1r"
                     self.assertEqual(dialog.patterns.isHidden(), direct)
                     self.assertEqual(dialog.direct_touch_note.isHidden(), not direct)
                     self.assertEqual(dialog.entry_mode.isHidden(), direct)
-                    self.assertEqual(dialog.resting_entry_enabled.isHidden(), not parallel)
-                    self.assertEqual(dialog.parallel_entry_note.isHidden(), not parallel)
                     self.assertEqual(dialog.entry_offset.isHidden(), direct or entry != "breakout")
                     self.assertEqual(dialog.fixed_stop_distance.isHidden(), stop != "fixed_distance")
                     self.assertEqual(dialog.stop_offset.isHidden(), stop == "fixed_distance")
@@ -231,7 +222,7 @@ class AreaShapeDialogTests(QtWidgetTestCase):
                         self.assertEqual(widget.isHidden(), not dynamic)
                     config = dialog.config()
                     self.assertEqual(dialog.atr_period.isHidden(), not config.requires_atr())
-                    self.assertEqual(config.resting_entry_enabled, parallel and gtc)
+                    self.assertFalse(config.resting_entry_enabled)
                     self.assertEqual(config.entry_mode, "next_open" if direct else entry)
                     self.assertEqual(config.time_break_even_enabled, be and time_be)
                     self.assertEqual(config.fee_offset_enabled, fee)

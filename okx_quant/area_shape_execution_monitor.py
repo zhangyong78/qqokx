@@ -273,7 +273,7 @@ class AreaShapeDemoExecutionMonitor(QObject):
                 current["signal_cursor_ts"] = baseline
                 current["baseline_candle_ts"] = baseline
                 plan = AreaShapePlan.from_dict(current["plan_snapshot"])
-                if plan.config.resting_entry_enabled or plan.config.entry_trigger_mode == "direct_touch":
+                if plan.config.entry_trigger_mode == "direct_touch":
                     current["resting_entry_intent"], reason = self._prepare_resting_entry(current, plan, baseline_candles)
                     if reason:
                         current.setdefault("events", []).append({"kind": "resting_entry_skipped", "ts": int(time.time() * 1000),
@@ -393,7 +393,9 @@ class AreaShapeDemoExecutionMonitor(QObject):
             else:
                 raise RuntimeError("区域计划监控器不支持冻结环境的执行隔离")
             resting_reason = ""
-            place_line_order = plan.config.entry_trigger_mode == "direct_touch" or plan.config.resting_entry_enabled
+            # Only direct-touch plans may pre-submit the entry-line GTC.
+            # Pattern plans must wait for an actual touch and confirmed shape.
+            place_line_order = plan.config.entry_trigger_mode == "direct_touch"
             if place_line_order:
                 session["resting_entry_intent"], resting_reason = self._prepare_resting_entry(session, plan, candles)
                 if plan.config.entry_trigger_mode == "direct_touch" and not session["resting_entry_intent"]:
@@ -406,7 +408,7 @@ class AreaShapeDemoExecutionMonitor(QObject):
                 armed_message = (
                     f"直接价格触发已启用；正在向OKX提交{environment}入场线GTC限价单，成交后转入仓位保护"
                     if plan.config.entry_trigger_mode == "direct_touch"
-                    else f"{environment}执行已启用；GTC入场线挂单与形态确认入场并行，成交互斥"
+                    else f"{environment}执行已启用；等待触线与形态确认后入场"
                 )
                 session["events"].append({"kind": "armed", "ts": int(time.time() * 1000),
                                           "message": armed_message})
@@ -450,9 +452,10 @@ class AreaShapeDemoExecutionMonitor(QObject):
         expires = int(session.get("expires_at_candle_ts") or 0)
         if expires > 0 and int(time.time() * 1000) >= expires + 3_600_000:
             return None, "计划已到期；禁止准备新的入场线GTC"
-        if (plan.config.entry_trigger_mode != "direct_touch"
-                and plan.config.entry_mode != "next_open"):
-            return None, "普通GTC与旧版OKX条件触发模式不并行；本次保留条件触发路径"
+        if plan.config.entry_trigger_mode != "direct_touch":
+            return None, "形态模式等待触线与形态确认；不预挂入场线GTC"
+        if plan.config.entry_mode != "next_open":
+            return None, "直接价格触发模式不支持此入场方式"
         needs_atr = (plan.config.stop_basis != "fixed_distance" and plan.config.stop_offset_atr > 0) or plan.config.target_buffer_atr > 0
         current_atr = Decimal("0")
         if needs_atr:
@@ -530,6 +533,12 @@ class AreaShapeDemoExecutionMonitor(QObject):
             # The durable ID might already have been submitted before a crash;
             # reconcile/cancel it rather than placing a late new order.
             self._reconcile_resting_entry(session_id, force_cancel=True, cancel_mode="expire")
+            return
+        plan = AreaShapePlan.from_dict(session["plan_snapshot"])
+        if plan.config.entry_trigger_mode != "direct_touch":
+            # Legacy pattern sessions may still contain a persisted GTC intent.
+            # Reconcile its original client ID, but never submit or re-submit it.
+            self._reconcile_resting_entry(session_id, force_cancel=False)
             return
         self._assert_write_enabled(session_id)
         self._persist_session(session_id)  # stable clOrdId is durable before POST
@@ -1039,7 +1048,7 @@ class AreaShapeDemoExecutionMonitor(QObject):
                     session["pending_intent"] = None
                     session["signal_pending"] = None
                     plan = AreaShapePlan.from_dict(session["plan_snapshot"])
-                    if plan.config.resting_entry_enabled or plan.config.entry_trigger_mode == "direct_touch":
+                    if plan.config.entry_trigger_mode == "direct_touch":
                         session["resting_entry_intent"], reason = self._prepare_resting_entry(session, plan, candles)
                         if reason:
                             session.setdefault("events", []).append({"kind": "resting_entry_skipped", "ts": int(time.time() * 1000),
@@ -2233,7 +2242,7 @@ class AreaShapeDemoExecutionMonitor(QObject):
     def _maybe_rearm_resting_entry(self, session_id: str) -> None:
         session = self._sessions[session_id]
         plan = AreaShapePlan.from_dict(session["plan_snapshot"])
-        if (not (plan.config.resting_entry_enabled or plan.config.entry_trigger_mode == "direct_touch")
+        if (plan.config.entry_trigger_mode != "direct_touch"
                 or session.get("status") != "armed"
                 or session.get("paused") or session.get("position") or session.get("resting_entry_intent")):
             return
