@@ -17126,6 +17126,17 @@ class KlineAnalysisWindow(QMainWindow):
                 "protected_cancelled_remainder",
             }
             status = str(ledger_entry.status or "").strip().lower()
+            # A filled order can remain in cancel_confirmation_required when OKX
+            # no longer returns the completed entry order. If the ledger already
+            # confirms there is no remainder, do not try to cancel a nonexistent
+            # order; remove only the local drawing and keep the protection ledger.
+            if (
+                status == "cancel_confirmation_required"
+                and (ledger_entry.filled_size or Decimal("0")) > 0
+                and ledger_entry.remaining_size is not None
+                and ledger_entry.remaining_size <= 0
+            ):
+                protected_statuses.add(status)
             if status in protected_statuses:
                 confirmed = QMessageBox.question(
                     self,
