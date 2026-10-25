@@ -82,6 +82,10 @@ from okx_quant.log_utils import (
     strategy_session_log_file_path,
 )
 from okx_quant.market_data_hub import MarketDataHub
+from okx_quant.network_proxy import (
+    PROXY_MODE_OPTIONS, PROXY_RESTART_NOTE, load_network_proxy_settings,
+    save_network_proxy_settings, validate_network_proxy_settings,
+)
 from okx_quant.models import (
     Candle,
     Credentials,
@@ -4349,6 +4353,7 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
 
         settings_menu = Menu(menu_bar, tearoff=False)
         settings_menu.add_command(label="API 与通知设置", command=self.open_settings_window)
+        settings_menu.add_command(label="网络代理设置", command=self.open_network_proxy_settings_window)
         menu_bar.add_cascade(label="设置", menu=settings_menu)
 
         tools_menu = Menu(menu_bar, tearoff=False)
@@ -8100,7 +8105,55 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
             text="发送策略状态测试邮件",
             command=self.send_strategy_status_test_email,
         ).grid(row=0, column=1, padx=(0, 8))
-        ttk.Button(footer, text="关闭", command=self._close_settings_window).grid(row=0, column=2)
+        ttk.Button(footer, text="网络代理设置", command=self.open_network_proxy_settings_window).grid(row=0, column=2, padx=(0, 8))
+        ttk.Button(footer, text="关闭", command=self._close_settings_window).grid(row=0, column=3)
+
+    def open_network_proxy_settings_window(self) -> None:
+        window = Toplevel(self._settings_window or self.root)
+        window.title("网络代理设置")
+        window.transient(self._settings_window or self.root)
+        container = ttk.Frame(window, padding=20)
+        container.pack(fill="both", expand=True)
+        container.columnconfigure(1, weight=1)
+        mode = StringVar(window, value="跟随系统代理")
+        url = StringVar(window)
+        loaded = None
+        error = ""
+        try:
+            loaded = load_network_proxy_settings()
+            mode.set(next(label for label, value in PROXY_MODE_OPTIONS.items() if value == loaded.mode))
+            url.set(loaded.url)
+        except (OSError, ValueError):
+            error = "网络代理设置读取失败，请重新保存。\n"
+        ttk.Label(container, text="代理模式").grid(row=0, column=0, sticky="w", padx=(0, 12))
+        combo = ttk.Combobox(container, textvariable=mode, values=list(PROXY_MODE_OPTIONS), state="readonly", width=30)
+        combo.grid(row=0, column=1, sticky="ew")
+        ttk.Label(container, text="HTTP 代理地址").grid(row=1, column=0, sticky="w", padx=(0, 12), pady=(12, 0))
+        entry = ttk.Entry(container, textvariable=url, width=54)
+        entry.grid(row=1, column=1, sticky="ew", pady=(12, 0))
+        def update_state(event=None):
+            entry.configure(state="normal" if PROXY_MODE_OPTIONS[mode.get()] == "custom" else "disabled")
+        combo.bind("<<ComboboxSelected>>", update_state)
+        update_state()
+        ttk.Label(container, text="例如 http://127.0.0.1:10808").grid(row=2, column=1, sticky="w", pady=(6, 0))
+        ttk.Label(container, text=error + PROXY_RESTART_NOTE, wraplength=540).grid(
+            row=3, column=0, columnspan=2, sticky="w", pady=(14, 0),
+        )
+        def save_proxy():
+            nonlocal loaded
+            try:
+                settings = validate_network_proxy_settings(PROXY_MODE_OPTIONS[mode.get()], url.get())
+                if loaded is not None and load_network_proxy_settings() not in (loaded, settings):
+                    raise ValueError("代理设置已被另一窗口修改，请重新打开设置。")
+                loaded = save_network_proxy_settings(settings.mode, settings.url)
+            except Exception as exc:
+                messagebox.showerror("代理设置保存失败", str(exc), parent=window)
+                return
+            messagebox.showinfo("代理设置已保存", PROXY_RESTART_NOTE, parent=window)
+        buttons = ttk.Frame(container)
+        buttons.grid(row=4, column=0, columnspan=2, sticky="e", pady=(16, 0))
+        ttk.Button(buttons, text="保存代理设置", command=save_proxy).pack(side="left", padx=(0, 8))
+        ttk.Button(buttons, text="关闭", command=window.destroy).pack(side="left")
 
 
 

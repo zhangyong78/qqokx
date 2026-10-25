@@ -6,6 +6,8 @@ import asyncio
 import inspect
 from typing import Any
 
+from okx_quant.network_proxy import runtime_network_proxy_settings
+
 try:
     import websockets
 except Exception:  # noqa: BLE001
@@ -28,14 +30,18 @@ def connect_okx_websocket(url: str, *, headers: dict[str, str] | None = None, **
     """Create an OKX WebSocket context safely across supported versions."""
     if websockets is None:
         raise RuntimeError("websockets dependency is unavailable")
+    settings = runtime_network_proxy_settings()
+    proxy = True if settings.mode == "system" else (settings.url if settings.mode == "custom" else None)
     if _modern_proxy_supported:
         modern_kwargs = dict(kwargs)
         if headers:
             modern_kwargs["additional_headers"] = headers
         # True makes the library re-read system / environment proxies on each
         # connection attempt, including after the local proxy has restarted.
-        modern_kwargs.setdefault("proxy", True)
+        modern_kwargs["proxy"] = proxy
         return _modern_connect(url, **modern_kwargs)
+    if settings.mode == "custom":
+        raise RuntimeError("自定义 HTTP 代理需要 websockets >= 15，请使用 QQOKX 项目启动脚本。")
     if _legacy_connect is not None:
         legacy_kwargs = dict(kwargs)
         if headers:

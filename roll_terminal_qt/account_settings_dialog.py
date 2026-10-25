@@ -11,6 +11,10 @@ from okx_quant.persistence import (
     load_notification_snapshot, save_credentials_profiles_snapshot,
     save_notification_snapshot, settings_file_path, verify_profile_switch_password,
 )
+from okx_quant.network_proxy import (
+    PROXY_MODE_OPTIONS, PROXY_RESTART_NOTE, load_network_proxy_settings,
+    save_network_proxy_settings, validate_network_proxy_settings,
+)
 from roll_terminal_qt.profile_access import ensure_profile_unlocked
 
 
@@ -102,6 +106,35 @@ class AccountSettingsDialog(QDialog):
         form.addRow("Custom Fee (%)", fee_grid)
         form.addRow(QLabel(f"凭证加密保存：{credentials_file_path()}"))
         layout.addWidget(account)
+
+        network = QGroupBox("网络代理（交易接口与行情）", page)
+        network_form = QFormLayout(network)
+        self.proxy_mode = QComboBox(network)
+        for label, mode in PROXY_MODE_OPTIONS.items():
+            self.proxy_mode.addItem(label, mode)
+        self.proxy_url = QLineEdit(network)
+        self.proxy_url.setPlaceholderText("http://127.0.0.1:10808")
+        self.proxy_mode.currentIndexChanged.connect(
+            lambda: self.proxy_url.setEnabled(self.proxy_mode.currentData() == "custom")
+        )
+        network_form.addRow("代理模式", self.proxy_mode)
+        network_form.addRow("HTTP 代理地址", self.proxy_url)
+        note = QLabel(PROXY_RESTART_NOTE, network)
+        note.setWordWrap(True)
+        network_form.addRow(note)
+        proxy_save = QPushButton("保存代理设置", network)
+        proxy_save.clicked.connect(self._save_proxy)
+        network_form.addRow(proxy_save)
+        layout.addWidget(network)
+        self._loaded_proxy = None
+        try:
+            self._loaded_proxy = load_network_proxy_settings()
+            self._set_combo(self.proxy_mode, self._loaded_proxy.mode)
+            self.proxy_url.setText(self._loaded_proxy.url)
+        except (OSError, ValueError):
+            self._set_combo(self.proxy_mode, "system")
+            note.setText("网络代理设置读取失败，请重新保存。" + PROXY_RESTART_NOTE)
+        self.proxy_url.setEnabled(self.proxy_mode.currentData() == "custom")
 
         mail = QGroupBox("邮件通知设置", page)
         mail_form = QFormLayout(mail)
@@ -316,6 +349,23 @@ class AccountSettingsDialog(QDialog):
             **{key: field.text().strip() for key, field in self.fees.items()},
         }
 
+    def _save_proxy_settings(self) -> None:
+        settings = validate_network_proxy_settings(str(self.proxy_mode.currentData()), self.proxy_url.text())
+        if settings != self._loaded_proxy:
+            if self._loaded_proxy is not None:
+                current = load_network_proxy_settings()
+                if current not in (self._loaded_proxy, settings):
+                    raise ValueError("代理设置已被另一窗口修改，请重新打开设置。")
+            self._loaded_proxy = save_network_proxy_settings(settings.mode, settings.url)
+
+    def _save_proxy(self) -> None:
+        try:
+            self._save_proxy_settings()
+        except Exception as exc:
+            QMessageBox.warning(self, "代理设置保存失败", str(exc))
+            return
+        QMessageBox.information(self, "代理设置已保存", PROXY_RESTART_NOTE)
+
     def _save(self) -> bool:
         name = self._selected_profile
         if not name:
@@ -327,6 +377,7 @@ class AccountSettingsDialog(QDialog):
             QMessageBox.warning(self, "保存失败", "API Key、Secret Key 和 Passphrase 必须同时填写。")
             return False
         try:
+            validate_network_proxy_settings(str(self.proxy_mode.currentData()), self.proxy_url.text())
             for key in self._FEES:
                 if fields[key] and float(fields[key]) < 0:
                     raise ValueError(f"{key} 不能为负数")
@@ -367,6 +418,7 @@ class AccountSettingsDialog(QDialog):
             merged = {**current_mail, **mail_changes, "smtp_port": port}
             save_credentials_profiles_snapshot(selected_profile=str(current.get("selected_profile") or name), profiles=profiles)
             save_notification_snapshot(**merged)
+            self._save_proxy_settings()
             self._profiles = profiles
             self._loaded_profile = dict(profiles[name])
             self._displayed_fields = fields
@@ -374,5 +426,5 @@ class AccountSettingsDialog(QDialog):
         except Exception as exc:
             QMessageBox.warning(self, "保存失败", str(exc))
             return False
-        QMessageBox.information(self, "已保存", f"API 配置 {name} 已保存；新启动的任务会读取新参数。")
+        QMessageBox.information(self, "已保存", f"API 配置 {name} 已保存；新启动的任务会读取新参数。\n代理设置需重启所有 QQOKX 窗口生效。")
         return True
