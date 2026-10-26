@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from time import perf_counter
+import threading
 
 from dataclasses import dataclass, replace
 from decimal import Decimal
@@ -19,6 +20,7 @@ from PySide6.QtWidgets import (
     QTabWidget,
     QTableWidget,
     QTableWidgetItem,
+    QSpinBox,
     QVBoxLayout,
     QWidget,
 )
@@ -26,6 +28,7 @@ from PySide6.QtWidgets import (
 from okx_quant.okx_client import OkxFillHistoryItem, OkxPosition, OkxPositionHistoryItem, OkxTradeOrderItem
 from okx_quant.okx_client import OkxRestClient
 from okx_quant.pricing import format_decimal
+from okx_quant.pending_order_chase import chase_unavailable_reason, get_pending_order_chase_service, order_reference
 from roll_terminal_qt.account_positions_home import (
     POSITION_COLUMNS,
     _break_even_taker_fee_rate,
@@ -398,6 +401,64 @@ class AccountDrawerCancelThread(QThread):
         self.completed.emit(result)
 
 
+class AccountDrawerChaseThread(QThread):
+    updated = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, *, runtime: object, order: object, context: dict[str, object], interval: int,
+                 service=None, client_factory=OkxRestClient) -> None:
+        super().__init__()
+        self.runtime, self.order, self.context = runtime, order, context
+        self.order_id = order_reference(order)
+        self.profile_name = str(getattr(runtime, "credential_profile_name", "") or "")
+        self.environment = str(runtime.environment)
+        self.service = service or get_pending_order_chase_service()
+        self.client_factory = client_factory
+        self.interval = max(1, interval)
+        self.key = ""
+        self.stopping = threading.Event()
+
+    def stop(self) -> None:
+        self.stopping.set()
+        if self.key:
+            try:
+                self.service.stop(self.key)
+            except Exception as exc:
+                self.failed.emit(str(exc))
+
+    def run(self) -> None:
+        client = None
+        try:
+            client = self.client_factory()
+            if self.stopping.is_set():
+                return
+            self.key = self.service.start(client=client, runtime=self.runtime, order=self.order, context=self.context)
+            self.updated.emit(self.service.snapshot(self.key))
+            while not self.stopping.is_set():
+                task = self.service.step(client=client, runtime=self.runtime, key=self.key)
+                self.updated.emit(task)
+                if not task.get("active") or self.stopping.wait(self.interval):
+                    break
+        except Exception as exc:
+            if self.key:
+                try:
+                    self.service.stop(self.key, f"自动追单已暂停：{exc}")
+                except Exception:
+                    pass
+            self.failed.emit(str(exc))
+        finally:
+            if self.key:
+                try:
+                    task = self.service.snapshot(self.key)
+                    if task.get("active"):
+                        self.service.stop(self.key)
+                    self.updated.emit(self.service.snapshot(self.key))
+                except Exception:
+                    pass
+            if client is not None:
+                client.close()
+
+
 class KlineAccountDrawer(QWidget):
     collapseRequested = Signal()
 
@@ -434,6 +495,9 @@ class KlineAccountDrawer(QWidget):
         self._load_thread: AccountDrawerLoadThread | None = None
         self._cancel_thread: AccountDrawerCancelThread | None = None
         self._cancel_in_flight = False
+        self._chase_thread: AccountDrawerChaseThread | None = None
+        self._chase_shutting_down = False
+        self.chase_context_provider = None
         # Current positions are the urgent source of truth.  Defer the shared
         # current-order refresh until the REST position check has completed.
         self._orders_refresh_waiting_for_realtime = False
@@ -504,13 +568,30 @@ class KlineAccountDrawer(QWidget):
         orders_layout.addWidget(self._orders_table, 1)
 
         orders_toolbar = QHBoxLayout()
+        self._chase_button = QPushButton("自动追单")
+        self._chase_button.setEnabled(False)
+        self._chase_button.clicked.connect(self._start_selected_order_chase)
+        orders_toolbar.addWidget(self._chase_button)
+        self._stop_chase_button = QPushButton("停止追单")
+        self._stop_chase_button.setEnabled(False)
+        self._stop_chase_button.clicked.connect(self._stop_order_chase)
+        orders_toolbar.addWidget(self._stop_chase_button)
+        orders_toolbar.addWidget(QLabel("间隔（秒）"))
+        self._chase_interval = QSpinBox()
+        self._chase_interval.setRange(1, 60)
+        self._chase_interval.setValue(2)
+        orders_toolbar.addWidget(self._chase_interval)
         self._cancel_button = QPushButton("撤单")
         self._cancel_button.setEnabled(False)
         self._cancel_button.clicked.connect(self._cancel_selected_order)
         orders_toolbar.addStretch(1)
         orders_toolbar.addWidget(self._cancel_button, 0)
         orders_layout.addLayout(orders_toolbar)
+        self._chase_status_label = QLabel("选中普通限价委托后可追单：买单跟买一、卖单跟卖一；开仓按止损和原风险预算调数量，平仓只改价格。")
+        self._chase_status_label.setWordWrap(True)
+        orders_layout.addWidget(self._chase_status_label)
         self._tabs.addTab(orders_tab, "当前委托")
+        self._tabs.currentChanged.connect(self._sync_chase_button_state)
 
         self._positions_table = self._create_table(
             ["合约 / 分组", *[heading for _column_id, heading, _width, _alignment in POSITION_COLUMNS]],
@@ -667,6 +748,11 @@ class KlineAccountDrawer(QWidget):
         self._start_load(self._request_generation)
 
     def shutdown(self, wait_ms: int = 1500) -> bool:
+        self._chase_shutting_down = True
+        if self._chase_thread is not None and self._chase_thread.isRunning():
+            self._chase_thread.stop()
+            if not self._chase_thread.wait(wait_ms):
+                return False
         history_threads = [
             thread
             for thread in (self._fill_history_thread, self._position_history_thread, *self._retired_history_threads)
@@ -761,6 +847,8 @@ class KlineAccountDrawer(QWidget):
             self._ensure_position_history_loaded()
 
     def _populate_orders_table(self, orders: list[object]) -> None:
+        previous = self._selected_order()
+        previous_id = order_reference(previous) if previous is not None else ""
         self._visible_orders = list(orders)
         self._orders_table.setRowCount(len(orders))
         instruments = dict(self._snapshot.position_instruments or {})
@@ -768,7 +856,11 @@ class KlineAccountDrawer(QWidget):
             values = _order_table_values(order, instruments)
             for column, value in enumerate(values):
                 item = QTableWidgetItem(self._format_value(value))
+                if self._chase_thread is not None and self._chase_thread.isRunning() and order_reference(order) == self._chase_thread.order_id:
+                    item.setBackground(QColor("#fff4cc"))
                 self._orders_table.setItem(row, column, item)
+            if previous_id and order_reference(order) == previous_id:
+                self._orders_table.selectRow(row)
         pending_ids: set[str] = set()
         for order in orders:
             raw = getattr(order, "raw", {})
@@ -1007,6 +1099,75 @@ class KlineAccountDrawer(QWidget):
             and bool(order_cancel_reference(self._selected_order()))
         )
         self._cancel_button.setEnabled(enabled)
+        self._sync_chase_button_state()
+
+    def _sync_chase_button_state(self, *_args: object) -> None:
+        if not hasattr(self, "_chase_button"):
+            return
+        busy = self._chase_thread is not None and self._chase_thread.isRunning()
+        order = self._selected_order()
+        reason = chase_unavailable_reason(order) if order is not None else "请先选中一条普通限价委托"
+        self._chase_button.setEnabled(self._runtime is not None and not self._chase_shutting_down and not busy and not self._cancel_in_flight
+                                      and self._tabs.currentIndex() == 0 and not reason)
+        self._chase_button.setToolTip(reason or "买单跟买一、卖单跟卖一；不更改止盈止损触发价")
+        self._stop_chase_button.setEnabled(busy)
+        self._chase_interval.setEnabled(not busy)
+
+    def blocks_order_reconcile(self, order_id: str, profile: str, environment: str) -> bool:
+        worker = self._chase_thread
+        return bool(worker is not None and worker.isRunning() and not worker.key and worker.order_id == order_id
+                    and worker.profile_name == profile and worker.environment == environment)
+
+    def _start_selected_order_chase(self) -> None:
+        order = self._selected_order()
+        if self._chase_shutting_down or self._runtime is None or order is None or (self._chase_thread and self._chase_thread.isRunning()):
+            return
+        try:
+            reason = chase_unavailable_reason(order)
+            if reason:
+                raise ValueError(reason)
+            context = self.chase_context_provider(order) if callable(self.chase_context_provider) else {}
+            thread = AccountDrawerChaseThread(runtime=self._runtime, order=order, context=context,
+                                              interval=self._chase_interval.value())
+        except Exception as exc:
+            self._chase_status_label.setText(str(exc))
+            return
+        self._chase_thread = thread
+        thread.updated.connect(self._apply_chase_update)
+        thread.failed.connect(lambda message, worker=thread: self._apply_chase_failure(worker, message))
+        thread.finished.connect(lambda finished=thread: self._clear_chase_thread(finished))
+        self._chase_status_label.setText("正在核对原订单、账户和开平仓性质…")
+        thread.start()
+        self._sync_chase_button_state()
+
+    def _apply_chase_failure(self, worker: AccountDrawerChaseThread, message: str) -> None:
+        if worker.profile_name == self._profile_name and worker.environment == self._environment:
+            self._chase_status_label.setText(f"追单已暂停：{message}")
+
+    def _apply_chase_update(self, task: object) -> None:
+        if not isinstance(task, dict) or task.get("environment") != self._environment:
+            return
+        if task.get("profile_name") and task.get("profile_name") != self._profile_name:
+            return
+        mode = "开仓" if task.get("mode") == "open" else "平仓"
+        budget = f" | 风险预算 {task['budget']} U | 止损 {task['stop']}" if task.get("mode") == "open" else " | 只改价格，数量不变"
+        self._chase_status_label.setText(f"{task.get('inst_id', '')} {mode}：{task.get('message', '')}{budget}")
+        self._sync_chase_button_state()
+        self._schedule_active_table_refresh()
+
+    def _stop_order_chase(self) -> None:
+        if self._chase_thread is not None:
+            self._chase_status_label.setText("正在停止追单；等待在途请求核实，交易所委托保留。")
+            self._chase_thread.stop()
+
+    def _clear_chase_thread(self, thread: AccountDrawerChaseThread) -> None:
+        if self._chase_thread is thread:
+            self._chase_thread = None
+        thread.deleteLater()
+        self._sync_chase_button_state()
+        self._schedule_active_table_refresh()
+        if self._runtime is not None and not self._chase_shutting_down:
+            self._shared_order_store.request_refresh(runtime=self._runtime, profile_name=self._profile_name)
 
     def _cancel_selected_order(self) -> None:
         if self._runtime is None or self._cancel_in_flight:
@@ -1031,6 +1192,8 @@ class KlineAccountDrawer(QWidget):
         )
         if answer != QMessageBox.StandardButton.Yes:
             return
+        if self._chase_thread is not None and order_reference(order) == self._chase_thread.order_id:
+            self._chase_thread.stop()
         self._cancel_in_flight = True
         self._cancel_button.setEnabled(False)
         self._status_label.setText("撤单中...")
@@ -1068,6 +1231,8 @@ def _shared_set_context(
     refresh_if_visible: bool = True,
 ) -> None:
     normalized_symbol = symbol.strip().upper()
+    if self._chase_thread is not None and (runtime is not self._runtime or profile_name != self._profile_name or environment != self._environment):
+        self._chase_thread.stop()
     changed = (
         runtime is not self._runtime
         or profile_name != self._profile_name

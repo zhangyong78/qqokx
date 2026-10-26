@@ -24,14 +24,15 @@ from okx_quant.area_shape_execution import (
 )
 from okx_quant.area_shape_execution_store import load_area_shape_execution_records, save_area_shape_execution_records
 from okx_quant.area_shape_trade import (
-    AREA_DYNAMIC_TAKE_PROFIT_R, AreaShapePlan, area_shape_lock_profit_r,
-    area_shape_net_progress_r, calculate_initial_stop,
+    AREA_DYNAMIC_TAKE_PROFIT_R, AREA_MIN_ENTRY_SPACE_R, AreaShapePlan, area_shape_lock_profit_r,
+    area_shape_net_progress_r, area_shape_target_space_r, calculate_initial_stop,
 )
 from okx_quant.engine import StrategyEngine
 from okx_quant.indicators import atr
 from okx_quant.models import StrategyConfig
 from okx_quant.okx_client import OkxRestClient
 from okx_quant.pricing import snap_to_increment
+from okx_quant.pending_order_chase import get_pending_order_chase_service
 
 
 _ACTIVE = {"arming", "armed", "signal_pending", "entry_intent", "position_unprotected", "tp_pending", "protected", "closing_pending", "manual_control"}
@@ -242,7 +243,11 @@ class AreaShapeDemoExecutionMonitor(QObject):
         has_position = isinstance(session.get("position"), dict)
         baseline = 0
         baseline_candles: list[Any] = []
+        resting_intent = None
+        entry_epoch_ns = time.time_ns()
         if not has_position:
+            plan = AreaShapePlan.from_dict(session["plan_snapshot"])
+            _validate_new_entry_stop(plan)
             expires = int(session.get("expires_at_candle_ts") or 0)
             if expires > 0 and int(time.time() * 1000) >= expires + 3_600_000:
                 self._finish_entry_cancel(session_id, "expire")
@@ -256,6 +261,11 @@ class AreaShapeDemoExecutionMonitor(QObject):
                     created_client.close()
                 raise RuntimeError("恢复新入场监控需要最新已收盘1H基线")
             baseline = max(int(item.ts) for item in baseline_candles)
+            if plan.config.entry_trigger_mode == "direct_touch":
+                candidate = {**session, "baseline_candle_ts": baseline, "entry_epoch_ns": entry_epoch_ns}
+                resting_intent, reason = self._prepare_resting_entry(candidate, plan, baseline_candles)
+                if resting_intent is None:
+                    raise RuntimeError(reason or "固定止损入场单未能准备；保持暂停")
         with self._lock:
             if self._stop.is_set() or self._sessions[session_id].get("status") != session.get("status"):
                 if created_client is not None:
@@ -272,12 +282,8 @@ class AreaShapeDemoExecutionMonitor(QObject):
                 current["status"] = "armed"
                 current["signal_cursor_ts"] = baseline
                 current["baseline_candle_ts"] = baseline
-                plan = AreaShapePlan.from_dict(current["plan_snapshot"])
-                if plan.config.entry_trigger_mode == "direct_touch":
-                    current["resting_entry_intent"], reason = self._prepare_resting_entry(current, plan, baseline_candles)
-                    if reason:
-                        current.setdefault("events", []).append({"kind": "resting_entry_skipped", "ts": int(time.time() * 1000),
-                                                                  "message": reason})
+                current["entry_epoch_ns"] = entry_epoch_ns
+                current["resting_entry_intent"] = resting_intent
             current.setdefault("events", []).append({"kind": "resumed", "ts": int(time.time() * 1000),
                                                        "message": "人工恢复；持仓继续保护管理，新入场从当前已收盘K线之后开始"})
             self._persist_locked()
@@ -328,6 +334,11 @@ class AreaShapeDemoExecutionMonitor(QObject):
                 self._arm_workers.discard(threading.current_thread())
 
     def arm_plan(self, *, plan: AreaShapePlan, runtime: Any, unlocked: bool, paper_monitor: Any, environment: str | None = None) -> dict[str, Any]:
+        _validate_new_entry_stop(plan)
+        if plan.config.entry_trigger_mode == "pattern":
+            plan.config.entry_mode = "next_open"
+            plan.config.entry_offset_atr = Decimal("0")
+        plan.config.min_space_r = max(plan.config.min_space_r, AREA_MIN_ENTRY_SPACE_R)
         if str(getattr(runtime, "environment", "")).lower() == "live" and str(environment or "").lower() != "live":
             raise PermissionError("live执行必须显式传入 environment='live'")
         environment = str(environment or getattr(runtime, "environment", "")).lower()
@@ -456,15 +467,15 @@ class AreaShapeDemoExecutionMonitor(QObject):
             return None, "形态模式等待触线与形态确认；不预挂入场线GTC"
         if plan.config.entry_mode != "next_open":
             return None, "直接价格触发模式不支持此入场方式"
-        needs_atr = (plan.config.stop_basis != "fixed_distance" and plan.config.stop_offset_atr > 0) or plan.config.target_buffer_atr > 0
+        if plan.config.stop_basis not in {"fixed_price", "fixed_distance"}:
+            return None, "价格触发需要先确认固定止损价格或固定价差；不再使用ATR止损"
+        needs_atr = plan.config.target_buffer_atr > 0
         current_atr = Decimal("0")
         if needs_atr:
             values = atr(candles, plan.config.atr_period)
             current_atr = values[-1] if values else None
             if current_atr is None or current_atr <= 0:
                 return None, "最新已收盘1H ATR不可用；无法计算入场保护止损或目标缓冲"
-        if plan.config.stop_basis != "fixed_distance" and plan.config.stop_offset_atr <= 0:
-            return None, "止损ATR偏移必须大于0才能计算入场保护止损"
         instrument = session["instrument"]
         tick = Decimal(str(instrument["tick_size"]))
         side = "buy" if plan.config.direction == "long" else "sell"
@@ -472,8 +483,6 @@ class AreaShapeDemoExecutionMonitor(QObject):
         entry = snap_to_increment(raw_entry, tick, "down" if side == "buy" else "up")
         if not candles:
             return None, "缺少已收盘K线，无法计算入场保护止损"
-        if plan.config.stop_basis == "three_candle" and len(candles) < 3:
-            return None, "最近三根已收盘K线不足；无法计算入场保护止损"
         raw_stop = calculate_initial_stop(
             plan.config, plan.config.direction, entry_reference=entry,
             signal_candle=candles[-1], recent_candles=candles[-3:], atr_value=current_atr,
@@ -483,11 +492,15 @@ class AreaShapeDemoExecutionMonitor(QObject):
             return None, "GTC线价/ATR止损关系无效；本次未挂GTC"
         target = plan.pressure_price if side == "buy" else plan.support_price
         target_buffer = current_atr * plan.config.target_buffer_atr
-        total_cost = Decimal(session["fee_rate"]) + Decimal(session["slippage_rate"])
-        available = (target - entry - target_buffer) if side == "buy" else (entry - target - target_buffer)
-        space_after_cost = available - (entry + target) * total_cost
-        if space_after_cost / abs(entry - stop) < plan.config.min_space_r:
-            return None, f"GTC线价估算空间不足最低{plan.config.min_space_r}R；本次未挂GTC"
+        space_r = area_shape_target_space_r(
+            entry=entry, stop=stop, target=target, direction=plan.config.direction,
+            cost_rate=Decimal(session["fee_rate"]) + Decimal(session["slippage_rate"]),
+            target_buffer=target_buffer,
+        )
+        minimum_space_r = max(plan.config.min_space_r, AREA_MIN_ENTRY_SPACE_R,
+                              plan.config.fixed_tp_r if plan.config.exit_template == "fixed_1r" else Decimal(0))
+        if space_r < minimum_space_r:
+            return None, f"GTC线价估算空间不足最低{minimum_space_r}R；本次未挂GTC"
         multiplier = Decimal(str(instrument["ct_val"])) * Decimal(str(instrument["ct_mult"]))
         try:
             size, _ = size_usdt_linear_contracts(
@@ -498,7 +511,8 @@ class AreaShapeDemoExecutionMonitor(QObject):
             )
         except ValueError as exc:
             return None, f"GTC风险定仓不可用（{exc}）；本次未挂GTC"
-        signal_key = f"resting:{session['baseline_candle_ts']}:{session.get('last_signal_key') or 'initial'}"
+        signal_key = (f"resting:{session.get('session_id', session['plan_id'])}:"
+                      f"{session.get('entry_epoch_ns', 0)}:{session['baseline_candle_ts']}")
         stop_algo_cl_ord_id = new_execution_client_order_id(session["plan_id"], signal_key, "stop")
         try:
             take_profit_price = price_for_net_r(
@@ -509,6 +523,9 @@ class AreaShapeDemoExecutionMonitor(QObject):
             )
         except ValueError as exc:
             return None, f"止盈保护价不可用；本次未挂GTC：{exc}"
+        if plan.config.exit_template == "fixed_1r" and (
+                take_profit_price > target - target_buffer if side == "buy" else take_profit_price < target + target_buffer):
+            return None, "固定止盈报价取整后超过对侧可用空间；本次未挂GTC"
         take_profit_algo_cl_ord_id = stop_algo_cl_ord_id
         return ({
             "entry_kind": "gtc", "signal_key": signal_key,
@@ -556,6 +573,20 @@ class AreaShapeDemoExecutionMonitor(QObject):
             pass
         self._reconcile_resting_entry(session_id, force_cancel=False)
 
+    def _adopt_authorized_entry_amendment(self, session: dict[str, Any], intent: dict[str, Any], status: Any, runtime: Any) -> None:
+        task = get_pending_order_chase_service().authorized_update(
+            runtime=runtime, inst_id=session["symbol"], status=status,
+            old_price=intent["price"], old_size=intent["size"], stop=intent["stop"],
+            account_uid=str(session.get("account_uid") or ""),
+        )
+        if task is None or task.get("owner") != "area" or (Decimal(intent["price"]) == status.price and Decimal(intent["size"]) == status.size):
+            return
+        with self._lock:
+            intent.update(price=str(status.price), size=str(status.size))
+            session.setdefault("events", []).append({"kind": "entry_chase_adopted", "ts": int(time.time()*1000),
+                "message": "已核对当前委托自动追单的原订单改单，沿用原止损和仓位保护", "price": str(status.price), "size": str(status.size)})
+            self._persist_locked()
+
     def _reconcile_resting_entry(
         self, session_id: str, *, force_cancel: bool = False, cancel_mode: str = "",
     ) -> str:
@@ -570,6 +601,7 @@ class AreaShapeDemoExecutionMonitor(QObject):
         except Exception as exc:
             self._set_status(session_id, "manual_review", f"GTC原订单回查未确认；禁止提交第二种入场：{exc}")
             return "error"
+        self._adopt_authorized_entry_amendment(session, intent, status, runtime)
         raw = status.raw if isinstance(status.raw, dict) else {}
         if (str(raw.get("instId") or "").upper() != str(session["symbol"]).upper()
                 or str(raw.get("clOrdId") or "") != str(intent["cl_ord_id"])
@@ -594,6 +626,7 @@ class AreaShapeDemoExecutionMonitor(QObject):
                     return "filled"
                 self._set_status(session_id, "manual_review", f"GTC撤单后成交/终态未确认；停止FOK并需人工核对：{exc}")
                 return "error"
+            self._adopt_authorized_entry_amendment(session, intent, status, runtime)
             raw = status.raw if isinstance(status.raw, dict) else {}
             if (str(raw.get("instId") or "").upper() != str(session["symbol"]).upper()
                     or str(raw.get("clOrdId") or "") != str(intent["cl_ord_id"])
@@ -756,6 +789,7 @@ class AreaShapeDemoExecutionMonitor(QObject):
                 config = _strategy_config(session, runtime)
                 resting_status = client.get_order(runtime.credentials, config, inst_id=session["symbol"],
                                                  cl_ord_id=resting["cl_ord_id"])
+                self._adopt_authorized_entry_amendment(session, resting, resting_status, runtime)
                 if not _verified_entry_fill_order(resting_status, session, resting, order_type="limit"):
                     raise RuntimeError("原GTC身份或冻结参数不符；保持只读")
                 state = str(resting_status.state or "").lower()
@@ -764,6 +798,7 @@ class AreaShapeDemoExecutionMonitor(QObject):
                                         cl_ord_id=resting["cl_ord_id"])
                     resting_status = client.get_order(runtime.credentials, config, inst_id=session["symbol"],
                                                      cl_ord_id=resting["cl_ord_id"])
+                    self._adopt_authorized_entry_amendment(session, resting, resting_status, runtime)
                     state = str(resting_status.state or "").lower()
                 if not _verified_entry_fill_order(resting_status, session, resting, order_type="limit"):
                     raise RuntimeError("撤单后原GTC身份或冻结参数不符；保持只读")
@@ -787,6 +822,8 @@ class AreaShapeDemoExecutionMonitor(QObject):
                     expected_ord_type = "limit" if str(intent.get("entry_kind")) == "gtc" else "fok"
                     intent_status = client.get_order(runtime.credentials, config, inst_id=session["symbol"],
                                                      cl_ord_id=intent["cl_ord_id"])
+                    if expected_ord_type == "limit":
+                        self._adopt_authorized_entry_amendment(session, intent, intent_status, runtime)
                     if not _verified_entry_fill_order(intent_status, session, intent, order_type=expected_ord_type):
                         raise RuntimeError("原入场订单身份或冻结参数不符；保持只读")
                     entry_state = str(intent_status.state or "").lower()
@@ -795,6 +832,8 @@ class AreaShapeDemoExecutionMonitor(QObject):
                                             cl_ord_id=intent["cl_ord_id"])
                         intent_status = client.get_order(runtime.credentials, config, inst_id=session["symbol"],
                                                          cl_ord_id=intent["cl_ord_id"])
+                        if expected_ord_type == "limit":
+                            self._adopt_authorized_entry_amendment(session, intent, intent_status, runtime)
                         entry_state = str(intent_status.state or "").lower()
                     if entry_state not in {"filled", "canceled", "partially_canceled"}:
                         raise RuntimeError("原FOK订单终态未核实；保持只读且不重发")
@@ -1049,10 +1088,11 @@ class AreaShapeDemoExecutionMonitor(QObject):
                     session["signal_pending"] = None
                     plan = AreaShapePlan.from_dict(session["plan_snapshot"])
                     if plan.config.entry_trigger_mode == "direct_touch":
+                        _validate_new_entry_stop(plan)
+                        session["entry_epoch_ns"] = time.time_ns()
                         session["resting_entry_intent"], reason = self._prepare_resting_entry(session, plan, candles)
-                        if reason:
-                            session.setdefault("events", []).append({"kind": "resting_entry_skipped", "ts": int(time.time() * 1000),
-                                                                      "message": reason})
+                        if session["resting_entry_intent"] is None:
+                            raise RuntimeError(reason or "恢复入场委托未能准备；保持只读")
                     new_status = "armed"
         except Exception:
             try:
@@ -1161,6 +1201,8 @@ class AreaShapeDemoExecutionMonitor(QObject):
                 if result in {"filled", "error"} or self._sessions[session_id].get("status") != "armed":
                     return
             self._check_new_signals(session_id)
+            if self._sessions[session_id].get("status") == "signal_pending":
+                self._try_live_entry(session_id)
         elif status == "signal_pending":
             self._try_live_entry(session_id)
         elif status == "entry_intent":
@@ -1284,8 +1326,8 @@ class AreaShapeDemoExecutionMonitor(QObject):
         candles = sorted((item for item in client.get_candles_history(session["symbol"], "1H", limit=240) if item.confirmed), key=lambda item: item.ts)
         cursor = int(session.get("signal_cursor_ts", 0))
         if snapshot.config.entry_trigger_mode == "direct_touch":
-            # Direct-touch plans use the exchange-hosted GTC order submitted
-            # at arm time. Do not create a second local FOK entry.
+            # Manual-stop price plans use their exchange-hosted line GTC;
+            # never submit another entry from the local pattern scanner.
             return
         if not candles or candles[-1].ts <= cursor:
             return
@@ -1355,20 +1397,7 @@ class AreaShapeDemoExecutionMonitor(QObject):
         if int(session.get("signal_cursor_ts", 0)) < signal_ts:
             self._set_status(session_id, "manual_review", "信号游标落后于信号K线；停止执行")
             return
-        entry_kind = "fok" if plan.config.entry_mode == "next_open" else "trigger"
-        if entry_kind == "trigger" and now_ms > signal_ts + 2 * 3_600_000:
-            self._consume_signal(session_id, "形态突破等待超过默认60分钟；已放弃该信号")
-            return
-        trigger = Decimal(str(signal.get("entry_trigger") or "0"))
-        if entry_kind == "trigger":
-            current_price = client.get_trigger_price(session["symbol"], "last", environment=_session_environment(session), max_cached_age_seconds=5)
-            if trigger <= 0:
-                self._consume_signal(session_id, "形态信号缺少有效突破触发价；跳过")
-                return
-            crossed = current_price >= trigger if plan.config.direction == "long" else current_price <= trigger
-            if crossed:
-                self._consume_signal(session_id, "价格已越过条件单触发位；不追价")
-                return
+        entry_kind = "fok"
         instrument = client.get_area_shape_instrument(session["symbol"])
         tick, lot, minimum, multiplier = validate_usdt_linear_swap(instrument, session["symbol"])
         book = client.get_order_book(session["symbol"], depth=1)
@@ -1384,45 +1413,31 @@ class AreaShapeDemoExecutionMonitor(QObject):
         side = "buy" if plan.config.direction == "long" else "sell"
         if side == "buy":
             reference_quote = book.asks[0][0]
-            if entry_kind == "trigger":
-                if reference_quote >= trigger:
-                    self._consume_signal(session_id, "ask已触及条件单触发区；不追价挂单")
-                    return
-                limit = trigger * (Decimal("1") + Decimal(session["slippage_rate"]))
-            else:
-                # FOK follows the local line+pattern confirmation immediately;
-                # the best ask plus configured slippage is a strict price cap.
-                limit = reference_quote * (Decimal("1") + Decimal(session["slippage_rate"]))
+            # FOK follows the local line+pattern confirmation immediately;
+            # the best ask plus configured slippage is a strict price cap.
+            limit = reference_quote * (Decimal("1") + Decimal(session["slippage_rate"]))
         else:
             reference_quote = book.bids[0][0]
-            if entry_kind == "trigger":
-                if reference_quote <= trigger:
-                    self._consume_signal(session_id, "bid已触及条件单触发区；不追价挂单")
-                    return
-                limit = trigger * (Decimal("1") - Decimal(session["slippage_rate"]))
-            else:
-                limit = reference_quote * (Decimal("1") - Decimal(session["slippage_rate"]))
+            limit = reference_quote * (Decimal("1") - Decimal(session["slippage_rate"]))
         stop = Decimal(str(signal["stop"]))
         limit = snap_to_increment(limit, tick, "down" if side == "buy" else "up")
-        normalized_stop = snap_to_increment(stop, tick, "nearest")
-        if normalized_stop != stop:
-            self._consume_signal(session_id, "冻结初始止损价不符合tickSz；拒绝扩大风险后下单")
-            return
-        if (entry_kind == "trigger" and
-                ((side == "buy" and not stop < trigger <= limit) or (side == "sell" and not limit <= trigger < stop))):
-            self._consume_signal(session_id, "触发价/限价/冻结止损关系不安全；跳过该信号")
-            return
-        if (entry_kind == "fok" and ((side == "buy" and stop >= limit) or (side == "sell" and stop <= limit))):
+        # Round toward the entry, then size/check R using the exact stop that
+        # will be sent. ATR-derived prices rarely land on an exchange tick.
+        stop = snap_to_increment(stop, tick, "up" if side == "buy" else "down")
+        if (side == "buy" and stop >= limit) or (side == "sell" and stop <= limit):
             self._consume_signal(session_id, "当前盘口价格与冻结初始止损关系不安全；拒绝提交FOK")
             return
-        costs = Decimal(session["fee_rate"]) + Decimal(session["slippage_rate"])
-        risk_per_contract = abs(limit - stop) * multiplier + (limit + stop) * multiplier * costs
         target = plan.pressure_price if plan.config.direction == "long" else plan.support_price
         buffer = Decimal(str(signal.get("target_buffer_atr") or "0"))
-        available = (target - limit - buffer) if plan.config.direction == "long" else (limit - target - buffer)
-        space_after_cost = available - (limit + target) * costs
-        if space_after_cost / abs(limit - stop) < plan.config.min_space_r:
-            self._consume_signal(session_id, "实时last/盘口计算后可用空间不足最低R门槛；未下单")
+        space_r = area_shape_target_space_r(
+            entry=limit, stop=stop, target=target, direction=plan.config.direction,
+            cost_rate=Decimal(session["fee_rate"]) + Decimal(session["slippage_rate"]),
+            target_buffer=buffer,
+        )
+        minimum_space_r = max(plan.config.min_space_r, AREA_MIN_ENTRY_SPACE_R,
+                              plan.config.fixed_tp_r if plan.config.exit_template == "fixed_1r" else Decimal(0))
+        if space_r < minimum_space_r:
+            self._consume_signal(session_id, f"按可成交限价和止损计算的净盈亏比不足{minimum_space_r}R；未下单")
             return
         size, _ = size_usdt_linear_contracts(
             risk_amount=plan.config.risk_amount, entry=limit, stop=stop,
@@ -1435,9 +1450,6 @@ class AreaShapeDemoExecutionMonitor(QObject):
             side=side, size=size, price=limit, stop=stop,
         )
         intent["entry_kind"] = entry_kind
-        if entry_kind == "trigger":
-            intent["trigger_px"] = str(snap_to_increment(trigger, tick, "up" if side == "buy" else "down"))
-            intent["trigger_expires_at_ms"] = signal_ts + 2 * 3_600_000
         intent["stop_algo_cl_ord_id"] = new_execution_client_order_id(session["plan_id"], str(signal["signal_key"]), "stop")
         try:
             frozen_tp = price_for_net_r(
@@ -1448,6 +1460,10 @@ class AreaShapeDemoExecutionMonitor(QObject):
             )
         except ValueError as exc:
             self._consume_signal(session_id, f"附带止盈保护价无效；未提交入场：{exc}")
+            return
+        if plan.config.exit_template == "fixed_1r" and (
+                frozen_tp > target - buffer if side == "buy" else frozen_tp < target + buffer):
+            self._consume_signal(session_id, "固定止盈报价取整后超过对侧可用空间；未下单")
             return
         intent.update({"take_profit_price": str(frozen_tp),
                        "take_profit_algo_cl_ord_id": intent["stop_algo_cl_ord_id"],
@@ -2234,6 +2250,7 @@ class AreaShapeDemoExecutionMonitor(QObject):
             session = self._sessions[session_id]
             session["status"] = "armed"
             session["pending_intent"] = None
+            session["signal_pending"] = None
             session.setdefault("events", []).append({"kind": "signal_skipped", "ts": int(time.time() * 1000), "message": message})
             self._persist_locked()
         self.session_updated.emit(copy.deepcopy(session))
@@ -2364,6 +2381,15 @@ def _session_environment(session: dict[str, Any]) -> str:
     if str(session.get("mode") or f"{environment}_exchange") != f"{environment}_exchange":
         raise PermissionError("session mode与环境不一致；拒绝REST请求")
     return environment
+
+
+def _validate_new_entry_stop(plan: AreaShapePlan) -> None:
+    """Validate fresh entries without changing frozen rules for existing positions."""
+    plan.config.validate()
+    if plan.config.stop_basis == "entry_line_atr":
+        raise ValueError("入场线外ATR止损已停用；请先编辑计划并确认止损基准")
+    if plan.config.entry_trigger_mode == "direct_touch" and plan.config.stop_basis not in {"fixed_price", "fixed_distance"}:
+        raise ValueError("价格触发仅使用手工固定止损价格或固定价差；请先编辑止损参数")
 
 
 def _session_position_mode(session: dict[str, Any], runtime: Any) -> str:

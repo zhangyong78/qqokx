@@ -3717,6 +3717,8 @@ class OkxRestClient:
         ord_id: str | None = None,
         cl_ord_id: str | None = None,
         req_id: str | None = None,
+        new_price: Decimal | None = None,
+        new_size: Decimal | None = None,
         new_take_profit_trigger_price: Decimal | None = None,
         new_take_profit_order_price: Decimal | None = None,
         new_take_profit_trigger_price_type: str | None = None,
@@ -3724,11 +3726,14 @@ class OkxRestClient:
         new_stop_loss_order_price: Decimal | None = None,
         new_stop_loss_trigger_price_type: str | None = None,
     ) -> OkxOrderResult:
-        """Amend TP/SL attached to a regular pending order (including OCO)."""
+        """Amend a regular order's price/total size or its existing TP/SL."""
         if not ord_id and not cl_ord_id:
             raise ValueError("ord_id 和 cl_ord_id 至少需要提供一个")
-        if new_take_profit_trigger_price is None and new_stop_loss_trigger_price is None:
-            raise ValueError("至少需要提供新的止盈或止损触发价")
+        if all(value is None for value in (new_price, new_size, new_take_profit_trigger_price, new_stop_loss_trigger_price)):
+            raise ValueError("至少需要提供新的委托价格、总数量或止盈止损触发价")
+        for value in (new_price, new_size):
+            if value is not None and (not value.is_finite() or value <= 0):
+                raise ValueError("委托价格和总数量必须为有限正数")
 
         body: dict[str, Any] = {"instId": inst_id}
         if ord_id:
@@ -3737,6 +3742,10 @@ class OkxRestClient:
             body["clOrdId"] = cl_ord_id
         if req_id:
             body["reqId"] = req_id
+        if new_price is not None:
+            body["newPx"] = format_decimal(new_price)
+        if new_size is not None:
+            body["newSz"] = format_decimal(new_size)
         if new_take_profit_trigger_price is not None:
             body["newTpTriggerPx"] = format_decimal(new_take_profit_trigger_price)
             body["newTpOrdPx"] = (

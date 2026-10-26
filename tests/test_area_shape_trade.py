@@ -1,17 +1,96 @@
 from __future__ import annotations
 
 from decimal import Decimal
+from unittest.mock import patch
 
 import pytest
 
 from okx_quant.area_shape_trade import (
     AreaShapeConfig, AreaShapePlan, area_shape_lock_profit_r, area_shape_net_progress_r,
     area_shape_price_for_net_r, calculate_initial_stop,
+    area_shape_target_space_r,
 )
 from okx_quant.models import Candle
 
 
 HOUR = 3_600_000
+
+
+@pytest.mark.parametrize("direction", ["long", "short"])
+@pytest.mark.parametrize("stop_basis", ["pattern_candles", "signal_candle"])
+@pytest.mark.parametrize("long_pattern,short_pattern,count,touch", [
+    (long_pattern, short_pattern, count, touch)
+    for long_pattern, short_pattern, count in (
+        ("long_lower_shadow", "long_upper_shadow", 1),
+        ("double_reversal_up", "double_reversal_down", 2),
+        ("bottom_fractal", "top_fractal", 3),
+    )
+    for touch in range(-1, count)
+])
+def test_only_current_pattern_constituents_can_supply_touch_and_pattern_stop(direction, stop_basis, long_pattern, short_pattern, count, touch):
+    pattern = long_pattern if direction == "long" else short_pattern
+    plan = _plan(AreaShapeConfig(direction=direction, stop_basis=stop_basis,
+        stop_offset_atr=Decimal(0), signal_patterns=(pattern,)))
+    history = [_candle((index + 1) * HOUR, "100", "103", "98", "101") for index in range(6)]
+    start = len(history) - count
+    # A much older extreme may touch the line, but must not validate this shape
+    # or become its stop anchor.
+    history[start - 1] = _candle(start * HOUR, "100", "103", "50", "101")
+    if touch >= 0:
+        history[start + touch] = _candle((start + touch + 1) * HOUR, "100", "103", "94", "101")
+    if direction == "short":
+        history = [Candle(c.ts, 200-c.open, 200-c.low, 200-c.high, 200-c.close, c.volume, c.confirmed) for c in history]
+        plan.support_price, plan.pressure_price = Decimal(80), Decimal(105)
+    markers = {history[-1].ts: [(pattern, direction, 90)]}
+    with patch("okx_quant.area_shape_trade._chart_patterns_by_candle_ts", return_value=markers):
+        event = plan.observe(history)
+    if touch < 0:
+        assert event is None and plan.paper_position is None
+    else:
+        assert event is not None and event["kind"] == "paper_pending"
+        expected = (Decimal(94 if direction == "long" else 106) if stop_basis == "pattern_candles"
+                    else history[-1].low if direction == "long" else history[-1].high)
+        assert Decimal(event["paper_position"]["stop"]) == expected
+
+
+@pytest.mark.parametrize("direction", ["long", "short"])
+def test_manual_absolute_stop_is_independent_of_pre_entry_candle_extremes_and_atr(direction):
+    stop = Decimal(90 if direction == "long" else 110)
+    config = AreaShapeConfig(direction=direction, entry_trigger_mode="direct_touch", stop_basis="fixed_price",
+        fixed_stop_price=stop, atr_period=200)
+    plan = _plan(config)
+    candles = [_candle(2*HOUR, "80", "90", "75", "80")]
+    price = Decimal(94)
+    if direction == "short":
+        plan.support_price, plan.pressure_price = Decimal(80), Decimal(105)
+        candles = [Candle(c.ts, 200-c.open, 200-c.low, 200-c.high, 200-c.close, c.volume, c.confirmed) for c in candles]
+        price = Decimal(106)
+    assert not config.requires_atr()
+    assert AreaShapeConfig.from_dict(config.to_dict()).fixed_stop_price == stop
+    event = plan.observe_direct_touch_price(price, 3*HOUR+1, candles)
+    assert event and event["kind"] == "paper_entry"
+    assert Decimal(plan.paper_position["initial_stop"]) == stop
+    assert plan.status == "paper_position"  # pre-entry extremes cannot stop this new position
+
+
+@pytest.mark.parametrize("direction", ["long", "short"])
+def test_entry_space_and_fixed_target_use_identical_original_r_and_both_side_costs(direction):
+    entry, stop, cost = Decimal(100), Decimal(95 if direction == "long" else 105), Decimal("0.001")
+    target = area_shape_price_for_net_r(entry=entry, initial_stop=stop, direction=direction,
+        target_r=Decimal(2), fee_rate=cost)
+    space = area_shape_target_space_r(entry=entry, stop=stop, target=target, direction=direction, cost_rate=cost)
+    assert abs(space-Decimal(2)) < Decimal("1e-24")
+    assert area_shape_target_space_r(entry=entry, stop=stop, target=target, direction=direction,
+        cost_rate=cost, target_buffer=Decimal(1)) < Decimal(2)
+
+
+def test_fixed_take_profit_target_must_fit_opposite_line_even_when_minimum_entry_r_is_lower():
+    plan = _plan(AreaShapeConfig(entry_trigger_mode="direct_touch", stop_basis="fixed_price",
+        fixed_stop_price=Decimal(90), fixed_tp_r=Decimal(6), min_space_r=Decimal(2)))
+    event = plan.observe_direct_touch_price(Decimal(95), 3*HOUR+1, [_candle(2*HOUR, "100", "101", "99", "100")])
+    assert event and event["kind"] == "signal_skipped"
+    assert event["min_space_r"] == "6"
+    assert plan.paper_position is None
 
 
 def _candle(ts: int, o: str, h: str, low: str, close: str, *, confirmed: bool = True) -> Candle:

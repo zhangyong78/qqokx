@@ -25,7 +25,9 @@ def instrument():
         inst_family="BTC-USDT")
 
 
-def test_live_arm_preflight_reaches_gtc_through_real_client_adapters_without_demo_requests():
+@pytest.mark.parametrize("direction", ["long", "short"])
+@pytest.mark.parametrize("stop_basis", ["fixed_price", "fixed_distance"])
+def test_live_arm_preflight_reaches_gtc_through_real_client_adapters_without_demo_requests(direction, stop_basis):
     """Exercise preflight too: correct POST alone is insufficient to enable live."""
     client = OkxRestClient()
     calls = []
@@ -55,8 +57,9 @@ def test_live_arm_preflight_reaches_gtc_through_real_client_adapters_without_dem
     runtime = SimpleNamespace(environment="live", credential_profile_name="acceptance",
         credentials=Credentials("fake", "fake", "fake", "acceptance"), trade_mode="cross", position_mode="net")
     plan = AreaShapePlan.create(profile_name="acceptance", environment="live", symbol="BTC-USDT-SWAP",
-        support_price=Decimal(95), pressure_price=Decimal(150), config=AreaShapeConfig(
-            entry_trigger_mode="direct_touch", stop_basis="fixed_distance", fixed_stop_distance=Decimal(10),
+        support_price=Decimal(95 if direction == "long" else 50), pressure_price=Decimal(150 if direction == "long" else 105), config=AreaShapeConfig(
+            direction=direction, entry_trigger_mode="direct_touch", stop_basis=stop_basis, fixed_stop_distance=Decimal(10),
+            fixed_stop_price=Decimal(85 if direction == "long" else 115), atr_period=200,
             target_buffer_atr=Decimal(0), break_even_enabled=False))
     plan.activate(last_closed_candle_ts=baseline, profile_name="acceptance", environment="live")
     paper_routes = []
@@ -70,7 +73,9 @@ def test_live_arm_preflight_reaches_gtc_through_real_client_adapters_without_dem
         assert ("GET", "/api/v5/account/trade-fee") in calls
         assert ("GET", "/api/v5/trade/orders-algo-pending") in calls
         assert calls.count(("POST", "/api/v5/trade/order")) == 1
-        assert posted["ordType"] == "limit" and posted["px"] == "95"
+        assert posted["ordType"] == "limit" and posted["px"] == ("95" if direction == "long" else "105")
+        assert posted["side"] == ("buy" if direction == "long" else "sell")
+        assert Decimal(posted["attachAlgoOrds"][0]["slTriggerPx"]) == Decimal(85 if direction == "long" else 115)
         assert len(posted["attachAlgoOrds"]) == 1
         assert session["resting_entry_intent"]["cl_ord_id"] == posted["clOrdId"]
     finally:

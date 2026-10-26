@@ -11,6 +11,30 @@ from roll_terminal_qt.area_shape_dialog import AreaShapeConfigDialog
 
 
 class AreaShapeDialogTests(QtWidgetTestCase):
+    def test_stop_options_follow_entry_mode_and_manual_price_requires_correct_side(self):
+        dialog = AreaShapeConfigDialog(AreaShapeConfig(), support_price=Decimal(100), pressure_price=Decimal(120))
+        try:
+            self.assertEqual(dialog.stop_basis.findData("entry_line_atr"), -1)
+            self.assertNotEqual(dialog.stop_basis.findData("pattern_candles"), -1)
+            dialog.entry_trigger_mode.setCurrentIndex(dialog.entry_trigger_mode.findData("direct_touch"))
+            self.assertEqual({dialog.stop_basis.itemData(i) for i in range(dialog.stop_basis.count())},
+                             {"fixed_price", "fixed_distance"})
+            self.assertTrue(dialog.stop_offset.isHidden())
+            dialog.stop_basis.setCurrentIndex(dialog.stop_basis.findData("fixed_price"))
+            save = dialog.buttons.button(QDialogButtonBox.StandardButton.Ok)
+            dialog.fixed_stop_price.setValue(101)
+            self.assertFalse(save.isEnabled())
+            dialog.fixed_stop_price.setValue(90)
+            self.assertTrue(save.isEnabled())
+            self.assertFalse(dialog.config().requires_atr())
+            dialog.direction.setCurrentIndex(dialog.direction.findData("short"))
+            self.assertFalse(save.isEnabled())
+            dialog.fixed_stop_price.setValue(130)
+            self.assertTrue(save.isEnabled())
+            self.assertEqual(dialog.config().fixed_stop_price, Decimal(130))
+        finally:
+            self.dispose_widget(dialog)
+
     def test_atr_defaults_are_period_10_and_stop_offset_0_5(self) -> None:
         dialog = AreaShapeConfigDialog(AreaShapeConfig())
         try:
@@ -60,15 +84,16 @@ class AreaShapeDialogTests(QtWidgetTestCase):
             self.assertFalse(dialog.direct_touch_note.isHidden())
             self.assertEqual(dialog.trigger_content_label.text(), "价格触发")
             self.assertIn("启用交易时立即向 OKX 提交", dialog.direct_touch_note.text())
-            self.assertTrue(dialog.entry_mode.isHidden())
+            self.assertTrue(dialog.entry_mode_note.isHidden())
             self.assertEqual(dialog.config().entry_trigger_mode, "direct_touch")
             self.assertFalse(dialog.config().resting_entry_enabled)
             dialog.entry_trigger_mode.setCurrentIndex(dialog.entry_trigger_mode.findData("pattern"))
             self.assertFalse(dialog.patterns.isHidden())
             self.assertTrue(dialog.direct_touch_note.isHidden())
+            self.assertFalse(dialog.entry_mode_note.isHidden())
             self.assertEqual(dialog.trigger_content_label.text(), "1H形态（可多选）")
-            dialog.stop_basis.setCurrentIndex(dialog.stop_basis.findData("three_candle"))
-            self.assertEqual(dialog.config().stop_basis, "three_candle")
+            dialog.stop_basis.setCurrentIndex(dialog.stop_basis.findData("pattern_candles"))
+            self.assertEqual(dialog.config().stop_basis, "pattern_candles")
             self.assertFalse(dialog.stop_offset.isHidden())
             dialog.stop_basis.setCurrentIndex(dialog.stop_basis.findData("fixed_distance"))
             self.assertTrue(dialog.stop_offset.isHidden())
@@ -88,7 +113,9 @@ class AreaShapeDialogTests(QtWidgetTestCase):
         try:
             self.assertFalse(dialog.patterns.isHidden())
             self.assertFalse(dialog.config().resting_entry_enabled)
-            self.assertEqual(dialog.entry_mode.currentData(), "next_open")
+            self.assertIn("立即FOK吃单", dialog.entry_mode_note.text())
+            self.assertEqual(dialog.config().entry_mode, "next_open")
+            self.assertEqual(dialog.min_space_r.minimum(), 2)
         finally:
             self.dispose_widget(dialog)
 
@@ -190,29 +217,32 @@ class AreaShapeDialogTests(QtWidgetTestCase):
     def test_combination_matrix_preserves_values_and_only_shows_relevant_controls(self) -> None:
         dialog = AreaShapeConfigDialog(AreaShapeConfig())
         try:
-            for direction, trigger, entry, exit_mode, be, time_be, fee, stop, advanced in product(
-                ("long", "short"), ("pattern", "direct_touch"), ("next_open", "breakout"),
+            for direction, trigger, exit_mode, be, time_be, fee, stop, advanced in product(
+                ("long", "short"), ("pattern", "direct_touch"),
                 ("fixed_1r", "lock_2r_at_3r"), (False, True), (False, True), (False, True),
-                ("signal_candle", "three_candle", "fixed_distance"), (False, True),
+                ("signal_candle", "pattern_candles", "fixed_price", "fixed_distance"), (False, True),
             ):
-                with self.subTest(direction=direction, trigger=trigger, entry=entry, exit=exit_mode,
+                with self.subTest(direction=direction, trigger=trigger, exit=exit_mode,
                                   be=be, time_be=time_be, fee=fee, stop=stop, advanced=advanced):
+                    direct = trigger == "direct_touch"
+                    effective_stop = "fixed_distance" if direct and stop not in {"fixed_price", "fixed_distance"} else stop
                     for widget, value in ((dialog.direction, direction), (dialog.entry_trigger_mode, trigger),
-                                          (dialog.entry_mode, entry), (dialog.exit_template, exit_mode),
-                                          (dialog.stop_basis, stop)):
+                                          (dialog.exit_template, exit_mode),
+                                          (dialog.stop_basis, effective_stop)):
                         widget.setCurrentIndex(widget.findData(value))
+                    dialog.fixed_stop_price.setValue(90)
                     dialog.break_even_enabled.setChecked(be)
                     dialog.time_break_even_enabled.setChecked(time_be)
                     dialog.fee_offset_enabled.setChecked(fee)
                     dialog.advanced_toggle.setChecked(advanced)
-                    direct = trigger == "direct_touch"
                     dynamic = exit_mode != "fixed_1r"
                     self.assertEqual(dialog.patterns.isHidden(), direct)
                     self.assertEqual(dialog.direct_touch_note.isHidden(), not direct)
-                    self.assertEqual(dialog.entry_mode.isHidden(), direct)
-                    self.assertEqual(dialog.entry_offset.isHidden(), direct or entry != "breakout")
-                    self.assertEqual(dialog.fixed_stop_distance.isHidden(), stop != "fixed_distance")
-                    self.assertEqual(dialog.stop_offset.isHidden(), stop == "fixed_distance")
+                    self.assertEqual(dialog.entry_mode_note.isHidden(), direct)
+                    self.assertEqual(dialog.stop_basis.currentData(), effective_stop)
+                    self.assertEqual(dialog.fixed_stop_distance.isHidden(), effective_stop != "fixed_distance")
+                    self.assertEqual(dialog.stop_offset.isHidden(), effective_stop in {"fixed_distance", "fixed_price"})
+                    self.assertEqual(dialog.fixed_stop_price.isHidden(), effective_stop != "fixed_price")
                     self.assertEqual(dialog.fixed_tp_r.isHidden(), dynamic)
                     self.assertEqual(dialog.be_trigger_r.isHidden(), not be)
                     self.assertEqual(dialog.time_break_even_enabled.isHidden(), not be)
@@ -223,7 +253,7 @@ class AreaShapeDialogTests(QtWidgetTestCase):
                     config = dialog.config()
                     self.assertEqual(dialog.atr_period.isHidden(), not config.requires_atr())
                     self.assertFalse(config.resting_entry_enabled)
-                    self.assertEqual(config.entry_mode, "next_open" if direct else entry)
+                    self.assertEqual(config.entry_mode, "next_open")
                     self.assertEqual(config.time_break_even_enabled, be and time_be)
                     self.assertEqual(config.fee_offset_enabled, fee)
                     self.assertTrue(dialog.buttons.button(QDialogButtonBox.StandardButton.Ok).isEnabled())
@@ -255,7 +285,7 @@ class AreaShapeDialogTests(QtWidgetTestCase):
             self.assertTrue(save.isEnabled())
             dialog.lock_trail_add_r.setValue(1)
             dialog.stop_offset.setValue(0)
-            self.assertIn("可保存为纸面计划", dialog.validation_message.text())
+            self.assertEqual(dialog.validation_message.text(), "")
             self.assertTrue(save.isEnabled())
             dialog.stop_basis.setCurrentIndex(dialog.stop_basis.findData("fixed_distance"))
             self.assertTrue(save.isEnabled())
@@ -264,7 +294,7 @@ class AreaShapeDialogTests(QtWidgetTestCase):
         finally:
             self.dispose_widget(dialog)
 
-    def test_direction_switch_and_legacy_advanced_settings_roundtrip(self) -> None:
+    def test_direction_switch_and_legacy_cost_settings_roundtrip(self) -> None:
         dialog = AreaShapeConfigDialog(AreaShapeConfig(
             slippage_rate=Decimal("0.001"), target_buffer_atr=Decimal("0.5"),
             entry_offset_atr=Decimal("0.25"),
@@ -281,17 +311,15 @@ class AreaShapeDialogTests(QtWidgetTestCase):
             self.assertFalse(dialog.target_buffer.isHidden())
             self.assertFalse(dialog.slippage.isHidden())
             self.assertEqual(dialog.slippage.value(), 0.1)
-            dialog.entry_mode.setCurrentIndex(dialog.entry_mode.findData("breakout"))
-            self.assertFalse(dialog.entry_offset.isHidden())
             result = dialog.config()
             self.assertEqual(result.slippage_rate, Decimal("0.001"))
-            self.assertEqual(result.entry_offset_atr, Decimal("0.25"))
+            self.assertEqual(result.entry_offset_atr, Decimal("0"))
             self.assertEqual(result.target_buffer_atr, Decimal("0.5"))
             self.assertFalse(result.resting_entry_enabled)
         finally:
             self.dispose_widget(dialog)
 
-    def test_atr_controls_follow_actual_stop_buffer_and_breakout_dependencies(self) -> None:
+    def test_atr_controls_follow_stop_and_target_buffer_dependencies(self) -> None:
         dialog = AreaShapeConfigDialog(AreaShapeConfig(
             entry_trigger_mode="direct_touch", stop_basis="fixed_distance",
         ))
@@ -299,16 +327,14 @@ class AreaShapeDialogTests(QtWidgetTestCase):
             self.assertTrue(dialog.atr_period.isHidden())
             self.assertIn("无需等待ATR", dialog.atr_note.text())
             dialog.entry_trigger_mode.setCurrentIndex(dialog.entry_trigger_mode.findData("pattern"))
-            dialog.entry_mode.setCurrentIndex(dialog.entry_mode.findData("breakout"))
             self.assertTrue(dialog.atr_period.isHidden())
-            dialog.entry_offset.setValue(0.5)
-            self.assertFalse(dialog.atr_period.isHidden())
             dialog.entry_trigger_mode.setCurrentIndex(dialog.entry_trigger_mode.findData("direct_touch"))
             self.assertTrue(dialog.atr_period.isHidden())
             dialog.target_buffer.setValue(0.5)
             self.assertFalse(dialog.atr_period.isHidden())
             dialog.target_buffer.setValue(0)
-            dialog.stop_basis.setCurrentIndex(dialog.stop_basis.findData("three_candle"))
+            dialog.entry_trigger_mode.setCurrentIndex(dialog.entry_trigger_mode.findData("pattern"))
+            dialog.stop_basis.setCurrentIndex(dialog.stop_basis.findData("pattern_candles"))
             self.assertFalse(dialog.atr_period.isHidden())
         finally:
             self.dispose_widget(dialog)

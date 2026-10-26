@@ -1141,7 +1141,7 @@ class AreaShapeDemoUiTests(QtWidgetTestCase):
             break_even_enabled=False,
         )
         details = self.window._area_shape_plan_details_text(plan)
-        self.assertIn("预挂入场线GTC", details)
+        self.assertIn("GTC限价单", details)
         self.assertIn("固定价差 1000 U", details)
         self.assertIn("当前组合不需ATR", details)
         self.assertIn("保本关闭", details)

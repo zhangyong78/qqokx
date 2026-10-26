@@ -87,7 +87,10 @@ from okx_quant.deribit_volatility_ui import (
 )
 from okx_quant.kline_rr_execution import RRTradeExecutionService
 from okx_quant.kline_rr_trade import RRTradeLedgerEntry, RRTradePlan, build_rr_trade_plan
-from okx_quant.area_shape_trade import AREA_DYNAMIC_TAKE_PROFIT_R, AreaShapeConfig, AreaShapePlan
+from okx_quant.area_shape_trade import (
+    AREA_DYNAMIC_TAKE_PROFIT_R, AREA_MIN_ENTRY_SPACE_R, AreaShapeConfig, AreaShapePlan,
+    area_shape_pattern_candle_count,
+)
 from okx_quant.analysis.auto_zones import find_auto_zone_pair
 from okx_quant.kline_trade_recommendations import KlineTradeIdea, build_kline_trade_idea
 from roll_terminal_qt.area_shape_dialog import AreaShapeConfigDialog
@@ -8109,7 +8112,7 @@ class KlineAnalysisWindow(QMainWindow):
         self._area_shape_mode_combo.addItem("纸面演练", "paper")
         self._area_shape_mode_combo.addItem("OKX模拟盘", "demo")
         self._area_shape_mode_combo.addItem("OKX实盘", "live")
-        self._area_shape_mode_combo.setToolTip("价格触发模式：做多下穿支撑线、做空上穿压力线时按画线价模拟入场；实时流不可用时按1H OHLC检查同方向穿越。OKX实盘/模拟盘在对应入场线挂GTC限价单。形态模式仍等待1H收盘确认。")
+        self._area_shape_mode_combo.setToolTip("价格触发：支撑位挂买入限价单、压力位挂卖出限价单，使用手工固定止损并附带交易所止盈止损。形态触发：本次形态的1/2/3根K线内至少一根碰线，收盘确认后按盘口和滑点上限FOK入场。纸面按线价或下一根开盘模拟。")
         self._area_shape_mode_combo.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
         self._area_shape_mode_combo.setMinimumContentsLength(8)
         self._area_shape_mode_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
@@ -8176,7 +8179,7 @@ class KlineAnalysisWindow(QMainWindow):
         self._area_shape_demo_status.setWordWrap(True)
         self._area_shape_demo_status.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         area_layout.addWidget(self._area_shape_demo_status)
-        self._area_shape_summary = QLabel("直接价格触发：做多下穿支撑、做空上穿压力后按画线价模拟入场；形态确认模式按下一根1H开盘价推演。纸面不发送订单。")
+        self._area_shape_summary = QLabel("价格触发采用手工固定止损、交易所入场线GTC挂单；形态组合内须有K线碰到入场线，收盘确认后FOK入场。纸面按线价或下一根1H开盘模拟。")
         self._area_shape_summary.setObjectName("Subtle")
         self._area_shape_summary.setWordWrap(True)
         self._area_shape_summary.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
@@ -8557,6 +8560,7 @@ class KlineAnalysisWindow(QMainWindow):
         self._chart_account_splitter.setChildrenCollapsible(False)
         self._chart_account_splitter.addWidget(chart_frame)
         self._account_drawer = KlineAccountDrawer()
+        self._account_drawer.chase_context_provider = self._current_order_chase_context
         self._account_drawer.collapseRequested.connect(self._collapse_account_drawer)
         self._chart_account_splitter.addWidget(self._account_drawer)
         self._account_drawer.hide()
@@ -10321,8 +10325,51 @@ class KlineAnalysisWindow(QMainWindow):
             if self._rr_trade_execution_service.should_monitor_status(entry.status)
         ]
 
+    def _current_order_chase_context(self, order: object) -> dict[str, object]:
+        """Freeze the owning strategy's risk rules before the drawer starts writes."""
+        profile, environment = self._active_profile_name(), self._active_environment()
+        if (self._account_drawer._profile_name != profile or self._account_drawer._environment != environment
+                or self._account_drawer._runtime is not self._runtime):
+            raise ValueError("账户切换尚未完成，请等待当前委托更新")
+        if not profile or not self._ensure_profile_access(profile):
+            raise ValueError("请先解锁当前账户")
+        order_id = str(getattr(order, "order_id", "") or "")
+        client_id = str(getattr(order, "client_order_id", "") or "")
+        for entry in self._all_rr_trade_ledger_entries():
+            plan, link = entry.plan, entry.entry_order
+            if (link is None or plan.profile_name != profile or plan.environment != environment
+                    or plan.inst_id != getattr(order, "inst_id", "")
+                    or not ((order_id and link.order_id == order_id) or (client_id and link.client_id == client_id))):
+                continue
+            if self._rr_execution_in_flight:
+                raise ValueError("RR正在核对交易所订单，请稍后再启用追单")
+            return {"owner": "rr", "risk_amount": plan.risk_amount, "stop": plan.stop_loss_price,
+                    "stop_on_fill": True, "take_profit": plan.take_profit_price, "take_profit_r": 0}
+        monitor = self._area_shape_execution_monitor
+        for session in (monitor.sessions() if monitor is not None else []):
+            if session.get("profile_name") != profile or session.get("environment") != environment:
+                continue
+            for name in ("resting_entry_intent", "pending_intent"):
+                intent = session.get(name)
+                if not isinstance(intent, dict) or not client_id or intent.get("cl_ord_id") != client_id:
+                    continue
+                if session.get("paused") or session.get("status") != "armed" or session.get("position"):
+                    raise ValueError("该区域计划已暂停或需要核对，不能追改其入场单")
+                plan = AreaShapePlan.from_dict(session["plan_snapshot"])
+                target = plan.pressure_price if intent.get("side") == "buy" else plan.support_price
+                return {"owner": "area", "risk_amount": plan.config.risk_amount, "stop": intent["stop"],
+                        "slippage_rate": session.get("slippage_rate", "0"), "stop_on_fill": True,
+                        "target": target, "min_space_r": max(Decimal(2), plan.config.min_space_r),
+                        "take_profit": intent.get("take_profit_price") or None,
+                        "take_profit_r": plan.config.fixed_tp_r if plan.config.exit_template == "fixed_1r" else 0}
+        return {}
+
     def _next_monitorable_rr_entry(self) -> RRTradeLedgerEntry | None:
         entries = self._monitorable_rr_trade_ledger_entries()
+        drawer = getattr(self, "_account_drawer", None)
+        if drawer is not None:
+            entries = [entry for entry in entries if entry.entry_order is None or not drawer.blocks_order_reconcile(
+                entry.entry_order.order_id, entry.plan.profile_name, entry.plan.environment)]
         if not entries:
             self._rr_monitor_cursor = 0
             return None
@@ -12584,8 +12631,15 @@ class KlineAnalysisWindow(QMainWindow):
 
     def _workspace_entry(self, *, symbol: str | None = None, period: str | None = None) -> dict[str, object]:
         key = self._current_workspace_key(symbol=symbol, period=period)
-        entry = normalize_workspace_entry(self._workspace_entries.get(key))
+        current = self._workspace_entries.get(key)
+        normalized_entries = getattr(self, "_normalized_workspace_entries", None)
+        if normalized_entries is None:
+            normalized_entries = self._normalized_workspace_entries = {}
+        if isinstance(current, dict) and normalized_entries.get(key) is current:
+            return current
+        entry = normalize_workspace_entry(current)
         self._workspace_entries[key] = entry
+        normalized_entries[key] = entry
         return entry
 
     def _save_workspace_snapshot(self) -> None:
@@ -14001,10 +14055,21 @@ class KlineAnalysisWindow(QMainWindow):
             open_price = entry + direction_sign * atr_value * 0.12
             close = entry + direction_sign * atr_value * 0.98
             append_bar(open_price, close, max(open_price, close) + atr_value * 0.12, min(open_price, close) - atr_value * 0.26)
-        signal_lows = [item["low"] for item in bars[-3:]]
-        signal_highs = [item["high"] for item in bars[-3:]]
-        stop_base = min(signal_lows) if side_sign > 0 else max(signal_highs)
-        stop = stop_base - atr_value * float(plan.config.stop_offset_atr) if side_sign > 0 else stop_base + atr_value * float(plan.config.stop_offset_atr)
+        if plan.config.stop_basis == "fixed_price":
+            stop = float(plan.config.fixed_stop_price)
+        elif plan.config.stop_basis == "fixed_distance":
+            distance = float(plan.config.fixed_stop_distance)
+            stop = entry - distance if side_sign > 0 else entry + distance
+        elif plan.config.stop_basis == "entry_line_atr":
+            distance = atr_value * float(plan.config.stop_offset_atr)
+            stop = entry - distance if side_sign > 0 else entry + distance
+        else:
+            count = (area_shape_pattern_candle_count(pattern) if plan.config.stop_basis == "pattern_candles"
+                     else 3 if plan.config.stop_basis == "three_candle" else 1)
+            signal_lows = [item["low"] for item in bars[-count:]]
+            signal_highs = [item["high"] for item in bars[-count:]]
+            stop_base = min(signal_lows) if side_sign > 0 else max(signal_highs)
+            stop = stop_base - atr_value * float(plan.config.stop_offset_atr) if side_sign > 0 else stop_base + atr_value * float(plan.config.stop_offset_atr)
         return {"label": _REPLAY_SIGNAL_LABELS.get(pattern, pattern), "bars": bars,
                 "entry": entry, "stop": stop, "target": target, "direction": side,
                 "support": float(plan.support_price), "pressure": float(plan.pressure_price),
@@ -14086,7 +14151,8 @@ class KlineAnalysisWindow(QMainWindow):
                 raise ValueError("缺少已收盘1H K线")
             support = self._area_line_price(plan.support_line_id)
             pressure = self._area_line_price(plan.pressure_line_id)
-            plan.config.validate()
+            minimum_space_r = max(plan.config.min_space_r, AREA_MIN_ENTRY_SPACE_R,
+                                  plan.config.fixed_tp_r if plan.config.exit_template == "fixed_1r" else Decimal(0))
             direction_text = "做多" if plan.config.direction == "long" else "做空"
             entry_line = f"下方支撑线 {support}" if plan.config.direction == "long" else f"上方压力线 {pressure}"
             target_line = f"上方压力线 {pressure}" if plan.config.direction == "long" else f"下方支撑线 {support}"
@@ -14095,15 +14161,14 @@ class KlineAnalysisWindow(QMainWindow):
                          "OKX 实盘，可能提交真实委托")
             profile_text = self._active_profile_name().strip() or "未选账户"
             if plan.config.entry_trigger_mode == "direct_touch":
-                execution_text = "入场线触发 GTC 限价单"
+                execution_text = "手工固定止损；在支撑/压力线提交附带止盈止损的 GTC 限价单"
             else:
-                signal_entry = "形态确认 FOK" if plan.config.entry_mode == "next_open" else "形态确认条件限价单"
-                execution_text = f"触线并确认形态后：{signal_entry}"
+                execution_text = "触线并确认形态后立即 FOK 吃单；按盘口和滑点上限校验净盈亏比"
             confirmation_text = (
                 f"账户：{profile_text} / {mode if mode in {'demo', 'live'} else plan.environment}\n方向：{direction_text}\n"
                 f"风险预算：{plan.config.risk_amount} USDT\n执行方式：{execution_text}\n"
                 f"入场参考：{entry_line}\n"
-                f"盈亏比校验：{target_line}（最低 {plan.config.min_space_r}R）\n"
+                f"盈亏比校验：{target_line}（最低 {minimum_space_r}R）\n"
                 f"执行：{mode_text}\n\n确认启用此计划？"
             )
             accepted = QMessageBox.question(
@@ -14114,6 +14179,11 @@ class KlineAnalysisWindow(QMainWindow):
             if accepted != QMessageBox.StandardButton.Yes:
                 self._set_area_shape_status("已取消启用；计划保持原状态。")
                 return
+            plan.config.min_space_r = max(plan.config.min_space_r, AREA_MIN_ENTRY_SPACE_R)
+            if plan.config.entry_trigger_mode == "pattern":
+                plan.config.entry_mode = "next_open"
+                plan.config.entry_offset_atr = Decimal("0")
+            plan.config.validate()
             if plan.status == "draft":
                 plan.support_price, plan.pressure_price = support, pressure
                 self._area_shape_monitor.save_draft(plan)
@@ -14319,30 +14389,32 @@ class KlineAnalysisWindow(QMainWindow):
                 exit_text += f"；时间保本：持仓满{config.time_break_even_bars}根1H且当前价允许保本"
         else:
             exit_text += "；保本关闭"
-        entry_mode = "做多下穿支撑/做空上穿压力即触发（纸面按线价模拟；OKX实盘/模拟盘预挂入场线GTC）" if config.entry_trigger_mode == "direct_touch" else (
-            "触线+形态确认后入场（纸面按下一根1H开盘；OKX实盘/模拟盘价格受限FOK）"
-            if config.entry_mode == "next_open" else "形态后等待价格突破（OKX条件单）"
+        entry_mode = "支撑位买入/压力位卖出GTC限价单，手工固定止损（纸面按线价模拟）" if config.entry_trigger_mode == "direct_touch" else (
+            "触线并确认形态后立即FOK吃单（纸面按下一根1H开盘模拟）"
         )
         paper_fee = format_decimal(config.round_trip_fee_rate * Decimal("100"))
         slippage = format_decimal(config.slippage_rate * Decimal("100"))
         target_buffer = format_decimal(config.target_buffer_atr)
-        entry_offset = format_decimal(config.entry_offset_atr)
         stop_offset = format_decimal(config.stop_offset_atr)
-        if config.stop_basis == "fixed_distance":
+        if config.stop_basis == "fixed_price":
+            stop_text = f"手工止损价 {self._format_area_shape_price(config.fixed_stop_price, plan.symbol)}"
+        elif config.stop_basis == "fixed_distance":
             stop_text = f"固定价差 {format_decimal(config.fixed_stop_distance)} U（相对入场线）"
+        elif config.stop_basis == "entry_line_atr":
+            stop_text = "旧入场线ATR参数已停用；新启用前请编辑止损"
+        elif config.stop_basis == "pattern_candles":
+            stop_text = f"本次形态组合（1/2/3根）极值外 {stop_offset} ATR缓冲"
         else:
             reference = "最近三根" if config.stop_basis == "three_candle" else (
                 "最近已收盘" if config.entry_trigger_mode == "direct_touch" else "信号"
             )
             stop_text = f"{reference}K线高低点外 {stop_offset} ATR"
         stop_text += f" | ATR周期 {config.atr_period}" if config.requires_atr() else " | 当前组合不需ATR"
-        if config.entry_trigger_mode == "pattern" and config.entry_mode == "breakout":
-            stop_text += f" | 突破入场偏移 {entry_offset} ATR"
-        gtc_text = "直接价格触发时挂单" if config.entry_trigger_mode == "direct_touch" else "关闭（触线并确认形态后入场）"
+        gtc_text = "入场线挂单（手工止损）" if config.entry_trigger_mode == "direct_touch" else "关闭（触线并确认形态后入场）"
         return "\n".join((
             "当前计划参数",
             f"方向：{direction} | 入场参考：{entry_name} {self._format_area_shape_price(entry_price, plan.symbol)}",
-            f"盈亏比校验：{target_name} {self._format_area_shape_price(target_price, plan.symbol)} | 最低目标空间 {format_decimal(config.min_space_r)}R",
+            f"盈亏比校验：{target_name} {self._format_area_shape_price(target_price, plan.symbol)} | 最低目标空间 {format_decimal(max(config.min_space_r, AREA_MIN_ENTRY_SPACE_R, config.fixed_tp_r if config.exit_template == 'fixed_1r' else Decimal(0)))}R",
             f"1H触发形态：{patterns}",
             f"单笔风险预算：{format_decimal(config.risk_amount)} U",
             f"入场：{entry_mode} | GTC：{gtc_text}",
@@ -14353,7 +14425,17 @@ class KlineAnalysisWindow(QMainWindow):
         ))
 
     def _format_area_shape_price(self, value: Decimal, symbol: str) -> str:
-        instrument = self._instrument_for_symbol(symbol)
+        # Rendering a stop price must not block the UI on a REST request or
+        # permanently cache a metadata miss before the background load finishes.
+        normalized = str(symbol).strip().upper()
+        instrument = self._instrument_cache.get(normalized)
+        if instrument is None:
+            try:
+                instrument = self._market_client.get_cached_instrument(normalized)
+            except Exception:
+                instrument = None
+            if instrument is not None:
+                self._instrument_cache[normalized] = instrument
         tick_size = getattr(instrument, "tick_size", None)
         if isinstance(tick_size, Decimal) and tick_size > 0:
             return format_decimal_by_increment(value, tick_size)
@@ -14565,7 +14647,7 @@ class KlineAnalysisWindow(QMainWindow):
             return
         mode = self._area_shape_mode_combo.currentData()
         if mode == "paper":
-            summary = "直接价格触发按方向穿越触发：做多下穿支撑、做空上穿压力，纸面按画线价模拟入场；形态确认模式按下一根1H开盘价推演。纸面不发送订单。"
+            summary = "价格触发采用手工固定止损及交易所入场线GTC挂单；形态组合内至少一根K线碰线，收盘确认后FOK入场。纸面按线价或下一根1H开盘模拟，不发送订单。"
         else:
             environment_label = "OKX实盘" if mode == "live" else "OKX模拟盘"
             summary = f"{environment_label}按确认框显示的入场方式执行；入场成交后先核验并保护真实成交仓位。"
@@ -17172,13 +17254,20 @@ class KlineAnalysisWindow(QMainWindow):
         updated_entry["area_replays"].update(copy.deepcopy(current_entry.get("area_replays", {})))
         new_events = list(snapshot.new_events)
         structure = dict(snapshot.structure)
-        self._workspace_entries[self._current_workspace_key()] = updated_entry
+        key = self._current_workspace_key()
+        changed = updated_entry != current_entry
+        if changed:
+            self._workspace_entries[key] = updated_entry
         email_sent_count = self._dispatch_line_alert_emails(new_events, updated_entry) if new_events else 0
-        self._save_workspace_snapshot()
+        if changed or new_events:
+            self._save_workspace_snapshot()
         self._structure_hint.setText(str(structure.get("note", "") or ""))
-        self._refresh_event_log()
-        self._populate_line_table()
-        self._populate_rr_table(selected_index=self._selected_rr_index)
+        binding = (key, self._active_profile_name(), self._active_environment())
+        if changed or new_events or binding != getattr(self, "_last_alert_binding", None):
+            self._refresh_event_log()
+            self._populate_line_table()
+            self._populate_rr_table(selected_index=self._selected_rr_index)
+            self._last_alert_binding = binding
         if new_events:
             self._enqueue_line_trade_events(new_events)
             latest = str(new_events[0].get("message", "") or "")

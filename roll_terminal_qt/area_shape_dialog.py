@@ -21,7 +21,9 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from okx_quant.area_shape_trade import AREA_DYNAMIC_TAKE_PROFIT_R, AREA_TAKER_FEE_RATE, AreaShapeConfig
+from okx_quant.area_shape_trade import (
+    AREA_DYNAMIC_TAKE_PROFIT_R, AREA_MIN_ENTRY_SPACE_R, AREA_TAKER_FEE_RATE, AreaShapeConfig,
+)
 
 
 _PATTERNS = (
@@ -99,19 +101,18 @@ class AreaShapeConfigDialog(QDialog):
         trigger_layout = QVBoxLayout(self.trigger_content)
         trigger_layout.setContentsMargins(0, 0, 0, 0)
         trigger_layout.addWidget(self.patterns)
-        self.direct_touch_note = QLabel("OKX实盘/模拟盘：启用交易时立即向 OKX 提交入场线 GTC 限价单，不等待形态；价格已越线时可能立即成交。纸面复盘按方向触线，以画线价模拟入场。")
+        self.direct_touch_note = QLabel("价格触发使用手工固定止损。启用交易时立即向 OKX 提交支撑买入/压力卖出 GTC 限价单，并附带止损和止盈；不等待形态。价格已越过入场线时可能立即成交。纸面按画线价模拟。")
         self.direct_touch_note.setWordWrap(True)
         trigger_layout.addWidget(self.direct_touch_note)
         self.trigger_content_label = QLabel("1H形态（可多选）")
         form.addRow(self.trigger_content_label, self.trigger_content)
 
         self.risk_amount = self._number(self._initial.risk_amount, 0.01, 1_000_000, 2)
-        self.min_space_r = self._number(self._initial.min_space_r, 0.1, 100, 2)
-        self.min_space_r.setToolTip("另一条线用于核算可用空间；低于此R门槛不入场。此筛选门槛与固定止盈目标独立。")
+        self.min_space_r = self._number(self._initial.min_space_r, float(AREA_MIN_ENTRY_SPACE_R), 100, 2)
+        self.min_space_r.setToolTip("做多按压力位到预计成交价÷成交价到止损的距离；做空反向计算。最少2R，低于门槛不下单。")
         self.atr_period = _WheelSafeSpinBox()
         self.atr_period.setRange(2, 200)
         self.atr_period.setValue(self._initial.atr_period)
-        self.entry_offset = self._number(self._initial.entry_offset_atr, 0, 10, 3)
         self.stop_offset = self._number(self._initial.stop_offset_atr, 0, 10, 3)
         self.target_buffer = self._number(self._initial.target_buffer_atr, 0, 10, 3)
         self.fee = self._number(self._initial.round_trip_fee_rate, 0, 0.1, 6)
@@ -119,22 +120,24 @@ class AreaShapeConfigDialog(QDialog):
         self.slippage.setSuffix(" %")
         self._show_legacy_slippage = self._initial.slippage_rate != 0
         self._show_target_buffer = self._initial.target_buffer_atr != 0
-        self.entry_mode = QComboBox()
-        self.entry_mode.addItem("触线+形态确认后立即FOK", "next_open")
-        self.entry_mode.addItem("形态后再等价格突破（OKX条件单）", "breakout")
-        self.entry_mode.setToolTip("FOK方式在实际触线与1H形态确认后立即提交价格受限订单；突破方式另挂OKX条件单，不能并行预挂入场线GTC。")
-        self._set_combo(self.entry_mode, self._initial.entry_mode)
+        self.entry_mode_note = QLabel("触线并确认形态后，按当前盘口立即FOK吃单并限制滑点；做多按压力位空间÷止损风险、做空反向计算。低于2R或计划门槛不下单。")
+        self.entry_mode_note.setWordWrap(True)
         self.stop_basis = QComboBox()
-        self.stop_basis.addItem("信号K线高低点 + ATR偏移", "signal_candle")
-        self.stop_basis.addItem("最近三根K线高低点 + ATR偏移", "three_candle")
+        self.stop_basis.addItem("信号K线高低点 + ATR缓冲", "signal_candle")
+        self.stop_basis.addItem("形态组合高低点 + ATR缓冲（1/2/3根）", "pattern_candles")
+        self.stop_basis.addItem("手工固定止损价格", "fixed_price")
         self.stop_basis.addItem("固定价差（相对入场线）", "fixed_distance")
-        self._set_combo(self.stop_basis, self._initial.stop_basis)
-        self.fixed_stop_distance = self._number(self._initial.fixed_stop_distance, 0.01, 10_000_000, 2)
+        initial_basis = {"three_candle": "pattern_candles", "entry_line_atr": "signal_candle"}.get(
+            self._initial.stop_basis, self._initial.stop_basis,
+        )
+        self._set_combo(self.stop_basis, initial_basis)
+        self.fixed_stop_distance = self._number(self._initial.fixed_stop_distance, 0.00000001, 1_000_000_000, 8)
+        self.fixed_stop_price = self._number(self._initial.fixed_stop_price, 0, 1_000_000_000, 8)
+        self.fixed_stop_price.setToolTip("输入实际止损价格，例如78500；做多须低于入场价，做空须高于入场价。")
         self.fee_offset_enabled = QCheckBox("计入双边 Taker 手续费")
         self.fee_offset_enabled.setChecked(self._initial.fee_offset_enabled)
         self.fee_offset_enabled.setToolTip("勾选后，保本和锁盈触发R按扣除入场与退出两侧手续费后的净R判断，保护止损价也按双边手续费计算。纸面估算使用固定Taker费率，OKX实盘/模拟盘使用对应账户费率。")
         self.entry_trigger_mode.currentIndexChanged.connect(self._refresh_entry_mode)
-        self.entry_mode.currentIndexChanged.connect(self._refresh_entry_mode)
         self.exit_template = QComboBox()
         self.exit_template.addItem("固定止盈", "fixed_1r")
         self.exit_template.addItem("动态止盈", "lock_2r_at_3r")
@@ -143,7 +146,7 @@ class AreaShapeConfigDialog(QDialog):
             "fixed_1r" if self._initial.exit_template == "fixed_1r" else "lock_2r_at_3r",
         )
         self.fixed_tp_r = self._number(self._initial.fixed_tp_r, 0.1, 100, 2)
-        self.fixed_tp_r.setToolTip("固定止盈价按此 R 计算；若同时启用保本，保本触发 R 应低于固定止盈 R。")
+        self.fixed_tp_r.setToolTip("固定止盈价按此净R计算。实盘随入场单按委托参考价预挂保护，成交价改善时实际净R可能高于设定；后续保本/锁盈按真实成交价和初始止损计算。保本触发R应低于固定止盈R。")
         self.break_even_enabled = QCheckBox("启用保本保护")
         self.break_even_enabled.setChecked(self._initial.break_even_enabled)
         self.be_trigger_r = self._number(self._initial.be_trigger_r, 0.1, 100, 2)
@@ -176,6 +179,7 @@ class AreaShapeConfigDialog(QDialog):
         for label, widget in (
             ("单笔风险预算（U）", self.risk_amount), ("最低可用空间（R）", self.min_space_r),
             ("止损基准", self.stop_basis), ("固定止损价差（U）", self.fixed_stop_distance),
+            ("固定止损价格", self.fixed_stop_price),
             ("K线止损ATR偏移", self.stop_offset), ("止盈方式", self.exit_template),
         ):
             form.addRow(label, widget)
@@ -209,8 +213,7 @@ class AreaShapeConfigDialog(QDialog):
         for label, widget in (
             ("ATR周期", self.atr_period),
             ("ATR用途", self.atr_note),
-            ("形态确认后执行", self.entry_mode),
-            ("突破入场偏移（ATR）", self.entry_offset),
+            ("形态确认后执行", self.entry_mode_note),
             ("目标空间缓冲（ATR）", self.target_buffer),
             ("滑点预算", self.slippage),
             ("计划有效期（1H根数）", self.valid_bars),
@@ -218,10 +221,9 @@ class AreaShapeConfigDialog(QDialog):
             advanced_form.addRow(label, widget)
         self._advanced_form = advanced_form
         self.target_buffer.setToolTip("从另一条线提供的目标空间扣除此ATR缓冲，再检查最低可用空间。")
-        self.entry_offset.setToolTip("形态突破模式：做多在信号K线高点之上加偏移，做空在低点之下减偏移。")
         self.valid_bars.setToolTip("按启用监控后的1H K线计算计划有效期；不是时间保本的持仓时长。")
         self.stop_basis.currentIndexChanged.connect(self._refresh_stop_controls)
-        for field in (self.stop_offset, self.entry_offset, self.target_buffer):
+        for field in (self.stop_offset, self.target_buffer):
             field.valueChanged.connect(self._refresh_stop_controls)
         self._refresh_stop_controls()
         self.advanced_panel.setVisible(False)
@@ -243,10 +245,10 @@ class AreaShapeConfigDialog(QDialog):
         self.buttons.accepted.connect(self.accept)
         self.buttons.rejected.connect(self.reject)
         layout.addWidget(self.buttons)
-        for combo in (self.entry_trigger_mode, self.entry_mode, self.stop_basis, self.exit_template):
+        for combo in (self.entry_trigger_mode, self.stop_basis, self.exit_template):
             combo.currentIndexChanged.connect(self._refresh_validation)
         for field in (self.fixed_tp_r, self.min_space_r, self.be_trigger_r, self.lock_trigger_r, self.lock_profit_r, self.lock_trail_every_r,
-                      self.lock_trail_add_r, self.stop_offset):
+                      self.lock_trail_add_r, self.stop_offset, self.fixed_stop_distance, self.fixed_stop_price):
             field.valueChanged.connect(self._refresh_validation)
         self.patterns.itemChanged.connect(self._refresh_validation)
         self.break_even_enabled.toggled.connect(self._refresh_validation)
@@ -314,16 +316,20 @@ class AreaShapeConfigDialog(QDialog):
         self.advanced_toggle.setText("收起高级参数" if checked else "展开高级参数")
 
     def _refresh_stop_controls(self) -> None:
-        fixed = self.stop_basis.currentData() == "fixed_distance"
-        self._set_row_visible(self._main_form, self.fixed_stop_distance, fixed)
+        basis = self.stop_basis.currentData()
+        fixed = basis in {"fixed_distance", "fixed_price"}
+        self._set_row_visible(self._main_form, self.fixed_stop_distance, basis == "fixed_distance")
+        self._set_row_visible(self._main_form, self.fixed_stop_price, basis == "fixed_price")
         self._set_row_visible(self._main_form, self.stop_offset, not fixed)
         direct = self.entry_trigger_mode.currentData() == "direct_touch"
-        self.stop_basis.setItemText(0, "最近已收盘K线高低点 + ATR偏移" if direct else "信号K线高低点 + ATR偏移")
+        stop_offset_label = self._main_form.labelForField(self.stop_offset)
+        if stop_offset_label is not None:
+            stop_offset_label.setText("K线极值外 ATR 缓冲")
         atr_config = replace(
             self._initial, entry_trigger_mode=str(self.entry_trigger_mode.currentData()),
-            entry_mode=str(self.entry_mode.currentData()), stop_basis=str(self.stop_basis.currentData()),
+            entry_mode="next_open", stop_basis=str(self.stop_basis.currentData()),
             stop_offset_atr=Decimal(str(self.stop_offset.value())),
-            entry_offset_atr=Decimal(str(self.entry_offset.value())),
+            entry_offset_atr=Decimal("0"),
             target_buffer_atr=Decimal(str(self.target_buffer.value())),
         )
         needs_atr = atr_config.requires_atr()
@@ -331,11 +337,9 @@ class AreaShapeConfigDialog(QDialog):
         if not needs_atr:
             text = "当前入场、止损与目标缓冲不使用ATR。入场要求实际触线，无需等待ATR历史数据预热。"
         elif direct and fixed:
-            text = "固定价差止损不用ATR；当前ATR用于非零目标空间缓冲，不会扩大触线范围。"
-        elif direct:
-            text = "ATR用于K线止损偏移及非零目标缓冲，不扩大触线范围；模拟盘GTC止损按启用时已收盘K线计算并冻结。"
+            text = "固定止损不使用ATR；ATR仅用于已设置的非零目标空间缓冲。"
         else:
-            text = "形态信号要求实际触线。ATR仅用于K线止损偏移、非零目标缓冲或突破入场偏移。"
+            text = "形态组合内至少一根K线须实际碰线。ATR只作为所选K线极值外的止损缓冲；设为0即直接使用极值。形态组合止损仅取本次形态的1/2/3根K线。"
         self.atr_note.setText(text)
 
     @staticmethod
@@ -350,9 +354,8 @@ class AreaShapeConfigDialog(QDialog):
             return
         dynamic = self.exit_template.currentData() != "fixed_1r"
         pattern = self.entry_trigger_mode.currentData() == "pattern"
-        # Direct-touch mode is the only mode that pre-submits a line-price GTC.
-        # Pattern mode must wait for both the touch and a confirmed pattern.
-        gtc = not pattern
+        # Price entry pre-submits a manual-stop GTC; pattern entry waits for
+        # the shape's own touch window and close before submitting a FOK.
         error = ""
         if pattern and not self._selected_patterns():
             error = "请至少选择一种1H形态，或改用价格触发。"
@@ -363,17 +366,17 @@ class AreaShapeConfigDialog(QDialog):
         if not error:
             try:
                 self.config()
-            except ValueError:
-                error = "参数组合无效，请检查止盈、保本和止损设置。"
+            except ValueError as exc:
+                error = ("请输入有效的手工止损价格；做多止损应在入场价下方，做空应在上方。"
+                         if self.stop_basis.currentData() == "fixed_price" else str(exc)
+                         if "止损" in str(exc) else "参数组合无效，请检查止盈、保本和止损设置。")
         warning = ""
-        if not error and gtc and self.stop_basis.currentData() != "fixed_distance" and self.stop_offset.value() <= 0:
-            warning = "模拟盘GTC入场要求K线止损ATR偏移大于0；当前值可保存为纸面计划，启用模拟盘前需调整。"
-        elif not error and dynamic and self.lock_trail_add_r.value() > self.lock_trail_every_r.value():
+        if not error and dynamic and self.lock_trail_add_r.value() > self.lock_trail_every_r.value():
             warning = "止损上移快于浮盈增长，后续候选止损可能越过当前价而暂缓推进；请核对阶梯步长。"
         elif not error and dynamic and self.lock_trigger_r.value() >= float(AREA_DYNAMIC_TAKE_PROFIT_R):
             warning = "锁盈启动不早于远端15R止盈，可能先止盈退出；请核对锁盈起点。"
         elif not error and not dynamic and self.fixed_tp_r.value() > self.min_space_r.value():
-            warning = "固定止盈目标高于最低空间门槛，可能越过对侧线；请核对是否需要提高最低可用空间。"
+            warning = "固定止盈目标高于最低空间门槛；实际入场将按较高的固定止盈R校验对侧空间，不足则跳过。"
         self.validation_message.setStyleSheet("color: #b42318;" if error else "color: #8a5300;")
         self.validation_message.setText(error or warning)
         self.validation_message.setVisible(bool(error or warning))
@@ -391,7 +394,7 @@ class AreaShapeConfigDialog(QDialog):
             min_space_r=Decimal(str(self.min_space_r.value())),
             atr_period=self.atr_period.value(),
             area_half_width_atr=self._initial.area_half_width_atr,
-            entry_offset_atr=Decimal(str(self.entry_offset.value())),
+            entry_offset_atr=Decimal("0"),
             stop_offset_atr=Decimal(str(self.stop_offset.value())),
             target_buffer_atr=Decimal(str(self.target_buffer.value())),
             round_trip_fee_rate=AREA_TAKER_FEE_RATE if self.fee_offset_enabled.isChecked() else Decimal("0"),
@@ -408,10 +411,11 @@ class AreaShapeConfigDialog(QDialog):
             lock_profit_r=Decimal(str(self.lock_profit_r.value())),
             lock_trail_every_r=Decimal(str(self.lock_trail_every_r.value())),
             lock_trail_add_r=Decimal(str(self.lock_trail_add_r.value())),
-            entry_mode="next_open" if self.entry_trigger_mode.currentData() == "direct_touch" else str(self.entry_mode.currentData()),
+            entry_mode="next_open",
             entry_trigger_mode=str(self.entry_trigger_mode.currentData()),
             stop_basis=str(self.stop_basis.currentData()),
             fixed_stop_distance=Decimal(str(self.fixed_stop_distance.value())),
+            fixed_stop_price=Decimal(str(self.fixed_stop_price.value())),
             fee_offset_enabled=self.fee_offset_enabled.isChecked(),
             resting_entry_enabled=False,
             exit_template=str(self.exit_template.currentData()),
@@ -420,6 +424,14 @@ class AreaShapeConfigDialog(QDialog):
             signal_patterns=self._selected_patterns(),
         )
         result.validate()
+        if result.entry_trigger_mode == "direct_touch":
+            entry_line = self.support_price if result.direction == "long" else self.pressure_price
+            if entry_line is not None:
+                stop = (result.fixed_stop_price if result.stop_basis == "fixed_price" else
+                        entry_line - result.fixed_stop_distance if result.direction == "long" else
+                        entry_line + result.fixed_stop_distance)
+                if stop <= 0 or (stop >= entry_line if result.direction == "long" else stop <= entry_line):
+                    raise ValueError("手工止损价格方向不正确或价差过大")
         return result
 
     def _refresh_patterns(self) -> None:
@@ -444,16 +456,33 @@ class AreaShapeConfigDialog(QDialog):
 
     def _refresh_entry_mode(self) -> None:
         direct = self.entry_trigger_mode.currentData() == "direct_touch"
+        current_basis = str(self.stop_basis.currentData() or self._initial.stop_basis)
+        if direct and current_basis not in {"fixed_price", "fixed_distance"}:
+            current_basis = "fixed_distance"
+        elif current_basis == "entry_line_atr":
+            current_basis = "signal_candle"
+        elif current_basis == "three_candle":
+            current_basis = "pattern_candles"
+        stop_options = (
+            (("手工固定止损价格", "fixed_price"), ("固定价差（相对入场线）", "fixed_distance"))
+            if direct else
+            (("信号K线高低点 + ATR缓冲", "signal_candle"),
+             ("形态组合高低点 + ATR缓冲（1/2/3根）", "pattern_candles"),
+             ("手工固定止损价格", "fixed_price"),
+             ("固定价差（相对入场线）", "fixed_distance"))
+        )
+        self.stop_basis.blockSignals(True)
+        self.stop_basis.clear()
+        for label, value in stop_options:
+            self.stop_basis.addItem(label, value)
+        self._set_combo(self.stop_basis, current_basis)
+        self.stop_basis.blockSignals(False)
         self.patterns.setVisible(not direct)
         self.direct_touch_note.setVisible(direct)
         self.trigger_content_label.setText("价格触发" if direct else "1H形态（可多选）")
         self.patterns.setEnabled(not direct)
-        self.entry_mode.setEnabled(not direct)
-        self._set_row_visible(self._advanced_form, self.entry_mode, not direct)
-        self._set_row_visible(
-            self._advanced_form, self.entry_offset,
-            not direct and self.entry_mode.currentData() == "breakout",
-        )
+        self.entry_mode_note.setVisible(not direct)
+        self._advanced_form.labelForField(self.entry_mode_note).setVisible(not direct)
         self._set_row_visible(self._advanced_form, self.target_buffer, self._show_target_buffer)
         self._set_row_visible(self._advanced_form, self.slippage, self._show_legacy_slippage)
         self._refresh_stop_controls()

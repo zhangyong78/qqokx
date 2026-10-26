@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import unittest
+import time
+import pytest
 from decimal import Decimal
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -12,6 +14,81 @@ from okx_quant.area_shape_trade import (
 )
 from okx_quant.engine import StrategyEngine
 from okx_quant.models import Candle, Instrument
+
+
+@pytest.mark.parametrize("direction", ["long", "short"])
+@pytest.mark.parametrize("space_sufficient", [True, False])
+@pytest.mark.parametrize("fixed_target_r", [2, 5])
+def test_confirmed_pattern_fok_uses_tick_safe_stop_and_durable_single_intent(direction, space_sufficient, fixed_target_r):
+    monitor, session, client, _ = _fixture()
+    plan = AreaShapePlan.from_dict(session["plan_snapshot"])
+    plan.config.direction = direction
+    plan.config.exit_template = "fixed_1r"
+    plan.config.fixed_tp_r = Decimal(fixed_target_r)
+    plan.config.min_space_r = Decimal(2)
+    plan.support_price, plan.pressure_price = ((Decimal(80), Decimal(120)) if space_sufficient
+                                             else (Decimal(90), Decimal(110)))
+    now_ms = int(time.time()*1000)
+    signal_ts = now_ms - 3_600_000
+    session.update(status="signal_pending", direction=direction, plan_snapshot=plan.to_dict(), pending_intent=None,
+        baseline_candle_ts=signal_ts-3_600_000, expires_at_candle_ts=signal_ts+24*3_600_000,
+        signal_cursor_ts=signal_ts, paused=False, resting_entry_intent=None,
+        signal_pending=dict(signal_key="confirmed", signal_candle_ts=signal_ts,
+            stop="94.123" if direction == "long" else "105.877", target_buffer_atr="0"))
+    client.get_order_book = lambda *_args, **_kwargs: SimpleNamespace(
+        raw={"ts": now_ms}, bids=((Decimal(100), Decimal(5)),), asks=((Decimal(100), Decimal(5)),))
+    client.get_positions = lambda *_args, **_kwargs: []
+    client.get_area_shape_pending_orders = lambda *_args, **_kwargs: []
+    with patch.object(monitor, "_submit_or_reconcile_entry") as submit:
+        monitor._try_live_entry(session["session_id"])
+    if not space_sufficient or fixed_target_r > 2:
+        submit.assert_not_called()
+        assert session["status"] == "armed" and session["signal_pending"] is None
+        assert session["pending_intent"] is None
+        return
+    submit.assert_called_once()
+    intent = session["pending_intent"]
+    assert session["status"] == "entry_intent" and intent["entry_kind"] == "fok"
+    assert Decimal(intent["stop"]) == Decimal("94.2" if direction == "long" else "105.8")
+    assert Decimal(intent["take_profit_price"]) == Decimal("111.6" if direction == "long" else "88.4")
+    with patch.object(monitor, "_reconcile_entry_intent") as reconcile, patch.object(monitor, "_submit_or_reconcile_entry") as resend:
+        monitor._tick(session["session_id"], dict(session))
+    reconcile.assert_called_once()
+    resend.assert_not_called()
+
+
+def test_consumed_pattern_signal_is_cleared_before_looking_for_next_opportunity():
+    monitor, session, _, _ = _fixture()
+    session.update(status="signal_pending", signal_pending={"signal_key": "expired"}, pending_intent=None)
+    monitor._consume_signal(session["session_id"], "盈亏比不足，跳过")
+    assert session["status"] == "armed"
+    assert session["pending_intent"] is None and session["signal_pending"] is None
+
+
+def test_retired_entry_line_atr_plan_cannot_be_silently_rearmed_for_new_entry():
+    monitor, session, _, _ = _fixture()
+    plan = AreaShapePlan.from_dict(session["plan_snapshot"])
+    plan.config.stop_basis = "entry_line_atr"
+    with patch.object(monitor, "_client_factory") as client_factory:
+        with pytest.raises(ValueError, match="已停用"):
+            monitor.arm_plan(plan=plan, runtime=monitor._runtimes[session["session_id"]],
+                unlocked=True, paper_monitor=None, environment="demo")
+    client_factory.assert_not_called()
+
+
+def test_gtc_fixed_take_profit_must_fit_opposite_line_in_addition_to_minimum_entry_r():
+    monitor, session, _, _ = _fixture()
+    plan = AreaShapePlan.from_dict(session["plan_snapshot"])
+    plan.config.entry_trigger_mode = "direct_touch"
+    plan.config.stop_basis = "fixed_price"
+    plan.config.fixed_stop_price = Decimal(90)
+    plan.config.fixed_tp_r = Decimal(6)
+    plan.config.exit_template = "fixed_1r"
+    session.update(expires_at_candle_ts=int(time.time()*1000)+24*3_600_000, baseline_candle_ts=1,
+        instrument=dict(tick_size="0.1", ct_val="1", ct_mult="1", lot_size="0.1", min_size="0.1"))
+    candles = [Candle(1, Decimal(100), Decimal(101), Decimal(99), Decimal(100), Decimal(1), True)]
+    intent, reason = monitor._prepare_resting_entry(session, plan, candles)
+    assert intent is None and "最低6R" in reason
 
 
 class _FakeClient:
@@ -82,7 +159,7 @@ def _fixture(*, filled: Decimal = Decimal("0.4")):
 
 
 class AreaShapeExecutionMonitorTests(unittest.TestCase):
-    def test_direct_touch_does_not_create_a_second_local_entry(self):
+    def test_pattern_scanner_does_not_duplicate_direct_touch_local_entry(self):
         monitor, session, client, _order = _fixture()
         plan = AreaShapePlan.from_dict(session["plan_snapshot"])
         plan.config = AreaShapeConfig(
@@ -98,7 +175,7 @@ class AreaShapeExecutionMonitorTests(unittest.TestCase):
             Candle(baseline, Decimal("101"), Decimal("104"), Decimal("92"), Decimal("102"), Decimal("1"), True),
         ]
         client.get_candles_history = lambda *_args, **_kwargs: candles
-        client.get_trigger_price = lambda *_args, **_kwargs: self.fail("direct touch must use the exchange GTC")
+        client.get_trigger_price = lambda *_args, **_kwargs: self.fail("this method only scans confirmed pattern signals")
         session.update({
             "status": "armed", "plan_snapshot": plan.to_dict(), "baseline_candle_ts": baseline,
             "signal_cursor_ts": baseline, "expires_at_candle_ts": baseline + 20 * 3_600_000,
@@ -209,10 +286,17 @@ class AreaShapeExecutionMonitorTests(unittest.TestCase):
         self.assertEqual(client.cancels, [session["resting_entry_intent"]["cl_ord_id"]])
         self.assertEqual(monitor.sessions()[0]["status"], "paused")
         self.assertEqual(fok_calls, [])
+        # Resume in the same hour must create a fresh logical entry epoch,
+        # while retries of each persisted order still use its original ID.
+        resumed = monitor.resume_session(session["session_id"], runtime=runtime, unlocked=True)
+        self.assertEqual(len(client.posts), 2)
+        self.assertNotEqual(resumed["resting_entry_intent"]["cl_ord_id"], session["resting_entry_intent"]["cl_ord_id"])
+        self.assertEqual(resumed["status"], "armed")
 
-    def test_resting_entry_uses_line_price_and_atr_stop(self):
+    def test_resting_entry_rejects_atr_stop_for_direct_price_entry(self):
         monitor, session, _client, _order = _fixture()
         plan = AreaShapePlan.from_dict(session["plan_snapshot"])
+        plan.config.entry_trigger_mode = "direct_touch"
         plan.config.atr_period = 2
         plan.config.stop_offset_atr = Decimal("0.5")
         plan.config.risk_amount = Decimal("100")
@@ -225,14 +309,13 @@ class AreaShapeExecutionMonitorTests(unittest.TestCase):
             Candle(1_800_003_600_000, Decimal("100"), Decimal("103"), Decimal("92"), Decimal("101"), Decimal("1"), True),
         ]
         intent, reason = monitor._prepare_resting_entry(session, plan, candles)
-        self.assertFalse(reason)
-        self.assertEqual(intent["price"], "95")
-        self.assertLess(Decimal(intent["stop"]), Decimal(intent["price"]))
-        self.assertEqual(intent["entry_kind"], "gtc")
+        self.assertIsNone(intent)
+        self.assertIn("固定止损", reason)
 
     def test_resting_entry_supports_fixed_price_distance_stop(self):
         monitor, session, _client, _order = _fixture()
         plan = AreaShapePlan.from_dict(session["plan_snapshot"])
+        plan.config.entry_trigger_mode = "direct_touch"
         plan.config.atr_period = 200  # Fixed distance and no ATR buffer need no ATR warmup.
         plan.config.stop_basis = "fixed_distance"
         plan.config.fixed_stop_distance = Decimal("10")
@@ -345,6 +428,7 @@ class AreaShapeExecutionMonitorTests(unittest.TestCase):
     def test_resting_entry_includes_target_buffer_in_minimum_space(self):
         monitor, session, _client, _order = _fixture()
         plan = AreaShapePlan.from_dict(session["plan_snapshot"])
+        plan.config.entry_trigger_mode = "direct_touch"
         plan.config.atr_period = 2
         plan.config.stop_basis = "fixed_distance"
         plan.config.fixed_stop_distance = Decimal("5")
@@ -712,14 +796,14 @@ class AreaShapeExecutionMonitorTests(unittest.TestCase):
         observe.assert_not_called()
         self.assertEqual(session["status"], "armed")
 
-    def test_native_trigger_is_not_placed_for_a_stale_confirmed_signal(self):
+    def test_immediate_fok_is_not_placed_for_a_stale_confirmed_signal(self):
         api_key = "fake-demo-key"
         credentials = SimpleNamespace(api_key=api_key, profile_name="demo-profile")
         runtime = SimpleNamespace(environment="demo", credential_profile_name="demo-profile", credentials=credentials,
                                   position_mode="net", trade_mode="cross")
         plan = AreaShapePlan.create(profile_name="demo-profile", environment="demo", symbol="BTC-USDT-SWAP",
                                     support_price=Decimal("90"), pressure_price=Decimal("130"),
-                                    config=AreaShapeConfig(entry_mode="breakout"))
+                                    config=AreaShapeConfig())
         plan.status = "monitoring"
         close_ts = 1_800_000_000_000
         session_id = "breakout-session"

@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 from decimal import Decimal, ROUND_FLOOR
 from hashlib import sha1
 from typing import Any
+from types import SimpleNamespace
 
 from okx_quant.client_order_id import with_custom_order_id_prefix
 from okx_quant.engine import resolve_open_pos_side
@@ -12,6 +13,7 @@ from okx_quant.kline_rr_trade import RRTradeEvent, RRTradeLedgerEntry, RRTradeOr
 from okx_quant.models import Candle, OrderPlan
 from okx_quant.okx_client import OkxOrderStatus
 from okx_quant.pricing import snap_to_increment
+from okx_quant.pending_order_chase import get_pending_order_chase_service
 
 
 _WORKING_STATES = {"live", "partially_filled"}
@@ -174,6 +176,34 @@ class RRTradeExecutionService:
         entry: RRTradeLedgerEntry,
         exchange_status: OkxOrderStatus,
     ) -> RRTradeLedgerEntry:
+        order = entry.entry_order
+        assert order is not None
+        task = get_pending_order_chase_service().authorized_update(
+            runtime=SimpleNamespace(credentials=credentials, environment=entry.plan.environment),
+            inst_id=entry.plan.inst_id, status=exchange_status,
+            old_price=order.price, old_size=order.size, stop=entry.plan.stop_loss_price,
+        )
+        if task is not None and task.get("owner") == "rr":
+            reference = entry.plan.entry_price
+            if entry.filled_size <= 0:
+                reference = (exchange_status.avg_price if (exchange_status.filled_size or 0) > 0
+                             else exchange_status.price) or reference
+            quantity = exchange_status.size or order.size or entry.plan.sizing.contract_size
+            old_risk = abs(entry.plan.entry_price-entry.plan.stop_loss_price)
+            new_risk = abs(reference-entry.plan.stop_loss_price)
+            trigger = entry.plan.management_trigger_price
+            if trigger is not None and old_risk > 0:
+                trigger_r = abs(trigger-entry.plan.entry_price)/old_risk
+                trigger = reference + (Decimal(1) if entry.plan.direction == "long" else Decimal(-1))*trigger_r*new_risk
+                trigger = snap_to_increment(trigger, entry.plan.instrument_tick_size, "nearest")
+            multiplier = (entry.plan.instrument_ct_val or Decimal(1))*(entry.plan.instrument_ct_mult or Decimal(1))
+            sizing = replace(entry.plan.sizing, contract_size=quantity, risk_per_contract=new_risk*multiplier,
+                actual_risk_amount=quantity*new_risk*multiplier, base_size=quantity*multiplier,
+                notional_usdt=quantity*multiplier*reference)
+            plan = replace(entry.plan, entry_execution_mode="limit", entry_price=reference,
+                           management_trigger_price=trigger, sizing=sizing)
+            entry = replace(entry, plan=plan,
+                entry_order=replace(order, price=exchange_status.price or order.price, size=quantity))
         filled_size, remaining_size = self._fill_sizes(entry=entry, exchange_status=exchange_status)
         state = str(exchange_status.state or "").strip().lower()
         order = entry.entry_order
