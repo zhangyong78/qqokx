@@ -155,7 +155,7 @@ class _CurrentOrderTpSlDialog(QDialog):
         title = QLabel("修改参数")
         title.setObjectName("OrderTpSlTitle")
         layout.addWidget(title)
-        hint = QLabel("留空表示保持原值不变；价格必须为正数。预估收益未扣除手续费。")
+        hint = QLabel("预览使用当前缓存；提交前重新核对交易所委托。留空保持原值；预计平仓毛盈亏未扣手续费、资金费和滑点。")
         hint.setObjectName("OrderTpSlHint")
         hint.setWordWrap(True)
         layout.addWidget(hint)
@@ -188,7 +188,9 @@ class _CurrentOrderTpSlDialog(QDialog):
             summary_layout.addWidget(name_label, 0, column)
             summary_layout.addWidget(value_label, 1, column)
 
-        add_metric(0, "当前方向", direction_text, color="#2563eb" if direction == "buy" else "#dc2626")
+        holding_direction = str(self._preview_context.get("position_direction") or "")
+        add_metric(0, "持仓方向", {"long": "做多", "short": "做空"}.get(holding_direction, "未确认"),
+                   color="#2563eb" if holding_direction == "long" else "#dc2626")
         add_metric(1, "开仓均价", entry_text)
         add_metric(2, "最新价", latest_text)
         add_metric(3, "预估强平价", liquidation_text, color="#dc2626")
@@ -230,6 +232,13 @@ class _CurrentOrderTpSlDialog(QDialog):
         self._stop_loss_preview = QLabel()
         self._stop_loss_preview.setWordWrap(True)
         stop_loss_layout.addWidget(self._stop_loss_preview, 2, 0, 1, 2)
+        self._break_even_requested = False
+        self._break_even_button = QPushButton("设置保本")
+        self._break_even_note = QLabel("按真实持仓和双向手续费计算，提交前再次核对。")
+        self._break_even_note.setWordWrap(True)
+        stop_loss_layout.addWidget(self._break_even_button, 3, 0, 1, 2)
+        stop_loss_layout.addWidget(self._break_even_note, 4, 0, 1, 2)
+        self._stop_loss_edit.textEdited.connect(lambda _text: setattr(self, "_break_even_requested", False))
         layout.addWidget(stop_loss_card)
 
         preview_card = QFrame()
@@ -253,9 +262,11 @@ class _CurrentOrderTpSlDialog(QDialog):
         quantity_layout = QGridLayout(quantity_card)
         quantity_layout.setContentsMargins(12, 8, 12, 8)
         quantity_layout.addWidget(QLabel("数量"), 0, 0)
-        quantity_layout.addWidget(QLabel(quantity_text), 0, 1)
+        self._quantity_value = QLabel(quantity_text)
+        quantity_layout.addWidget(self._quantity_value, 0, 1)
         quantity_layout.addWidget(QLabel("持仓量"), 0, 2)
-        quantity_layout.addWidget(QLabel(holding_text), 0, 3)
+        self._holding_value = QLabel(holding_text)
+        quantity_layout.addWidget(self._holding_value, 0, 3)
         layout.addWidget(quantity_card)
         self._take_profit_edit.textChanged.connect(self._refresh_preview)
         self._stop_loss_edit.textChanged.connect(self._refresh_preview)
@@ -336,7 +347,7 @@ class _CurrentOrderTpSlDialog(QDialog):
         sign = "+" if delta > 0 else ""
         return (
             f"当前 {current_text} → 修改后 {proposed_text}  |  "
-            f"变动 {sign}{self._format_value(delta)}（{sign}{self._format_percent(percent)}%）"
+            f"变动 {sign}{cls._format_value(abs(delta))}（{sign}{cls._format_percent(abs(percent))}%）"
         )
 
     def _estimated_pnl_text(self, label: str, target: Decimal | None) -> str:
@@ -353,6 +364,8 @@ class _CurrentOrderTpSlDialog(QDialog):
         currency = str(self._preview_context.get("pnl_currency") or "USDT").strip().upper()
         if entry is None or entry <= 0:
             return f"{label}预计收益：暂无（缺少开仓均价）"
+        if direction not in {"long", "short"}:
+            return f"{label}预计收益：暂无（无法确定持仓方向）"
         change = target - entry
         if direction == "short":
             change = -change
@@ -3091,6 +3104,29 @@ class PositionProtectionDialog(QDialog):
         return value
 
 
+class _OrderInstrumentMetadataThread(QThread):
+    loaded = Signal(object)
+
+    def __init__(self, inst_ids: list[str], parent: QWidget) -> None:
+        super().__init__(parent)
+        self._inst_ids = inst_ids
+
+    def run(self) -> None:
+        client = OkxRestClient()
+        instruments = {}
+        try:
+            for inst_id in self._inst_ids:
+                if self.isInterruptionRequested():
+                    break
+                try:
+                    instruments[inst_id] = client.get_instrument(inst_id, prefer_cached=True)
+                except Exception:
+                    continue
+            self.loaded.emit(instruments)
+        finally:
+            client.close()
+
+
 class AccountPositionsHomeWidget(QWidget):
     _ui_callback = Signal(object)
     _selected_position_manual_flatten_callback = Signal(object)
@@ -3183,6 +3219,12 @@ class AccountPositionsHomeWidget(QWidget):
         self._position_history_filter_resetting = False
         self._current_order_canceling = False
         self._current_order_amending = False
+        self._order_instrument_thread = None
+        self._order_instrument_pending: set[str] = set()
+        self._order_instrument_attempted: set[str] = set()
+        self._order_instrument_timer = QTimer(self)
+        self._order_instrument_timer.setSingleShot(True)
+        self._order_instrument_timer.timeout.connect(self._start_order_instrument_fetch)
         self._selected_position_manual_flatten_running = False
         self._shared_client = OkxRestClient()
         self._realtime_store = get_shared_realtime_account_store(client=self._shared_client)
@@ -3672,6 +3714,7 @@ class AccountPositionsHomeWidget(QWidget):
             self._start_private_threads()
 
     def shutdown(self) -> None:
+        self._stop_order_instrument_fetch()
         self._save_positions_view_prefs_now()
         self._stop_private_threads()
         self._stop_order_history_thread()
@@ -3688,6 +3731,12 @@ class AccountPositionsHomeWidget(QWidget):
         self._flush_retired_threads()
 
     def begin_shutdown(self, finished: Callable[[], None] | None = None) -> None:
+        self._stop_order_instrument_fetch()
+        actions = getattr(self, "_order_actions", None)
+        if actions is not None:
+            for worker in actions.shutdown():
+                if worker not in self._retired_threads:
+                    self._retired_threads.append(worker)
         if finished is not None:
             self._shutdown_finish_callbacks.append(finished)
         if self._shutdown_in_progress:
@@ -6974,6 +7023,16 @@ class AccountPositionsHomeWidget(QWidget):
             top.addWidget(button)
         layout.addLayout(top)
 
+        from roll_terminal_qt.order_actions import OrderActions
+        self._order_actions = OrderActions(self, self._order_action_runtime, self._selected_current_order,
+            lambda: self._shared_order_store.request_refresh(runtime=self._runtime,
+                profile_name=self._last_profile_name, include_history=False),
+            lambda item: self.chase_context_provider(item) if callable(getattr(self, "chase_context_provider", None)) else {})
+        actions = QHBoxLayout()
+        self._order_actions.add_chase_controls(actions)
+        actions.addStretch(1)
+        layout.addLayout(actions)
+
         filter_row = QGridLayout()
         filter_row.setHorizontalSpacing(8)
         filter_row.setVerticalSpacing(8)
@@ -7022,7 +7081,7 @@ class AccountPositionsHomeWidget(QWidget):
         layout.addLayout(filter_row)
 
         self._orders_table = self._build_history_table(
-            ("时间", "来源", "类型", "合约", "状态", "方向", "委托类型", "委托价", "委托量（币/张）", "已成交（币/张）", "手续费", "TP/SL", "订单ID", "clOrdId"),
+            ("时间", "来源", "类型", "合约", "状态", "方向", "委托类型", "委托价", "委托量（币/张）", "已成交（币/张）", "手续费", "止盈止损", "订单ID", "clOrdId"),
             stretch_columns={3, 11, 13},
         )
         self._orders_table.setColumnWidth(8, 200)
@@ -7096,7 +7155,7 @@ class AccountPositionsHomeWidget(QWidget):
         layout.addLayout(filter_row)
 
         self._order_history_table = self._build_history_table(
-            ("时间", "来源", "类型", "合约", "状态", "方向", "委托类型", "委托价", "委托量（币/张）", "已成交（币/张）", "手续费", "TP/SL", "订单ID", "clOrdId"),
+            ("时间", "来源", "类型", "合约", "状态", "方向", "委托类型", "委托价", "委托量（币/张）", "已成交（币/张）", "手续费", "止盈止损", "订单ID", "clOrdId"),
             stretch_columns={3, 11, 13},
         )
         layout.addWidget(self._order_history_table, 1)
@@ -7320,7 +7379,7 @@ class AccountPositionsHomeWidget(QWidget):
             "最大持仓（币/张）": 220,
             "已平仓（币/张）": 220,
             "手续费": 240,
-            "TP/SL": 320,
+            "止盈止损": 320,
             "订单ID": 220,
             "clOrdId": 300,
             "盈亏": 240,
@@ -7598,21 +7657,70 @@ class AccountPositionsHomeWidget(QWidget):
             result.append(item)
         return result
 
+    def _cached_order_instrument(self, inst_id: str):
+        cache = getattr(self, "_current_order_instruments", {})
+        instrument = cache.get(inst_id)
+        if instrument is None:
+            getter = getattr(self._shared_client, "_get_cached_instrument", None)
+            try:
+                instrument = getter(inst_id) if callable(getter) else None
+            except Exception:
+                instrument = None
+            if instrument is not None:
+                cache[inst_id] = instrument
+                self._current_order_instruments = cache
+        if instrument is None and inst_id not in self._order_instrument_attempted:
+            self._order_instrument_attempted.add(inst_id)
+            self._order_instrument_pending.add(inst_id)
+            if not self._order_instrument_timer.isActive():
+                self._order_instrument_timer.start(0)
+        return instrument
+
+    def _start_order_instrument_fetch(self) -> None:
+        if self._shutdown_in_progress or self._order_instrument_thread is not None or not self._order_instrument_pending:
+            return
+        inst_ids = sorted(self._order_instrument_pending)
+        self._order_instrument_pending.clear()
+        thread = _OrderInstrumentMetadataThread(inst_ids, self)
+        self._order_instrument_thread = thread
+        thread.loaded.connect(self._apply_order_instruments)
+        thread.finished.connect(lambda: self._finish_order_instrument_fetch(thread))
+        thread.start()
+
+    def _apply_order_instruments(self, result: object) -> None:
+        if self._shutdown_in_progress or not isinstance(result, dict) or not result:
+            return
+        cache = dict(getattr(self, "_current_order_instruments", {}) or {})
+        cache.update(result)
+        self._current_order_instruments = cache
+        self._refresh_current_orders_table()
+        self._refresh_order_history_table()
+
+    def _finish_order_instrument_fetch(self, thread: QThread) -> None:
+        if self._order_instrument_thread is thread:
+            self._order_instrument_thread = None
+        cache = getattr(self, "_current_order_instruments", {}) or {}
+        for inst_id in getattr(thread, "_inst_ids", ()):
+            if inst_id not in cache:
+                self._order_instrument_attempted.discard(inst_id)
+        thread.deleteLater()
+        if self._order_instrument_pending and not self._shutdown_in_progress:
+            self._order_instrument_timer.start(0)
+
+    def _stop_order_instrument_fetch(self) -> None:
+        self._order_instrument_timer.stop()
+        thread = self._order_instrument_thread
+        if thread is not None:
+            self._order_instrument_thread = None
+            thread.requestInterruption()
+            self._retire_thread(thread)
+
     def _format_current_order_size_with_coin(self, order: object, *, filled: bool) -> str:
         instruments = dict(self._position_instruments)
         inst_id = str(getattr(order, "inst_id", "") or "").strip()
         inst_type = str(getattr(order, "inst_type", "") or "").upper()
         if inst_id and inst_type in {"SWAP", "FUTURES", "OPTION"} and inst_id not in instruments:
-            cache = getattr(self, "_current_order_instruments", {})
-            instrument = cache.get(inst_id)
-            if instrument is None:
-                try:
-                    instrument = self._shared_client.get_instrument(inst_id)
-                except Exception:
-                    instrument = None
-                if instrument is not None:
-                    cache[inst_id] = instrument
-                    self._current_order_instruments = cache
+            instrument = self._cached_order_instrument(inst_id)
             if instrument is not None:
                 instruments[inst_id] = instrument
         return _format_trade_order_size_with_coin(order, instruments, filled=filled)
@@ -7624,16 +7732,7 @@ class AccountPositionsHomeWidget(QWidget):
         inst_id = str(getattr(order, "inst_id", "") or "").strip()
         inst_type = str(getattr(order, "inst_type", "") or "").upper()
         if inst_id and inst_type in {"SWAP", "FUTURES", "OPTION"} and inst_id not in instruments:
-            cache = getattr(self, "_current_order_instruments", {})
-            instrument = cache.get(inst_id)
-            if instrument is None:
-                try:
-                    instrument = self._shared_client.get_instrument(inst_id, prefer_cached=True)
-                except Exception:
-                    instrument = None
-                if instrument is not None:
-                    cache[inst_id] = instrument
-                    self._current_order_instruments = cache
+            instrument = self._cached_order_instrument(inst_id)
             if instrument is not None:
                 instruments[inst_id] = instrument
         return _format_trade_order_size_with_coin(order, instruments, filled=filled)
@@ -7765,7 +7864,8 @@ class AccountPositionsHomeWidget(QWidget):
             for position in positions
             if order_pos_side and str(getattr(position, "pos_side", "") or "").strip().lower() == order_pos_side
         ]
-        position = (matching or positions or [None])[0]
+        candidates = matching if order_pos_side in {"long", "short"} else positions
+        position = candidates[0] if len(candidates) == 1 else None
         instrument = (
             getattr(self, "_position_instruments", {}).get(inst_id)
             or getattr(self, "_current_order_instruments", {}).get(inst_id)
@@ -7821,13 +7921,20 @@ class AccountPositionsHomeWidget(QWidget):
         elif instrument_type == "SPOT":
             base_quantity = quantity
 
-        position_direction = order_pos_side if order_pos_side in {"long", "short"} else ""
+        position_direction = order_pos_side if position is not None and order_pos_side in {"long", "short"} else ""
         if not position_direction and position is not None:
             candidate = str(getattr(position, "pos_side", "") or "").strip().lower()
             if candidate in {"long", "short"}:
                 position_direction = candidate
-        if not position_direction:
-            position_direction = "long" if str(item.side or order.side or "").strip().lower() == "buy" else "short"
+            elif candidate in {"net", ""}:
+                position_size = getattr(position, "position", None)
+                if position_size is not None:
+                    try:
+                        signed_size = Decimal(str(position_size))
+                        if signed_size.is_finite() and signed_size != 0:
+                            position_direction = "long" if signed_size > 0 else "short"
+                    except (ArithmeticError, ValueError, TypeError):
+                        pass
 
         if base_quantity is not None:
             quantity_text = f"{format_decimal(base_quantity)} {base_currency or '币'}"
@@ -7862,6 +7969,12 @@ class AccountPositionsHomeWidget(QWidget):
         }
 
     def _amend_selected_current_order(self) -> None:
+        self._order_actions.edit()
+
+    def _order_action_runtime(self):
+        return self._runtime if self._ensure_runtime_ready(force_unlock=True) else None
+
+    def _legacy_amend_selected_current_order(self) -> None:
         if self._current_order_amending:
             QMessageBox.information(self, "修改止盈止损", "当前已有一笔改单请求在处理中，请稍等。")
             return
@@ -9424,18 +9537,27 @@ def _account_positions_home_shared_init(self: AccountPositionsHomeWidget, parent
 
 
 def _account_positions_home_apply_orders(self: AccountPositionsHomeWidget, orders: object) -> None:
-    _ACCOUNT_POSITIONS_HOME_ORIGINAL_APPLY_ORDERS(self, orders)
     shared_order_store = getattr(self, "_shared_order_store", None)
     runtime = getattr(self, "_runtime", None)
     profile_name = str(getattr(self, "_last_profile_name", "") or "").strip()
     environment = str(getattr(runtime, "environment", "") or "").strip()
-    if runtime is None or not profile_name or shared_order_store is None:
+    if runtime is None or not profile_name or shared_order_store is None or not isinstance(orders, list):
+        _ACCOUNT_POSITIONS_HOME_ORIGINAL_APPLY_ORDERS(self, orders)
         return
-    shared_order_store.publish_current_orders(
+    # Realtime snapshots are incremental and may be empty.  They must not
+    # replace the complete pending-order snapshot held by the shared store.
+    shared_order_store.publish_order_updates(
         profile_name=profile_name,
         environment=environment,
-        orders=list(self._orders),
+        orders=orders,
     )
+    snapshot = shared_order_store.snapshot_for(profile_name=profile_name, environment=environment)
+    if isinstance(snapshot, SharedOrderSnapshot):
+        next_orders = list(snapshot.current_order_views)
+        if next_orders != list(getattr(self, "_orders", [])):
+            _ACCOUNT_POSITIONS_HOME_ORIGINAL_APPLY_ORDERS(self, next_orders)
+    else:
+        _ACCOUNT_POSITIONS_HOME_ORIGINAL_APPLY_ORDERS(self, orders)
 
 
 def _account_positions_home_apply_order_history_payload(self: AccountPositionsHomeWidget, payload: object) -> None:

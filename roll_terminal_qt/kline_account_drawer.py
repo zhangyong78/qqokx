@@ -222,8 +222,8 @@ def order_display_tp_sl(item: object) -> str:
     parts = [
         segment
         for segment in (
-            _segment("TP", getattr(item, "take_profit_trigger_price", None), getattr(item, "take_profit_order_price", None)),
-            _segment("SL", getattr(item, "stop_loss_trigger_price", None), getattr(item, "stop_loss_order_price", None)),
+            _segment("止盈", getattr(item, "take_profit_trigger_price", None), getattr(item, "take_profit_order_price", None)),
+            _segment("止损", getattr(item, "stop_loss_trigger_price", None), getattr(item, "stop_loss_order_price", None)),
         )
         if segment
     ]
@@ -485,6 +485,7 @@ class KlineAccountDrawer(QWidget):
         self._position_history_instruments: dict[str, object] = {}
         self._position_history_usdt_prices: dict[str, Decimal] = {}
         self._history_generation = 0
+        self._history_orders_requested = False
         self._fill_history_loaded = False
         self._position_history_loaded = False
         self._fill_history_thread: FillHistoryFeedThread | None = None
@@ -498,6 +499,10 @@ class KlineAccountDrawer(QWidget):
         self._chase_thread: AccountDrawerChaseThread | None = None
         self._chase_shutting_down = False
         self.chase_context_provider = None
+        self.action_access_provider = None
+        self.profile_snapshots_provider = None
+        from roll_terminal_qt.order_actions import OrderActions
+        self._order_actions = OrderActions(self, self._order_action_runtime, self._selected_order, self.refresh_data)
         # Current positions are the urgent source of truth.  Defer the shared
         # current-order refresh until the REST position check has completed.
         self._orders_refresh_waiting_for_realtime = False
@@ -523,6 +528,7 @@ class KlineAccountDrawer(QWidget):
         self._scope_combo = QComboBox()
         self._scope_combo.addItem("当前交易对", "symbol")
         self._scope_combo.addItem("全部", "all")
+        self._scope_combo.setCurrentIndex(1)
         self._scope_combo.currentIndexChanged.connect(self._schedule_active_table_refresh)
         toolbar.addWidget(self._scope_combo, 0)
 
@@ -555,7 +561,7 @@ class KlineAccountDrawer(QWidget):
                 "成交张数",
                 "状态",
                 "更新时间",
-                "TP/SL",
+                "止盈止损",
                 "订单ID",
                 "clOrdId",
             ]
@@ -568,6 +574,9 @@ class KlineAccountDrawer(QWidget):
         orders_layout.addWidget(self._orders_table, 1)
 
         orders_toolbar = QHBoxLayout()
+        self._amend_button = QPushButton("修改止盈止损")
+        self._amend_button.clicked.connect(self._edit_protection)
+        orders_toolbar.addWidget(self._amend_button)
         self._chase_button = QPushButton("自动追单")
         self._chase_button.setEnabled(False)
         self._chase_button.clicked.connect(self._start_selected_order_chase)
@@ -615,7 +624,7 @@ class KlineAccountDrawer(QWidget):
                 "成交张数",
                 "状态",
                 "更新时间",
-                "TP/SL",
+                "止盈止损",
                 "订单ID",
                 "clOrdId",
             ]
@@ -748,6 +757,9 @@ class KlineAccountDrawer(QWidget):
         self._start_load(self._request_generation)
 
     def shutdown(self, wait_ms: int = 1500) -> bool:
+        for worker in self._order_actions.shutdown():
+            if not worker.wait(wait_ms):
+                return False
         self._chase_shutting_down = True
         if self._chase_thread is not None and self._chase_thread.isRunning():
             self._chase_thread.stop()
@@ -835,6 +847,11 @@ class KlineAccountDrawer(QWidget):
             self._populate_history_orders_table(
                 filter_account_items(self._snapshot.order_history, scope=scope, symbol=self._symbol)
             )
+            if not self._history_orders_requested and self._runtime is not None:
+                self._history_orders_requested = True
+                self._shared_order_store.request_refresh(
+                    runtime=self._runtime, profile_name=self._profile_name, include_history=True,
+                )
         elif current_tab == 3:
             self._populate_fill_history_table(
                 filter_account_items(self._fill_history_items, scope=scope, symbol=self._symbol)
@@ -1091,6 +1108,17 @@ class KlineAccountDrawer(QWidget):
             return None
         return self._visible_orders[row]
 
+    def _order_action_runtime(self):
+        if callable(self.action_access_provider) and not self.action_access_provider():
+            return None
+        return self._runtime
+
+    def _edit_protection(self):
+        if self._chase_thread is not None and self._chase_thread.isRunning():
+            QMessageBox.information(self, "修改止盈止损", "请先停止追单")
+            return
+        self._order_actions.edit()
+
     def _sync_cancel_button_state(self) -> None:
         enabled = (
             not self._cancel_in_flight
@@ -1233,12 +1261,14 @@ def _shared_set_context(
     normalized_symbol = symbol.strip().upper()
     if self._chase_thread is not None and (runtime is not self._runtime or profile_name != self._profile_name or environment != self._environment):
         self._chase_thread.stop()
-    changed = (
+    account_changed = (
         runtime is not self._runtime
         or profile_name != self._profile_name
         or environment != self._environment
-        or normalized_symbol != self._symbol
     )
+    changed = account_changed or normalized_symbol != self._symbol
+    if account_changed:
+        self._history_orders_requested = False
     self._runtime = runtime
     self._profile_name = profile_name
     self._environment = environment
@@ -1274,7 +1304,12 @@ def _shared_refresh_data(self: KlineAccountDrawer) -> None:
     self._orders_refresh_deferred_timer.stop()
     self._orders_refresh_waiting_for_realtime = False
     self._orders_refresh_started_after_realtime = True
-    self._shared_order_store.request_refresh(runtime=self._runtime, profile_name=self._profile_name)
+    include_history = self._tabs.currentIndex() == 2
+    if include_history:
+        self._history_orders_requested = True
+    self._shared_order_store.request_refresh(
+        runtime=self._runtime, profile_name=self._profile_name, include_history=include_history,
+    )
     self._realtime_store.start_if_needed(self._runtime)
     self._realtime_store.request_reconcile("drawer")
     self._status_label.setText("正在同步当前委托和持仓…")

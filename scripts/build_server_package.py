@@ -80,6 +80,11 @@ def build_package(version: str) -> tuple[Path, Path]:
         dirs_exist_ok=True,
         ignore=package_ignore,
     )
+    write_text(
+        stage_dir / "okx_quant" / "server_build.py",
+        'APP_DISTRIBUTION = "server"\n',
+        encoding="utf-8",
+    )
     shutil.copytree(
         project_root / "roll_terminal_qt",
         stage_dir / "roll_terminal_qt",

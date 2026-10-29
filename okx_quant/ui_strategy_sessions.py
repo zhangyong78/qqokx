@@ -45,6 +45,7 @@ from okx_quant.strategy_ui_schema import (
     strategy_ui_extra_defaults,
     strategy_ui_fixed_extra_value,
 )
+from okx_quant.app_meta import APP_DISTRIBUTION
 from okx_quant.strategy_status_email import (
     StrategyStatusEmailRow,
     build_strategy_status_email,
@@ -6962,6 +6963,7 @@ class UiStrategySessionsMixin:
             scheduled_for=scheduled_for,
             generated_at=generated_at,
             is_test=is_test,
+            edition=APP_DISTRIBUTION,
         )
         notifier.notify_async(content.subject, content.body, html_body=content.html_body)
         kind = "测试" if is_test else "定时"

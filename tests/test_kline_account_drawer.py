@@ -1,12 +1,16 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from decimal import Decimal
+import threading
+import time
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 from unittest import TestCase
 
 from PySide6.QtWidgets import QAbstractItemView, QMessageBox
 from PySide6.QtCore import Qt
+from PySide6.QtTest import QTest
 
 from okx_quant.okx_client import OkxPositionHistoryItem
 from roll_terminal_qt.kline_account_drawer import (
@@ -22,7 +26,8 @@ from roll_terminal_qt.kline_account_drawer import (
 from roll_terminal_qt.account_positions_home import POSITION_COLUMNS
 from roll_terminal_qt.kline_analysis_window import KlineAnalysisWindow
 from roll_terminal_qt.realtime_account_store import AccountRealtimeSnapshot
-from roll_terminal_qt.shared_order_store import SharedOrderSnapshot
+from roll_terminal_qt.order_service import OrderStatusView, order_view_to_trade_order_item
+from roll_terminal_qt.shared_order_store import SharedOrderSnapshot, SharedOrderStore
 from tests.qt_test_case import QtWidgetTestCase
 
 
@@ -81,6 +86,82 @@ class KlineAccountDrawerHelperTests(TestCase):
 
 
 class KlineAccountDrawerWidgetTests(QtWidgetTestCase):
+    def test_drawer_shows_normal_order_while_algo_query_is_still_running(self) -> None:
+        store = SharedOrderStore()
+        drawer = KlineAccountDrawer()
+        release_algo = threading.Event()
+        try:
+            drawer._profile_name, drawer._environment = "moni", "demo"
+            drawer._symbol = "BTC-USDT-SWAP"
+            drawer._shared_order_store = store
+            store.snapshot_changed.connect(drawer._apply_shared_order_snapshot)
+            drawer.show()
+            self._app.processEvents()
+            order = OrderStatusView(
+                inst_id="BTC-USDT-SWAP", inst_type="SWAP", ord_id="order-fast",
+                side="buy", pos_side="long", td_mode="cross", ord_type="limit", state="live",
+                price=Decimal("60000"), avg_price=None, size=Decimal("1"), filled_size=Decimal("0"),
+                created_time=1, update_time=10, client_order_id="", reduce_only=False,
+                raw={"_source_kind": "normal", "_feed_source": "rest_pending"},
+            )
+            runtime = SimpleNamespace(environment="demo", credentials=object())
+            client = Mock()
+            client.get_pending_orders.return_value = [order_view_to_trade_order_item(order)]
+            client._fetch_algo_orders.side_effect = lambda **_kwargs: (release_algo.wait(3) and []) or []
+            with (
+                patch("roll_terminal_qt.shared_order_store.OkxRestClient", return_value=client),
+                patch("roll_terminal_qt.shared_order_store.load_current_order_views", return_value=("ok", [order])),
+            ):
+                store.request_refresh(runtime=runtime, profile_name="moni", include_history=False)
+                deadline = time.monotonic() + 2
+                while drawer._orders_table.rowCount() == 0 and time.monotonic() < deadline:
+                    QTest.qWait(10)
+                self.assertEqual(drawer._orders_table.rowCount(), 1)
+                self.assertTrue(store.is_refreshing(profile_name="moni", environment="demo"))
+                release_algo.set()
+                while store.is_refreshing(profile_name="moni", environment="demo") and time.monotonic() < deadline:
+                    QTest.qWait(10)
+                self._app.processEvents()
+                self.assertEqual(drawer._orders_table.rowCount(), 1)
+        finally:
+            release_algo.set()
+            self.dispose_widget(drawer)
+
+    def test_drawer_keeps_rest_order_on_empty_realtime_update_until_terminal_event(self) -> None:
+        store = SharedOrderStore()
+        drawer = KlineAccountDrawer()
+        try:
+            drawer._profile_name, drawer._environment = "moni", "demo"
+            drawer._symbol = "BTC-USDT-SWAP"
+            drawer._shared_order_store = store
+            store.snapshot_changed.connect(drawer._apply_shared_order_snapshot)
+            drawer.show()
+            self._app.processEvents()
+            order = OrderStatusView(
+                inst_id="BTC-USDT-SWAP", inst_type="SWAP", ord_id="order-1",
+                side="buy", pos_side="long", td_mode="cross", ord_type="limit", state="live",
+                price=Decimal("60000"), avg_price=None, size=Decimal("1"), filled_size=Decimal("0"),
+                created_time=1, update_time=10, client_order_id="", reduce_only=False,
+                raw={"_source_kind": "normal", "_feed_source": "rest_pending"},
+            )
+            store.publish_current_orders(profile_name="moni", environment="demo", orders=[order], started_revision=0)
+            self._app.processEvents()
+            self.assertEqual(drawer._orders_table.rowCount(), 1)
+
+            home = SimpleNamespace(
+                _shared_order_store=store, _runtime=SimpleNamespace(environment="demo"),
+                _last_profile_name="moni", _orders=[], _refresh_current_orders_table=Mock(),
+            )
+            from roll_terminal_qt.account_positions_home import AccountPositionsHomeWidget
+            AccountPositionsHomeWidget._apply_orders(home, [])
+            self._app.processEvents()
+            self.assertEqual(drawer._orders_table.rowCount(), 1)
+            AccountPositionsHomeWidget._apply_orders(home, [replace(order, state="filled", update_time=20)])
+            self._app.processEvents()
+            self.assertEqual(drawer._orders_table.rowCount(), 0)
+        finally:
+            self.dispose_widget(drawer)
+
     def test_realtime_order_updates_reach_shared_store_without_waiting_for_rest(self) -> None:
         drawer = KlineAccountDrawer()
         try:
@@ -185,10 +266,10 @@ class KlineAccountDrawerWidgetTests(QtWidgetTestCase):
         finally:
             self.dispose_widget(drawer)
 
-    def test_drawer_defaults_to_symbol_scope_and_read_only_positions(self) -> None:
+    def test_drawer_defaults_to_all_scope_and_read_only_positions(self) -> None:
         drawer = KlineAccountDrawer()
         try:
-            self.assertEqual(drawer._scope_combo.currentData(), "symbol")
+            self.assertEqual(drawer._scope_combo.currentData(), "all")
             self.assertEqual(drawer._tabs.tabText(0), "当前委托")
             self.assertEqual(drawer._tabs.tabText(1), "当前持仓")
             self.assertEqual(drawer._tabs.tabText(2), "历史委托")
@@ -352,9 +433,29 @@ class KlineAccountDrawerWidgetTests(QtWidgetTestCase):
             shared_order_store.request_refresh.assert_called_once_with(
                 runtime=drawer._runtime,
                 profile_name="moni",
+                include_history=False,
             )
             drawer._realtime_store.start_if_needed.assert_called_once_with(drawer._runtime)
             drawer._realtime_store.request_reconcile.assert_called_once_with("drawer")
+        finally:
+            self.dispose_widget(drawer)
+
+    @patch("roll_terminal_qt.kline_account_drawer.get_shared_order_store")
+    def test_history_orders_are_requested_when_the_history_tab_is_opened(self, get_shared_order_store: Mock) -> None:
+        store = get_shared_order_store.return_value
+        drawer = KlineAccountDrawer()
+        try:
+            drawer._runtime = SimpleNamespace(credentials=object(), environment="demo")
+            drawer._profile_name = "moni"
+            drawer.show()
+            drawer._tabs.setCurrentIndex(2)
+            self._app.processEvents()
+            store.request_refresh.assert_called_once_with(
+                runtime=drawer._runtime, profile_name="moni", include_history=True,
+            )
+            drawer._schedule_active_table_refresh()
+            self._app.processEvents()
+            self.assertEqual(store.request_refresh.call_count, 1)
         finally:
             self.dispose_widget(drawer)
 
@@ -402,15 +503,15 @@ class KlineAccountDrawerWidgetTests(QtWidgetTestCase):
                 drawer._orders_table.horizontalHeaderItem(index).text()
                 for index in range(drawer._orders_table.columnCount())
             ]
-            self.assertIn("TP/SL", headers)
+            self.assertIn("止盈止损", headers)
             self.assertIn("clOrdId", headers)
-            tp_sl_col = headers.index("TP/SL")
+            tp_sl_col = headers.index("止盈止损")
             order_id_col = headers.index("订单ID")
             cl_ord_col = headers.index("clOrdId")
             direction_col = headers.index("方向")
 
-            self.assertIn("TP 65000", drawer._orders_table.item(0, tp_sl_col).text())
-            self.assertIn("SL 59000", drawer._orders_table.item(0, tp_sl_col).text())
+            self.assertIn("止盈 65000", drawer._orders_table.item(0, tp_sl_col).text())
+            self.assertIn("止损 59000", drawer._orders_table.item(0, tp_sl_col).text())
             self.assertEqual(drawer._orders_table.item(0, headers.index("币数量")).text(), "0.026 BTC")
             self.assertEqual(drawer._orders_table.item(0, order_id_col).text(), "3730927321386143744")
             self.assertEqual(drawer._orders_table.item(0, cl_ord_col).text(), "rrsto77e9a3508b0457d3688e9631")
@@ -487,12 +588,12 @@ class KlineAccountDrawerWidgetTests(QtWidgetTestCase):
                 for index in range(drawer._history_orders_table.columnCount())
             ]
             state_col = headers.index("状态")
-            tp_sl_col = headers.index("TP/SL")
+            tp_sl_col = headers.index("止盈止损")
 
             self.assertEqual(drawer._history_orders_table.rowCount(), 1)
             self.assertEqual(drawer._history_orders_table.item(0, state_col).text(), "canceled")
-            self.assertIn("TP 62084.2", drawer._history_orders_table.item(0, tp_sl_col).text())
-            self.assertIn("SL 65628.9", drawer._history_orders_table.item(0, tp_sl_col).text())
+            self.assertIn("止盈 62084.2", drawer._history_orders_table.item(0, tp_sl_col).text())
+            self.assertIn("止损 65628.9", drawer._history_orders_table.item(0, tp_sl_col).text())
         finally:
             self.dispose_widget(drawer)
 

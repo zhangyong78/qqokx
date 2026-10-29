@@ -6203,7 +6203,7 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
             "size": "委托量（币/张）",
             "filled": "已成交（币/张）",
             "fee": "手续费",
-            "tp_sl": "TP/SL",
+            "tp_sl": "止盈止损",
             "order_id": "订单ID",
             "cl_ord_id": "clOrdId",
         }
@@ -8013,7 +8013,7 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
 
 
         row += 1
-        ttk.Label(account_frame, text="TP/SL 触发价格类型").grid(row=row, column=0, sticky="w", pady=(12, 0))
+        ttk.Label(account_frame, text="止盈止损触发价格类型").grid(row=row, column=0, sticky="w", pady=(12, 0))
         ttk.Combobox(
             account_frame,
             textvariable=self.trigger_type_label,
@@ -14251,8 +14251,8 @@ def _format_trade_order_tp_sl(item: OkxTradeOrderItem) -> str:
     parts = [
         segment
         for segment in (
-            _build_tp_sl_segment("TP", item.take_profit_trigger_price, item.take_profit_order_price),
-            _build_tp_sl_segment("SL", item.stop_loss_trigger_price, item.stop_loss_order_price),
+        _build_tp_sl_segment("止盈", item.take_profit_trigger_price, item.take_profit_order_price),
+        _build_tp_sl_segment("止损", item.stop_loss_trigger_price, item.stop_loss_order_price),
         )
         if segment
     ]
@@ -14472,7 +14472,7 @@ def _build_trade_order_detail_text(item: OkxTradeOrderItem) -> str:
         f"已成交：{_format_trade_order_size(item.filled_size)}",
         f"成交均价：{_format_trade_order_price(item.avg_price, item.inst_id, item.inst_type)}",
         f"reduceOnly：{_format_flag(item.reduce_only)}",
-        f"TP/SL：{_format_trade_order_tp_sl(item)}",
+        f"止盈止损：{_format_trade_order_tp_sl(item)}",
         f"订单ID：{item.order_id or '-'}",
         f"算法ID：{item.algo_id or '-'}",
         f"clOrdId：{item.client_order_id or '-'}",

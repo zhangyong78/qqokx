@@ -42,9 +42,24 @@ def test_modern_websocket_keeps_proxy_detection_enabled_and_demo_headers() -> No
         )
         modern.assert_called_once_with(
             "wss://wspap.okx.com/ws/v5/private", proxy=True,
+            create_connection=websockets_compat._SafeClientConnection,
             additional_headers={"x-simulated-trading": "1"}, open_timeout=20,
         )
         legacy.assert_not_called()
+
+
+def test_websocket_proxy_reset_before_connection_made() -> None:
+    from websockets.client import ClientProtocol
+    from websockets.uri import parse_uri
+
+    async def check() -> None:
+        connection = websockets_compat._SafeClientConnection(
+            ClientProtocol(parse_uri("wss://example.com"))
+        )
+        connection.connection_lost(ConnectionResetError())
+        assert connection.connection_lost_waiter.done()
+
+    asyncio.run(check())
 
 
 def test_old_websocket_api_preserves_header_compatibility() -> None:

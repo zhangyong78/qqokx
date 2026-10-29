@@ -5,6 +5,11 @@ from pathlib import Path
 
 from okx_quant import __version__
 
+try:
+    from okx_quant.server_build import APP_DISTRIBUTION
+except ImportError:
+    APP_DISTRIBUTION = "local"
+
 
 APP_NAME = "OKX 策略工作台（服务器版本）"
 DEFAULT_APP_VERSION = __version__

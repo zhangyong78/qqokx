@@ -1926,6 +1926,51 @@ def _candle_amplitude(candle: Any) -> float:
     return max(0.0, _to_float(candle.high) - _to_float(candle.low))
 
 
+def _has_preceding_swing(
+    candles: list[Any],
+    formation_start: int,
+    direction: str,
+    *,
+    lookback: int = 12,
+    min_move_atr: float = 1.5,
+) -> bool:
+    """Require a visible move into a reversal pattern before showing it on the chart."""
+    start = max(0, int(formation_start))
+    if start > len(candles):
+        return False
+    context = candles[max(0, start - lookback) : start]
+    atr_window = candles[max(0, start - 20) : start]
+    if len(context) < 8 or len(atr_window) < 8:
+        return False
+    atr_start = max(0, start - 20)
+    true_ranges: list[float] = []
+    for index, candle in enumerate(atr_window, start=atr_start):
+        previous_close = _to_float(candles[index - 1].close) if index > 0 else _to_float(candle.open)
+        high = _to_float(candle.high)
+        low = _to_float(candle.low)
+        true_ranges.append(max(high - low, abs(high - previous_close), abs(low - previous_close)))
+    average_range = sum(true_ranges) / len(true_ranges)
+    context_high = max(_to_float(candle.high) for candle in context)
+    context_low = min(_to_float(candle.low) for candle in context)
+    context_span = context_high - context_low
+    if average_range <= 0.0 or context_span <= 0.0:
+        return False
+
+    move = _to_float(context[-1].close) - _to_float(context[0].close)
+    last_close = _to_float(context[-1].close)
+    if direction == "short":
+        return (
+            move >= average_range * min_move_atr
+            and last_close >= context_low + context_span * 0.65
+        )
+    if direction == "long":
+        return (
+            move <= -average_range * min_move_atr
+            and last_close <= context_high - context_span * 0.65
+        )
+    return False
+
+
 def _candle_body_size(candle: Any) -> float:
     return abs(_to_float(candle.close) - _to_float(candle.open))
 
@@ -2255,6 +2300,14 @@ def _build_replay_signal_markers(
         pattern_start = _signal_pattern_index_range(
             signal_index=index, candle_count=int(signal.candle_count),
         ).start
+        if signal.pattern_id in {
+            "top_fractal", "bottom_fractal", "long_upper_shadow", "long_lower_shadow",
+        } and not _has_preceding_swing(candles, pattern_start, str(signal.direction or "")):
+            continue
+        if signal.pattern_id == "inside_bar" and not _has_preceding_swing(
+            candles, pattern_start, str(signal.direction or ""),
+        ):
+            continue
         if pattern_start < 0 or any(
             not bool(getattr(candles[item], "confirmed", True))
             for item in range(pattern_start, index + 1)
@@ -2358,6 +2411,8 @@ def _build_replay_signal_markers(
             pattern_id = "double_reversal_down"
             direction = "short"
         if not pattern_id:
+            continue
+        if not _has_preceding_swing(candles, index - 1, direction):
             continue
         if not _double_reversal_has_structure(
             candles=candles,
@@ -7659,6 +7714,8 @@ class KlineAnalysisWindow(QMainWindow):
 
         shape_signal_tooltip = (
             "形态说明：1H/4H/1D/1W 显示核心标志K触发的形态信号。\n"
+            "反转形态需先有同方向前置走势：最多12根K线位移达到平均真实波幅的1.5倍，并处于近期区间边缘；孕线也需处于对应边缘。\n"
+            "大阳线、大阴线沿用原规则。\n"
             "核心K按振幅排序，需在含自身最近10根K线中排前4。\n"
             "勾选碰均线后，核心K还需触碰对应均线；1H 只参考 SMA50，4H/1D/1W 参考 EMA15 或 MA50。"
         )
@@ -8561,6 +8618,8 @@ class KlineAnalysisWindow(QMainWindow):
         self._chart_account_splitter.addWidget(chart_frame)
         self._account_drawer = KlineAccountDrawer()
         self._account_drawer.chase_context_provider = self._current_order_chase_context
+        self._account_drawer.action_access_provider = lambda: self._ensure_profile_access(self._active_profile_name())
+        self._account_drawer.profile_snapshots_provider = lambda: self._profile_snapshots
         self._account_drawer.collapseRequested.connect(self._collapse_account_drawer)
         self._chart_account_splitter.addWidget(self._account_drawer)
         self._account_drawer.hide()

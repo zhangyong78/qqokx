@@ -143,7 +143,7 @@ class AccountSettingsDialog(QDialog):
         self.trigger_type = QComboBox(mail)
         for label in ("标记价格 mark", "最新价格 last", "指数价格 index"):
             self.trigger_type.addItem(label)
-        mail_form.addRow("TP/SL 触发价格类型", self.trigger_type)
+        mail_form.addRow("止盈止损触发价格类型", self.trigger_type)
         self.mail_fields: dict[str, QLineEdit] = {}
         for key, label in (
             ("smtp_host", "SMTP 主机"), ("smtp_port", "SMTP 端口"),

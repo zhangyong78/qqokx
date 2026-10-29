@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from decimal import Decimal
 from types import SimpleNamespace
+import threading
 from unittest import TestCase
 from unittest.mock import MagicMock, patch
 
@@ -18,9 +19,106 @@ from roll_terminal_qt.account_positions_home import (
 )
 from okx_quant.okx_client import OkxOrderResult
 from roll_terminal_qt.order_service import OrderStatusView
+from PySide6.QtCore import QTimer
+from PySide6.QtTest import QTest
+from tests.qt_test_case import QtWidgetTestCase
 
 
 class AccountPositionsHomeQtCurrentOrderHelpersTest(TestCase):
+    def test_missing_instrument_never_triggers_network_during_table_render(self) -> None:
+        client = MagicMock()
+        client._get_cached_instrument.return_value = None
+        timer = MagicMock()
+        timer.isActive.return_value = False
+        home = SimpleNamespace(_position_instruments={}, _shared_client=client,
+            _order_instrument_attempted=set(), _order_instrument_pending=set(), _order_instrument_timer=timer)
+        home._cached_order_instrument = lambda inst_id: AccountPositionsHomeWidget._cached_order_instrument(home, inst_id)
+        order = SimpleNamespace(inst_id="BTC-USDT-SWAP", inst_type="SWAP", size=Decimal("0.82"),
+                                filled_size=Decimal("0"), price=Decimal("80000"), avg_price=None)
+        AccountPositionsHomeWidget._format_current_order_size_with_coin(home, order, filled=False)
+        AccountPositionsHomeWidget._format_current_order_size_with_coin(home, order, filled=True)
+        AccountPositionsHomeWidget._format_order_history_size_with_coin(home, order, filled=False)
+        client.get_instrument.assert_not_called()
+        self.assertEqual(home._order_instrument_pending, {"BTC-USDT-SWAP"})
+        timer.start.assert_called_once_with(0)
+
+    def test_background_instrument_result_refreshes_both_order_tables(self) -> None:
+        home = SimpleNamespace(_shutdown_in_progress=False, _current_order_instruments={},
+            _refresh_current_orders_table=MagicMock(), _refresh_order_history_table=MagicMock())
+        instrument = object()
+        AccountPositionsHomeWidget._apply_order_instruments(home, {"BTC-USDT-SWAP": instrument})
+        self.assertIs(home._current_order_instruments["BTC-USDT-SWAP"], instrument)
+        home._refresh_current_orders_table.assert_called_once()
+        home._refresh_order_history_table.assert_called_once()
+
+
+class AccountInstrumentLoadingResponsivenessTest(QtWidgetTestCase):
+    def test_slow_metadata_query_runs_in_background_and_updates_the_cache(self):
+        started, release = threading.Event(), threading.Event()
+        client = MagicMock()
+        client._get_cached_instrument.return_value = None
+        instrument = SimpleNamespace(inst_id="BTC-USDT-SWAP")
+        def slow_lookup(*_args, **_kwargs):
+            started.set()
+            if not release.wait(3):
+                raise TimeoutError("test timed out")
+            return instrument
+        client.get_instrument.side_effect = slow_lookup
+        home = None
+        with (patch("roll_terminal_qt.account_positions_home.load_runtime", return_value=None),
+              patch("roll_terminal_qt.account_positions_home.OkxRestClient", return_value=client)):
+            try:
+                home = AccountPositionsHomeWidget()
+                order = SimpleNamespace(inst_id="BTC-USDT-SWAP", inst_type="SWAP", size=Decimal("1"),
+                                        filled_size=Decimal("0"), price=Decimal("80000"), avg_price=None)
+                home._format_current_order_size_with_coin(order, filled=False)
+                responsive = []
+                QTimer.singleShot(50, lambda: responsive.append(True))
+                QTest.qWait(150)
+                self.assertTrue(started.is_set())
+                self.assertEqual(responsive, [True])
+                self.assertFalse(release.is_set())
+                release.set()
+                for _ in range(100):
+                    QTest.qWait(10)
+                    if home._order_instrument_thread is None:
+                        break
+                self.assertIsNone(home._order_instrument_thread)
+                self.assertIs(home._current_order_instruments[order.inst_id], instrument)
+            finally:
+                release.set()
+                if home is not None:
+                    home.shutdown()
+                    self.dispose_widget(home)
+
+
+class AccountPositionsHomeQtCurrentOrderRemainingTest(TestCase):
+    def test_net_position_direction_uses_signed_holding_not_protection_order_side(self) -> None:
+        order = SimpleNamespace(inst_id="BTC-USDT-SWAP", pos_side="net", side="sell", raw={})
+        item = SimpleNamespace(inst_id=order.inst_id, pos_side="net", side="sell", inst_type="SWAP", price=None, size=Decimal("1"))
+        position = SimpleNamespace(inst_id=order.inst_id, pos_side="net", position=Decimal("1"), avg_price=Decimal("80225"), raw={})
+        home = SimpleNamespace(_raw_positions=[position], _position_instruments={}, _current_order_instruments={}, _position_tickers={})
+        context = AccountPositionsHomeWidget._current_order_tp_sl_preview_context(home, order, item)
+        self.assertEqual(context["position_direction"], "long")
+        position.position = Decimal("-1")
+        context = AccountPositionsHomeWidget._current_order_tp_sl_preview_context(home, order, item)
+        self.assertEqual(context["position_direction"], "short")
+        home._raw_positions = []
+        context = AccountPositionsHomeWidget._current_order_tp_sl_preview_context(home, order, item)
+        self.assertEqual(context["position_direction"], "")
+
+    def test_estimated_pnl_requires_known_direction_and_is_mirrored_for_short(self) -> None:
+        dialog_type = account_positions_home_module._CurrentOrderTpSlDialog
+        context = {"entry_price": Decimal("80225"), "quantity": Decimal("0.82"),
+                   "contract_value": Decimal("0.01"), "contract_value_currency": "BTC",
+                   "base_currency": "BTC", "instrument_type": "SWAP", "pnl_currency": "USDT"}
+        dialog = SimpleNamespace(_preview_context=context, _decimal_value=dialog_type._decimal_value,
+                                 _format_amount=dialog_type._format_amount)
+        self.assertIn("无法确定持仓方向", dialog_type._estimated_pnl_text(dialog, "止盈", Decimal("82966.1")))
+        context["position_direction"] = "long"
+        self.assertIn("+22.48", dialog_type._estimated_pnl_text(dialog, "止盈", Decimal("82966.1")))
+        context["position_direction"] = "short"
+        self.assertIn("-22.48", dialog_type._estimated_pnl_text(dialog, "止盈", Decimal("82966.1")))
     def test_current_order_view_to_trade_order_item_preserves_algo_fields(self) -> None:
         order = OrderStatusView(
             inst_id="BTC-USDT-SWAP",

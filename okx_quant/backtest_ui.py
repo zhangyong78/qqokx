@@ -137,6 +137,7 @@ TRIGGER_TYPE_OPTIONS = {
 BACKTEST_BAR_LABEL_TO_VALUE = {
     "5分钟": "5m",
     "15分钟": "15m",
+    "30分钟": "30m",
     "1小时": "1H",
     "4小时": "4H",
     "日线": "1D",
@@ -152,7 +153,7 @@ BACKTEST_SYMBOL_OPTIONS = (
     "BNB-USDT-SWAP",
     "DOGE-USDT-SWAP",
 )
-BACKTEST_HISTORY_SYNC_BARS = ("5m", "15m", "1H", "4H", "1D")
+BACKTEST_HISTORY_SYNC_BARS = ("5m", "15m", "30m", "1H", "4H", "1D")
 DEFAULT_HISTORY_SYNC_BAR_FLAGS = {
     "5m": False,
     "15m": False,
@@ -2143,7 +2144,7 @@ class BacktestWindow:
         self._last_strategy_parameter_strategy_id: str | None = None
         self.local_data_status = StringVar(value="本地数据：等待选择标的与周期。")
         self.history_sync_status = StringVar(
-            value="填 0 = 全量；填 10000 = 最新往前 10000 根。可先点“同步历史数据”下载 5 个币种的 5m / 15m / 1H / 4H / 1D 全量缓存；点“校验数据”检查连续性并尝试补洞。"
+            value="填 0 = 全量；填 10000 = 最新往前 10000 根。可先点“同步历史数据”下载 5 个币种的 5m / 15m / 30m / 1H / 4H / 1D 全量缓存；点“校验数据”检查连续性并尝试补洞。"
         )
         self.report_summary = StringVar(value="点击“开始回测”后，会在这里显示报告摘要。")
         self.manual_summary = StringVar(value="当前策略没有额外扩展统计。")
@@ -8468,7 +8469,7 @@ class BacktestWindow:
         toolbar.columnconfigure(0, weight=1)
         self._chart_zoom_intro_label = ttk.Label(
             toolbar,
-            text="回测K线图：用于查看 K 线结构、EMA 轨迹、资金曲线、回撤曲线和 TP/SL 触发位置，支持滚轮缩放和拖动平移。",
+            text="回测K线图：用于查看 K 线结构、EMA 轨迹、资金曲线、回撤曲线和止盈止损触发位置，支持滚轮缩放和拖动平移。",
             justify="left",
         )
         self._chart_zoom_intro_label.grid(row=0, column=0, sticky="w")
@@ -8700,7 +8701,7 @@ def _format_chart_axis_price(value: Decimal) -> str:
 
 def _format_backtest_stop_r_label(r_multiple: Decimal) -> str:
     if r_multiple <= 0:
-        return "SL"
+        return "止损"
     places = 1 if abs(r_multiple) >= Decimal("1") else 2
     text = format_decimal_fixed(r_multiple, places).rstrip("0").rstrip(".")
     return f"{text}R"
@@ -8708,12 +8709,12 @@ def _format_backtest_stop_r_label(r_multiple: Decimal) -> str:
 
 def _format_backtest_trade_exit_label(trade: BacktestTrade) -> str:
     if trade.exit_reason == "take_profit":
-        return "TP"
+        return "止盈"
     if trade.exit_reason == "break_even_stop":
         return "BE"
     if is_stop_exit_reason(trade.exit_reason):
         return _format_backtest_stop_r_label(trade.r_multiple)
-    return "SL"
+    return "止损"
 
 
 def _backtest_candle_color(open_price: Decimal, close_price: Decimal) -> str:

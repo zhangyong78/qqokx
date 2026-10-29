@@ -963,7 +963,7 @@ class AccountPositionsHomeQtHelpersTest(TestCase):
         self.assertEqual(app._visible_orders, [order])
         app._refresh_current_orders_table.assert_called_once_with()
 
-    def test_apply_orders_publishes_current_orders_to_shared_store(self) -> None:
+    def test_apply_orders_publishes_incremental_orders_to_shared_store(self) -> None:
         order = OrderStatusView(
             inst_id="BTC-USDT-SWAP",
             inst_type="SWAP",
@@ -994,7 +994,7 @@ class AccountPositionsHomeQtHelpersTest(TestCase):
 
         AccountPositionsHomeWidget._apply_orders(app, [order])
 
-        shared_order_store.publish_current_orders.assert_called_once_with(
+        shared_order_store.publish_order_updates.assert_called_once_with(
             profile_name="moni",
             environment="demo",
             orders=[order],

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field, replace
 from decimal import Decimal
 
@@ -23,35 +23,71 @@ class SharedOrderSnapshot:
 
 
 class SharedOrderRefreshThread(QThread):
+    current_order_updates_ready = Signal(str, str, object)
     current_orders_ready = Signal(str, str, object)
     completed = Signal(str, str, object)
     cached_history_ready = Signal(str, str, object)
     failed = Signal(str, str, str)
 
-    def __init__(self, *, runtime: ArbitrageTradeRuntime, profile_name: str, limit: int = 200) -> None:
+    def __init__(self, *, runtime: ArbitrageTradeRuntime, profile_name: str, limit: int = 200, include_history: bool = True) -> None:
         super().__init__()
         self._runtime = runtime
         self._profile_name = str(profile_name or "").strip()
         self._limit = max(20, int(limit))
+        self._include_history = bool(include_history)
 
     def run(self) -> None:
         environment = str(getattr(self._runtime, "environment", "") or "").strip()
-        cached_history = load_cached_order_history(self._profile_name, environment, self._limit)
+        cached_history = load_cached_order_history(self._profile_name, environment, self._limit) if self._include_history else []
         if cached_history:
             self.cached_history_ready.emit(self._profile_name, environment, cached_history)
         client = OkxRestClient()
+        feed = OrderFeedThread(None)
         try:
-            with ThreadPoolExecutor(max_workers=2) as executor:
-                current_future = executor.submit(
-                    load_current_order_views,
-                    self._runtime,
-                    client=client,
+            with ThreadPoolExecutor(max_workers=3) as executor:
+                normal_future = executor.submit(
+                    client.get_pending_orders,
+                    self._runtime.credentials,
+                    environment=environment,
                     limit=min(self._limit, 100),
+                    include_algo=False,
                 )
-                history_future = executor.submit(self._load_history_orders, client)
-                _status_text, current_views = current_future.result()
-                self.current_orders_ready.emit(self._profile_name, environment, current_views)
-                history_orders, history_prices = history_future.result()
+                algo_errors: list[tuple[str, str]] = []
+                algo_future = executor.submit(
+                    client._fetch_algo_orders,
+                    credentials=self._runtime.credentials,
+                    environment=environment,
+                    limit=min(self._limit, 100),
+                    history=False,
+                    errors=algo_errors,
+                )
+                history_future = executor.submit(self._load_history_orders, client) if self._include_history else None
+                batches: list[OkxTradeOrderItem] = []
+                current_errors: list[str] = []
+                for future in as_completed((normal_future, algo_future)):
+                    try:
+                        batch = list(future.result())
+                    except Exception as exc:  # noqa: BLE001
+                        current_errors.append(str(exc))
+                        continue
+                    batches.extend(batch)
+                    if batch:
+                        self.current_order_updates_ready.emit(
+                            self._profile_name, environment,
+                            [feed._trade_order_to_view(item) for item in batch],
+                        )
+                current_errors.extend(f"算法委托 {kind}: {message}" for kind, message in algo_errors)
+                current_views: list[OrderStatusView] = []
+                if current_errors:
+                    self.failed.emit(self._profile_name, environment, "；".join(current_errors))
+                else:
+                    batches.sort(key=lambda item: item.update_time or item.created_time or 0, reverse=True)
+                    _status_text, current_views = load_current_order_views(
+                        self._runtime, client=client, limit=min(self._limit, 100),
+                        pending_orders=batches[: min(self._limit, 100)],
+                    )
+                    self.current_orders_ready.emit(self._profile_name, environment, current_views)
+                history_orders, history_prices = history_future.result() if history_future is not None else ([], {})
             snapshot = SharedOrderSnapshot(
                 current_order_views=tuple(current_views),
                 current_order_items=tuple(order_view_to_trade_order_item(item) for item in current_views),
@@ -62,8 +98,10 @@ class SharedOrderRefreshThread(QThread):
             self.failed.emit(self._profile_name, environment, str(exc))
             return
         finally:
+            feed.stop()
             client.close()
-        self.completed.emit(self._profile_name, environment, snapshot)
+        if self._include_history:
+            self.completed.emit(self._profile_name, environment, snapshot)
 
     def _load_history_orders(
         self,
@@ -162,7 +200,7 @@ class SharedOrderStore(QObject):
         super().__init__()
         self._snapshots: dict[tuple[str, str], SharedOrderSnapshot] = {}
         self._refresh_threads: dict[tuple[str, str], SharedOrderRefreshThread] = {}
-        self._pending_refreshes: dict[tuple[str, str], ArbitrageTradeRuntime] = {}
+        self._pending_refreshes: dict[tuple[str, str], tuple[ArbitrageTradeRuntime, bool]] = {}
         self._order_revisions: dict[tuple[str, str], int] = {}
         self._order_updates: dict[tuple[str, str], dict[tuple[str, str, str], tuple[int, OrderStatusView]]] = {}
         self._observed_orders: dict[tuple[str, str], dict[tuple[str, str, str], OrderStatusView]] = {}
@@ -273,7 +311,7 @@ class SharedOrderStore(QObject):
         self._snapshots[key] = snapshot
         self.snapshot_changed.emit(key[0], key[1], snapshot)
 
-    def request_refresh(self, *, runtime: ArbitrageTradeRuntime | None, profile_name: str) -> None:
+    def request_refresh(self, *, runtime: ArbitrageTradeRuntime | None, profile_name: str, include_history: bool = True) -> None:
         if runtime is None:
             return
         key = _snapshot_key(profile_name, getattr(runtime, "environment", ""))
@@ -281,10 +319,14 @@ class SharedOrderStore(QObject):
             return
         thread = self._refresh_threads.get(key)
         if thread is not None and thread.isRunning():
-            self._pending_refreshes[key] = runtime
+            pending = self._pending_refreshes.get(key)
+            self._pending_refreshes[key] = (runtime, bool(include_history or (pending is not None and pending[1])))
             return
-        thread = SharedOrderRefreshThread(runtime=runtime, profile_name=key[0])
+        thread = SharedOrderRefreshThread(runtime=runtime, profile_name=key[0], include_history=include_history)
         started_revision = self._order_revisions.get(key, 0)
+        thread.current_order_updates_ready.connect(lambda profile, environment, orders: self.publish_order_updates(
+            profile_name=profile, environment=environment, orders=orders,
+        ))
         thread.current_orders_ready.connect(lambda profile, environment, orders: self.publish_current_orders(
             profile_name=profile, environment=environment, orders=orders, started_revision=started_revision,
         ))
@@ -332,9 +374,12 @@ class SharedOrderStore(QObject):
             if thread is not None:
                 thread.deleteLater()
         self.refresh_finished.emit(key[0], key[1])
-        pending_runtime = self._pending_refreshes.pop(key, None)
-        if pending_runtime is not None:
-            QTimer.singleShot(0, self, lambda: self.request_refresh(runtime=pending_runtime, profile_name=key[0]))
+        pending = self._pending_refreshes.pop(key, None)
+        if pending is not None:
+            pending_runtime, include_history = pending
+            QTimer.singleShot(0, self, lambda: self.request_refresh(
+                runtime=pending_runtime, profile_name=key[0], include_history=include_history,
+            ))
 
 
 _SHARED_ORDER_STORE: SharedOrderStore | None = None

@@ -697,7 +697,7 @@ class UiPositionsMixin:
             "size": "委托量（币/张）",
             "filled": "已成交（币/张）",
             "fee": "手续费",
-            "tp_sl": "TP/SL",
+            "tp_sl": "止盈止损",
             "order_id": "订单ID",
             "cl_ord_id": "clOrdId",
         }
@@ -879,7 +879,7 @@ class UiPositionsMixin:
             "size": "委托量（币/张）",
             "filled": "已成交（币/张）",
             "fee": "手续费",
-            "tp_sl": "TP/SL",
+            "tp_sl": "止盈止损",
             "order_id": "订单ID",
             "cl_ord_id": "clOrdId",
         }

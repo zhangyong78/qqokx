@@ -20,8 +20,25 @@ except Exception:  # noqa: BLE001
 
 try:
     from websockets.asyncio.client import connect as _modern_connect
+    from websockets.asyncio.client import ClientConnection as _ClientConnection
 except Exception:  # noqa: BLE001
     _modern_connect = None
+    _ClientConnection = None
+
+
+if _ClientConnection is not None:
+    class _SafeClientConnection(_ClientConnection):
+        def connection_lost(self, exc: Exception | None) -> None:
+            # An HTTP proxy's TLS handshake can fail before connection_made.
+            if not hasattr(self, "recv_messages"):
+                self.protocol.receive_eof()
+                self.set_recv_exc(exc)
+                if not self.connection_lost_waiter.done():
+                    self.connection_lost_waiter.set_result(None)
+                return
+            super().connection_lost(exc)
+else:
+    _SafeClientConnection = None
 
 _modern_proxy_supported = _modern_connect is not None and "proxy" in inspect.signature(_modern_connect).parameters
 
@@ -34,6 +51,7 @@ def connect_okx_websocket(url: str, *, headers: dict[str, str] | None = None, **
     proxy = True if settings.mode == "system" else (settings.url if settings.mode == "custom" else None)
     if _modern_proxy_supported:
         modern_kwargs = dict(kwargs)
+        modern_kwargs.setdefault("create_connection", _SafeClientConnection)
         if headers:
             modern_kwargs["additional_headers"] = headers
         # True makes the library re-read system / environment proxies on each

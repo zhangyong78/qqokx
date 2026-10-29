@@ -60,6 +60,25 @@ class SharedOrderStoreTest(TestCase):
         store.publish_order_updates(profile_name="moni", environment="demo", orders=[partial])
         self.assertEqual(store.snapshot_for(profile_name="moni", environment="demo").current_order_views, ())
 
+    def test_empty_realtime_update_does_not_erase_rest_orders_and_terminal_update_removes_them(self) -> None:
+        from roll_terminal_qt.account_positions_home import AccountPositionsHomeWidget
+
+        store = SharedOrderStore()
+        order = _view(source="rest_pending")
+        store.publish_current_orders(profile_name="moni", environment="demo", orders=[order], started_revision=0)
+        home = SimpleNamespace(
+            _shared_order_store=store, _runtime=SimpleNamespace(environment="demo"),
+            _last_profile_name="moni", _orders=[], _refresh_current_orders_table=MagicMock(),
+        )
+        AccountPositionsHomeWidget._apply_orders(home, [])
+        self.assertEqual(home._orders, [order])
+        self.assertEqual(store.snapshot_for(profile_name="moni", environment="demo").current_order_views, (order,))
+
+        terminal = _view(state="filled", timestamp=20, filled="1")
+        AccountPositionsHomeWidget._apply_orders(home, [terminal])
+        self.assertEqual(home._orders, [])
+        self.assertEqual(store.snapshot_for(profile_name="moni", environment="demo").current_order_views, ())
+
     def test_fresh_full_snapshot_can_remove_missing_live_order_but_history_cannot_replace_current(self) -> None:
         store = SharedOrderStore()
         order = _view()
@@ -77,7 +96,7 @@ class SharedOrderStoreTest(TestCase):
     def test_current_orders_are_published_before_slow_history_finishes(self, load_current, _cache, _client) -> None:
         order = _view()
         load_current.return_value = ("ok", [order])
-        thread = SharedOrderRefreshThread(runtime=SimpleNamespace(environment="demo"), profile_name="moni")
+        thread = SharedOrderRefreshThread(runtime=SimpleNamespace(environment="demo", credentials=object()), profile_name="moni")
         released = threading.Event()
         events = []
 
@@ -143,7 +162,7 @@ class SharedOrderStoreTest(TestCase):
     @patch("roll_terminal_qt.shared_order_store.load_cached_order_history", return_value=[])
     @patch("roll_terminal_qt.shared_order_store.load_current_order_views", return_value=("ok", [_view()]))
     def test_history_failure_does_not_discard_current_orders(self, _current, _cache, _client) -> None:
-        thread = SharedOrderRefreshThread(runtime=SimpleNamespace(environment="demo"), profile_name="moni")
+        thread = SharedOrderRefreshThread(runtime=SimpleNamespace(environment="demo", credentials=object()), profile_name="moni")
         current = []
         failures = []
         thread.current_orders_ready.connect(lambda *_args: current.extend(_args[2]))
@@ -152,6 +171,92 @@ class SharedOrderStoreTest(TestCase):
             thread.run()
         self.assertEqual(len(current), 1)
         self.assertEqual(failures, ["slow history failed"])
+
+    @patch("roll_terminal_qt.shared_order_store.load_current_order_views", return_value=("ok", [_view()]))
+    @patch("roll_terminal_qt.shared_order_store.OkxRestClient")
+    def test_normal_orders_arrive_before_slow_algo_and_history(self, client_type, _current) -> None:
+        client = client_type.return_value
+        client.get_pending_orders.return_value = [replace(_history_order(), state="live")]
+        normal_emitted = threading.Event()
+        completed_orders = threading.Event()
+
+        def slow_algo(**_kwargs):
+            self.assertTrue(normal_emitted.wait(2), "normal orders were blocked by algorithm orders")
+            return []
+
+        client._fetch_algo_orders.side_effect = slow_algo
+        thread = SharedOrderRefreshThread(
+            runtime=SimpleNamespace(environment="demo", credentials=object()), profile_name="moni",
+        )
+        partial = []
+        thread.current_order_updates_ready.connect(lambda _p, _e, items: (partial.extend(items), normal_emitted.set()))
+        thread.current_orders_ready.connect(lambda *_args: completed_orders.set())
+        with (
+            patch("roll_terminal_qt.shared_order_store.load_cached_order_history", return_value=[]),
+            patch.object(thread, "_load_history_orders", side_effect=lambda _client: (completed_orders.wait(2) and [], {})),
+        ):
+            thread.run()
+        self.assertEqual([item.ord_id for item in partial], ["order-1"])
+        self.assertTrue(completed_orders.is_set())
+
+    @patch("roll_terminal_qt.shared_order_store.load_current_order_views")
+    @patch("roll_terminal_qt.shared_order_store.load_cached_order_history")
+    @patch("roll_terminal_qt.shared_order_store.OkxRestClient")
+    def test_current_only_refresh_skips_history_and_does_not_publish_incomplete_snapshot(
+        self, client_type, cached_history, load_current,
+    ) -> None:
+        client = client_type.return_value
+        client.get_pending_orders.return_value = [replace(_history_order(), state="live")]
+
+        def failed_algo(**kwargs):
+            kwargs["errors"].append(("oco", "temporary error"))
+            return []
+
+        client._fetch_algo_orders.side_effect = failed_algo
+        thread = SharedOrderRefreshThread(
+            runtime=SimpleNamespace(environment="demo", credentials=object()),
+            profile_name="moni", include_history=False,
+        )
+        partial, full, failures = [], [], []
+        thread.current_order_updates_ready.connect(lambda _p, _e, items: partial.extend(items))
+        thread.current_orders_ready.connect(lambda *_args: full.append(True))
+        thread.failed.connect(lambda _p, _e, message: failures.append(message))
+        with patch.object(thread, "_load_history_orders") as history:
+            thread.run()
+        self.assertEqual([item.ord_id for item in partial], ["order-1"])
+        self.assertEqual(full, [])
+        self.assertTrue(any("oco" in item and "temporary error" in item for item in failures))
+        history.assert_not_called()
+        cached_history.assert_not_called()
+        load_current.assert_not_called()
+
+    def test_algo_query_reports_failed_types_to_callers_requesting_completeness(self) -> None:
+        from okx_quant.okx_client import OkxRestClient
+
+        client = OkxRestClient()
+        failures = []
+
+        def request(_method, _path, **kwargs):
+            if kwargs["params"]["ordType"] == "oco":
+                raise RuntimeError("temporary error")
+            return {"data": []}
+
+        with patch.object(client, "_request", side_effect=request):
+            result = client._fetch_algo_orders(
+                credentials=object(), environment="demo", limit=20, history=False, errors=failures,
+            )
+        self.assertEqual(result, [])
+        self.assertEqual(failures, [("oco", "temporary error")])
+
+    def test_queued_current_refresh_does_not_drop_a_history_refresh_request(self) -> None:
+        store = SharedOrderStore()
+        runtime = SimpleNamespace(environment="demo", credentials=object())
+        running = MagicMock()
+        running.isRunning.return_value = True
+        store._refresh_threads[("moni", "demo")] = running
+        store.request_refresh(runtime=runtime, profile_name="moni", include_history=True)
+        store.request_refresh(runtime=runtime, profile_name="moni", include_history=False)
+        self.assertEqual(store._pending_refreshes[("moni", "demo")], (runtime, True))
 
     def test_publish_identical_history_snapshot_emits_only_once(self) -> None:
         store = SharedOrderStore()

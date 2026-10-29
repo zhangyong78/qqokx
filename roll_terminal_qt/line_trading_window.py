@@ -2154,7 +2154,7 @@ class LineTradingQtWindow(QMainWindow):
             field_map = {
                 2: ("price_entry", "入场价"),
                 3: ("price_stop", "止损价"),
-                4: ("price_tp", "TP"),
+                4: ("price_tp", "止盈"),
                 5: ("r_multiple", "R"),
             }
             field_key, field_name = field_map[column]

@@ -3011,6 +3011,7 @@ class OkxRestClient:
         environment: str,
         limit: int,
         history: bool,
+        errors: list[tuple[str, str]] | None = None,
     ) -> list[OkxTradeOrderItem]:
         endpoint = "/api/v5/trade/orders-algo-history" if history else "/api/v5/trade/orders-algo-pending"
         ord_types = ("conditional", "oco", "trigger", "move_order_stop")
@@ -3032,7 +3033,9 @@ class OkxRestClient:
                         credentials=credentials,
                         simulated=environment == "demo",
                     )
-                except Exception:
+                except Exception as exc:
+                    if errors is not None:
+                        errors.append((ord_type, str(exc)))
                     continue
                 for item in payload.get("data", []):
                     parsed = self._parse_trade_order_item(item, default_inst_type="", source_kind="algo")

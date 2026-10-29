@@ -699,6 +699,7 @@ class LauncherWindow(QMainWindow):
             return page
         if page_key == "account":
             page = AccountPositionsHomeWidget(self)
+            page.chase_context_provider = self._account_order_chase_context
             set_workspace_managed = getattr(page, "set_workspace_managed", None)
             if callable(set_workspace_managed):
                 set_workspace_managed(True)
@@ -717,6 +718,17 @@ class LauncherWindow(QMainWindow):
             raise KeyError(f"unknown page: {page_key}")
         page.setWindowFlags(Qt.WindowType.Widget)
         return page
+
+    def _account_order_chase_context(self, item):
+        kline = self._pages.get("kline")
+        if kline is None:
+            return {}
+        home = self._home_widget
+        if (home._last_profile_name != kline._active_profile_name()
+                or home._runtime.environment != kline._active_environment()):
+            raise ValueError("两个页面的账户尚未同步，请等待账户切换完成")
+        kline._sync_account_drawer_context(refresh_if_visible=False)
+        return kline._current_order_chase_context(item)
 
     def show_page(self, page_key: str) -> None:
         normalized = page_key.strip().lower()

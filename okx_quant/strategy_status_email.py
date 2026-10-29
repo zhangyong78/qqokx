@@ -87,12 +87,17 @@ def build_strategy_status_email(
     scheduled_for: datetime,
     generated_at: datetime,
     is_test: bool = False,
+    edition: str = "server",
 ) -> StrategyStatusEmailContent:
     ordered = sorted(rows, key=lambda row: (_clean_cell(row.api).casefold(), _clean_cell(row.session)))
     api_counts = Counter(_clean_cell(row.api) for row in ordered)
-    title = "策略运行状态测试" if is_test else "策略运行状态"
+    is_local = str(edition).strip().casefold() == "local"
+    title = "本地策略运行状态" if is_local else "策略运行状态"
+    if is_test:
+        title += "测试"
     subject_time = generated_at if is_test else scheduled_for
-    subject = f"[OKXQQ] {title} | {subject_time:%Y-%m-%d %H:%M} | 活跃 {len(ordered)}"
+    subject_prefix = "[OKXQQ-本地]" if is_local else "[OKXQQ]"
+    subject = f"{subject_prefix} {title} | {subject_time:%Y-%m-%d %H:%M} | 活跃 {len(ordered)}"
 
     intro_lines = [
         f"计划时段：{scheduled_for:%Y-%m-%d %H:%M}",
@@ -100,6 +105,8 @@ def build_strategy_status_email(
         f"活跃会话：{len(ordered)}",
         f"涉及 API：{len(api_counts)}",
     ]
+    if is_local:
+        intro_lines.insert(0, "运行版本：本地版（仅统计本地工作台中的策略会话）")
     if is_test:
         intro_lines.insert(0, "本邮件由手动测试触发，不占用定时发送时段。")
     intro_lines.extend(f"{api}：{count}" for api, count in sorted(api_counts.items()))
@@ -116,27 +123,60 @@ def build_strategy_status_email(
 
     summary_html = "".join(f"<li>{escape(line)}</li>" for line in intro_lines)
     if ordered:
-        heading_html = "".join(f"<th>{escape(label)}</th>" for _name, label in _COLUMN_LABELS)
-        row_html = "".join(
-            "<tr>"
-            + "".join(
-                f"<td>{escape(_clean_cell(getattr(row, name)))}</td>"
-                for name, _label in _COLUMN_LABELS
+        if is_local:
+            cards_html = "".join(
+                f"<section class=\"session-card\"><h3>会话 {escape(_clean_cell(row.session))}</h3>"
+                "<table><tbody>"
+                + "".join(
+                    f"<tr><th>{escape(label)}</th><td>{escape(_clean_cell(getattr(row, name)))}</td></tr>"
+                    for name, label in _COLUMN_LABELS
+                )
+                + "</tbody></table></section>"
+                for row in ordered
             )
-            + "</tr>"
-            for row in ordered
-        )
-        detail_html = f"<table><thead><tr>{heading_html}</tr></thead><tbody>{row_html}</tbody></table>"
+            detail_html = f"<div class=\"session-cards\">{cards_html}</div>"
+        else:
+            heading_html = "".join(f"<th>{escape(label)}</th>" for _name, label in _COLUMN_LABELS)
+            row_html = "".join(
+                "<tr>"
+                + "".join(
+                    f"<td>{escape(_clean_cell(getattr(row, name)))}</td>"
+                    for name, _label in _COLUMN_LABELS
+                )
+                + "</tr>"
+                for row in ordered
+            )
+            detail_html = f"<table><thead><tr>{heading_html}</tr></thead><tbody>{row_html}</tbody></table>"
     else:
         detail_html = "<p><strong>当前无活跃策略</strong></p>"
+    if is_local:
+        body_style = (
+            "body{font-family:Arial,'Microsoft YaHei',sans-serif;color:#183153;background:#eef5ff;padding:18px}"
+            ".edition-banner{background:#163f73;color:#fff;padding:14px 18px;border-radius:10px;font-weight:bold}"
+            ".summary{background:#fff;border:1px solid #c8daf0;border-radius:10px;padding:12px 24px;margin:14px 0}"
+            ".session-card{background:#fff;border:1px solid #c8daf0;border-radius:10px;padding:12px 16px;margin:12px 0}"
+            ".session-card h3{margin:0 0 8px;color:#1459a6}"
+            "table{border-collapse:collapse;font-size:13px;width:100%}"
+            "th,td{border-bottom:1px solid #e4ebf3;padding:7px 8px;text-align:left;white-space:normal}"
+            ".session-card th{width:38%;color:#53677e;font-weight:normal}"
+        )
+        email_heading = "本地策略运行状态"
+        edition_banner = '<div class="edition-banner">本地版邮件 · 仅包含此电脑上的策略会话</div>'
+        summary_wrap = f'<ul class="summary">{summary_html}</ul>'
+    else:
+        body_style = (
+            "body{font-family:Arial,'Microsoft YaHei',sans-serif;color:#1f2328}"
+            "table{border-collapse:collapse;font-size:12px;width:100%}"
+            "th,td{border:1px solid #d0d7de;padding:6px 8px;text-align:left;white-space:nowrap}"
+            "th{background:#f6f8fa}tbody tr:nth-child(even){background:#fbfcfd}"
+        )
+        email_heading = title
+        edition_banner = ""
+        summary_wrap = f"<ul>{summary_html}</ul>"
     html_body = (
         "<!doctype html><html><head><meta charset=\"utf-8\"><style>"
-        "body{font-family:Arial,'Microsoft YaHei',sans-serif;color:#1f2328}"
-        "table{border-collapse:collapse;font-size:12px;width:100%}"
-        "th,td{border:1px solid #d0d7de;padding:6px 8px;text-align:left;white-space:nowrap}"
-        "th{background:#f6f8fa}tbody tr:nth-child(even){background:#fbfcfd}"
-        "</style></head><body>"
-        f"<h2>{escape(title)}</h2><ul>{summary_html}</ul>{detail_html}</body></html>"
+        f"{body_style}</style></head><body>"
+        f"{edition_banner}<h2>{escape(email_heading)}</h2>{summary_wrap}{detail_html}</body></html>"
     )
     return StrategyStatusEmailContent(subject=subject, body=body, html_body=html_body)
 
