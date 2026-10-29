@@ -588,10 +588,14 @@ class KlineAccountDrawerWidgetTests(QtWidgetTestCase):
                 for index in range(drawer._history_orders_table.columnCount())
             ]
             state_col = headers.index("状态")
+            source_col = headers.index("来源")
+            type_col = headers.index("类型")
             tp_sl_col = headers.index("止盈止损")
 
             self.assertEqual(drawer._history_orders_table.rowCount(), 1)
-            self.assertEqual(drawer._history_orders_table.item(0, state_col).text(), "canceled")
+            self.assertEqual(drawer._history_orders_table.item(0, state_col).text(), "已撤销")
+            self.assertEqual(drawer._history_orders_table.item(0, source_col).text(), "普通委托")
+            self.assertEqual(drawer._history_orders_table.item(0, type_col).text(), "限价")
             self.assertIn("止盈 62084.2", drawer._history_orders_table.item(0, tp_sl_col).text())
             self.assertIn("止损 65628.9", drawer._history_orders_table.item(0, tp_sl_col).text())
         finally:

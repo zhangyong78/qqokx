@@ -319,6 +319,15 @@ class RealtimeAccountStore(QObject):
         self._reconcile_retry_timer.stop()
         self._reconcile_retry_delay = 5
         if int(result.get("started_ws_revision", self._ws_revision)) != self._ws_revision:
+            # Account updates do not invalidate public quotes when the set of
+            # held instruments is unchanged. Never apply the stale positions.
+            current_ids = {getattr(p, "inst_id", None) for p in self._positions}
+            result_ids = {getattr(p, "inst_id", None) for p in result.get("positions", [])}
+            if current_ids == result_ids and None not in current_ids:
+                self._upl_usdt_prices = dict(result.get("upl_usdt_prices") or {})
+                self._position_tickers = dict(result.get("position_tickers") or {})
+                self._position_instruments = dict(result.get("position_instruments") or {})
+                self._schedule_emit()
             self.status_changed.emit(f"账户 REST {reason} 校验结果已过期，保留较新的 WS 状态")
             return
         self._positions = list(result.get("positions") or [])

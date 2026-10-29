@@ -54,6 +54,10 @@ from okx_quant.ui_shell import (
     _build_position_ticker_map,
     _build_upl_usdt_price_map,
     _format_margin_mode,
+    _format_instrument_type,
+    _format_order_source,
+    _format_trade_order_type,
+    _format_trade_order_state,
     _format_mark_price,
     _format_option_trade_side_display,
     _format_okx_ms_timestamp,
@@ -102,7 +106,7 @@ def _position_table_values(
     position_tickers: dict[str, object],
 ) -> list[object]:
     values = (
-        getattr(position, "inst_type", "-"),
+        _format_instrument_type(getattr(position, "inst_type", "-")),
         _format_margin_mode(getattr(position, "mgn_mode", "")),
         _format_position_option_price_component(position, upl_usdt_prices, component="time_value"),
         _format_position_option_component_usdt(position, upl_usdt_prices, component="time_value"),
@@ -194,7 +198,7 @@ def order_display_direction(item: object) -> str:
         return "买入"
     if pos_side == "short":
         return "卖出"
-    return side or pos_side
+    return {"long": "多头", "short": "空头", "net": ""}.get(pos_side, side or pos_side)
 
 
 def order_display_price(item: object) -> str:
@@ -298,14 +302,14 @@ def order_display_coin_size(item: object, instruments: dict[str, object] | None 
 def _order_table_values(order: object, instruments: dict[str, object] | None = None) -> list[object]:
     return [
         getattr(order, "inst_id", ""),
-        getattr(order, "source_label", "") or order_source_kind(order),
+        _format_order_source(getattr(order, "source_label", "") or order_source_kind(order)),
         order_display_direction(order),
-        getattr(order, "ord_type", ""),
+        _format_trade_order_type(getattr(order, "ord_type", "")),
         order_display_price(order),
         order_display_coin_size(order, instruments),
         getattr(order, "size", ""),
         getattr(order, "filled_size", ""),
-        "待交易所确认" if getattr(order, "state", "") == "pending_confirmation" else getattr(order, "state", ""),
+        _format_trade_order_state(getattr(order, "state", "")),
         _format_okx_ms_timestamp(getattr(order, "update_time", None) or getattr(order, "created_time", None)),
         order_display_tp_sl(order),
         order_display_ids(order)[0],
@@ -929,7 +933,7 @@ class KlineAccountDrawer(QWidget):
         for row, fill in enumerate(fills):
             values = (
                 _format_okx_ms_timestamp(getattr(fill, "fill_time", None)),
-                getattr(fill, "inst_type", "-") or "-",
+                _format_instrument_type(getattr(fill, "inst_type", "-")),
                 getattr(fill, "inst_id", "-") or "-",
                 _format_history_side(getattr(fill, "side", None), getattr(fill, "pos_side", None)),
                 _format_fill_history_price(fill),

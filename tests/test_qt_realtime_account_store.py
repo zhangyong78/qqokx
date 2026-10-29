@@ -316,3 +316,23 @@ def test_stale_rest_reconcile_does_not_overwrite_newer_ws_snapshot() -> None:
     assert store._source == "ws"
     assert any("已过期" in message for message in statuses)
     store.stop()
+
+
+def test_stale_account_result_keeps_public_quotes_for_unchanged_instruments() -> None:
+    from types import SimpleNamespace
+
+    store = RealtimeAccountStore(client=_FakeRealtimeClient(), coalesce_ms=0)
+    store._runtime = _runtime()
+    current = SimpleNamespace(inst_id="BTC-USD-261225-95000-C")
+    store._positions = [current]
+    store._ws_revision = 2
+    store._apply_reconcile_result(store._generation, "safety", {
+        "started_ws_revision": 1,
+        "positions": [SimpleNamespace(inst_id=current.inst_id)],
+        "upl_usdt_prices": {"BTC": 80000},
+        "position_tickers": {current.inst_id: "quote"},
+    })
+    assert store._positions == [current]
+    assert store._upl_usdt_prices == {"BTC": 80000}
+    assert store._position_tickers == {current.inst_id: "quote"}
+    store.stop()

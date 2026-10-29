@@ -876,6 +876,33 @@ class AccountPositionsHomeQtHelpersTest(TestCase):
         app._apply_positions_payload.assert_not_called()
         app._apply_orders.assert_called_once_with([])
 
+    def test_realtime_market_only_snapshot_updates_position_columns(self) -> None:
+        position = SimpleNamespace(inst_id="BTC-USD-260731-63000-C")
+        app = SimpleNamespace(
+            _runtime=SimpleNamespace(environment="demo"),
+            _last_profile_name="moni",
+            _raw_positions=[position],
+            _position_instruments={},
+            _position_tickers={},
+            _upl_usdt_prices={},
+            _apply_positions_payload=MagicMock(),
+            _apply_positions_summary=MagicMock(),
+            _apply_orders=MagicMock(),
+        )
+        AccountPositionsHomeWidget._apply_realtime_snapshot(
+            app,
+            AccountRealtimeSnapshot(
+                profile_name="moni", environment="demo", positions=(position,),
+                orders=(), account=None, generation=1, source="ws",
+                upl_usdt_prices={"BTC": Decimal("64000")},
+                position_tickers={position.inst_id: object()},
+            ),
+        )
+        payload = app._apply_positions_payload.call_args.args[0]
+        self.assertEqual(payload["positions"], [position])
+        self.assertEqual(payload["upl_usdt_prices"], {"BTC": Decimal("64000")})
+        self.assertIn(position.inst_id, payload["position_tickers"])
+
     def test_realtime_position_snapshot_preserves_loaded_price_maps(self) -> None:
         next_position = SimpleNamespace(inst_id="BTC-USD-260731-63000-C")
         app = SimpleNamespace(

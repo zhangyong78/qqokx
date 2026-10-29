@@ -11819,10 +11819,38 @@ def _format_margin_mode(value: str | None) -> str:
     if not text:
         return "-"
     if text == "isolated":
-        return "逐仓 isolated"
+        return "逐仓"
     if text == "cross":
-        return "全仓 cross"
+        return "全仓"
     return text
+
+
+def _format_instrument_type(value: str | None) -> str:
+    normalized = str(value or "").strip().upper()
+    return {
+        "SPOT": "现货",
+        "MARGIN": "杠杆",
+        "SWAP": "永续",
+        "FUTURES": "交割",
+        "OPTION": "期权",
+    }.get(normalized, normalized or "-")
+
+
+def _format_order_source(value: str | None) -> str:
+    normalized = str(value or "").strip().lower()
+    if not normalized:
+        return "-"
+    if normalized in {"normal", "普通委托"}:
+        return "普通委托"
+    if normalized == "algo" or "algo" in normalized or "算法" in normalized:
+        return "算法委托"
+    if "pending" in normalized or "rest" in normalized:
+        return "交易所委托"
+    if "ws" in normalized or "实时" in normalized:
+        return "实时推送"
+    if any(0x4E00 <= ord(char) <= 0x9FFF for char in normalized):
+        return str(value).strip()
+    return "其他来源"
 
 
 def _format_account_level(value: str | None) -> str:
@@ -13854,8 +13882,35 @@ def _format_okx_ms_timestamp(timestamp_ms: int | None) -> str:
 
 
 def _format_history_side(side: str | None, pos_side: str | None) -> str:
-    parts = [part for part in (side, pos_side) if part and part.lower() != "net"]
-    return " / ".join(parts) if parts else (side or pos_side or "-")
+    labels = {"buy": "买入", "sell": "卖出", "long": "多头", "short": "空头"}
+    parts = [labels.get(part.lower(), part) for part in (side, pos_side) if part and part.lower() != "net"]
+    if parts:
+        return " / ".join(parts)
+    if side or pos_side:
+        return "单向"
+    return "-"
+
+
+def _format_trade_order_type(value: str | None) -> str:
+    normalized = str(value or "").strip().lower()
+    if not normalized:
+        return "-"
+    labels = {
+        "market": "市价",
+        "limit": "限价",
+        "post_only": "只做挂单",
+        "fok": "全部成交或立即取消",
+        "ioc": "立即成交并取消剩余",
+        "optimal_limit_ioc": "最优限价立即成交",
+        "conditional": "条件委托",
+        "oco": "双向止盈止损",
+        "trigger": "计划委托",
+        "move_order_stop": "移动止损",
+        "iceberg": "冰山委托",
+        "twap": "时间加权委托",
+        "bbo": "对手价委托",
+    }
+    return labels.get(normalized, "其他委托类型")
 
 
 def _decimal_sign(value: Decimal | None) -> int:
@@ -14147,18 +14202,19 @@ def _format_trade_order_state(state: str | None) -> str:
     if not normalized:
         return "-"
     mapping = {
-        "live": "生效中 live",
-        "partially_filled": "部分成交 partially_filled",
-        "filled": "已成交 filled",
-        "canceled": "已撤销 canceled",
-        "mmp_canceled": "风控撤销 mmp_canceled",
-        "effective": "算法生效 effective",
-        "triggered": "已触发 triggered",
-        "pause": "暂停 pause",
-        "order_failed": "失败 order_failed",
-        "partially_failed": "部分失败 partially_failed",
+        "live": "生效中",
+        "partially_filled": "部分成交",
+        "filled": "已成交",
+        "canceled": "已撤销",
+        "mmp_canceled": "风控撤销",
+        "effective": "已生效",
+        "triggered": "已触发",
+        "pause": "已暂停",
+        "order_failed": "委托失败",
+        "partially_failed": "部分失败",
+        "pending_confirmation": "待交易所确认",
     }
-    return mapping.get(normalized, normalized)
+    return mapping.get(normalized, "其他状态")
 
 
 def _format_trade_order_trigger_price_type(trigger_price_type: str | None) -> str:
@@ -14987,9 +15043,9 @@ def _normalize_fill_history_exec_type(value: object) -> str:
 def _format_fill_history_exec_type(value: object) -> str:
     normalized = _normalize_fill_history_exec_type(value)
     if normalized == "t":
-        return "T"
+        return "主动成交"
     if normalized == "m":
-        return "M"
+        return "被动成交"
     if normalized == "exercise":
         return "行权"
     if normalized == "delivery":

@@ -949,8 +949,8 @@ class PositionUplConversionTest(TestCase):
         self.assertEqual(text, "23692.50000 USDT")
 
     def test_format_margin_mode_returns_cross_or_isolated(self) -> None:
-        self.assertEqual(_format_margin_mode("isolated"), "逐仓 isolated")
-        self.assertEqual(_format_margin_mode("cross"), "全仓 cross")
+        self.assertEqual(_format_margin_mode("isolated"), "逐仓")
+        self.assertEqual(_format_margin_mode("cross"), "全仓")
         self.assertEqual(_format_margin_mode(""), "-")
         self.assertEqual(_margin_mode_tag("isolated"), "isolated_mode")
         self.assertEqual(_margin_mode_tag("cross"), "cross_mode")

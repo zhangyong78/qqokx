@@ -485,6 +485,8 @@ from okx_quant.ui_shell import (
     _format_position_realized_pnl,
     _format_position_size,
     _format_position_contracts,
+    _format_instrument_type,
+    _format_order_source,
     _format_position_unrealized_pnl,
     _format_ratio,
     _format_mark_price,
@@ -497,6 +499,7 @@ from okx_quant.ui_shell import (
     _normalize_position_note_text,
     _option_search_shortcuts,
     _format_trade_order_price,
+    _format_trade_order_type,
     _format_trade_order_size,
     _format_trade_order_coin_size_with_fallback,
     _format_trade_order_coin_filled_size_with_fallback,
@@ -5968,9 +5971,10 @@ class AccountPositionsHomeWidget(QWidget):
         row_key = _position_tree_row_id(position)
         label = position.inst_id
         if position.pos_side and position.pos_side.lower() != "net":
-            label = f"{label} [{position.pos_side}]"
+            pos_side_label = {"long": "多头", "short": "空头"}.get(position.pos_side.lower(), position.pos_side)
+            label = f"{label} [{pos_side_label}]"
         values = (
-            position.inst_type,
+            _format_instrument_type(position.inst_type),
             _format_margin_mode(position.mgn_mode),
             _format_position_option_price_component(position, self._upl_usdt_prices, component="time_value"),
             _format_position_option_component_usdt(position, self._upl_usdt_prices, component="time_value"),
@@ -6305,14 +6309,14 @@ class AccountPositionsHomeWidget(QWidget):
             values = (
                 _format_okx_ms_timestamp(order.update_time or order.created_time),
                 order.inst_id,
-                order.inst_type or "-",
+                _format_instrument_type(order.inst_type),
                 _format_trade_order_state(order.state),
                 _format_history_side(order.side or "-", order.pos_side or ""),
-                order.ord_type or "-",
+                _format_trade_order_type(order.ord_type),
                 _format_trade_order_price(order.price, order.inst_id, order.inst_type or ""),
                 self._format_current_order_size_with_coin(order, filled=False),
                 self._format_current_order_size_with_coin(order, filled=True),
-                order.td_mode or "-",
+                _format_margin_mode(order.td_mode),
                 order.client_order_id or "-",
             )
             for column, value in enumerate(values):
@@ -6937,7 +6941,15 @@ class AccountPositionsHomeWidget(QWidget):
             if hasattr(self, "_render_account_equity"):
                 self._render_account_equity()
         latest_positions = list(snapshot.positions)
-        if latest_positions != self._raw_positions:
+        market_changed = any(
+            incoming and incoming != getattr(self, attr, {})
+            for incoming, attr in (
+                (snapshot.position_instruments, "_position_instruments"),
+                (snapshot.position_tickers, "_position_tickers"),
+                (snapshot.upl_usdt_prices, "_upl_usdt_prices"),
+            )
+        )
+        if latest_positions != self._raw_positions or market_changed:
             instruments = snapshot.position_instruments or self._position_instruments
             tickers = snapshot.position_tickers or self._position_tickers
             prices = snapshot.upl_usdt_prices or self._upl_usdt_prices
@@ -7751,19 +7763,19 @@ class AccountPositionsHomeWidget(QWidget):
             feed_source = str(order.raw.get("_feed_source") or "").strip().lower()
             source_kind = str(order.raw.get("_source_kind") or "").strip().lower()
             if feed_source == "rest_pending" and source_kind == "algo":
-                source_label = "REST 算法"
+                source_label = "算法委托"
             elif feed_source == "rest_pending":
-                source_label = "REST pending"
+                source_label = "交易所委托"
             else:
-                source_label = "WS 当前"
+                source_label = "实时推送"
             values = (
                 _format_okx_ms_timestamp(order.update_time or order.created_time),
                 source_label,
-                order.inst_type or "-",
+                _format_instrument_type(order.inst_type),
                 order.inst_id or "-",
                 _format_trade_order_state(order.state),
                 _format_history_side(order.side or "-", order.pos_side or ""),
-                order.ord_type or "-",
+                _format_trade_order_type(order.ord_type),
                 _format_trade_order_price(order.price, order.inst_id, order.inst_type or ""),
                 self._format_current_order_size_with_coin(order, filled=False),
                 self._format_current_order_size_with_coin(order, filled=True),
@@ -8470,12 +8482,12 @@ class AccountPositionsHomeWidget(QWidget):
         for row, item in enumerate(filtered):
             values = (
                 _format_okx_ms_timestamp(item.update_time or item.created_time),
-                item.source_label or "-",
-                item.inst_type or "-",
+                _format_order_source(item.source_label),
+                _format_instrument_type(item.inst_type),
                 item.inst_id or "-",
                 _format_trade_order_state(item.state),
                 _format_history_side(item.side, item.pos_side),
-                item.ord_type or "-",
+                _format_trade_order_type(item.ord_type),
                 _format_trade_order_price(item.price, item.inst_id, item.inst_type),
                 self._format_order_history_size_with_coin(item, filled=False),
                 self._format_order_history_size_with_coin(item, filled=True),
@@ -8557,7 +8569,7 @@ class AccountPositionsHomeWidget(QWidget):
             for row, item in enumerate(filtered):
                 values = (
                     _format_okx_ms_timestamp(item.fill_time),
-                    item.inst_type or "-",
+                    _format_instrument_type(item.inst_type),
                     item.inst_id or "-",
                     _format_history_side(item.side, item.pos_side),
                     _format_fill_history_price(item),

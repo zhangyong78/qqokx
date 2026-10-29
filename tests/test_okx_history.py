@@ -1135,7 +1135,7 @@ class OkxHistoryParsingTest(TestCase):
         self.assertEqual(_format_fill_history_exec_type("exercise"), "行权")
         self.assertEqual(_format_fill_history_exec_type("delivery"), "交割")
         self.assertEqual(_format_fill_history_exec_type("琛屾潈/浜ゅ壊"), "行权/交割")
-        self.assertEqual(_format_fill_history_exec_type("T"), "T")
+        self.assertEqual(_format_fill_history_exec_type("T"), "主动成交")
 
     def test_fill_history_price_keeps_option_trade_precision(self) -> None:
         text = _format_fill_history_price(
