@@ -23,8 +23,9 @@ from tkinter import BooleanVar, Canvas, END, Label, Listbox, Menu, StringVar, Te
 from tkinter import messagebox, ttk
 
 from okx_quant.app_paths import configured_data_root, data_root
+from okx_quant.ui_refresh_workers import record_server_resources, refresh_queries_paused, submit_refresh_query
 from okx_quant.client_order_id import CUSTOM_ORDER_ID_PREFIX, strategy_order_identity, with_custom_order_id_prefix
-from okx_quant.app_meta import APP_VERSION, build_app_title, build_version_info_text
+from okx_quant.app_meta import APP_DISTRIBUTION, APP_VERSION, build_app_title, build_version_info_text
 from okx_quant.analysis import (
     BoxDetectionConfig,
     ChannelDetectionConfig,
@@ -32,12 +33,13 @@ from okx_quant.analysis import (
     TrendlineDetectionConfig,
     TriangleDetectionConfig,
 )
-from okx_quant.backtest_ui import BacktestCompareOverviewWindow, BacktestLaunchState, BacktestWindow
-from okx_quant.btc_market_analysis_ui import BtcMarketAnalysisWindow
-from okx_quant.btc_research_workbench_ui import BtcResearchWorkbenchWindow
 from okx_quant.deribit_client import DeribitRestClient
-from okx_quant.deribit_volatility_monitor_ui import DeribitVolatilityMonitorWindow
-from okx_quant.deribit_volatility_ui import DeribitVolatilityWindow
+if APP_DISTRIBUTION != "server":
+    from okx_quant.backtest_ui import BacktestCompareOverviewWindow, BacktestLaunchState, BacktestWindow
+    from okx_quant.btc_market_analysis_ui import BtcMarketAnalysisWindow
+    from okx_quant.btc_research_workbench_ui import BtcResearchWorkbenchWindow
+    from okx_quant.deribit_volatility_monitor_ui import DeribitVolatilityMonitorWindow
+    from okx_quant.deribit_volatility_ui import DeribitVolatilityWindow
 from okx_quant.email_schedule_manager_ui import EmailScheduleManagerWindow
 from okx_quant.daily_filters import daily_boundary_anchor_offset_ms
 from okx_quant.daily_trade_report import (
@@ -3918,7 +3920,7 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         self.position_history_keyword = StringVar()
         self.position_history_range_start = StringVar(value="")
         self.position_history_range_end = StringVar(value="")
-        self.position_refresh_interval_label = StringVar(value="15秒")
+        self.position_refresh_interval_label = StringVar(value="30秒" if APP_DISTRIBUTION == "server" else "15秒")
         self.position_auto_refresh_button_text = StringVar(value="暂停自动刷新")
         self.position_auto_refresh_enabled = True
         self.protection_trigger_source_label = StringVar(value="期权标记价格")
@@ -6816,6 +6818,10 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         max_age_seconds: int = 30,
         min_scan_interval_seconds: int = 5,
     ) -> None:
+        if refresh_queries_paused(self):
+            return
+        if APP_DISTRIBUTION == "server":
+            max_age_seconds = max(max_age_seconds, 60)
         now = datetime.now()
         if not force and self._running_session_account_equity_last_scan_at is not None:
             since = (now - self._running_session_account_equity_last_scan_at).total_seconds()
@@ -6835,11 +6841,13 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
             if credentials is None:
                 continue
             self._account_overview_refreshing_keys.add(key)
-            threading.Thread(
-                target=self._refresh_session_account_overview_worker,
-                args=(credentials, key[0], key[1]),
-                daemon=True,
-            ).start()
+            try:
+                submit_refresh_query(self, self._refresh_session_account_overview_worker, credentials, key[0], key[1])
+            except (RuntimeError, MemoryError):
+                self._account_overview_refreshing_keys.discard(key)
+                self._account_overview_last_error_by_key[key] = "系统资源不足，账户权益刷新延后 60 秒，继续显示缓存。"
+                self._enqueue_log("账户权益刷新 | 系统资源不足或刷新队列已满，延后 60 秒重试，继续显示缓存。")
+                break
 
     def open_account_equity_curve_window_for_session(self, session: StrategySession) -> None:
         key = self._session_account_overview_key(session)
@@ -8193,6 +8201,8 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
             self._btc_research_workbench_window.show()
             return
 
+        from okx_quant.btc_research_workbench_ui import BtcResearchWorkbenchWindow
+
         self._btc_research_workbench_window = BtcResearchWorkbenchWindow(
             self.root,
             client=self.client,
@@ -8307,6 +8317,8 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
             self._deribit_volatility_monitor_window.show()
             return
 
+        from okx_quant.deribit_volatility_monitor_ui import DeribitVolatilityMonitorWindow
+
         self._deribit_volatility_monitor_window = DeribitVolatilityMonitorWindow(
             self.root,
             self.deribit_client,
@@ -8319,6 +8331,8 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         if self._deribit_volatility_window is not None and self._deribit_volatility_window.window.winfo_exists():
             self._deribit_volatility_window.show()
             return
+
+        from okx_quant.deribit_volatility_ui import DeribitVolatilityWindow
 
         self._deribit_volatility_window = DeribitVolatilityWindow(
             self.root,
@@ -15274,6 +15288,13 @@ def _pnl_tag(value: Decimal | None) -> str:
 
 
 def _refresh_status_with_recovery_support(self: QuantApp) -> None:
+    record_server_resources(self)
+    now = time.monotonic()
+    refresh_display = APP_DISTRIBUTION != "server" or (
+        now >= getattr(self, "_server_display_refresh_at", 0.0) and not refresh_queries_paused(self)
+    )
+    if refresh_display:
+        self._server_display_refresh_at = now + 2.0
     running_count = 0
     self._refresh_session_live_pnl_cache()
     for session in self.sessions.values():
@@ -15313,15 +15334,22 @@ def _refresh_status_with_recovery_support(self: QuantApp) -> None:
                 self._remove_recoverable_strategy_session(session.session_id)
                 self._trader_desk_handle_stopped_session(session)
         self._update_session_runtime_heartbeat_state(session)
-        self._upsert_session_row(session)
+        if refresh_display:
+            if APP_DISTRIBUTION == "server":
+                self._upsert_session_row(session, reorder=False)
+            else:
+                self._upsert_session_row(session)
         self._sync_strategy_history_from_session(session)
 
     self.status_text.set(f"运行中策略：{running_count}")
     self._refresh_trader_desk_runtime()
-    self._refresh_running_session_summary()
-    self._update_settings_summary()
-    self._refresh_selected_session_details()
-    self._refresh_strategy_book_window()
+    if refresh_display:
+        if APP_DISTRIBUTION == "server":
+            self._apply_running_session_tree_sort_order()
+        self._refresh_running_session_summary()
+        self._update_settings_summary()
+        self._refresh_selected_session_details()
+        self._refresh_strategy_book_window()
     self.root.after(500, self._refresh_status)
 
 

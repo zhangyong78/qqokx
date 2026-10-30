@@ -7,6 +7,26 @@ import sys
 from okx_quant.app_paths import configure_data_root, data_root
 
 
+def _disable_windows_console_quick_edit() -> None:
+    """Prevent an accidental console selection from blocking program output."""
+    if sys.platform != "win32":
+        return
+    try:
+        from ctypes import wintypes
+
+        kernel32 = ctypes.windll.kernel32
+        kernel32.GetStdHandle.argtypes = [wintypes.DWORD]
+        kernel32.GetStdHandle.restype = wintypes.HANDLE
+        kernel32.GetConsoleMode.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+        kernel32.SetConsoleMode.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+        handle = kernel32.GetStdHandle(-10)
+        mode = wintypes.DWORD()
+        if kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+            kernel32.SetConsoleMode(handle, (mode.value | 0x0080) & ~0x0040)
+    except (AttributeError, OSError):
+        pass
+
+
 def _enable_windows_dpi_awareness() -> None:
     if sys.platform != "win32":
         return
@@ -29,6 +49,7 @@ def _enable_windows_dpi_awareness() -> None:
 
 
 def main() -> None:
+    _disable_windows_console_quick_edit()
     _enable_windows_dpi_awareness()
     parser = argparse.ArgumentParser(description="Run QQOKX desktop app")
     parser.add_argument(

@@ -20,6 +20,8 @@ class UiBacktestEntryMixin:
             self._backtest_window.window.focus_force()
             return
 
+        from okx_quant.backtest_ui import BacktestLaunchState, BacktestWindow
+
         backtest_strategy_name = self.strategy_name.get()
         backtest_strategy_names = {item.name for item in BACKTEST_STRATEGY_DEFINITIONS}
         if backtest_strategy_name not in backtest_strategy_names:
@@ -105,6 +107,8 @@ class UiBacktestEntryMixin:
         if self._backtest_compare_window is not None and self._backtest_compare_window.window.winfo_exists():
             self._backtest_compare_window.show()
             return
+        from okx_quant.backtest_ui import BacktestCompareOverviewWindow
+
         self._backtest_compare_window = BacktestCompareOverviewWindow(self.root)
 
     def open_btc_market_analysis_window(self) -> None:
@@ -114,6 +118,8 @@ class UiBacktestEntryMixin:
         ):
             self._btc_market_analysis_window.show()
             return
+
+        from okx_quant.btc_market_analysis_ui import BtcMarketAnalysisWindow
 
         self._btc_market_analysis_window = BtcMarketAnalysisWindow(
             self.root,

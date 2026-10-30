@@ -9005,18 +9005,17 @@ class SessionLivePnlSummaryTest(TestCase):
             _apply_positions_error=MagicMock(),
         )
 
-        with patch("okx_quant.ui.threading.Thread") as thread_cls:
-            thread_instance = MagicMock()
-            thread_cls.return_value = thread_instance
-
+        with patch("okx_quant.ui.submit_refresh_query") as submit:
             QuantApp._drain_pending_positions_refresh_request(app)
 
         self.assertIsNone(app._positions_refresh_request)
         self.assertTrue(app._positions_refreshing)
         self.assertEqual(1, app._positions_refresh_generation)
         app._mark_api_switch_refresh_step.assert_called_once_with("positions", "running")
-        thread_cls.assert_called_once()
-        thread_instance.start.assert_called_once_with()
+        submit.assert_called_once()
+        self.assertIs(app, submit.call_args.args[0])
+        self.assertEqual("desk", submit.call_args.args[2].profile_name)
+        self.assertEqual(("demo", "desk", 1), submit.call_args.args[3:])
 
     def test_session_position_snapshot_targets_only_lists_missing_profiles(self) -> None:
         refreshed_at = datetime(2026, 4, 23, 19, 5, 0)

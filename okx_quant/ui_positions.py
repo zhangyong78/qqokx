@@ -18,7 +18,8 @@ class UiPositionsMixin:
             return
 
     def _position_refresh_interval_ms(self) -> int:
-        return POSITION_REFRESH_INTERVAL_OPTIONS.get(self.position_refresh_interval_label.get(), 15_000)
+        interval = POSITION_REFRESH_INTERVAL_OPTIONS.get(self.position_refresh_interval_label.get(), 15_000)
+        return max(interval, 30_000) if APP_DISTRIBUTION == "server" else interval
 
     def _format_private_ws_cache_note(self, credentials: Credentials, environment: str) -> str:
         try:
@@ -62,7 +63,7 @@ class UiPositionsMixin:
         self.position_auto_refresh_enabled = not self.position_auto_refresh_enabled
         if self.position_auto_refresh_enabled:
             self.position_auto_refresh_button_text.set("暂停自动刷新")
-            self._enqueue_log(f"账户持仓已恢复自动刷新，当前间隔：{self.position_refresh_interval_label.get()}")
+            self._enqueue_log(f"账户持仓已恢复自动刷新，当前间隔：{self._position_refresh_interval_ms() // 1000}秒")
             self.refresh_positions()
         else:
             self.position_auto_refresh_button_text.set("恢复自动刷新")
@@ -72,7 +73,7 @@ class UiPositionsMixin:
     def _on_position_refresh_interval_changed(self, *_: object) -> None:
         visible_positions = self._positions_zoom_visible_positions()
         self._update_position_summary(visible_positions)
-        self._enqueue_log(f"账户持仓自动刷新间隔已切换为：{self.position_refresh_interval_label.get()}")
+        self._enqueue_log(f"账户持仓自动刷新间隔已切换为：{self._position_refresh_interval_ms() // 1000}秒")
 
     def _on_position_filter_changed(self, *_: object) -> None:
         self._render_positions_view()
@@ -3817,6 +3818,8 @@ class UiPositionsMixin:
         return None
 
     def refresh_positions(self) -> None:
+        if refresh_queries_paused(self):
+            return
         credentials = self._current_credentials_or_none()
         if credentials is None:
             self._apply_positions([], "未配置 API 凭证，无法读取持仓。")
@@ -3836,16 +3839,15 @@ class UiPositionsMixin:
         self._mark_api_switch_refresh_step("positions", "running")
         self.positions_summary_text.set("正在刷新账户持仓...")
         try:
-            threading.Thread(
-                target=self._refresh_positions_worker,
-                args=(credentials, environment, profile_name, generation),
-                daemon=True,
-            ).start()
-        except RuntimeError as exc:
+            submit_refresh_query(self, self._refresh_positions_worker, credentials, environment, profile_name, generation)
+        except (RuntimeError, MemoryError) as exc:
+            self._positions_refresh_request = None
             self._apply_positions_error(f"系统线程资源不足，无法启动持仓刷新：{exc}")
             return
 
     def _drain_pending_positions_refresh_request(self) -> None:
+        if refresh_queries_paused(self):
+            return
         pending = getattr(self, "_positions_refresh_request", None)
         self._positions_refresh_request = None
         if pending is None:
@@ -3857,12 +3859,9 @@ class UiPositionsMixin:
         self._mark_api_switch_refresh_step("positions", "running")
         self.positions_summary_text.set("正在刷新账户持仓...")
         try:
-            threading.Thread(
-                target=self._refresh_positions_worker,
-                args=(credentials, environment, profile_name, generation),
-                daemon=True,
-            ).start()
-        except RuntimeError as exc:
+            submit_refresh_query(self, self._refresh_positions_worker, credentials, environment, profile_name, generation)
+        except (RuntimeError, MemoryError) as exc:
+            self._positions_refresh_request = None
             self._apply_positions_error(f"系统线程资源不足，无法启动持仓刷新：{exc}")
             return
 
@@ -3999,18 +3998,18 @@ class UiPositionsMixin:
         profile_name: str,
         generation: int,
     ) -> None:
+        if refresh_queries_paused(self):
+            return
+        if APP_DISTRIBUTION == "server" and not positions:
+            return
         if self._positions_enrichment_refreshing:
             self._positions_enrichment_request = (generation, list(positions), environment, profile_name)
             return
         self._positions_enrichment_refreshing = True
         self._positions_enrichment_request = None
         try:
-            threading.Thread(
-                target=self._refresh_positions_enrichment_worker,
-                args=(list(positions), environment, profile_name, generation),
-                daemon=True,
-            ).start()
-        except RuntimeError:
+            submit_refresh_query(self, self._refresh_positions_enrichment_worker, list(positions), environment, profile_name, generation)
+        except (RuntimeError, MemoryError):
             self._positions_enrichment_refreshing = False
             self._positions_enrichment_request = (generation, list(positions), environment, profile_name)
             self._enqueue_api_switch_refresh_log_once(
@@ -4227,6 +4226,8 @@ class UiPositionsMixin:
         return targets
 
     def _schedule_session_position_snapshot_sync(self) -> None:
+        if APP_DISTRIBUTION == "server" and refresh_queries_paused(self):
+            return
         targets = self._session_position_snapshot_targets()
         if not targets:
             return
@@ -4246,12 +4247,15 @@ class UiPositionsMixin:
         if isinstance(forced_keys, set):
             forced_keys.difference_update(targets)
         try:
-            threading.Thread(
-                target=self._refresh_session_position_snapshots_worker,
-                args=(targets,),
-                daemon=True,
-            ).start()
-        except RuntimeError:
+            if APP_DISTRIBUTION == "server":
+                submit_refresh_query(self, self._refresh_session_position_snapshots_worker, targets)
+            else:
+                threading.Thread(
+                    target=self._refresh_session_position_snapshots_worker,
+                    args=(targets,),
+                    daemon=True,
+                ).start()
+        except (RuntimeError, MemoryError):
             self._session_positions_snapshot_refreshing = False
             self._session_positions_snapshot_refresh_requested = True
             if isinstance(forced_keys, set):
@@ -4425,6 +4429,8 @@ class UiPositionsMixin:
         return targets
 
     def _schedule_running_session_market_price_sync(self) -> None:
+        if APP_DISTRIBUTION == "server" and refresh_queries_paused(self):
+            return
         targets = self._running_session_market_price_targets()
         if not targets:
             return
@@ -4434,12 +4440,15 @@ class UiPositionsMixin:
         self._running_session_market_price_refreshing = True
         self._running_session_market_price_refresh_requested = False
         try:
-            threading.Thread(
-                target=self._refresh_running_session_market_price_worker,
-                args=(targets,),
-                daemon=True,
-            ).start()
-        except RuntimeError:
+            if APP_DISTRIBUTION == "server":
+                submit_refresh_query(self, self._refresh_running_session_market_price_worker, targets)
+            else:
+                threading.Thread(
+                    target=self._refresh_running_session_market_price_worker,
+                    args=(targets,),
+                    daemon=True,
+                ).start()
+        except (RuntimeError, MemoryError):
             self._running_session_market_price_refreshing = False
             self._running_session_market_price_refresh_requested = True
 
@@ -5230,7 +5239,7 @@ class UiPositionsMixin:
         if filter_text:
             parts.append(f"筛选：{filter_text}")
         if self.position_auto_refresh_enabled:
-            parts.append(f"自动刷新：{self.position_refresh_interval_label.get()}")
+            parts.append(f"自动刷新：{self._position_refresh_interval_ms() // 1000}秒")
         else:
             parts.append("自动刷新：已暂停")
         parts.append(f"最近刷新：{timestamp}")
