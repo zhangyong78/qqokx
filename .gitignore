@@ -11,6 +11,7 @@ __pycache__/
 *.pem
 *.key
 *.secret
+market_relay.json
 tests_artifacts/
 .okx_quant_credentials.json
 .okx_quant_settings.json

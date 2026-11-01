@@ -28,6 +28,7 @@ class ServerPackageFilterTest(TestCase):
             ".okx_quant_credentials.json",
             "credentials.json",
             "settings.json",
+            "market_relay.json",
             "server.pem",
             "private.key",
             "client.p12",
@@ -44,7 +45,7 @@ class ServerPackageFilterTest(TestCase):
             nested.mkdir(parents=True)
             (source / "module.py").write_text("pass\n", encoding="utf-8")
             (nested / "child.py").write_text("pass\n", encoding="utf-8")
-            for name in ("child.py.corrupted_backup", ".env", "credentials.json", "private.pem"):
+            for name in ("child.py.corrupted_backup", ".env", "credentials.json", "market_relay.json", "private.pem"):
                 (nested / name).write_text("synthetic test content", encoding="utf-8")
 
             shutil.copytree(source, target, ignore=package_ignore)

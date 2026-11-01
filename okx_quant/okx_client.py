@@ -3961,11 +3961,38 @@ class OkxRestClient:
         url = f"{self.base_url}{path}"
         req = request.Request(url, data=data or None, headers=headers, method=method.upper())
 
-        try:
+        from okx_quant import market_relay
+        relay_path = path.split("?", 1)[0]
+        relay_allowed = (
+            not auth and credentials is None and not simulated and method.upper() == "GET"
+            and body is None and relay_path in market_relay.ALLOWED_PATHS
+            and self.base_url == "https://www.okx.com"
+        )
+        relay_query = path.split("?", 1)[1] if "?" in path else ""
+
+        def fetch_direct(timeout_limit: float | None = None) -> dict[str, Any]:
             refresh_http_proxy_settings()
-            with request.urlopen(req, timeout=max(float(timeout_seconds or 20), 0.1)) as response:
+            direct_timeout = max(float(timeout_seconds or 20), 0.1)
+            if timeout_limit is not None:
+                direct_timeout = min(direct_timeout, timeout_limit)
+            with request.urlopen(req, timeout=direct_timeout) as response:
                 content = response.read().decode("utf-8")
-                payload = json.loads(content)
+                return json.loads(content)
+
+        try:
+            if relay_allowed and market_relay.runtime().enabled:
+                # Invalid/non-whitelisted public parameters retain their original
+                # direct API behavior, rather than becoming a relay request.
+                try:
+                    market_relay.protocol.validate(relay_path, relay_query)
+                except ValueError:
+                    payload = fetch_direct()
+                else:
+                    payload = market_relay.execute(relay_path, relay_query, fetch_direct, self._logger)
+            else:
+                payload = fetch_direct()
+        except market_relay.RelayError as exc:
+            raise OkxApiError(str(exc)) from None
         except error.HTTPError as exc:
             body_text = exc.read().decode("utf-8", errors="replace")
             raise OkxApiError(f"HTTP {exc.code}: {body_text}", status=exc.code) from exc

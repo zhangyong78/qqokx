@@ -88,6 +88,7 @@ from okx_quant.network_proxy import (
     PROXY_MODE_OPTIONS, PROXY_RESTART_NOTE, load_network_proxy_settings,
     save_network_proxy_settings, validate_network_proxy_settings,
 )
+from okx_quant import market_relay
 from okx_quant.models import (
     Candle,
     Credentials,
@@ -8125,6 +8126,10 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
         container.columnconfigure(1, weight=1)
         mode = StringVar(window, value="跟随系统代理")
         url = StringVar(window)
+        relay_enabled = BooleanVar(window, value=False)
+        relay_url = StringVar(window)
+        relay_token = StringVar(window)
+        relay_loaded = None
         loaded = None
         error = ""
         try:
@@ -8133,6 +8138,14 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
             url.set(loaded.url)
         except (OSError, ValueError):
             error = "网络代理设置读取失败，请重新保存。\n"
+        relay_error = ""
+        try:
+            relay_loaded = market_relay.load()
+            relay_enabled.set(relay_loaded.enabled)
+            relay_url.set(relay_loaded.url)
+            relay_token.set(relay_loaded.token)
+        except (OSError, ValueError):
+            relay_error = "行情中转设置读取失败，请检查配置。\n"
         ttk.Label(container, text="代理模式").grid(row=0, column=0, sticky="w", padx=(0, 12))
         combo = ttk.Combobox(container, textvariable=mode, values=list(PROXY_MODE_OPTIONS), state="readonly", width=30)
         combo.grid(row=0, column=1, sticky="ew")
@@ -8158,9 +8171,29 @@ class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStra
                 messagebox.showerror("代理设置保存失败", str(exc), parent=window)
                 return
             messagebox.showinfo("代理设置已保存", PROXY_RESTART_NOTE, parent=window)
+        ttk.Separator(container).grid(row=4, column=0, columnspan=2, sticky="ew", pady=(16, 10))
+        ttk.Label(container, text="行情故障中转（仅只读 OKX 公共行情）").grid(row=5, column=0, columnspan=2, sticky="w")
+        ttk.Checkbutton(container, text="启用行情中转", variable=relay_enabled).grid(row=6, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        ttk.Label(container, text="HTTPS 服务地址").grid(row=7, column=0, sticky="w", padx=(0, 12), pady=(8, 0))
+        ttk.Entry(container, textvariable=relay_url, width=54).grid(row=7, column=1, sticky="ew", pady=(8, 0))
+        ttk.Label(container, text="访问密钥").grid(row=8, column=0, sticky="w", padx=(0, 12), pady=(8, 0))
+        ttk.Entry(container, textvariable=relay_token, width=54, show="•").grid(row=8, column=1, sticky="ew", pady=(8, 0))
+        ttk.Label(container, text=relay_error + market_relay.RESTART_NOTE, wraplength=540).grid(row=9, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        def save_relay():
+            nonlocal relay_loaded
+            try:
+                settings = market_relay.validate(relay_enabled.get(), relay_url.get(), relay_token.get())
+                if relay_loaded is not None and market_relay.load() not in (relay_loaded, settings):
+                    raise ValueError("行情中转设置已被另一窗口修改，请重新打开设置。")
+                relay_loaded = market_relay.save(settings)
+            except Exception as exc:
+                messagebox.showerror("行情中转设置保存失败", str(exc), parent=window)
+                return
+            messagebox.showinfo("行情中转设置已保存", market_relay.RESTART_NOTE, parent=window)
         buttons = ttk.Frame(container)
-        buttons.grid(row=4, column=0, columnspan=2, sticky="e", pady=(16, 0))
+        buttons.grid(row=10, column=0, columnspan=2, sticky="e", pady=(16, 0))
         ttk.Button(buttons, text="保存代理设置", command=save_proxy).pack(side="left", padx=(0, 8))
+        ttk.Button(buttons, text="保存行情中转", command=save_relay).pack(side="left", padx=(0, 8))
         ttk.Button(buttons, text="关闭", command=window.destroy).pack(side="left")
 
 

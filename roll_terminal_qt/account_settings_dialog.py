@@ -15,6 +15,7 @@ from okx_quant.network_proxy import (
     PROXY_MODE_OPTIONS, PROXY_RESTART_NOTE, load_network_proxy_settings,
     save_network_proxy_settings, validate_network_proxy_settings,
 )
+from okx_quant import market_relay
 from roll_terminal_qt.profile_access import ensure_profile_unlocked
 
 
@@ -125,6 +126,20 @@ class AccountSettingsDialog(QDialog):
         proxy_save = QPushButton("保存代理设置", network)
         proxy_save.clicked.connect(self._save_proxy)
         network_form.addRow(proxy_save)
+        self.relay_enabled = QCheckBox("启用行情中转（仅只读 OKX 公共行情）", network)
+        network_form.addRow(self.relay_enabled)
+        self.relay_url = QLineEdit(network)
+        self.relay_url.setPlaceholderText("https://relay.example.com")
+        network_form.addRow("HTTPS 服务地址", self.relay_url)
+        self.relay_token = QLineEdit(network)
+        self.relay_token.setEchoMode(QLineEdit.Password)
+        network_form.addRow("访问密钥", self.relay_token)
+        self.relay_note = QLabel(market_relay.RESTART_NOTE, network)
+        self.relay_note.setWordWrap(True)
+        network_form.addRow(self.relay_note)
+        relay_save = QPushButton("保存行情中转设置", network)
+        relay_save.clicked.connect(self._save_relay)
+        network_form.addRow(relay_save)
         layout.addWidget(network)
         self._loaded_proxy = None
         try:
@@ -135,6 +150,14 @@ class AccountSettingsDialog(QDialog):
             self._set_combo(self.proxy_mode, "system")
             note.setText("网络代理设置读取失败，请重新保存。" + PROXY_RESTART_NOTE)
         self.proxy_url.setEnabled(self.proxy_mode.currentData() == "custom")
+        self._loaded_relay = None
+        try:
+            self._loaded_relay = market_relay.load()
+            self.relay_enabled.setChecked(self._loaded_relay.enabled)
+            self.relay_url.setText(self._loaded_relay.url)
+            self.relay_token.setText(self._loaded_relay.token)
+        except (OSError, ValueError):
+            self.relay_note.setText("行情中转设置读取失败，请检查配置。" + market_relay.RESTART_NOTE)
 
         mail = QGroupBox("邮件通知设置", page)
         mail_form = QFormLayout(mail)
@@ -365,6 +388,21 @@ class AccountSettingsDialog(QDialog):
             QMessageBox.warning(self, "代理设置保存失败", str(exc))
             return
         QMessageBox.information(self, "代理设置已保存", PROXY_RESTART_NOTE)
+
+    def _save_relay(self) -> None:
+        try:
+            settings = market_relay.validate(
+                self.relay_enabled.isChecked(), self.relay_url.text(), self.relay_token.text(),
+            )
+            if self._loaded_relay is not None:
+                current = market_relay.load()
+                if current not in (self._loaded_relay, settings):
+                    raise ValueError("行情中转设置已被另一窗口修改，请重新打开设置。")
+            self._loaded_relay = market_relay.save(settings)
+        except Exception as exc:
+            QMessageBox.warning(self, "行情中转设置保存失败", str(exc))
+            return
+        QMessageBox.information(self, "行情中转设置已保存", market_relay.RESTART_NOTE)
 
     def _save(self) -> bool:
         name = self._selected_profile

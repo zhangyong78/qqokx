@@ -26,7 +26,7 @@ def package_ignore(_src: str, names: list[str]) -> set[str]:
             or lowered == ".env"
             or lowered.startswith(".env.")
             or lowered.startswith(".okx_quant_")
-            or lowered in {"credentials.json", "settings.json"}
+            or lowered in {"credentials.json", "settings.json", "market_relay.json"}
             or lowered.endswith((".pem", ".key", ".p12", ".pfx"))
         ):
             ignored.add(name)
@@ -73,6 +73,11 @@ def build_package(version: str) -> tuple[Path, Path]:
         source = project_root / file_name
         if source.exists():
             shutil.copy2(source, stage_dir / file_name)
+
+    relay_guide = project_root / "docs" / "market_relay.md"
+    if relay_guide.exists():
+        (stage_dir / "docs").mkdir(exist_ok=True)
+        shutil.copy2(relay_guide, stage_dir / "docs" / relay_guide.name)
 
     shutil.copytree(
         project_root / "okx_quant",
