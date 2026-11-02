@@ -217,7 +217,7 @@ class WorkspaceHeader(QFrame):
             font_menu.addAction(action)
             self._font_actions[mode] = action
         menu.addSeparator()
-        for route_key, label in self._ROUTES[13:]:
+        for route_key, label in self._ROUTES[14:]:
             menu.addAction(self._register_action(route_key, label))
         button = QToolButton(self)
         button.setText("⚙")

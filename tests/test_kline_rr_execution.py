@@ -215,6 +215,26 @@ class KlineRRExecutionTest(TestCase):
         self.credentials = SimpleNamespace(profile_name="moni")
         self.config = SimpleNamespace(position_mode="net")
 
+    def test_closed_rr_position_requires_two_absent_account_snapshots(self) -> None:
+        entry = RRTradeLedgerEntry(
+            entry_id="rr-execution",
+            status="protected",
+            plan=_plan(),
+            entry_order=RRTradeOrderLink(role="entry", channel="order", order_id="entry-order-1"),
+            filled_size=Decimal("10"),
+            remaining_size=Decimal("0"),
+        )
+        client = SimpleNamespace(get_positions=lambda *args, **kwargs: [])
+
+        first = self.service._reconcile_position_lifecycle(client=client, credentials=object(), entry=entry)
+        self.assertEqual(first.status, "protected")
+        self.assertEqual(first.events[-1].kind, "rr_position_absent_once")
+
+        second = self.service._reconcile_position_lifecycle(client=client, credentials=object(), entry=first)
+        self.assertEqual(second.status, "closed")
+        self.assertEqual(second.events[-1].kind, "rr_position_closed_confirmed")
+        self.assertFalse(self.service.should_monitor_status(second.status))
+
     def test_activate_chase_long_places_bid_one_with_attached_protection(self) -> None:
         client = _FakeClient(bid="60001", ask="60002")
 

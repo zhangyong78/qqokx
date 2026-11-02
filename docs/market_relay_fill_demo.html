@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>QQOKX 行情中转填写示意</title>
+<style>
+:root{font-family:"Segoe UI","Microsoft YaHei",sans-serif;color:#e7eef8;background:#101722}*{box-sizing:border-box}body{margin:0;padding:36px 18px;background:radial-gradient(ellipse at top,#1e3450,#101722 65%);min-height:100vh}.card{max-width:720px;margin:auto;background:#182333;border:1px solid #30435c;border-radius:18px;padding:30px;box-shadow:0 18px 50px #0005}h1{font-size:25px;margin:0 0 8px}.sub{color:#a9bbd1;margin:0 0 25px}.tag{display:inline-block;padding:5px 10px;border-radius:20px;background:#133d34;color:#80e1ba;font-size:13px;margin-bottom:15px}.field{margin:18px 0}.field label{display:block;font-weight:650;margin-bottom:8px}.input{width:100%;border-radius:9px;border:1px solid #455a73;padding:12px 14px;background:#111a27;color:#f2f6fb;font:15px ui-monospace,Consolas,monospace}.hint{font-size:13px;color:#9cafc5;margin-top:7px}.warning{background:#402a1c;border:1px solid #936634;color:#ffdcaa;padding:14px 16px;border-radius:10px;line-height:1.6;margin-top:18px}.good{background:#14342e;border:1px solid #286d5b;color:#b7f2dd;padding:14px 16px;border-radius:10px;line-height:1.6;margin-top:12px}.steps{margin-top:24px;padding-top:20px;border-top:1px solid #30435c;line-height:1.8;color:#c5d2e2}.steps b{color:#fff}.note{font-size:12px;color:#8296ad;margin-top:22px}
+</style>
+</head>
+<body>
+<main class="card">
+<div class="tag">本地版本 · 网络代理设置 · 填写示意</div>
+<h1>启用行情中转</h1>
+<p class="sub">本地先直连 OKX；网络故障时改由你的服务器代取公开行情。</p>
+<div class="field"><label>☑ 启用行情中转</label></div>
+<div class="field"><label for="url">HTTPS 服务地址</label><input class="input" id="url" value="https://43.132.213.112:8765" readonly><div class="hint">只有服务器已配置有效 HTTPS 证书并监听 8765 端口时才能这样填。</div></div>
+<div class="field"><label for="key">访问密钥</label><input class="input" id="key" type="password" value="Great" readonly><div class="hint">这里必须填写与服务器端完全相同的专用行情密钥。</div></div>
+<div class="warning"><b>“Great”不能直接用作密钥。</b>它只有 5 个字符，软件要求 32–128 位随机字符。请在服务器生成随机密钥，将同一个密钥放入服务器的 <code>MARKET_RELAY_TOKEN</code> 环境变量和本地这个访问密钥框。不要用交易所 API 密钥。</div>
+<div class="good"><b>服务器地址要留意 HTTPS 证书。</b>直接用 IP 地址时，证书必须包含 <code>43.132.213.112</code>。如果证书签发给域名，就把本框改填该域名，例如 <code>https://relay.example.com</code>。</div>
+<div class="steps"><b>服务器端：</b>单独启动行情中转服务（HTTPS 直连监听或由 HTTPS 反向代理转发到服务器本机 8765 端口）。启动/停止这个服务就是服务器端的开/关，现有策略不用为此切换程序版本。<br><b>本地端：</b>勾选开关，填服务 HTTPS 地址和同一密钥，点击“保存行情中转”，重启本地 QQOKX。</div>
+<p class="note">此页仅为填写示意，不会连接服务器、启动服务或保存凭证。当前服务器端还没有 GUI 复选框。</p>
+</main>
+</body>
+</html>

@@ -112,12 +112,54 @@ class RRTradeExecutionService:
         if order is None or not order.order_id:
             return self._with_event(entry, status="manual_review", kind="missing_entry_order", message="RR entry order identifier is missing")
         status = client.get_order(credentials, config, inst_id=entry.plan.inst_id, ord_id=order.order_id)
-        return self._reconcile_status(
+        updated = self._reconcile_status(
             client=client,
             credentials=credentials,
             config=config,
             entry=entry,
             exchange_status=status,
+        )
+        return self._reconcile_position_lifecycle(client=client, credentials=credentials, entry=updated)
+
+    def _reconcile_position_lifecycle(self, *, client: Any, credentials: Any, entry: RRTradeLedgerEntry) -> RRTradeLedgerEntry:
+        protected_statuses = {"protected", "protected_break_even", "protected_trailing", "protected_cancelled_remainder"}
+        if entry.status not in protected_statuses or entry.filled_size <= 0:
+            return entry
+        get_positions = getattr(client, "get_positions", None)
+        if not callable(get_positions):
+            return entry
+        positions = get_positions(
+            credentials,
+            environment=entry.plan.environment,
+            inst_type="SWAP",
+            prefer_cache=False,
+        )
+        matching_position = any(
+            str(getattr(position, "inst_id", "") or "").strip().upper() == entry.plan.inst_id.upper()
+            and _position_matches_direction(position, entry.plan.direction)
+            for position in positions
+        )
+        if matching_position:
+            if entry.events and entry.events[-1].kind == "rr_position_absent_once":
+                return self._with_event(
+                    entry,
+                    status=entry.status,
+                    kind="rr_position_reappeared",
+                    message="Matching RR position is present; cleared the pending absence confirmation",
+                )
+            return entry
+        if entry.events and entry.events[-1].kind == "rr_position_absent_once":
+            return self._with_event(
+                entry,
+                status="closed",
+                kind="rr_position_closed_confirmed",
+                message="Matching position was absent in two consecutive successful account snapshots; RR monitoring completed",
+            )
+        return self._with_event(
+            entry,
+            status=entry.status,
+            kind="rr_position_absent_once",
+            message="Matching position was absent in one successful account snapshot; waiting for confirmation",
         )
 
     def cancel(

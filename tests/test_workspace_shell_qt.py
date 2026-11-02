@@ -76,6 +76,7 @@ class WorkspaceShellQtTests(QtWidgetTestCase):
                 "settings:font-large",
                 "settings:font-extra_large",
                 "settings:paths",
+                "settings:position-mode",
                 "settings:logs",
                 "settings:version",
                 "settings:history-sync",
@@ -96,6 +97,14 @@ class WorkspaceShellQtTests(QtWidgetTestCase):
             [action.text() for action in snapshot_menu.menu().actions()],
             ["生成 AI 快照", "快照内容说明", "生成 AI 精简快照", "BTC × DVOL 总览", "ETH × DVOL 总览", "样本预测"],
         )
+
+    def test_sample_prediction_is_only_in_ai_menu(self) -> None:
+        header = WorkspaceHeader()
+        ai_menu = next(button for button in header.findChildren(QToolButton) if button.text() == "AI").menu()
+        settings_menu = next(button for button in header.findChildren(QToolButton) if button.text() == "⚙").menu()
+
+        self.assertIn("样本预测", [action.text() for action in ai_menu.actions()])
+        self.assertNotIn("样本预测", [action.text() for action in settings_menu.actions()])
 
     def test_workspace_header_marks_trading_tools_active_for_smart_order(self) -> None:
         header = WorkspaceHeader()
