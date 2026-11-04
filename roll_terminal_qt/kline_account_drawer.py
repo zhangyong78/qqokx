@@ -496,6 +496,7 @@ class KlineAccountDrawer(QWidget):
         self._position_history_thread: PositionHistoryFeedThread | None = None
         self._retired_history_threads: list[QThread] = []
         self._visible_orders: list[object] = []
+        self._visible_positions: list[object] = []
         self._rendered_submission_ids: set[str] = set()
         self._load_thread: AccountDrawerLoadThread | None = None
         self._cancel_thread: AccountDrawerCancelThread | None = None
@@ -503,6 +504,7 @@ class KlineAccountDrawer(QWidget):
         self._chase_thread: AccountDrawerChaseThread | None = None
         self._chase_shutting_down = False
         self.chase_context_provider = None
+        self.position_flatten_callback = None
         self.action_access_provider = None
         self.profile_snapshots_provider = None
         from roll_terminal_qt.order_actions import OrderActions
@@ -613,6 +615,12 @@ class KlineAccountDrawer(QWidget):
         positions_tab = QWidget()
         positions_layout = QVBoxLayout(positions_tab)
         positions_layout.setContentsMargins(0, 0, 0, 0)
+        position_actions = QHBoxLayout()
+        self._flatten_position_button = QPushButton("平仓选中")
+        self._flatten_position_button.clicked.connect(self._flatten_selected_position)
+        position_actions.addWidget(self._flatten_position_button)
+        position_actions.addStretch(1)
+        positions_layout.addLayout(position_actions)
         positions_layout.addWidget(self._positions_table, 1)
         self._tabs.addTab(positions_tab, "当前持仓")
 
@@ -894,6 +902,7 @@ class KlineAccountDrawer(QWidget):
         self._rendered_submission_ids = pending_ids
 
     def _populate_positions_table(self, positions: list[object]) -> None:
+        self._visible_positions = list(positions)
         self._positions_table.setRowCount(len(positions))
         upl_usdt_prices = dict(self._snapshot.upl_usdt_prices or {})
         position_instruments = dict(self._snapshot.position_instruments or {})
@@ -917,6 +926,27 @@ class KlineAccountDrawer(QWidget):
                         self._positions_table.item(row, column).setForeground(pnl_color)
                 except (TypeError, ValueError):
                     pass
+
+    def _flatten_selected_position(self) -> None:
+        row = self._positions_table.currentRow()
+        if row < 0 or row >= len(getattr(self, "_visible_positions", [])):
+            QMessageBox.information(self, "平仓", "请先在 K 线页当前持仓中选中一条持仓。")
+            return
+        runtime = self._runtime
+        profile_name = str(self._profile_name or "").strip()
+        environment = str(self._environment or "").strip()
+        callback = self.position_flatten_callback
+        if runtime is None or not profile_name or not environment:
+            QMessageBox.warning(self, "平仓", "K 线页账户上下文尚未就绪，请刷新账户后重试。")
+            return
+        if not callable(callback):
+            QMessageBox.warning(self, "平仓", "账户持仓平仓服务尚未连接。")
+            return
+        position = self._visible_positions[row]
+        try:
+            callback(position, profile_name=profile_name, environment=environment, runtime=runtime)
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.warning(self, "平仓", str(exc))
 
     def _populate_history_orders_table(self, orders: list[object]) -> None:
         self._history_orders_table.setRowCount(len(orders))

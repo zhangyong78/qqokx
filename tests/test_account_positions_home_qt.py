@@ -698,6 +698,78 @@ class _ColumnConfigTableStub:
 
 
 class AccountPositionsHomeQtHelpersTest(TestCase):
+    def test_position_amount_display_caps_coin_decimals_but_preserves_contracts(self) -> None:
+        self.assertEqual(
+            AccountPositionsHomeWidget._format_amount_with_unit(Decimal("1.165800394014335415182126839"), "BTC"),
+            "1.16580039 BTC",
+        )
+        self.assertEqual(
+            AccountPositionsHomeWidget._format_amount_with_unit(Decimal("889.9"), "张"),
+            "889.9 张",
+        )
+
+    def test_kline_flatten_requires_same_context_and_matching_position(self) -> None:
+        runtime = SimpleNamespace(environment="demo")
+        position = SimpleNamespace(inst_id="BTC-USDT-SWAP", inst_type="SWAP", pos_side="long", mgn_mode="cross", position=Decimal("1"), avail_position=Decimal("1"), avg_price=Decimal("100"))
+        submit = MagicMock()
+        app = SimpleNamespace(_runtime=runtime, _last_profile_name="profile", _current_profile_name=lambda: "profile", _visible_positions=[position], flatten_selected_position=submit)
+        AccountPositionsHomeWidget.flatten_position_for_context(app, position, profile_name="profile", environment="demo", runtime=runtime)
+        submit.assert_called_once_with(position_override=position, expected_environment="demo")
+        with self.assertRaisesRegex(ValueError, "账户上下文"):
+            AccountPositionsHomeWidget.flatten_position_for_context(app, position, profile_name="other", environment="demo", runtime=runtime)
+        with self.assertRaisesRegex(ValueError, "交易环境"):
+            AccountPositionsHomeWidget.flatten_position_for_context(app, position, profile_name="profile", environment="live", runtime=runtime)
+        app._visible_positions = []
+        with self.assertRaisesRegex(ValueError, "持仓数据尚未一致"):
+            AccountPositionsHomeWidget.flatten_position_for_context(app, position, profile_name="profile", environment="demo", runtime=runtime)
+
+    def test_futures_r_target_covers_fees_for_linear_and_inverse_contracts(self) -> None:
+        calculate = account_positions_module._futures_r_target_price
+        entry = Decimal("100")
+        rate = Decimal("0.00036")
+        for direction, stop in (("long", Decimal("95")), ("short", Decimal("105"))):
+            for inverse in (False, True):
+                with self.subTest(direction=direction, inverse=inverse):
+                    target, price, distance = calculate(entry, stop, Decimal("1"), rate, direction=direction, inverse=inverse)
+                    self.assertEqual(distance, Decimal("5"))
+                    self.assertEqual(target, Decimal("105") if direction == "long" else Decimal("95"))
+                    if inverse:
+                        expected = (Decimal("1") / entry - Decimal("1") / target) if direction == "long" else (Decimal("1") / target - Decimal("1") / entry)
+                        actual = ((Decimal("1") - rate) / entry - (Decimal("1") + rate) / price) if direction == "long" else ((Decimal("1") - rate) / price - (Decimal("1") + rate) / entry)
+                    else:
+                        expected = abs(target - entry)
+                        actual = (price * (1 - rate) - entry * (1 + rate)) if direction == "long" else (entry * (1 - rate) - price * (1 + rate))
+                    self.assertLess(abs(actual - expected), Decimal("1e-22"))
+
+    def test_futures_r_rejects_stop_on_wrong_side(self) -> None:
+        with self.assertRaisesRegex(ValueError, "多头参考止损价"):
+            account_positions_module._futures_r_target_price(
+                Decimal("100"), Decimal("105"), Decimal("1"), Decimal("0.00036"), direction="long", inverse=False
+            )
+
+    def test_futures_r_order_uses_confirmed_stop_and_calculated_limit(self) -> None:
+        position = SimpleNamespace(inst_id="BTC-USDT-SWAP", inst_type="SWAP", avg_price=Decimal("100"))
+        instrument = SimpleNamespace(inst_type="SWAP")
+        client = SimpleNamespace(place_simple_order=MagicMock(return_value=object()))
+        app = SimpleNamespace(
+            _shared_client=client,
+            _profile_snapshots={},
+            _last_profile_name="demo",
+            _prepare_selected_position_manual_flatten=lambda *args, **kwargs: (
+                object(), object(), instrument, Decimal("1"), "sell", None, "long", "futures_r_target"
+            ),
+            _snap_selected_position_flatten_price=lambda item, value, *, rounding: value,
+            _validate_selected_position_limit_not_marketable=MagicMock(),
+        )
+        _, price, mode = AccountPositionsHomeWidget._submit_selected_position_manual_flatten(
+            app, position, "futures_r_target", fee_multiple=Decimal("1"), reference_stop_price=Decimal("95")
+        )
+        expected = (Decimal("100") * Decimal("1.00036") + Decimal("5")) / Decimal("0.99964")
+        self.assertEqual(price, expected)
+        self.assertEqual(mode, "futures_r_target")
+        self.assertEqual(client.place_simple_order.call_args.kwargs["price"], expected)
+        app._validate_selected_position_limit_not_marketable.assert_called_once_with(position.inst_id, side="sell", price=expected)
+
     @staticmethod
     def _current_order(inst_type: str) -> SimpleNamespace:
         return SimpleNamespace(
@@ -1907,6 +1979,41 @@ class AccountPositionsHomeQtHelpersTest(TestCase):
         client.get_order_book.assert_called_once_with(instrument.inst_id, depth=5)
         client.get_ticker.assert_not_called()
 
+    def test_limit_flatten_blocks_sell_when_bid_has_crossed_order_price(self) -> None:
+        client = SimpleNamespace(
+            get_order_book=MagicMock(
+                return_value=SimpleNamespace(
+                    bids=[(Decimal("100.1"), Decimal("1"))],
+                    asks=[(Decimal("100.2"), Decimal("1"))],
+                )
+            ),
+            get_ticker=MagicMock(),
+        )
+        app = SimpleNamespace(_shared_client=client)
+
+        with self.assertRaisesRegex(ValueError, "已拦截.*100.1.*100.*立即成交"):
+            AccountPositionsHomeWidget._validate_selected_position_limit_not_marketable(
+                app, "BTC-USDT-SWAP", side="sell", price=Decimal("100")
+            )
+        client.get_ticker.assert_not_called()
+
+    def test_limit_flatten_blocks_buy_when_ask_has_crossed_order_price(self) -> None:
+        client = SimpleNamespace(
+            get_order_book=MagicMock(
+                return_value=SimpleNamespace(
+                    bids=[(Decimal("99.8"), Decimal("1"))],
+                    asks=[(Decimal("99.9"), Decimal("1"))],
+                )
+            ),
+            get_ticker=MagicMock(),
+        )
+        app = SimpleNamespace(_shared_client=client)
+
+        with self.assertRaisesRegex(ValueError, "已拦截.*99.9.*100.*立即成交"):
+            AccountPositionsHomeWidget._validate_selected_position_limit_not_marketable(
+                app, "BTC-USDT-SWAP", side="buy", price=Decimal("100")
+            )
+
     def test_manual_flatten_reconcile_does_not_restart_realtime_store(self) -> None:
         realtime_store = SimpleNamespace(request_reconcile=MagicMock())
         app = SimpleNamespace(_realtime_store=realtime_store)
@@ -1946,6 +2053,78 @@ class AccountPositionsHomeQtHelpersTest(TestCase):
         )
 
         self.assertEqual(label, "卖方扣双向手续费赚70%平仓")
+
+    def test_manual_flatten_mode_label_includes_short_break_even_fee_order(self) -> None:
+        label = AccountPositionsHomeWidget._position_manual_flatten_mode_label("short_break_even_fee")
+
+        self.assertEqual(label, "挂单保本+双向手续费买入")
+
+    def test_short_break_even_flatten_price_covers_both_linear_fees(self) -> None:
+        position = SimpleNamespace(inst_type="SWAP", avg_price=Decimal("100"), position=Decimal("1"), raw={})
+        instrument = Instrument(
+            inst_id="BTC-USDT-SWAP",
+            inst_type="SWAP",
+            tick_size=Decimal("0.01"),
+            lot_size=Decimal("1"),
+            min_size=Decimal("1"),
+            state="live",
+        )
+        app = SimpleNamespace(_profile_snapshots={}, _last_profile_name="moni")
+        app._snap_selected_position_flatten_price = lambda item, value, *, rounding: (
+            AccountPositionsHomeWidget._snap_selected_position_flatten_price(app, item, value, rounding=rounding)
+        )
+
+        price = AccountPositionsHomeWidget._resolve_short_profit_flatten_price(
+            app,
+            position,
+            instrument,
+            side="buy",
+            profit_percent=Decimal("0"),
+        )
+
+        fee_rate = Decimal("0.00036")
+        exact_break_even = Decimal("100") * (Decimal("1") - fee_rate) / (Decimal("1") + fee_rate)
+        self.assertLessEqual(price, exact_break_even)
+        self.assertLess(exact_break_even - price, Decimal("0.01"))
+
+    def test_manual_flatten_zero_multiple_remains_zero_in_label(self) -> None:
+        label = AccountPositionsHomeWidget._position_manual_flatten_mode_label(
+            "best_quote_fee",
+            fee_multiple=Decimal("0"),
+        )
+
+        self.assertEqual(label, "买方赚0倍+双向手续费")
+
+    def test_zero_profit_multiple_covers_both_fees_without_adding_profit_multiple(self) -> None:
+        position = SimpleNamespace(
+            inst_id="BTC-USDT-SWAP",
+            inst_type="SWAP",
+            avg_price=Decimal("100"),
+            position=Decimal("10"),
+            raw={},
+        )
+        instrument = Instrument(
+            inst_id="BTC-USDT-SWAP",
+            inst_type="SWAP",
+            tick_size=Decimal("0.1"),
+            lot_size=Decimal("1"),
+            min_size=Decimal("1"),
+            state="live",
+        )
+        app = SimpleNamespace(_profile_snapshots={}, _last_profile_name="moni")
+        app._snap_selected_position_flatten_price = lambda item, value, *, rounding: (
+            AccountPositionsHomeWidget._snap_selected_position_flatten_price(app, item, value, rounding=rounding)
+        )
+
+        price = AccountPositionsHomeWidget._resolve_fee_adjusted_flatten_price(
+            app,
+            position,
+            instrument,
+            side="sell",
+            fee_multiple=Decimal("0"),
+        )
+
+        self.assertEqual(price, Decimal("100.1"))
 
     def test_selected_position_close_display_amount_uses_coin_for_linear_swap(self) -> None:
         position = SimpleNamespace(

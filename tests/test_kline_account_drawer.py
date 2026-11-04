@@ -266,6 +266,31 @@ class KlineAccountDrawerWidgetTests(QtWidgetTestCase):
         finally:
             self.dispose_widget(drawer)
 
+    def test_flatten_selected_position_passes_exact_position_and_account_context(self) -> None:
+        drawer = KlineAccountDrawer()
+        try:
+            position = SimpleNamespace(inst_id="BTC-USDT-SWAP")
+            runtime = SimpleNamespace()
+            callback = Mock()
+            drawer._visible_positions = [position]
+            drawer._profile_name = "profile-a"
+            drawer._environment = "live"
+            drawer._runtime = runtime
+            drawer.position_flatten_callback = callback
+            drawer._positions_table.setRowCount(1)
+            drawer._positions_table.setCurrentCell(0, 0)
+
+            drawer._flatten_selected_position()
+
+            callback.assert_called_once_with(
+                position,
+                profile_name="profile-a",
+                environment="live",
+                runtime=runtime,
+            )
+        finally:
+            self.dispose_widget(drawer)
+
     def test_drawer_defaults_to_all_scope_and_read_only_positions(self) -> None:
         drawer = KlineAccountDrawer()
         try:

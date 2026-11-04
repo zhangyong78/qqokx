@@ -687,6 +687,9 @@ class LauncherWindow(QMainWindow):
     def _create_page(self, page_key: str) -> QWidget:
         if page_key == "kline":
             page = KlineAnalysisWindow(embedded=True)
+            set_flatten_callback = getattr(page, "set_position_flatten_callback", None)
+            if callable(set_flatten_callback):
+                set_flatten_callback(self._flatten_kline_position)
             set_monitor = getattr(page, "set_shape_signal_monitor", None)
             if callable(set_monitor):
                 set_monitor(self._shape_signal_monitor)
@@ -718,6 +721,36 @@ class LauncherWindow(QMainWindow):
             raise KeyError(f"unknown page: {page_key}")
         page.setWindowFlags(Qt.WindowType.Widget)
         return page
+
+    def _flatten_kline_position(self, position, *, profile_name: str, environment: str, runtime) -> None:
+        kline = self._pages.get("kline")
+        home = self._home_widget
+        if home is None:
+            raise RuntimeError("请先打开账户持仓页面完成账户初始化，再从 K 线页平仓。")
+        home_runtime = getattr(home, "_runtime", None)
+        if kline is None or runtime is not getattr(kline, "_runtime", None):
+            raise RuntimeError("K 线页账户数据已变化，请刷新持仓后重试。")
+        if (
+            str(profile_name).strip() != str(kline._active_profile_name()).strip()
+            or str(environment).strip().lower() != str(kline._active_environment()).strip().lower()
+        ):
+            raise RuntimeError("K 线页账户或环境已变化，已阻止平仓。请刷新持仓后重试。")
+        expected_profile = str(getattr(home, "_last_profile_name", "") or "").strip()
+        expected_environment = str(getattr(home_runtime, "environment", "") or "").strip()
+        if expected_profile != str(profile_name).strip() or expected_environment != str(environment).strip():
+            raise RuntimeError("K 线页与账户持仓页的账户或环境不一致，已阻止平仓。请先切换到同一账户和环境。")
+        if home_runtime is None:
+            raise RuntimeError("账户持仓页运行上下文尚未准备好，请稍后重试。")
+        if getattr(home_runtime, "credentials", None) != getattr(runtime, "credentials", None):
+            raise RuntimeError("两个页面的 API 凭据不一致，已阻止平仓。请先同步账户配置。")
+        if str(getattr(runtime, "environment", "") or "").strip() != expected_environment:
+            raise RuntimeError("K 线页运行环境与账户持仓页不一致，已阻止平仓。")
+        home.flatten_position_for_context(
+            position,
+            profile_name=profile_name,
+            environment=environment,
+            runtime=home_runtime,
+        )
 
     def _account_order_chase_context(self, item):
         kline = self._pages.get("kline")

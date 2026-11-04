@@ -927,6 +927,53 @@ def _break_even_taker_fee_rate(profile: dict[str, str], *, inst_type: str) -> De
         return Decimal("0.00030") if is_option else Decimal("0.00036")
 
 
+def _futures_r_target_price(
+    entry_price: Decimal,
+    reference_stop_price: Decimal,
+    multiple: Decimal,
+    fee_rate: Decimal,
+    *,
+    direction: str,
+    inverse: bool,
+) -> tuple[Decimal, Decimal, Decimal]:
+    """Return (target before fees, price after both fees, R distance)."""
+    if entry_price <= 0 or reference_stop_price <= 0 or multiple < 0:
+        raise ValueError("开仓价、参考止损价必须大于 0，R 倍数不能小于 0。")
+    if direction == "long":
+        if reference_stop_price >= entry_price:
+            raise ValueError("多头参考止损价必须低于开仓均价。")
+        distance = entry_price - reference_stop_price
+        target = entry_price + multiple * distance
+    elif direction == "short":
+        if reference_stop_price <= entry_price:
+            raise ValueError("空头参考止损价必须高于开仓均价。")
+        distance = reference_stop_price - entry_price
+        target = entry_price - multiple * distance
+    else:
+        raise ValueError("无法识别持仓方向。")
+    if target <= 0:
+        raise ValueError("R 倍数对应的目标价不大于 0。")
+    rate = max(fee_rate, Decimal("0"))
+    if inverse:
+        # Coin-margined contract PnL and fees settle in the base coin.
+        denominator = (Decimal("1") / target - rate / entry_price) if direction == "long" else (Decimal("1") / target + rate / entry_price)
+        numerator = Decimal("1") + rate if direction == "long" else Decimal("1") - rate
+        if denominator <= 0 or numerator <= 0:
+            raise ValueError("币本位双向手续费无法求出有效目标价。")
+        adjusted = numerator / denominator
+    elif direction == "long":
+        denominator = Decimal("1") - rate
+        if denominator <= 0:
+            raise ValueError("平仓手续费率过高，无法计算目标价。")
+        adjusted = (entry_price * (Decimal("1") + rate) + multiple * distance) / denominator
+    else:
+        denominator = Decimal("1") + rate
+        adjusted = (entry_price * (Decimal("1") - rate) - multiple * distance) / denominator
+    if adjusted <= 0:
+        raise ValueError("扣除双向手续费后目标价不大于 0。")
+    return target, adjusted, distance
+
+
 _OPTION_PREMIUM_FEE_CAP_RATE = Decimal("0.07")
 
 
@@ -4607,10 +4654,16 @@ class AccountPositionsHomeWidget(QWidget):
     @staticmethod
     def _normalize_position_manual_flatten_mode(flatten_mode: str) -> str:
         normalized = str(flatten_mode or "").strip().lower()
+        if normalized in {"break_even_fee", "breakeven_fee"}:
+            return "break_even_fee"
         if normalized in {"best_quote_fee", "best_quote_with_fee"}:
             return "best_quote_fee"
         if normalized in {"short_profit_fee", "seller_profit_fee"}:
             return "short_profit_fee"
+        if normalized in {"short_break_even_fee", "short_breakeven_fee"}:
+            return "short_break_even_fee"
+        if normalized == "futures_r_target":
+            return "futures_r_target"
         return "best_quote" if normalized == "best_quote" else "market"
 
     @staticmethod
@@ -4630,12 +4683,19 @@ class AccountPositionsHomeWidget(QWidget):
         profit_percent: Decimal | None = None,
     ) -> str:
         normalized = AccountPositionsHomeWidget._normalize_position_manual_flatten_mode(flatten_mode)
+        if normalized == "break_even_fee":
+            return "挂单保本+双向手续费卖出"
         if normalized == "best_quote_fee":
-            multiple = fee_multiple if isinstance(fee_multiple, Decimal) and fee_multiple > 0 else Decimal("1")
+            multiple = fee_multiple if isinstance(fee_multiple, Decimal) and fee_multiple >= 0 else Decimal("1")
             return f"买方赚{format_decimal(multiple)}倍+双向手续费"
         if normalized == "short_profit_fee":
-            percent = profit_percent if isinstance(profit_percent, Decimal) and profit_percent > 0 else Decimal("50")
+            percent = profit_percent if isinstance(profit_percent, Decimal) and profit_percent >= 0 else Decimal("50")
             return f"卖方扣双向手续费赚{format_decimal(percent)}%平仓"
+        if normalized == "short_break_even_fee":
+            return "挂单保本+双向手续费买入"
+        if normalized == "futures_r_target":
+            multiple = fee_multiple if isinstance(fee_multiple, Decimal) else Decimal("1")
+            return f"按{format_decimal(multiple)}R挂单"
         return "挂买一/卖一平仓" if normalized == "best_quote" else "市价平仓"
 
     def _build_selected_position_manual_flatten_config(self, position: OkxPosition) -> StrategyConfig:
@@ -4722,6 +4782,12 @@ class AccountPositionsHomeWidget(QWidget):
 
     @staticmethod
     def _format_amount_with_unit(amount: Decimal, unit: str) -> str:
+        # Show converted coin quantities at a readable precision. Contract
+        # order sizes are still rounded separately using OKX lotSz.
+        normalized_unit = str(unit or "").strip().upper()
+        if normalized_unit not in {"张", "CONTRACTS"}:
+            quantum = Decimal("0.00000001")
+            amount = amount.quantize(quantum, rounding=ROUND_HALF_UP)
         return f"{format_decimal(amount)} {unit}".strip()
 
     @staticmethod
@@ -4813,6 +4879,42 @@ class AccountPositionsHomeWidget(QWidget):
             raise ValueError(f"{instrument.inst_id} 当前缺少卖一价，无法按卖一挂平多单。")
         return self._snap_selected_position_flatten_price(instrument, raw_price, rounding="up")
 
+    def _validate_selected_position_limit_not_marketable(
+        self,
+        inst_id: str,
+        *,
+        side: str,
+        price: Decimal,
+    ) -> None:
+        """Reject reduce-only limits that would cross the latest opposing quote."""
+        order_book = None
+        try:
+            order_book = self._shared_client.get_order_book(inst_id, depth=1)
+        except Exception:
+            order_book = None
+        if side == "sell":
+            opposing_price = order_book.bids[0][0] if order_book is not None and order_book.bids else None
+            relation = "买一价 ≥ 挂单价"
+        else:
+            opposing_price = order_book.asks[0][0] if order_book is not None and order_book.asks else None
+            relation = "卖一价 ≤ 挂单价"
+        if opposing_price is None or opposing_price <= 0:
+            try:
+                opposing_price = self._shared_client.get_ticker(inst_id).last
+            except Exception:
+                opposing_price = None
+        if opposing_price is None or opposing_price <= 0:
+            raise ValueError(f"已拦截：无法读取 {inst_id} 最新盘口或成交价，无法确认挂单不会立即成交。刷新行情后重试。")
+        crossed = opposing_price is not None and (
+            (side == "sell" and opposing_price >= price)
+            or (side == "buy" and opposing_price <= price)
+        )
+        if crossed:
+            raise ValueError(
+                f"已拦截：当前对手价 {format_decimal(opposing_price)}，挂单价 {format_decimal(price)}，"
+                f"满足{relation}，该限价单可能立即成交。价格变化后请重新确认挂单。"
+            )
+
     def _snap_selected_position_flatten_price(
         self,
         instrument: Instrument,
@@ -4851,8 +4953,8 @@ class AccountPositionsHomeWidget(QWidget):
             self._profile_snapshots.get(self._last_profile_name, {}),
             inst_type=position.inst_type,
         )
-        if fee_multiple <= 0:
-            return self._snap_selected_position_flatten_price(instrument, reference_price, rounding="up")
+        if fee_multiple < 0:
+            raise ValueError("买方盈利倍数不能小于 0。")
         close_fraction = _selected_position_close_fraction(position, close_size)
         profit_target = reference_price * (Decimal("1") + fee_multiple)
         if position.inst_type == "OPTION":
@@ -4885,8 +4987,8 @@ class AccountPositionsHomeWidget(QWidget):
     ) -> Decimal:
         if side != "buy":
             raise ValueError("卖方盈利比例平仓只适用于卖方开仓的空头持仓。")
-        if not isinstance(profit_percent, Decimal) or profit_percent <= 0 or profit_percent >= 100:
-            raise ValueError("卖方盈利比例必须大于 0 且小于 100。")
+        if not isinstance(profit_percent, Decimal) or profit_percent < 0 or profit_percent >= 100:
+            raise ValueError("卖方盈利比例不能小于 0，且必须小于 100。")
         reference_price = position.avg_price
         if reference_price is None or reference_price <= 0:
             raise ValueError("当前持仓缺少有效开仓均价，无法计算卖方盈利比例平仓价。")
@@ -4908,13 +5010,17 @@ class AccountPositionsHomeWidget(QWidget):
                 fee_rate,
             )
         else:
-            opening_fee = abs(reference_price) * fee_rate
-            closing_fee = abs(reference_price) * fee_rate
-            target_price = (
-                reference_price * (Decimal("1") - profit_ratio)
-                - opening_fee / close_fraction
-                - closing_fee
-            )
+            if profit_ratio == 0:
+                # Solve E(1-f_open) = P(1+f_close) so entry/exit fees are both covered.
+                target_price = reference_price * (Decimal("1") - fee_rate) / (Decimal("1") + fee_rate)
+            else:
+                opening_fee = abs(reference_price) * fee_rate
+                closing_fee = abs(reference_price) * fee_rate
+                target_price = (
+                    reference_price * (Decimal("1") - profit_ratio)
+                    - opening_fee / close_fraction
+                    - closing_fee
+                )
         if target_price <= 0:
             raise ValueError("卖方目标平仓价不大于 0，请降低盈利比例或检查开仓价/手续费。")
         return self._snap_selected_position_flatten_price(instrument, target_price, rounding="down")
@@ -4985,6 +5091,7 @@ class AccountPositionsHomeWidget(QWidget):
         close_size: Decimal | None = None,
         fee_multiple: Decimal | None = None,
         profit_percent: Decimal | None = None,
+        reference_stop_price: Decimal | None = None,
         instrument: Instrument | None = None,
     ) -> tuple[OkxOrderResult, Decimal | None, str]:
         prepare_kwargs: dict[str, object] = {"close_size": close_size}
@@ -5003,9 +5110,39 @@ class AccountPositionsHomeWidget(QWidget):
                 pos_side=None,
             )
             return result, None, normalized_mode
-        if normalized_mode in {"best_quote", "best_quote_fee", "short_profit_fee"}:
-            if normalized_mode == "best_quote_fee":
-                effective_fee_multiple = fee_multiple if isinstance(fee_multiple, Decimal) and fee_multiple > 0 else Decimal("1")
+        if normalized_mode in {"best_quote", "best_quote_fee", "break_even_fee", "short_profit_fee", "short_break_even_fee", "futures_r_target"}:
+            if normalized_mode == "futures_r_target" or (
+                normalized_mode in {"break_even_fee", "short_break_even_fee"}
+                and position.inst_type in {"SWAP", "FUTURES"}
+            ):
+                if position.inst_type not in {"SWAP", "FUTURES"}:
+                    raise ValueError("该产品暂不支持按期货 R 倍数计算。")
+                is_break_even = normalized_mode != "futures_r_target"
+                if not is_break_even and reference_stop_price is None:
+                    raise ValueError("请确认参考止损价后再按 R 倍数挂单。")
+                entry = position.avg_price
+                if entry is None or entry <= 0:
+                    raise ValueError("当前持仓缺少有效开仓均价，不能计算 R。")
+                fee_rate = _break_even_taker_fee_rate(
+                    self._profile_snapshots.get(self._last_profile_name, {}), inst_type=position.inst_type
+                )
+                parts = position.inst_id.upper().split("-")
+                if len(parts) < 2 or parts[1] not in {"USD", "USDT", "USDC"}:
+                    raise ValueError("无法确认合约结算类型，不能计算含手续费挂单价。")
+                inverse = parts[1] == "USD"
+                stop = reference_stop_price if not is_break_even else entry * (Decimal("0.5") if _direction == "long" else Decimal("2"))
+                multiple = Decimal("0") if is_break_even else (fee_multiple if fee_multiple is not None else Decimal("1"))
+                _target, adjusted, _distance = _futures_r_target_price(
+                    entry, stop, multiple, fee_rate,
+                    direction=_direction, inverse=inverse,
+                )
+                price = self._snap_selected_position_flatten_price(
+                    instrument, adjusted, rounding="up" if close_side == "sell" else "down"
+                )
+            elif normalized_mode in {"best_quote_fee", "break_even_fee"}:
+                effective_fee_multiple = fee_multiple if isinstance(fee_multiple, Decimal) and fee_multiple >= 0 else Decimal("1")
+                if normalized_mode == "break_even_fee":
+                    effective_fee_multiple = Decimal("0")
                 price = self._resolve_fee_adjusted_flatten_price(
                     position,
                     instrument,
@@ -5013,10 +5150,10 @@ class AccountPositionsHomeWidget(QWidget):
                     fee_multiple=effective_fee_multiple,
                     close_size=closeable_size,
                 )
-            elif normalized_mode == "short_profit_fee":
+            elif normalized_mode in {"short_profit_fee", "short_break_even_fee"}:
                 effective_profit_percent = (
                     profit_percent
-                    if isinstance(profit_percent, Decimal) and profit_percent > 0
+                    if isinstance(profit_percent, Decimal) and profit_percent >= 0
                     else Decimal("50")
                 )
                 price = self._resolve_short_profit_flatten_price(
@@ -5028,6 +5165,11 @@ class AccountPositionsHomeWidget(QWidget):
                 )
             else:
                 price = self._resolve_best_quote_flatten_price(instrument, side=close_side)
+            self._validate_selected_position_limit_not_marketable(
+                position.inst_id,
+                side=close_side,
+                price=price,
+            )
             result = self._shared_client.place_simple_order(
                 credentials,
                 config,
@@ -5223,19 +5365,37 @@ class AccountPositionsHomeWidget(QWidget):
         )
         if order_size_text:
             message = f"{message}\n实际下单量：{order_size_text}"
-        if normalized_flatten_mode in {"best_quote", "best_quote_fee", "short_profit_fee"} and price is not None:
+        if normalized_flatten_mode in {"best_quote", "best_quote_fee", "short_profit_fee", "break_even_fee", "short_break_even_fee", "futures_r_target"} and price is not None:
             message = f"{message}\n挂单价：{format_decimal(price)}"
         self._schedule_selected_position_manual_flatten_follow_up_refresh(normalized_flatten_mode)
         QMessageBox.information(self, "平仓已提交", message)
 
-    def flatten_selected_position(self) -> None:
+    def flatten_position_for_context(self, position: OkxPosition, *, profile_name: str, environment: str, runtime: object) -> None:
+        if runtime is not self._runtime or str(profile_name).strip() != str(self._last_profile_name).strip():
+            raise ValueError("账户持仓页的账户上下文已变化，请刷新后重试。")
+        if str(environment).strip().lower() != str(getattr(runtime, "environment", "")).strip().lower():
+            raise ValueError("账户持仓页的交易环境不一致，请刷新后重试。")
+        if self._current_profile_name() != str(profile_name).strip():
+            raise ValueError("账户切换尚未完成，请等待账户同步后重试。")
+        key_fields = ("inst_id", "inst_type", "pos_side", "mgn_mode", "position", "avail_position", "avg_price")
+        matches = [
+            candidate for candidate in self._visible_positions
+            if all(getattr(candidate, field, None) == getattr(position, field, None) for field in key_fields)
+        ]
+        if len(matches) != 1:
+            raise ValueError("两个页面的持仓数据尚未一致，请刷新持仓后重试。")
+        self.flatten_selected_position(position_override=matches[0], expected_environment=environment)
+
+    def flatten_selected_position(self, *, position_override: OkxPosition | None = None, expected_environment: str | None = None) -> None:
         flow_started_at = time.perf_counter()
         if not self._ensure_runtime_ready(force_unlock=True):
             return
+        if expected_environment is not None and str(getattr(self._runtime, "environment", "")).strip().lower() != str(expected_environment).strip().lower():
+            raise ValueError("交易环境已变化，请刷新持仓后重试。")
         if self._selected_position_manual_flatten_running:
             QMessageBox.information(self, "平仓", "当前已有一笔选中持仓平仓在提交中，请稍候。")
             return
-        position = self._selected_position()
+        position = position_override if position_override is not None else self._selected_position()
         if position is None:
             QMessageBox.information(self, "平仓", "请先在当前持仓里选中一条具体持仓。")
             return
@@ -5275,6 +5435,7 @@ class AccountPositionsHomeWidget(QWidget):
         )
         order_size_text = self._selected_position_order_size_text(position, instrument, preview_close_size)
         is_long_position = preview_direction == "long"
+        is_option_position = position.inst_type == "OPTION"
         size_dialog = QuantityInputDialog(
             title="平仓币数",
             prompt=f"输入本次平仓币数（默认可平全部，单位：{closeable_unit}）",
@@ -5335,9 +5496,11 @@ class AccountPositionsHomeWidget(QWidget):
                     "2. 挂买一/卖一平仓会先挂单，未成交前持仓不会消失。",
                     "3. 平多按卖一挂单，平空按买一挂单。",
                     (
-                        "4. 当前是买方开仓（多头）：按开仓成本赚 N 倍，并按 OKX 权利金手续费规则补足双向手续费后挂卖单。"
-                        if is_long_position
-                        else "4. 当前是卖方开仓（空头）：按 OKX 权利金手续费规则，挂出扣除双向手续费后赚 N% 的买单。"
+                        (
+                            "4. 期权卖方按开仓权利金比例设盈利目标；期权买方按权利金变化计算。"
+                            if is_option_position
+                            else f"4. 期货{direction_label}按开仓均价到参考止损价的距离计算 R；保本价计入双向手续费。"
+                        )
                     ),
                 ]
             )
@@ -5346,26 +5509,42 @@ class AccountPositionsHomeWidget(QWidget):
         best_quote_button = dialog.addButton("挂买一/卖一", QMessageBox.ButtonRole.ActionRole)
         fee_one_button = None
         fee_n_button = None
+        break_even_button = None
         short_profit_50_button = None
         short_profit_n_button = None
+        short_break_even_button = None
         action_buttons = {market_button, best_quote_button}
         if is_long_position:
-            fee_one_button = dialog.addButton("买方赚1倍+双向手续费", QMessageBox.ButtonRole.ActionRole)
-            fee_n_button = dialog.addButton("买方赚N倍+双向手续费", QMessageBox.ButtonRole.ActionRole)
-            action_buttons.update({fee_one_button, fee_n_button})
+            break_even_button = dialog.addButton("保本+双向手续费", QMessageBox.ButtonRole.ActionRole)
+            fee_one_button = dialog.addButton(
+                "盈利1倍+双向手续费" if is_option_position else "盈利1R+双向手续费",
+                QMessageBox.ButtonRole.ActionRole,
+            )
+            fee_n_button = dialog.addButton(
+                "盈利N倍+双向手续费" if is_option_position else "盈利NR+双向手续费",
+                QMessageBox.ButtonRole.ActionRole,
+            )
+            action_buttons.update({break_even_button, fee_one_button, fee_n_button})
         else:
-            short_profit_50_button = dialog.addButton("卖方扣双向费赚50%平仓", QMessageBox.ButtonRole.ActionRole)
-            short_profit_n_button = dialog.addButton("卖方扣双向费赚N%平仓", QMessageBox.ButtonRole.ActionRole)
-            action_buttons.update({short_profit_50_button, short_profit_n_button})
+            short_break_even_button = dialog.addButton("保本+双向手续费", QMessageBox.ButtonRole.ActionRole)
+            short_profit_50_button = dialog.addButton(
+                "盈利50%权利金" if is_option_position else "盈利1R+双向手续费",
+                QMessageBox.ButtonRole.ActionRole,
+            )
+            short_profit_n_button = dialog.addButton(
+                "盈利N%权利金" if is_option_position else "盈利NR+双向手续费",
+                QMessageBox.ButtonRole.ActionRole,
+            )
+            action_buttons.update({short_break_even_button, short_profit_50_button, short_profit_n_button})
         dialog.addButton(QMessageBox.StandardButton.Cancel)
-        button_widths = [(market_button, 120), (best_quote_button, 150)]
+        button_widths = [(market_button, 100), (best_quote_button, 125)]
         if is_long_position:
-            button_widths.extend([(fee_one_button, 250), (fee_n_button, 250)])
+            button_widths.extend([(break_even_button, 180), (fee_one_button, 180), (fee_n_button, 180)])
         else:
-            button_widths.extend([(short_profit_50_button, 230), (short_profit_n_button, 230)])
+            button_widths.extend([(short_break_even_button, 180), (short_profit_50_button, 180), (short_profit_n_button, 180)])
         for button, minimum_width in button_widths:
             button.setMinimumWidth(minimum_width)
-        dialog.setMinimumWidth(980)
+        dialog.setMinimumWidth(900)
         dialog.exec()
         clicked = dialog.clickedButton()
         if clicked not in action_buttons:
@@ -5373,10 +5552,13 @@ class AccountPositionsHomeWidget(QWidget):
         flatten_mode = "market"
         fee_multiple = Decimal("0")
         profit_percent = Decimal("0")
+        reference_stop_price: Decimal | None = None
         if clicked is best_quote_button:
             flatten_mode = "best_quote"
+        elif is_long_position and clicked is break_even_button:
+            flatten_mode = "break_even_fee"
         elif is_long_position and clicked is fee_one_button:
-            flatten_mode = "best_quote_fee"
+            flatten_mode = "best_quote_fee" if is_option_position else "futures_r_target"
             fee_multiple = Decimal("1")
         elif is_long_position and clicked is fee_n_button:
             fee_multiple_decimals = 1
@@ -5385,18 +5567,24 @@ class AccountPositionsHomeWidget(QWidget):
                 "买方盈利倍数",
                 "请输入买方盈利 N 倍数：",
                 2.0,
-                0.01,
+                0.0,
                 1000000.0,
                 fee_multiple_decimals,
             )
             if not ok:
                 return
             fee_multiple = Decimal(str(value))
-            flatten_mode = "best_quote_fee"
+            flatten_mode = "best_quote_fee" if is_option_position else "futures_r_target"
+        elif not is_long_position and clicked is short_break_even_button:
+            flatten_mode = "short_break_even_fee"
+            profit_percent = Decimal("0")
         elif not is_long_position and clicked is short_profit_50_button:
-            flatten_mode = "short_profit_fee"
-            profit_percent = Decimal("50")
-        elif not is_long_position and clicked is short_profit_n_button:
+            flatten_mode = "short_profit_fee" if is_option_position else "futures_r_target"
+            if is_option_position:
+                profit_percent = Decimal("50")
+            else:
+                fee_multiple = Decimal("1")
+        elif not is_long_position and clicked is short_profit_n_button and is_option_position:
             value, ok = QInputDialog.getDouble(
                 self,
                 "卖方盈利比例",
@@ -5410,6 +5598,97 @@ class AccountPositionsHomeWidget(QWidget):
                 return
             profit_percent = Decimal(str(value))
             flatten_mode = "short_profit_fee"
+        elif not is_long_position and clicked is short_profit_n_button:
+            value, ok = QInputDialog.getDouble(self, "盈利 R 倍数", "请输入 N 倍风险距离：", 2.0, 0.1, 1000000.0, 1)
+            if not ok:
+                return
+            fee_multiple = Decimal(str(value))
+            flatten_mode = "futures_r_target"
+        if flatten_mode == "futures_r_target":
+            entry = position.avg_price
+            if entry is None or entry <= 0:
+                QMessageBox.warning(self, "参考止损价", "持仓缺少有效开仓均价，不能计算 R。")
+                return
+            candidates: set[Decimal] = set()
+            for order in getattr(self, "_visible_orders", []):
+                if str(getattr(order, "inst_id", "") or "").upper() != position.inst_id.upper():
+                    continue
+                if str(getattr(order, "side", "") or "").strip().lower() != ("sell" if is_long_position else "buy"):
+                    continue
+                raw = getattr(order, "raw", {})
+                if not isinstance(raw, dict):
+                    raw = {}
+                value = getattr(order, "stop_loss_trigger_price", None)
+                for key in ("slTriggerPx", "stopLossTriggerPrice"):
+                    if value is not None:
+                        break
+                    try:
+                        candidate = Decimal(str(raw.get(key, "")))
+                    except Exception:
+                        candidate = Decimal("0")
+                    if candidate > 0:
+                        value = candidate
+                if value is None:
+                    for attach in raw.get("attachAlgoOrds", []) if isinstance(raw.get("attachAlgoOrds"), list) else []:
+                        if not isinstance(attach, dict):
+                            continue
+                        try:
+                            candidate = Decimal(str(attach.get("slTriggerPx", "")))
+                        except Exception:
+                            candidate = Decimal("0")
+                        if candidate > 0:
+                            value = candidate
+                            break
+                try:
+                    stop = value if isinstance(value, Decimal) else Decimal(str(value))
+                except Exception:
+                    continue
+                if stop > 0:
+                    candidates.add(stop)
+            candidate_text = "、".join(format_decimal(item) for item in sorted(candidates)) or "未找到当前止损候选"
+            reference_text, accepted = QInputDialog.getText(
+                self,
+                "确认参考止损价",
+                f"候选价格：{candidate_text}\n当前止损可能已上移，不一定是开仓时止损。请手动确认并输入本次参考止损价（仅用于计算，不会修改止损单）：",
+            )
+            if not accepted:
+                return
+            try:
+                reference_stop_price = self._parse_positive_decimal(reference_text, "参考止损价")
+                if is_long_position and reference_stop_price >= entry:
+                    raise ValueError("多头参考止损价必须低于开仓均价。")
+                if not is_long_position and reference_stop_price <= entry:
+                    raise ValueError("空头参考止损价必须高于开仓均价。")
+                fee_rate = _break_even_taker_fee_rate(
+                    self._profile_snapshots.get(self._last_profile_name, {}), inst_type=position.inst_type
+                )
+                parts = position.inst_id.upper().split("-")
+                if position.inst_type not in {"SWAP", "FUTURES"} or len(parts) < 2 or parts[1] not in {"USD", "USDT", "USDC"}:
+                    raise ValueError("无法确认合约结算类型，不能计算含手续费挂单价。")
+                inverse = position.inst_type in {"SWAP", "FUTURES"} and len(parts) > 1 and parts[1] == "USD"
+                raw_target, adjusted_target, distance = _futures_r_target_price(
+                    entry,
+                    reference_stop_price,
+                    fee_multiple,
+                    fee_rate,
+                    direction=preview_direction,
+                    inverse=inverse,
+                )
+                order_target = self._snap_selected_position_flatten_price(
+                    instrument, adjusted_target, rounding="up" if is_long_position else "down"
+                )
+                if QMessageBox.question(
+                    self,
+                    "确认 R 倍数挂单",
+                    f"开仓均价：{format_decimal(entry)}\n参考止损价：{format_decimal(reference_stop_price)}\n"
+                    f"风险距离：{format_decimal(distance)}\n目标：{format_decimal(fee_multiple)}R，手续费前 {format_decimal(raw_target)}\n"
+                    f"双向手续费估算率：{format_decimal(fee_rate * Decimal('100'))}%\n准备挂单价：{format_decimal(order_target)}\n\n"
+                    "该参考止损价仅用于本次 R 计算，不会修改止损单。确认提交？",
+                ) != QMessageBox.StandardButton.Yes:
+                    return
+            except Exception as exc:
+                QMessageBox.warning(self, "参考止损价无效", str(exc))
+                return
         self._log_selected_position_manual_flatten(
             f"用户确认平仓 | instId={position.inst_id} | direction={direction_label} | closeSide={close_side_label} | "
             f"mode={flatten_mode} | profitMultiple={format_decimal(fee_multiple)} | "
@@ -5434,6 +5713,7 @@ class AccountPositionsHomeWidget(QWidget):
                     close_size=requested_close_size,
                     fee_multiple=fee_multiple,
                     profit_percent=profit_percent,
+                    reference_stop_price=reference_stop_price,
                     instrument=instrument,
                 )
                 self._log_selected_position_manual_flatten(

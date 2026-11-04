@@ -1682,6 +1682,36 @@ class LineTradingQtWindow(QMainWindow):
             raise RuntimeError(f"{inst_id} 当前缺少卖一价。")
         return snap_to_increment(raw_price, instrument.tick_size, "up")
 
+    def _validate_limit_not_marketable(self, inst_id: str, *, side: str, price: Decimal) -> None:
+        """Block a limit close that has become immediately executable."""
+        order_book = None
+        try:
+            order_book = self._client.get_order_book(inst_id, depth=1)
+        except Exception:  # noqa: BLE001
+            order_book = None
+        if side == "sell":
+            opposing_price = order_book.bids[0][0] if order_book is not None and order_book.bids else None
+            relation = "买一价 ≥ 挂单价"
+        else:
+            opposing_price = order_book.asks[0][0] if order_book is not None and order_book.asks else None
+            relation = "卖一价 ≤ 挂单价"
+        if opposing_price is None or opposing_price <= 0:
+            try:
+                opposing_price = self._client.get_ticker(inst_id).last
+            except Exception:  # noqa: BLE001
+                opposing_price = None
+        if opposing_price is None or opposing_price <= 0:
+            raise RuntimeError(f"已拦截：无法读取 {inst_id} 最新盘口或成交价，无法确认挂单不会立即成交。刷新行情后重试。")
+        crossed = opposing_price is not None and (
+            (side == "sell" and opposing_price >= price)
+            or (side == "buy" and opposing_price <= price)
+        )
+        if crossed:
+            raise RuntimeError(
+                f"已拦截：当前对手价 {format_decimal(opposing_price)}，挂单价 {format_decimal(price)}，"
+                f"满足{relation}，该限价单可能立即成交。价格变化后请重新确认挂单。"
+            )
+
     def _flatten_selected_position(self, flatten_mode: str) -> None:
         try:
             position = self._selected_position()
@@ -1716,6 +1746,7 @@ class LineTradingQtWindow(QMainWindow):
         def _worker():
             if flatten_mode == "best_quote":
                 price = self._resolve_best_quote_flatten_price(position.inst_id, side=close_side)
+                self._validate_limit_not_marketable(position.inst_id, side=close_side, price=price)
                 return self._client.place_simple_order(
                     runtime.credentials,
                     config,

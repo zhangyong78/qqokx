@@ -8618,6 +8618,7 @@ class KlineAnalysisWindow(QMainWindow):
         self._chart_account_splitter.addWidget(chart_frame)
         self._account_drawer = KlineAccountDrawer()
         self._account_drawer.chase_context_provider = self._current_order_chase_context
+        self._account_drawer.position_flatten_callback = getattr(self, "position_flatten_callback", None)
         self._account_drawer.action_access_provider = lambda: self._ensure_profile_access(self._active_profile_name())
         self._account_drawer.profile_snapshots_provider = lambda: self._profile_snapshots
         self._account_drawer.collapseRequested.connect(self._collapse_account_drawer)
@@ -10247,6 +10248,11 @@ class KlineAnalysisWindow(QMainWindow):
             symbol=self._selected_symbol(),
             refresh_if_visible=refresh_if_visible,
         )
+
+    def set_position_flatten_callback(self, callback) -> None:
+        self.position_flatten_callback = callback
+        if self._account_drawer is not None:
+            self._account_drawer.position_flatten_callback = callback
 
     def _schedule_account_drawer_prefetch_after_chart_render(self) -> None:
         if self._account_drawer is None or self._runtime is None:

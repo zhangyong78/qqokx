@@ -3026,6 +3026,26 @@ class RollTerminalQtWindowHelperTests(QtWidgetTestCase):
             finally:
                 self.__class__.dispose_widget(window)
 
+    def test_line_trading_limit_close_is_blocked_when_opposing_quote_crosses_price(self) -> None:
+        window = LineTradingQtWindow()
+        try:
+            window._client = SimpleNamespace(
+                get_order_book=MagicMock(
+                    return_value=SimpleNamespace(
+                        bids=[(Decimal("100.1"), Decimal("1"))],
+                        asks=[(Decimal("100.2"), Decimal("1"))],
+                    )
+                ),
+                get_ticker=MagicMock(),
+            )
+            with self.assertRaisesRegex(RuntimeError, "已拦截.*100.1.*100.*立即成交"):
+                window._validate_limit_not_marketable(
+                    "BTC-USDT-SWAP", side="sell", price=Decimal("100")
+                )
+            window._client.get_ticker.assert_not_called()
+        finally:
+            self.__class__.dispose_widget(window)
+
     def test_line_trading_flatten_empty_input_uses_available_size(self) -> None:
         runtime = SimpleNamespace(
             credentials=object(),
