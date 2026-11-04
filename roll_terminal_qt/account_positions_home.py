@@ -3889,7 +3889,7 @@ class AccountPositionsHomeWidget(QWidget):
 
     def _restart_live_feeds_for_manual_refresh(self) -> None:
         self._stop_private_threads(wait_ms=0)
-        self._start_private_threads(force_restart=False, start_history=False)
+        self._start_private_threads(force_restart=False, start_history=True)
 
     def _render_position_history_table(self) -> None:
         if not hasattr(self, "_position_history_table"):
