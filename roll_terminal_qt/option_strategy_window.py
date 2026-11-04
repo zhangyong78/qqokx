@@ -456,6 +456,7 @@ class _ChainLinkedChartThread(QThread):
                 bar=self._bar,
                 requested_limit=self._candle_limit,
             )
+            volatility_candles = _mark_latest_dvol_candle_if_open(volatility_candles, self._bar, int(time.time() * 1000))
             self.volatility_ready.emit(
                 self._request_id,
                 ChainLinkedVolatilitySnapshot(
@@ -478,7 +479,9 @@ class _ChainLinkedChartThread(QThread):
                 if self._before_ts is not None
                 else self._client.get_mark_price_candles(inst_id, self._bar, limit=self._candle_limit)
             )
-            return [item for item in candles if item.confirmed], ""
+            if self._before_ts is not None:
+                candles = [item for item in candles if item.confirmed]
+            return candles, ""
         except Exception as exc:  # noqa: BLE001
             return [], str(exc)
 
@@ -491,9 +494,24 @@ class _ChainLinkedChartThread(QThread):
                 if self._before_ts is not None
                 else self._client.get_candles_history(inst_id, self._bar, limit=self._candle_limit)
             )
-            return [item for item in candles if item.confirmed], ""
+            if self._before_ts is not None:
+                candles = [item for item in candles if item.confirmed]
+            return candles, ""
         except Exception as exc:  # noqa: BLE001
             return [], str(exc)
+
+
+def _mark_latest_dvol_candle_if_open(candles: list[Candle], bar: str, now_ms: int) -> list[Candle]:
+    """Deribit candles do not expose confirmation; infer it from their time bucket."""
+    if not candles:
+        return candles
+    step_ms = {"1H": 3_600_000, "4H": 14_400_000, "1D": 86_400_000, "1DAY": 86_400_000}.get(bar.strip().upper())
+    if step_ms is None:
+        return candles
+    last = candles[-1]
+    if now_ms < last.ts + step_ms:
+        return [*candles[:-1], replace(last, confirmed=False)]
+    return candles
 
 
 class _ChainHistoricalDataSupplementThread(QThread):
@@ -1804,6 +1822,7 @@ class CandlestickChartView(QChartView):
         self.setRenderHint(QPainter.RenderHint.Antialiasing, False)
         self.setMouseTracking(True)
         self.viewport().setMouseTracking(True)
+        self._source_candles: list[Candle] = []
         self._candles: list[Candle] = []
         self._moving_average_values: list[tuple[int, float]] = []
         self._tooltip_close_usdt_rate: Decimal | None = None
@@ -1818,6 +1837,7 @@ class CandlestickChartView(QChartView):
         self._chart_title = ""
         self._show_moving_averages = False
         self._moving_average_mode = "ema15_sma50"
+        self._show_unconfirmed_candle = True
         self._axis_x: QDateTimeAxis | None = None
         self._axis_y: QValueAxis | None = None
         self._full_x_min_ms = 0.0
@@ -1850,6 +1870,7 @@ class CandlestickChartView(QChartView):
     def _clear_chart_context(self) -> None:
         self._axis_x = None
         self._axis_y = None
+        self._source_candles = []
         self._candles = []
         self._moving_average_values = []
         self._tooltip_close_usdt_rate = None
@@ -1883,15 +1904,24 @@ class CandlestickChartView(QChartView):
         if not candles:
             self.show_message(title)
             return
+        source_candles = list(candles)
+        if not self._show_unconfirmed_candle and not source_candles[-1].confirmed:
+            candles = source_candles[:-1]
+            if not candles:
+                self.show_message(f"{title}（无已收盘K线）")
+                self._source_candles = source_candles
+                self._chart_title = title
+                return
         if show_moving_averages is None:
             show_moving_averages = self._show_moving_averages
         else:
             self._show_moving_averages = show_moving_averages
-        if moving_average_mode in {"ema15_sma50", "ema21_ema55"}:
+        if moving_average_mode in {"ema15_sma50", "ema21_ema55", "ema15_sma50_ema21_ema55"}:
             self._moving_average_mode = moving_average_mode
         self._hide_wicks = hide_wicks
         self._chart_title = title
         self._clear_chart_context()
+        self._source_candles = source_candles
         self._time_markers = tuple(
             (str(label).strip(), int(timestamp))
             for label, timestamp in time_markers
@@ -1980,21 +2010,44 @@ class CandlestickChartView(QChartView):
         down_series.attachAxis(axis_y)
         first_ma_values: list[Decimal] = []
         second_ma_values: list[Decimal | None] = []
-        if self._moving_average_mode == "ema21_ema55":
+        ma_latest_values: list[Decimal | None] = []
+        combined_ma_mode = self._moving_average_mode == "ema15_sma50_ema21_ema55"
+        if combined_ma_mode:
+            ma_specs = (
+                ("EMA 15", "#ff4d6d"),
+                ("SMA 50", "#58c66d"),
+                ("EMA 21", "#f59e0b"),
+                ("EMA 55", "#3b82f6"),
+            )
+        elif self._moving_average_mode == "ema21_ema55":
             ma_specs = (("EMA 21", "#ff4d6d"), ("EMA 55", "#58c66d"))
         else:
             ma_specs = (("EMA 15", "#ff4d6d"), ("SMA 50", "#58c66d"))
         if show_moving_averages:
-            ema_period = 21 if self._moving_average_mode == "ema21_ema55" else 15
-            second_period = 55 if self._moving_average_mode == "ema21_ema55" else 50
+            ema_period = 15
+            second_period = 50
             first_ma_values, second_ma_values = _build_moving_average_series(
                 candles,
                 ema_period=ema_period,
                 second_period=second_period,
-                second_is_ema=self._moving_average_mode == "ema21_ema55",
+                second_is_ema=False,
             )
+            all_ma_values: list[list[Decimal | None]] = [first_ma_values, second_ma_values]
+            if self._moving_average_mode in {"ema21_ema55", "ema15_sma50_ema21_ema55"}:
+                ema21_values, ema55_values = _build_moving_average_series(
+                    candles,
+                    ema_period=21,
+                    second_period=55,
+                    second_is_ema=True,
+                )
+                if combined_ma_mode:
+                    all_ma_values.extend([ema21_values, ema55_values])
+                else:
+                    first_ma_values, second_ma_values = ema21_values, ema55_values
+                    all_ma_values = [first_ma_values, second_ma_values]
             for index, (label, color) in enumerate(ma_specs):
-                values = first_ma_values if index == 0 else second_ma_values
+                values = all_ma_values[index]
+                ma_latest_values.append(values[-1] if values else None)
                 series = QLineSeries()
                 series.setName(label)
                 series.setPen(QPen(QColor(color), 2))
@@ -2018,12 +2071,11 @@ class CandlestickChartView(QChartView):
         latest = candles[-1]
         suffix = "%" if self._percent_axis else ""
         moving_average_title = ""
-        if first_ma_values:
-            moving_average_title += f" | {ma_specs[0][0]} {_format_compact_number(first_ma_values[-1])}{suffix}"
-        if second_ma_values and second_ma_values[-1] is not None:
-            moving_average_title += f" | {ma_specs[1][0]} {_format_compact_number(second_ma_values[-1])}{suffix}"
+        for (label, _color), value in zip(ma_specs, ma_latest_values):
+            if value is not None:
+                moving_average_title += f" | {label} {_format_compact_number(value)}{suffix}"
         chart.setTitle(
-            f"{title} | 最新 O {_format_compact_number(latest.open)}{suffix} "
+            f"{title} | 最新{'（未收盘）' if not latest.confirmed else ''} O {_format_compact_number(latest.open)}{suffix} "
             f"H {_format_compact_number(latest.high)}{suffix} "
             f"L {_format_compact_number(latest.low)}{suffix} "
             f"C {_format_compact_number(latest.close)}{suffix}{moving_average_title}"
@@ -2047,8 +2099,9 @@ class CandlestickChartView(QChartView):
 
         if not candles:
             return False
-        if self._candles and self._candles[-1].ts == candles[-1].ts:
-            return False
+        if self._source_candles and self._source_candles[-1].ts == candles[-1].ts:
+            if self._source_candles == candles:
+                return False
         previous_range = self._current_x_range() if self._candles else None
         previous_span = (
             max(previous_range[1] - previous_range[0], 1.0)
@@ -2090,13 +2143,17 @@ class CandlestickChartView(QChartView):
 
     def set_moving_average_mode(self, mode: str) -> None:
         """Switch the displayed moving-average pair while retaining the viewport."""
-        if mode not in {"ema15_sma50", "ema21_ema55"} or mode == self._moving_average_mode or not self._candles:
+        if (
+            mode not in {"ema15_sma50", "ema21_ema55", "ema15_sma50_ema21_ema55"}
+            or mode == self._moving_average_mode
+            or not self._candles
+        ):
             return
         previous_range = self._current_x_range()
         previous_span = max(previous_range[1] - previous_range[0], 1.0)
         self.set_candles(
             title=self._chart_title,
-            candles=list(self._candles),
+            candles=list(self._source_candles),
             hide_wicks=self._hide_wicks,
             show_moving_averages=self._show_moving_averages,
             moving_average_mode=mode,
@@ -2109,9 +2166,43 @@ class CandlestickChartView(QChartView):
         if self._axis_x is not None:
             new_min = max(self._full_x_min_ms, previous_range[0])
             new_max = min(self._full_x_max_ms, max(previous_range[1], new_min + previous_span))
-            self._axis_x.setRange(QDateTime.fromMSecsSinceEpoch(int(new_min)), QDateTime.fromMSecsSinceEpoch(int(new_max)))
+            self._axis_x.setRange(
+                QDateTime.fromMSecsSinceEpoch(int(new_min)),
+                QDateTime.fromMSecsSinceEpoch(int(new_max)),
+            )
             self._fit_y_axis_to_visible_range()
             self.viewport().update()
+
+    def set_unconfirmed_candle_visible(self, visible: bool) -> None:
+        """Show or hide the current forming candle without reloading market data."""
+        visible = bool(visible)
+        if visible == self._show_unconfirmed_candle:
+            return
+        if not self._source_candles:
+            self._show_unconfirmed_candle = visible
+            return
+        previous_range = self._current_x_range() if self._axis_x is not None else None
+        previous_span = max(previous_range[1] - previous_range[0], 1.0) if previous_range else 0.0
+        source_candles = list(self._source_candles)
+        self._show_unconfirmed_candle = visible
+        self.set_candles(
+            title=self._chart_title,
+            candles=source_candles,
+            hide_wicks=self._hide_wicks,
+            show_moving_averages=self._show_moving_averages,
+            moving_average_mode=self._moving_average_mode,
+            tooltip_close_usdt_rate=self._tooltip_close_usdt_rate,
+            tooltip_close_usdt_basis=self._tooltip_close_usdt_basis,
+            tooltip_entry_price=self._tooltip_entry_price,
+            time_markers=self._time_markers,
+            position_price_markers=self._position_price_markers,
+        )
+        if previous_range is not None and self._axis_x is not None:
+            new_max = min(self._full_x_max_ms, max(previous_range[1], self._full_x_min_ms + previous_span))
+            new_min = max(self._full_x_min_ms, new_max - previous_span)
+            self._axis_x.setRange(QDateTime.fromMSecsSinceEpoch(int(new_min)), QDateTime.fromMSecsSinceEpoch(int(new_max)))
+            self._fit_y_axis_to_visible_range()
+        self.viewport().update()
 
     @staticmethod
     def _normalized_position_price_markers(
@@ -2164,11 +2255,11 @@ class CandlestickChartView(QChartView):
         """Prepend an older page while keeping the current chart settings and zoom."""
         if not candles or not self._candles:
             return False
-        existing_by_ts = {candle.ts: candle for candle in self._candles}
+        existing_by_ts = {candle.ts: candle for candle in self._source_candles}
         for candle in candles:
             existing_by_ts[candle.ts] = candle
         merged = sorted(existing_by_ts.values(), key=lambda candle: candle.ts)
-        if len(merged) == len(self._candles):
+        if len(merged) == len(self._source_candles):
             return False
         current_min, current_max = self._current_x_range()
         current_span = max(current_max - current_min, 1.0)
@@ -2178,6 +2269,7 @@ class CandlestickChartView(QChartView):
             candles=merged,
             hide_wicks=self._hide_wicks,
             show_moving_averages=self._show_moving_averages,
+            moving_average_mode=self._moving_average_mode,
             tooltip_close_usdt_rate=self._tooltip_close_usdt_rate,
             tooltip_close_usdt_basis=self._tooltip_close_usdt_basis,
             tooltip_entry_price=self._tooltip_entry_price,
@@ -2203,15 +2295,16 @@ class CandlestickChartView(QChartView):
     @Slot(bool)
     def set_moving_averages_visible(self, visible: bool) -> None:
         self._show_moving_averages = visible
-        if not self._candles:
+        if not self._source_candles:
             return
         self.set_candles(
             title=self._chart_title,
-            candles=list(self._candles),
+            candles=list(self._source_candles),
             hide_wicks=self._hide_wicks,
             tooltip_close_usdt_rate=self._tooltip_close_usdt_rate,
             tooltip_close_usdt_basis=self._tooltip_close_usdt_basis,
             tooltip_entry_price=self._tooltip_entry_price,
+            moving_average_mode=self._moving_average_mode,
             time_markers=self._time_markers,
             position_price_markers=self._position_price_markers,
         )
@@ -3128,6 +3221,16 @@ class OptionChainLinkedChartDialog(QDialog):
         self._auto_refresh_button.setChecked(True)
         self._auto_refresh_button.toggled.connect(self._toggle_auto_refresh)
         toolbar.addWidget(self._auto_refresh_button)
+        self._ema21_55_button = QPushButton("EMA21/55:开")
+        self._ema21_55_button.setCheckable(True)
+        self._ema21_55_button.setChecked(True)
+        self._ema21_55_button.toggled.connect(self._toggle_linked_ema21_55)
+        toolbar.addWidget(self._ema21_55_button)
+        self._unfinished_candle_button = QPushButton("未完成K线:开")
+        self._unfinished_candle_button.setCheckable(True)
+        self._unfinished_candle_button.setChecked(True)
+        self._unfinished_candle_button.toggled.connect(self._toggle_unfinished_candle)
+        toolbar.addWidget(self._unfinished_candle_button)
         supplement_button = QPushButton("补充本地历史")
         supplement_button.clicked.connect(self._supplement_local_history)
         self._history_supplement_button = supplement_button
@@ -3297,6 +3400,22 @@ class OptionChainLinkedChartDialog(QDialog):
         else:
             self._auto_refresh_button.setText("自动刷新:关")
             self._auto_refresh_timer.stop()
+
+    def _linked_chart_moving_average_mode(self) -> str:
+        return "ema21_ema55" if self._ema21_55_button.isChecked() else "ema15_sma50"
+
+    @Slot(bool)
+    def _toggle_linked_ema21_55(self, enabled: bool) -> None:
+        self._ema21_55_button.setText("EMA21/55:开" if enabled else "EMA21/55:关")
+        mode = self._linked_chart_moving_average_mode()
+        for chart in self._charts:
+            chart.set_moving_average_mode(mode)
+
+    @Slot(bool)
+    def _toggle_unfinished_candle(self, enabled: bool) -> None:
+        self._unfinished_candle_button.setText("未完成K线:开" if enabled else "未完成K线:关")
+        for chart in self._charts:
+            chart.set_unconfirmed_candle_visible(enabled)
 
     def apply_workspace_profile(self, profile_name: str) -> None:
         """Keep trade records on the same API selected by the parent workspace."""
@@ -3825,6 +3944,7 @@ class OptionChainLinkedChartDialog(QDialog):
             tuple(candles) if isinstance(candles, (tuple, list)) else (),
             str(error or ""),
             self._side_label(side),
+            moving_average_mode=self._linked_chart_moving_average_mode(),
             tooltip_close_usdt_rate=self._option_chart_usdt_context(side)[0],
             tooltip_close_usdt_basis=self._option_chart_usdt_context(side)[1],
         )
@@ -4081,6 +4201,7 @@ class OptionChainLinkedChartDialog(QDialog):
                 payload.call_candles,
                 payload.call_error,
                 "左侧",
+                moving_average_mode=self._linked_chart_moving_average_mode(),
                 tooltip_close_usdt_rate=self._option_chart_usdt_context("left")[0],
                 tooltip_close_usdt_basis=self._option_chart_usdt_context("left")[1],
                 incremental=incremental,
@@ -4093,6 +4214,7 @@ class OptionChainLinkedChartDialog(QDialog):
             payload.underlying_candles,
             payload.underlying_error,
             "标底",
+            moving_average_mode=self._linked_chart_moving_average_mode(),
             incremental=incremental,
         )
         if payload.put_inst_id == current_put_id:
@@ -4102,6 +4224,7 @@ class OptionChainLinkedChartDialog(QDialog):
                 payload.put_candles,
                 payload.put_error,
                 "右侧",
+                moving_average_mode=self._linked_chart_moving_average_mode(),
                 tooltip_close_usdt_rate=self._option_chart_usdt_context("right")[0],
                 tooltip_close_usdt_basis=self._option_chart_usdt_context("right")[1],
                 incremental=incremental,
@@ -4121,12 +4244,14 @@ class OptionChainLinkedChartDialog(QDialog):
                     title=volatility_title,
                     candles=list(payload.volatility_candles),
                     show_moving_averages=True,
+                    moving_average_mode=self._linked_chart_moving_average_mode(),
                 )
             else:
                 self._volatility_chart.set_candles(
                     title=volatility_title,
                     candles=list(payload.volatility_candles),
                     show_moving_averages=True,
+                    moving_average_mode=self._linked_chart_moving_average_mode(),
                 )
         elif not incremental:
             self._volatility_chart.show_message("正在从 Deribit 自动补齐最新 DVOL 波动率 K 线…")
@@ -4169,12 +4294,14 @@ class OptionChainLinkedChartDialog(QDialog):
                     title=volatility_title,
                     candles=list(payload.candles),
                     show_moving_averages=True,
+                    moving_average_mode=self._linked_chart_moving_average_mode(),
                 )
             else:
                 self._volatility_chart.set_candles(
                     title=volatility_title,
                     candles=list(payload.candles),
                     show_moving_averages=True,
+                    moving_average_mode=self._linked_chart_moving_average_mode(),
                 )
         elif not payload.incremental:
             detail = f"（{payload.resolution_note}）" if payload.resolution_note else ""
@@ -4193,6 +4320,7 @@ class OptionChainLinkedChartDialog(QDialog):
         error: str,
         side_label: str,
         *,
+        moving_average_mode: str = "ema15_sma50_ema21_ema55",
         tooltip_close_usdt_rate: Decimal | None = None,
         tooltip_close_usdt_basis: str = "",
         incremental: bool = False,
@@ -4202,6 +4330,7 @@ class OptionChainLinkedChartDialog(QDialog):
                 "title": f"{side_label} {inst_id} 标记价格K线",
                 "candles": list(candles),
                 "show_moving_averages": True,
+                "moving_average_mode": moving_average_mode,
                 "tooltip_close_usdt_rate": tooltip_close_usdt_rate,
                 "tooltip_close_usdt_basis": tooltip_close_usdt_basis,
             }

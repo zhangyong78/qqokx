@@ -50,6 +50,7 @@ from roll_terminal_qt.option_strategy_window import (
     CandlestickChartView,
     OptionStrategyQtWindow,
     PositionPriceMarker,
+    _mark_latest_dvol_candle_if_open,
     _option_position_coin_texts,
     build_option_position_import_payload,
 )
@@ -207,7 +208,7 @@ class RollTerminalQtWindowHelperTests(QtWidgetTestCase):
         finally:
             self.dispose_widget(chart)
 
-    def test_candlestick_chart_incremental_refresh_skips_same_bar_and_keeps_viewport(self) -> None:
+    def test_candlestick_chart_incremental_refresh_updates_open_same_bar_and_keeps_viewport(self) -> None:
         chart = CandlestickChartView()
         candles = [
             Candle(1_752_210_000_000, Decimal("0.01"), Decimal("0.02"), Decimal("0.009"), Decimal("0.015"), Decimal("1"), True),
@@ -228,8 +229,9 @@ class RollTerminalQtWindowHelperTests(QtWidgetTestCase):
                 Decimal("1"),
                 True,
             )
-            self.assertFalse(chart.set_candles_if_new_bar(title="测试", candles=same_bar))
+            self.assertTrue(chart.set_candles_if_new_bar(title="测试", candles=same_bar))
             self.assertEqual(chart._current_x_range(), previous_range)
+            self.assertEqual(chart._candles[-1].close, Decimal("0.019"))
 
             next_bar = same_bar + [
                 Candle(1_752_217_200_000, Decimal("0.019"), Decimal("0.023"), Decimal("0.018"), Decimal("0.022"), Decimal("1"), True),
@@ -238,6 +240,30 @@ class RollTerminalQtWindowHelperTests(QtWidgetTestCase):
             self.assertEqual(chart._current_x_range(), previous_range)
         finally:
             self.dispose_widget(chart)
+
+    def test_linked_chart_uses_ema21_ema55_and_updates_forming_bar(self) -> None:
+        chart = CandlestickChartView()
+        candles = [
+            Candle(1_752_210_000_000 + index * 3_600_000, Decimal(index + 1), Decimal(index + 2), Decimal(index), Decimal(index + 1), Decimal("1"), index < 59)
+            for index in range(60)
+        ]
+        try:
+            chart.set_candles(title="联动", candles=candles, show_moving_averages=True, moving_average_mode="ema15_sma50_ema21_ema55")
+            self.assertIn("EMA 15", chart.chart().title())
+            self.assertIn("SMA 50", chart.chart().title())
+            self.assertIn("EMA 21", chart.chart().title())
+            self.assertIn("EMA 55", chart.chart().title())
+            changed = list(candles)
+            changed[-1] = Candle(candles[-1].ts, candles[-1].open, Decimal("62"), candles[-1].low, Decimal("61"), Decimal("2"), False)
+            self.assertTrue(chart.set_candles_if_new_bar(title="联动", candles=changed, show_moving_averages=True, moving_average_mode="ema15_sma50_ema21_ema55"))
+            self.assertEqual(chart._candles[-1].close, Decimal("61"))
+        finally:
+            self.dispose_widget(chart)
+
+    def test_latest_dvol_candle_is_marked_open_only_inside_current_interval(self) -> None:
+        candles = [Candle(3_600_000, Decimal("30"), Decimal("31"), Decimal("29"), Decimal("30.5"), Decimal("0"), True)]
+        self.assertFalse(_mark_latest_dvol_candle_if_open(candles, "1H", 3_700_000)[-1].confirmed)
+        self.assertTrue(_mark_latest_dvol_candle_if_open(candles, "1H", 7_200_000)[-1].confirmed)
 
     def test_candlestick_chart_linked_hover_uses_source_timestamp_for_crosshair(self) -> None:
         chart = CandlestickChartView()
