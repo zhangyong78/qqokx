@@ -6,6 +6,7 @@ from okx_quant.arbitrage.arbitrage_executor import _build_strategy_config
 from okx_quant.pricing import snap_to_increment
 
 _PENDING_EDITS = {}
+_PENDING_PRICE_EDITS = {}
 _FEE_CACHE = {}
 
 
@@ -56,6 +57,50 @@ def matched_position(positions, item):
     p = matches[0]
     direction = p.pos_side if p.pos_side in {"long", "short"} else ("long" if p.position > 0 else "short")
     return p, direction
+
+
+def amend_option_limit_price(client, runtime, item, price):
+    """Amend one existing option limit order and verify its exchange state."""
+    from okx_quant.pending_order_chase import get_pending_order_chase_service, order_reference
+    from okx_quant.option_strategy import parse_option_contract
+    price = Decimal(str(price))
+    if not price.is_finite() or price <= 0:
+        raise ValueError("委托价格必须是大于零的有限数字")
+    if str(item.inst_type or "").upper() != "OPTION" or item.source_kind == "algo":
+        raise ValueError("请选择期权普通限价委托")
+    service = get_pending_order_chase_service()
+    key = service.key(runtime, item.inst_id, order_reference(item))
+    with service._operation_lock(key):
+        if service.snapshot(key).get("active"):
+            raise ValueError("该委托正在自动追单，请先停止追单")
+        current = read_order(client, runtime, item)
+        if key in _PENDING_PRICE_EDITS:
+            if current.price == _PENDING_PRICE_EDITS[key]:
+                del _PENDING_PRICE_EDITS[key]
+                return current
+            raise ValueError("上一笔改单尚未确认，请先核对交易所委托状态")
+        if current.ord_type not in {"limit", "post_only"}:
+            raise ValueError("仅支持修改期权限价委托")
+        if current.price != item.price:
+            raise ValueError("交易所委托价格已变化，请刷新后重新确认")
+        family = parse_option_contract(item.inst_id).inst_family
+        bands = client.get_option_tick_bands(family, force_refresh=True)
+        band = next((b for b in bands if b.min_price <= price and (b.max_price is None or price < b.max_price)), None)
+        if band is None or band.tick_size <= 0 or price % band.tick_size:
+            raise ValueError("价格不符合交易所期权价格分档，请按对应最小变动单位输入")
+        if price == current.price:
+            return current
+        _PENDING_PRICE_EDITS[key] = price
+        result = client.amend_order(runtime.credentials, environment=runtime.environment, inst_id=item.inst_id,
+                                    ord_id=current.order_id, cl_ord_id=current.client_order_id, new_price=price)
+        if str(result.s_code or "0") != "0":
+            _PENDING_PRICE_EDITS.pop(key, None)
+            raise ValueError(f"交易所拒绝改单：{result.s_msg}")
+        verified = read_order(client, runtime, current)
+        if verified.price != price:
+            raise ValueError("改单已请求，但回读尚未确认生效；请刷新核对，勿重复提交")
+        _PENDING_PRICE_EDITS.pop(key, None)
+        return verified
 
 
 def break_even_price(entry, fee, tick, direction):

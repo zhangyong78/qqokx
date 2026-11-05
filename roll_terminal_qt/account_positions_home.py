@@ -1079,7 +1079,12 @@ def _option_open_fee_per_premium_unit(
     actual_fee = _current_order_raw_decimal(raw, "fee")
     notional = _option_position_premium_notional(position, instrument)
     if actual_fee is not None and actual_fee != 0 and notional is not None:
-        return abs(actual_fee) / notional
+        # The position API can report accumulated fees. A single option opening
+        # fee cannot exceed OKX's 7%-of-premium cap, so do not let an accumulated
+        # or stale fee value make high-profit targets mathematically impossible.
+        actual_rate = abs(actual_fee) / notional
+        maximum_rate = _OPTION_PREMIUM_FEE_CAP_RATE * open_price
+        return min(actual_rate, maximum_rate)
     return _option_fee_per_premium_unit(open_price, fallback_fee_rate)
 
 
@@ -5006,7 +5011,10 @@ class AccountPositionsHomeWidget(QWidget):
                 fallback_fee_rate=fee_rate,
             )
             target_price = _option_premium_before_close_fee(
-                reference_price * (Decimal("1") - profit_ratio) - opening_fee / close_fraction,
+                # opening_fee is already normalized per contract premium unit.
+                # Dividing it by the selected close fraction charges the full
+                # position's opening fee to a partial close (e.g. 1 of 300 lots).
+                reference_price * (Decimal("1") - profit_ratio) - opening_fee,
                 fee_rate,
             )
         else:
@@ -7306,7 +7314,7 @@ class AccountPositionsHomeWidget(QWidget):
             ("带入合约", self.apply_selected_option_to_current_order_search),
             ("带入到期前缀", self.apply_selected_option_expiry_prefix_to_current_order_search),
             ("从选中条件单接管动态止盈", self._show_not_ready_action),
-            ("修改止盈止损", self._amend_selected_current_order),
+            ("修改委托/止盈止损", self._amend_selected_current_order),
             ("撤单选中", self._cancel_selected_current_order),
             ("批量撤当前筛选", self._show_not_ready_action),
         ):

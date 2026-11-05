@@ -3,10 +3,10 @@ from types import SimpleNamespace
 from decimal import Decimal
 
 from PySide6.QtCore import QObject, QThread, QTimer, Signal
-from PySide6.QtWidgets import QPushButton, QSpinBox, QLabel, QMessageBox, QDialog
+from PySide6.QtWidgets import QPushButton, QSpinBox, QLabel, QMessageBox, QDialog, QInputDialog
 
 from okx_quant.okx_client import OkxRestClient
-from okx_quant.manual_order_protection import prepare_break_even, amend_protection, matched_position, break_even_price, cached_fee
+from okx_quant.manual_order_protection import prepare_break_even, amend_protection, amend_option_limit_price, matched_position, break_even_price, cached_fee
 
 
 class _Task(QThread):
@@ -88,6 +88,9 @@ class OrderActions(QObject):
         except Exception as exc:
             self._error(str(exc))
             return
+        if str(item.inst_type or "").upper() == "OPTION" and item.source_kind != "algo":
+            self._edit_option_price(runtime, item)
+            return
         from roll_terminal_qt.account_positions_home import AccountPositionsHomeWidget
         from roll_terminal_qt.order_service import OrderFeedThread
         snapshot = getattr(self.view, "_snapshot", None)
@@ -114,6 +117,42 @@ class OrderActions(QObject):
                 cache_client.close()
         context = self._preview_context(runtime, item, source, view)
         self._dialog(runtime, item, context, source=source, order_view=view)
+
+    def _edit_option_price(self, runtime, item):
+        unit = str(item.inst_id).split("-", 1)[0]
+        text, accepted = QInputDialog.getText(
+            self.view, "修改期权委托价格",
+            f"合约：{item.inst_id}\n方向：{'卖出' if item.side == 'sell' else '买入'}\n"
+            f"委托数量：{item.size} 张\n当前委托价：{item.price} {unit}\n请输入新委托价（{unit}）：",
+            text=str(item.price or ""),
+        )
+        if not accepted:
+            return
+        try:
+            price = Decimal(text.strip())
+            if not price.is_finite() or price <= 0:
+                raise ValueError()
+        except Exception:
+            self._error("请输入大于零的有效委托价格")
+            return
+        if QMessageBox.question(self.view, "确认修改期权委托", f"{item.inst_id}\n委托价：{item.price} → {price} {unit}\n确认提交？") != QMessageBox.StandardButton.Yes:
+            return
+        self.busy = True
+        self._run(lambda client: amend_option_limit_price(client, runtime, item, price),
+                  lambda result: self._option_price_amended(runtime, result))
+
+    def _option_price_amended(self, runtime, result):
+        from roll_terminal_qt.order_service import OrderFeedThread
+        from roll_terminal_qt.shared_order_store import get_shared_order_store
+        feed = OrderFeedThread(None)
+        try:
+            view = feed._trade_order_to_view(result)
+        finally:
+            feed.stop()
+        profile = str(getattr(runtime.credentials, "profile_name", "") or getattr(runtime, "credential_profile_name", ""))
+        get_shared_order_store().publish_order_updates(profile_name=profile, environment=runtime.environment, orders=[view])
+        self.refresh()
+        QMessageBox.information(self.view, "修改完成", "交易所回读已确认期权委托价格修改生效")
 
     def _preview_context(self, runtime, item, source, view):
         from roll_terminal_qt.account_positions_home import AccountPositionsHomeWidget

@@ -1851,7 +1851,7 @@ class AccountPositionsHomeQtHelpersTest(TestCase):
         # the 0.0005 band and rounds down to 0.0555.
         self.assertEqual(price, Decimal("0.0555"))
 
-    def test_short_option_profit_flatten_price_allocates_full_opening_fee_to_partial_close(self) -> None:
+    def test_short_option_profit_flatten_price_allocates_opening_fee_per_contract_to_partial_close(self) -> None:
         position = SimpleNamespace(
             inst_type="OPTION",
             avg_price=Decimal("0.113"),
@@ -1892,7 +1892,43 @@ class AccountPositionsHomeQtHelpersTest(TestCase):
             close_size=Decimal("7.5"),
         )
 
-        self.assertEqual(price, Decimal("0.0550"))
+        self.assertEqual(price, Decimal("0.0555"))
+
+    def test_short_option_90_percent_target_caps_accumulated_position_fee(self) -> None:
+        position = SimpleNamespace(
+            inst_type="OPTION",
+            avg_price=Decimal("0.0672"),
+            position=Decimal("-300"),
+            raw={"fee": "-0.05"},
+        )
+        instrument = Instrument(
+            inst_id="BTC-USD-270625-105000-C",
+            inst_type="OPTION",
+            tick_size=Decimal("0.0001"),
+            lot_size=Decimal("1"),
+            min_size=Decimal("1"),
+            state="live",
+            ct_val=Decimal("1"),
+            ct_mult=Decimal("0.01"),
+            ct_val_ccy="BTC",
+        )
+        app = SimpleNamespace(
+            _profile_snapshots={"159": {"option_taker_fee_rate": "0.03"}},
+            _last_profile_name="159",
+            _shared_client=SimpleNamespace(get_option_tick_bands=lambda _family: [
+                OptionTickBand(Decimal("0"), None, Decimal("0.0001")),
+            ]),
+        )
+        app._snap_selected_position_flatten_price = lambda item, value, *, rounding: (
+            AccountPositionsHomeWidget._snap_selected_position_flatten_price(app, item, value, rounding=rounding)
+        )
+
+        price = AccountPositionsHomeWidget._resolve_short_profit_flatten_price(
+            app, position, instrument, side="buy", profit_percent=Decimal("90"), close_size=Decimal("1"),
+        )
+
+        self.assertGreater(price, Decimal("0"))
+        self.assertLess(price, Decimal("0.00672"))
 
     def test_option_flatten_price_uses_higher_tick_band_above_threshold(self) -> None:
         app = SimpleNamespace(

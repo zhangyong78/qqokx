@@ -580,7 +580,7 @@ class KlineAccountDrawer(QWidget):
         orders_layout.addWidget(self._orders_table, 1)
 
         orders_toolbar = QHBoxLayout()
-        self._amend_button = QPushButton("修改止盈止损")
+        self._amend_button = QPushButton("修改委托/止盈止损")
         self._amend_button.clicked.connect(self._edit_protection)
         orders_toolbar.addWidget(self._amend_button)
         self._chase_button = QPushButton("自动追单")
