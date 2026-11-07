@@ -64,6 +64,7 @@ from PySide6.QtWidgets import (
 )
 
 from okx_quant.candle_cache import load_candle_cache, merge_candles, replace_candle_cache, save_candle_cache
+from okx_quant.candle_continuity import bar_step_ms, find_candle_gaps_half_open_range
 from okx_quant.analysis import ChannelDetectionConfig
 from okx_quant.analysis.box_detector import BoxDetectionConfig, detect_boxes
 from okx_quant.strategy_live_chart import build_auto_channel_live_chart_snapshot
@@ -436,11 +437,13 @@ _DEFAULT_DUAL_PRIMARY_PERIOD = "1D"
 _DEFAULT_DUAL_SECONDARY_PERIOD = "4H"
 _PRIMARY_PERIOD_OPTIONS = (
     ("15m", "15m"),
+    ("30m", "30m"),
     ("1H", "1H"),
     ("4H", "4H"),
     ("1D", "1D"),
     ("1W", "1W"),
 )
+_LOCAL_HISTORY_BACKFILL_BARS = ("15m", "30m", "1H", "4H", "1D")
 
 
 def _to_ms_seconds(ts: int) -> int:
@@ -3465,7 +3468,7 @@ def _best_parameter_indicator_specs(
     """Return the selected best-parameter indicator lines for one symbol and period."""
 
     normalized_period = str(period or "").strip().upper()
-    if normalized_period not in {"15M", "1H", "4H", "1D", "1W"}:
+    if normalized_period not in {"15M", "30M", "1H", "4H", "1D", "1W"}:
         return []
     normalized_direction = str(direction_filter or "all").strip().lower()
     include_long = normalized_direction != "short"
@@ -6610,6 +6613,88 @@ class WeeklyCacheBackfillLoader(QThread):
         self.completed.emit(completed, total)
 
 
+class LocalCandleHistoryBackfillLoader(QThread):
+    """Incrementally refresh recent candles, repair a gap, or extend one older page."""
+
+    progress = Signal(int, int, str)
+    completed = Signal(int, int, object)
+
+    def run(self) -> None:
+        total = len(KLINE_SYMBOL_OPTIONS) * (len(_LOCAL_HISTORY_BACKFILL_BARS) + 1)
+        done = 0
+        failures: list[str] = []
+        client = OkxRestClient()
+        try:
+            for symbol in KLINE_SYMBOL_OPTIONS:
+                for bar in _LOCAL_HISTORY_BACKFILL_BARS:
+                    if self.isInterruptionRequested():
+                        return
+                    self.progress.emit(done, total, f"正在补充 {symbol} {bar}…")
+
+                    try:
+                        cached = load_candle_cache(symbol, bar, limit=None)
+                        latest = client.get_candles_history(symbol, bar, limit=300)
+                        merged = merge_candles(cached, latest)
+                        if self.isInterruptionRequested():
+                            break
+                        if merged:
+                            step = bar_step_ms(bar)
+                            gaps, _warnings = find_candle_gaps_half_open_range(
+                                merged,
+                                start_ms=merged[0].ts,
+                                end_exclusive_ms=merged[-1].ts + step,
+                                step_ms=step,
+                            )
+                            if gaps:
+                                if self.isInterruptionRequested():
+                                    break
+                                gap_start, gap_end, missing = gaps[0]
+                                repair_end = min(gap_end, gap_start + step * 300)
+                                repaired = client.get_candles_history_range(
+                                    symbol,
+                                    bar,
+                                    start_ts=gap_start,
+                                    end_ts=repair_end - step,
+                                    limit=300,
+                                    preload_count=0,
+                                )
+                                merged = merge_candles(merged, repaired)
+                                if len(repaired) < min(missing, 300):
+                                    failures.append(f"{symbol} {bar}: 缺口仍未补满，将在下次继续")
+                            elif cached:
+                                if self.isInterruptionRequested():
+                                    break
+                                older = client.get_candles_history_before(
+                                    symbol, bar, before_ts=cached[0].ts, limit=300
+                                )
+                                merged = merge_candles(merged, older)
+                            save_candle_cache(symbol, bar, merged, max_records=max(12_000, len(merged)))
+                        elif not cached:
+                            failures.append(f"{symbol} {bar}: OKX 未返回K线")
+                    except Exception as exc:  # noqa: BLE001
+                        failures.append(f"{symbol} {bar}: {exc}")
+                        _debug_log(f"[kline] candle history backfill failed | symbol={symbol} | bar={bar} | error={exc}")
+                    done += 1
+                    self.progress.emit(done, total, f"已处理 {done}/{total}：{symbol} {bar}")
+
+                if self.isInterruptionRequested():
+                    return
+                try:
+                    weekly, _changed, source_bar = _ensure_local_weekly_cache(symbol)
+                    if not weekly:
+                        failures.append(f"{symbol} 1W: 没有可用的本地周期数据生成周线")
+                    elif source_bar is None:
+                        failures.append(f"{symbol} 1W: 未找到周线生成源")
+                except Exception as exc:  # noqa: BLE001
+                    failures.append(f"{symbol} 1W: {exc}")
+                    _debug_log(f"[kline] weekly history backfill failed | symbol={symbol} | error={exc}")
+                done += 1
+                self.progress.emit(done, total, f"已处理 {done}/{total}：{symbol} 1W（本地生成）")
+        finally:
+            client.close()
+            self.completed.emit(done, total, failures)
+
+
 class KlineHistoryTradeLoader(QThread):
     """Fetch position lifecycles and current positions without blocking the chart."""
 
@@ -6972,6 +7057,8 @@ class KlineAnalysisWindow(QMainWindow):
         self._area_shape_replay_overlay: dict[str, Any] | None = None
         self._area_shape_replay_dialog: QDialog | None = None
         self._weekly_cache_backfill_loader: WeeklyCacheBackfillLoader | None = None
+        self._local_history_backfill_loader: LocalCandleHistoryBackfillLoader | None = None
+        self._local_history_backfill_button: QPushButton | None = None
         self._history_trade_request_id = 0
         self._active_history_trade_request_id = 0
         self._history_trade_loader: KlineHistoryTradeLoader | None = None
@@ -7218,6 +7305,60 @@ class KlineAnalysisWindow(QMainWindow):
         if loader is not None:
             loader.deleteLater()
 
+    def _start_local_history_backfill(self) -> None:
+        loader = self._local_history_backfill_loader
+        if loader is not None and loader.isRunning():
+            loader.requestInterruption()
+            if self._local_history_backfill_button is not None:
+                self._local_history_backfill_button.setEnabled(False)
+                self._local_history_backfill_button.setText("正在停止…")
+            return
+        loader = LocalCandleHistoryBackfillLoader()
+        self._local_history_backfill_loader = loader
+        if self._local_history_backfill_button is not None:
+            self._local_history_backfill_button.setText("停止补充…")
+        loader.progress.connect(self._on_local_history_backfill_progress)
+        loader.completed.connect(self._on_local_history_backfill_completed)
+        loader.finished.connect(self._on_local_history_backfill_finished)
+        loader.start()
+
+    @Slot(int, int, str)
+    def _on_local_history_backfill_progress(self, completed: int, total: int, message: str) -> None:
+        if self._local_history_backfill_button is not None:
+            self._local_history_backfill_button.setText(f"停止补充 {completed}/{total}")
+            self._local_history_backfill_button.setToolTip(message)
+        if self._loader is None or not self._loader.isRunning():
+            self._set_status(message)
+
+    @Slot(int, int, object)
+    def _on_local_history_backfill_completed(self, completed: int, total: int, failures: object) -> None:
+        failure_list = list(failures) if isinstance(failures, (list, tuple)) else []
+        loader = self._local_history_backfill_loader
+        stopped = loader is not None and loader.isInterruptionRequested()
+        if stopped:
+            message = f"已停止本地历史补充：完成 {completed}/{total} 项；已写入的数据保留，下次可继续。"
+        elif failure_list:
+            message = f"本地历史补充完成：{completed}/{total} 项，{len(failure_list)} 项失败。首项：{failure_list[0]}"
+        else:
+            message = f"本地历史补充完成：{completed}/{total} 项，包含周线本地生成。"
+        if self._local_history_backfill_button is not None:
+            self._local_history_backfill_button.setEnabled(True)
+            self._local_history_backfill_button.setText("继续补充历史数据" if stopped else "闲时补充历史数据")
+            self._local_history_backfill_button.setToolTip(message)
+        self._set_status(message)
+
+    @Slot()
+    def _on_local_history_backfill_finished(self) -> None:
+        loader = self.sender()
+        if loader is None:
+            loader = self._local_history_backfill_loader
+        if loader is not None and loader.isRunning():
+            return
+        if self._local_history_backfill_loader is loader:
+            self._local_history_backfill_loader = None
+        if loader is not None:
+            loader.deleteLater()
+
     def set_page_active(self, active: bool) -> None:
         self._page_active = bool(active)
         account_store = getattr(getattr(self, "_account_drawer", None), "_realtime_store", None)
@@ -7439,6 +7580,7 @@ class KlineAnalysisWindow(QMainWindow):
             getattr(self, "_secondary_volatility_loader", None),
             getattr(self, "_history_trade_loader", None),
             getattr(self, "_weekly_cache_backfill_loader", None),
+            getattr(self, "_local_history_backfill_loader", None),
             *tuple(getattr(self, "_area_shape_demo_workers", ())),
         )
         for loader in (*active_loaders, *tuple(self._retired_loaders)):
@@ -7496,6 +7638,7 @@ class KlineAnalysisWindow(QMainWindow):
             getattr(self, "_secondary_volatility_loader", None),
             getattr(self, "_history_trade_loader", None),
             getattr(self, "_weekly_cache_backfill_loader", None),
+            getattr(self, "_local_history_backfill_loader", None),
             getattr(self, "_rr_execution_thread", None),
             *tuple(getattr(self, "_area_shape_demo_workers", ())),
             *tuple(self._retired_loaders),
@@ -8017,6 +8160,12 @@ class KlineAnalysisWindow(QMainWindow):
         load_btn.setObjectName("Primary")
         load_btn.clicked.connect(self._load_data)
 
+        self._local_history_backfill_button = QPushButton("闲时补充历史数据")
+        self._local_history_backfill_button.setToolTip(
+            "后台顺序补充自选交易对的 15m、30m、1H、4H、1D 全量本地历史，并从日线生成 1W。"
+        )
+        self._local_history_backfill_button.clicked.connect(self._start_local_history_backfill)
+
         self._auto_refresh_btn = QPushButton("自动刷新:开" if _AUTO_REFRESH_DEFAULT_ENABLED else "自动刷新:关")
         self._auto_refresh_btn.setCheckable(True)
         self._auto_refresh_btn.setChecked(_AUTO_REFRESH_DEFAULT_ENABLED)
@@ -8047,6 +8196,7 @@ class KlineAnalysisWindow(QMainWindow):
         workspace_row.addWidget(self._account_drawer_button, 0)
         workspace_row.addWidget(view_options_button, 0)
         workspace_row.addWidget(load_btn, 0)
+        workspace_row.addWidget(self._local_history_backfill_button, 0)
         workspace_row.addWidget(self._auto_refresh_btn, 0)
         workspace_row.addWidget(self._chart_range_mode_btn, 0)
 
@@ -8766,6 +8916,7 @@ class KlineAnalysisWindow(QMainWindow):
             "3m": 20000,
             "5m": 25000,
             "15m": 45000,
+            "30m": 60_000,
             "1H": 60_000,
             "4H": 3 * 60_000,
             "1D": 10 * 60_000,
