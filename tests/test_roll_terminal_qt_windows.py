@@ -6511,7 +6511,7 @@ class RollTerminalQtWindowHelperTests(QtWidgetTestCase):
             [1.0, 1.5, 2.0, 3.0, 4.0],
         )
 
-    def test_reverse_kline_chart_payload_mirrors_price_series_around_first_close(self) -> None:
+    def test_reverse_kline_chart_payload_mirrors_price_series_in_log_price_space(self) -> None:
         payload = KlineChartPayload(
             candles=[
                 {"time": 1, "open": 100.0, "high": 110.0, "low": 90.0, "close": 105.0, "volume": 1.0},
@@ -6530,19 +6530,25 @@ class RollTerminalQtWindowHelperTests(QtWidgetTestCase):
 
         reversed_payload = _reverse_kline_chart_payload(payload)
 
-        self.assertEqual(reversed_payload.candles[0]["open"], 105.0)
-        self.assertEqual(reversed_payload.candles[0]["close"], 110.0)
-        self.assertEqual(reversed_payload.candles[0]["high"], 120.0)
-        self.assertEqual(reversed_payload.candles[0]["low"], 100.0)
+        self.assertAlmostEqual(reversed_payload.candles[0]["open"], 105.0)
+        self.assertAlmostEqual(reversed_payload.candles[0]["close"], 110.25)
+        self.assertAlmostEqual(reversed_payload.candles[0]["high"], 122.5)
+        self.assertAlmostEqual(reversed_payload.candles[0]["low"], 105.0**2 / 110.0)
         self.assertGreater(reversed_payload.candles[0]["close"], reversed_payload.candles[0]["open"])
         self.assertLess(reversed_payload.candles[1]["close"], reversed_payload.candles[1]["open"])
-        self.assertEqual(reversed_payload.candles[1]["open"], 104.0)
-        self.assertEqual(reversed_payload.candles[1]["close"], 101.0)
-        self.assertEqual(reversed_payload.ema_9[1]["value"], 103.0)
-        self.assertEqual(reversed_payload.box_overlays[0]["upper"], 120.0)
-        self.assertEqual(reversed_payload.box_overlays[0]["lower"], 98.0)
+        self.assertAlmostEqual(reversed_payload.candles[1]["open"], 105.0**2 / 106.0)
+        self.assertAlmostEqual(reversed_payload.candles[1]["close"], 105.0**2 / 109.0)
+        self.assertAlmostEqual(reversed_payload.ema_9[1]["value"], 105.0**2 / 107.0)
+        self.assertAlmostEqual(reversed_payload.box_overlays[0]["upper"], 122.5)
+        self.assertAlmostEqual(reversed_payload.box_overlays[0]["lower"], 105.0**2 / 112.0)
         self.assertTrue(reversed_payload.stats["reverse_kline"])
         self.assertEqual(reversed_payload.stats["reverse_anchor_price"], 105.0)
+
+    def test_reverse_kline_price_stays_positive_after_large_decline(self) -> None:
+        from roll_terminal_qt.kline_analysis_window import _reverse_kline_price
+
+        self.assertEqual(_reverse_kline_price(80_000.0, 80_000.0), 80_000.0)
+        self.assertGreater(_reverse_kline_price(1.0, 80_000.0), 0.0)
 
     def test_build_box_current_overlay_returns_current_effective_box(self) -> None:
         candles = [SimpleNamespace(open=100.0, high=101.0, low=99.0, close=100.0) for _ in range(60)]

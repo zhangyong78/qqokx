@@ -3610,7 +3610,13 @@ def _slice_chart_payload_tail(payload: KlineChartPayload, count: int) -> KlineCh
 
 
 def _reverse_kline_price(value: float, anchor_price: float) -> float:
-    return float(anchor_price) * 2.0 - float(value)
+    price = float(value)
+    anchor = float(anchor_price)
+    if price <= 0.0 or anchor <= 0.0:
+        return price
+    # Mirror in log-price space: preserves the anchor and reverses percentage
+    # moves without letting a large decline create impossible negative prices.
+    return (anchor * anchor) / price
 
 
 def _reverse_kline_anchor_price(payload: KlineChartPayload) -> float:
@@ -4364,6 +4370,7 @@ if QChartView is not None:
                 painter = QPainter(self.viewport())
                 painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
                 self._draw_latest_price_indicator(painter, plot_area)
+                self._draw_visible_extrema(painter, plot_area)
                 self._draw_atr_overlay(painter, plot_area)
                 self._draw_volume_overlay(painter, plot_area)
                 self._draw_trading_day_separators(painter, plot_area)
@@ -4500,6 +4507,58 @@ if QChartView is not None:
             painter.drawRoundedRect(QRectF(left, top, right - left, height), 4.0, 4.0)
             painter.setPen(color)
             painter.drawText(QRectF(left + padding_x, top, width - padding_x * 2.0, height), Qt.AlignmentFlag.AlignCenter, text)
+
+        def _draw_visible_extrema(self, painter: QPainter, plot_area: QRectF) -> None:
+            """Mark the highest high and lowest low among currently visible candles."""
+            if not self._candles or not self._axis_y:
+                return
+            left_index, right_index = self._visible_index_range()
+            left_index = max(0, left_index)
+            right_index = min(len(self._candles) - 1, right_index)
+            if right_index < left_index:
+                return
+            visible = self._candles[left_index : right_index + 1]
+            high_index = left_index + max(range(len(visible)), key=lambda i: float(visible[i]["high"]))
+            low_index = left_index + min(range(len(visible)), key=lambda i: float(visible[i]["low"]))
+            extremes = (
+                (high_index, float(self._candles[high_index]["high"]), "最高", QColor("#ef6b73")),
+                (low_index, float(self._candles[low_index]["low"]), "最低", QColor("#26a69a")),
+            )
+            painter.save()
+            painter.setClipRect(plot_area)
+            font = painter.font()
+            font.setPointSize(8)
+            font.setBold(False)
+            painter.setFont(font)
+            metrics = painter.fontMetrics()
+            label_centers: list[float] = []
+            for index, price, caption, color in extremes:
+                x = self._x_for_index(index, plot_area)
+                y = self._y_for_value(price, plot_area)
+                text = f"{caption} {self._format_hover_value(price)}"
+                text_width = float(metrics.horizontalAdvance(text))
+                right_side = x + 12.0 + text_width <= float(plot_area.right()) - 3.0
+                baseline = _clamp(y - 8.0, float(plot_area.top()) + metrics.ascent() + 2.0, float(plot_area.bottom()) - 2.0)
+                if label_centers and abs(baseline - label_centers[0]) < metrics.height() + 3.0:
+                    baseline = _clamp(
+                        label_centers[0] + metrics.height() + 3.0,
+                        float(plot_area.top()) + metrics.ascent() + 2.0,
+                        float(plot_area.bottom()) - 2.0,
+                    )
+                label_centers.append(baseline)
+                text_left = x + 12.0 if right_side else x - 12.0 - text_width
+                line_start = text_left - 5.0 if right_side else text_left + text_width + 5.0
+                line_end = x - 5.0 if right_side else x + 5.0
+                painter.setPen(QPen(QColor(130, 142, 154, 170), 0.8))
+                if abs(baseline - y) > 4.0:
+                    painter.drawLine(QPointF((line_start + line_end) / 2.0, y), QPointF((line_start + line_end) / 2.0, baseline - 3.0))
+                painter.drawLine(QPointF(line_start, baseline - 3.0), QPointF(line_end, baseline - 3.0))
+                painter.setPen(QColor("#aeb8c2"))
+                painter.drawText(QPointF(text_left, baseline), text)
+                painter.setPen(QPen(color, 1.2))
+                painter.setBrush(color)
+                painter.drawEllipse(QPointF(x, y), 2.4, 2.4)
+            painter.restore()
 
         def _draw_chart_header(
             self,
@@ -6058,7 +6117,7 @@ if QChartView is not None:
             min_y = float(self._axis_y.min())
             max_y = float(self._axis_y.max())
             span = max(max_y - min_y, 1e-9)
-            ratio = (max_y - value) / span
+            ratio = ((value - min_y) if self._axis_y.isReverse() else (max_y - value)) / span
             return float(plot_area.top()) + (_clamp(ratio, 0.0, 1.0) * float(plot_area.height()))
 
         def _value_for_y(self, y: float, plot_area: QRectF) -> float:
@@ -6067,7 +6126,7 @@ if QChartView is not None:
             min_y = float(self._axis_y.min())
             max_y = float(self._axis_y.max())
             ratio = _clamp((y - float(plot_area.top())) / max(float(plot_area.height()), 1.0), 0.0, 1.0)
-            return max_y - (ratio * (max_y - min_y))
+            return (min_y + ratio * (max_y - min_y)) if self._axis_y.isReverse() else (max_y - (ratio * (max_y - min_y)))
 
         def _pan_by_pixels(self, delta_px: float, plot_width: float) -> None:
             axis_x = self._axis_x
@@ -8095,7 +8154,7 @@ class KlineAnalysisWindow(QMainWindow):
         )
 
         self._reverse_kline_check = QCheckBox("K线反转")
-        self._reverse_kline_check.setToolTip("开启后，将当前主图及副图K线按价格镜像反转显示；波动率副图不参与反转。")
+        self._reverse_kline_check.setToolTip("开启后上下翻转K线显示，Y轴和最高/最低标记仍使用交易所真实价格；波动率副图不参与反转。")
         self._reverse_kline_check.toggled.connect(self._load_data)
 
         self._trading_day_separators_check = QCheckBox("交易日分隔")
@@ -11896,19 +11955,15 @@ class KlineAnalysisWindow(QMainWindow):
         return self._secondary_chart_kind() == "kline"
 
     def _display_payload_for_chart(self, payload: KlineChartPayload, *, is_secondary: bool) -> KlineChartPayload:
-        if not self._reverse_kline_enabled_for_chart(is_secondary=is_secondary):
-            return payload
-        return _reverse_kline_chart_payload(payload)
+        # Reverse the vertical scale, not the prices: keep true exchange values
+        # on the axis and in the visible high/low annotations.
+        return payload
 
     def _display_price_from_logical(self, payload: KlineChartPayload, value: float, *, is_secondary: bool) -> float:
-        if not self._reverse_kline_enabled_for_chart(is_secondary=is_secondary):
-            return float(value)
-        return _reverse_kline_price(float(value), _reverse_kline_anchor_price(payload))
+        return float(value)
 
     def _logical_price_from_display(self, payload: KlineChartPayload, value: float, *, is_secondary: bool) -> float:
-        if not self._reverse_kline_enabled_for_chart(is_secondary=is_secondary):
-            return float(value)
-        return _reverse_kline_price(float(value), _reverse_kline_anchor_price(payload))
+        return float(value)
 
     def _render_to_chart(self, payload: KlineChartPayload) -> None:
         if self._use_native_chart:
@@ -11926,6 +11981,7 @@ class KlineAnalysisWindow(QMainWindow):
             trend_payload = []
         payload_map: dict[str, Any] = {
             "candles": display_payload.candles,
+            "reverseScale": self._reverse_kline_enabled_for_chart(is_secondary=False),
             "ema": {
                 "ema9": display_payload.ema_9,
                 "ema21": display_payload.ema_21,
@@ -12763,6 +12819,7 @@ class KlineAnalysisWindow(QMainWindow):
         axis_x.setGridLineVisible(False)
 
         axis_y = QValueAxis()
+        axis_y.setReverse(self._reverse_kline_enabled_for_chart(is_secondary=is_secondary))
         top_padding, bottom_padding = _compute_axis_y_padding(min_price, max_price, show_atr=show_atr)
         axis_y.setRange(min_price - bottom_padding, max_price + top_padding)
         axis_y.setLabelFormat(_axis_y_label_format(min_price, max_price))
@@ -17865,6 +17922,7 @@ class KlineAnalysisWindow(QMainWindow):
                     }
                     const safePayload = payload || {};
                     window.__chartPeriod = safePayload.period || '';
+                    chart.priceScale('right').applyOptions({ invertScale: !!safePayload.reverseScale });
                     const candles = Array.isArray(safePayload.candles) ? safePayload.candles : [];
                     currentCandles = candles;
                     candlestickSeries.setData(candles);

@@ -824,8 +824,10 @@ POSITION_COLUMNS: tuple[tuple[str, str, int, Qt.AlignmentFlag], ...] = (
     ("intrinsic_value", "内在价值", 88, Qt.AlignmentFlag.AlignRight),
     ("intrinsic_usdt", "内在≈USDT", 72, Qt.AlignmentFlag.AlignRight),
     ("bid_price", "买一价", 78, Qt.AlignmentFlag.AlignRight),
+    ("bid_size", "买一量", 78, Qt.AlignmentFlag.AlignRight),
     ("bid_usdt", "买一≈USDT", 78, Qt.AlignmentFlag.AlignRight),
     ("ask_price", "卖一价", 78, Qt.AlignmentFlag.AlignRight),
+    ("ask_size", "卖一量", 78, Qt.AlignmentFlag.AlignRight),
     ("ask_usdt", "卖一≈USDT", 78, Qt.AlignmentFlag.AlignRight),
     ("mark", "标记价", 84, Qt.AlignmentFlag.AlignRight),
     ("mark_usdt", "标记≈USDT", 72, Qt.AlignmentFlag.AlignRight),
@@ -862,6 +864,23 @@ _POSITION_NEGATIVE_COLOR = "#c23b3b"
 _POSITION_TIME_INTRINSIC_COLOR = "#7c3aed"
 _POSITION_BID_ASK_COLOR = "#d97706"
 _POSITION_MARK_AVG_COLOR = "#2563eb"
+
+
+def _format_position_quote_size(ticker: object | None, *, side: str) -> str:
+    raw = getattr(ticker, "raw", None)
+    if not isinstance(raw, dict):
+        return "-"
+    raw_key = "bidSz" if side == "bid" else "askSz"
+    value = raw.get(raw_key)
+    if value in (None, ""):
+        return "-"
+    try:
+        amount = Decimal(str(value))
+    except Exception:
+        return "-"
+    if not amount.is_finite():
+        return "-"
+    return format(amount.normalize(), "f")
 
 
 def _position_display_foreground_colors(
@@ -6269,8 +6288,10 @@ class AccountPositionsHomeWidget(QWidget):
             _format_position_option_price_component(position, self._upl_usdt_prices, component="intrinsic_value"),
             _format_position_option_component_usdt(position, self._upl_usdt_prices, component="intrinsic_value"),
             _format_position_quote_price(position, self._position_instruments, self._position_tickers, side="bid"),
+            _format_position_quote_size(self._position_tickers.get(position.inst_id), side="bid"),
             _format_position_quote_price_usdt(position, self._position_tickers, self._upl_usdt_prices, side="bid"),
             _format_position_quote_price(position, self._position_instruments, self._position_tickers, side="ask"),
+            _format_position_quote_size(self._position_tickers.get(position.inst_id), side="ask"),
             _format_position_quote_price_usdt(position, self._position_tickers, self._upl_usdt_prices, side="ask"),
             _format_mark_price(position),
             _format_position_mark_price_usdt(position, self._upl_usdt_prices),
