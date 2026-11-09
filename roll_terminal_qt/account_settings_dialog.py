@@ -19,6 +19,13 @@ from okx_quant import market_relay
 from roll_terminal_qt.profile_access import ensure_profile_unlocked
 
 
+class WheelSafeComboBox(QComboBox):
+    """Prevent accidental wheel changes while the combo is closed."""
+
+    def wheelEvent(self, event) -> None:  # noqa: ANN001
+        event.ignore()
+
+
 class AccountSettingsDialog(QDialog):
     """Edit the same credential and notification files as the Tk settings page."""
 
@@ -50,7 +57,7 @@ class AccountSettingsDialog(QDialog):
         account = QGroupBox("API 与交易设置", page)
         form = QFormLayout(account)
         profile_row = QHBoxLayout()
-        self.profile_combo = QComboBox(account)
+        self.profile_combo = WheelSafeComboBox(account)
         self.profile_combo.currentTextChanged.connect(self._switch_profile)
         profile_row.addWidget(self.profile_combo, 1)
         new_button = QPushButton("新建配置", account)
@@ -81,18 +88,24 @@ class AccountSettingsDialog(QDialog):
         form.addRow("API Key", self.api_key)
         form.addRow("Secret Key", self.secret_key)
         form.addRow("Passphrase", self.passphrase)
-        self.environment = QComboBox(account)
+        self.environment = WheelSafeComboBox(account)
         self.environment.addItem("模拟盘 demo", "demo")
         self.environment.addItem("实盘 live", "live")
         form.addRow("环境", self.environment)
-        self.trade_mode = QComboBox(account)
+        self.trade_mode = WheelSafeComboBox(account)
         self.trade_mode.addItem("全仓 cross", "cross")
         self.trade_mode.addItem("逐仓 isolated", "isolated")
         form.addRow("Trade Mode", self.trade_mode)
-        self.position_mode = QComboBox(account)
+        self.position_mode = WheelSafeComboBox(account)
         self.position_mode.addItem("净持仓 net", "net")
         self.position_mode.addItem("双向持仓 long_short", "long_short")
         form.addRow("Position Mode", self.position_mode)
+        self._trading_settings_locked = True
+        self.trading_settings_lock_button = QPushButton("解锁交易设置", account)
+        self.trading_settings_lock_button.setToolTip("环境、Trade Mode 和 Position Mode 默认锁定防误触；解锁后才能修改。")
+        self.trading_settings_lock_button.clicked.connect(self._toggle_trading_settings_lock)
+        form.addRow("防误触保护", self.trading_settings_lock_button)
+        self._apply_trading_settings_lock()
         fee_grid = QGridLayout()
         self.fees: dict[str, QLineEdit] = {}
         for row, (label, prefix) in enumerate((("Spot", "spot"), ("Futures", "futures"), ("Option", "option")), 1):
@@ -110,7 +123,7 @@ class AccountSettingsDialog(QDialog):
 
         network = QGroupBox("网络代理（交易接口与行情）", page)
         network_form = QFormLayout(network)
-        self.proxy_mode = QComboBox(network)
+        self.proxy_mode = WheelSafeComboBox(network)
         for label, mode in PROXY_MODE_OPTIONS.items():
             self.proxy_mode.addItem(label, mode)
         self.proxy_url = QLineEdit(network)
@@ -163,7 +176,7 @@ class AccountSettingsDialog(QDialog):
         mail_form = QFormLayout(mail)
         self.mail_enabled = QCheckBox("启用邮件通知", mail)
         mail_form.addRow(self.mail_enabled)
-        self.trigger_type = QComboBox(mail)
+        self.trigger_type = WheelSafeComboBox(mail)
         for label in ("标记价格 mark", "最新价格 last", "指数价格 index"):
             self.trigger_type.addItem(label)
         mail_form.addRow("止盈止损触发价格类型", self.trigger_type)
@@ -222,6 +235,21 @@ class AccountSettingsDialog(QDialog):
                             (self.signals, "notify_signals"), (self.errors, "notify_errors")):
             widget.setChecked(bool(notification[key]))
 
+    def _toggle_trading_settings_lock(self) -> None:
+        self._trading_settings_locked = not self._trading_settings_locked
+        self._apply_trading_settings_lock()
+
+    def _apply_trading_settings_lock(self) -> None:
+        enabled = not self._trading_settings_locked
+        for combo in (self.environment, self.trade_mode, self.position_mode):
+            combo.setEnabled(enabled)
+        self.trading_settings_lock_button.setText("解锁交易设置" if self._trading_settings_locked else "锁定交易设置")
+        self.trading_settings_lock_button.setToolTip(
+            "环境、Trade Mode 和 Position Mode 当前已锁定。点击解锁后才能修改。"
+            if self._trading_settings_locked else
+            "环境、Trade Mode 和 Position Mode 当前可修改。点击重新锁定以防误触。"
+        )
+
     def _show_profile(self, name: str) -> None:
         profile = self._profiles.get(name)
         if not isinstance(profile, dict):
@@ -231,6 +259,8 @@ class AccountSettingsDialog(QDialog):
             self.profile_combo.setCurrentText(self._selected_profile)
             self.profile_combo.blockSignals(False)
             return
+        self._trading_settings_locked = True
+        self._apply_trading_settings_lock()
         self._selected_profile = name
         self._loaded_profile = dict(profile)
         self.password_status.setText("已设置" if profile.get("switch_password_hash") else "未设置")

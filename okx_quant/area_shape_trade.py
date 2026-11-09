@@ -79,6 +79,7 @@ class AreaShapeConfig:
     fixed_stop_distance: Decimal = Decimal("1000")
     fixed_stop_price: Decimal = Decimal("0")
     fee_offset_enabled: bool = True
+    email_enabled: bool = False
     resting_entry_enabled: bool = False
     exit_template: str = "fixed_1r"
     trigger_price_type: str = "last"
@@ -183,6 +184,7 @@ class AreaShapeConfig:
             fixed_stop_price=_required_decimal(raw, "fixed_stop_price") if "fixed_stop_price" in raw else Decimal("0"),
             # Older plans did not expose a fee-offset switch; preserve their behavior.
             fee_offset_enabled=bool(raw.get("fee_offset_enabled", False)),
+            email_enabled=bool(raw.get("email_enabled", False)),
             # Kept in the serialized schema for compatibility with older
             # snapshots, but pattern mode no longer supports a pre-hung GTC.
             resting_entry_enabled=False,

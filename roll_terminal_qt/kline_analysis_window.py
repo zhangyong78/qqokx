@@ -6,6 +6,7 @@ import os
 import random
 import re
 import sys
+import threading
 import time
 import copy
 from bisect import bisect_right
@@ -16,7 +17,7 @@ from statistics import median
 from typing import Any, Callable
 from uuid import uuid4
 
-from PySide6.QtCore import QDateTime, QMargins, QObject, QPointF, QRectF, QTimer, Qt, QThread, Signal, Slot
+from PySide6.QtCore import QDateTime, QMargins, QObject, QPointF, QRectF, QSettings, QTimer, Qt, QThread, Signal, Slot
 from PySide6.QtGui import QAction, QColor, QGuiApplication, QPainter, QPen, QPolygonF
 try:
     from PySide6.QtCharts import QCandlestickSeries, QCandlestickSet, QChart, QChartView, QDateTimeAxis, QLineSeries, QValueAxis
@@ -202,6 +203,19 @@ _HISTORY_TRADE_LOSS_COLOR = "#ef4444"
 _HISTORY_TRADE_FLAT_COLOR = "#94a3b8"
 _CHART_CROSSHAIR_COLOR = "#6b7280"
 _REPLAY_SIGNAL_NEAR_MA_MAX_PCT = 0.006
+_TRADE_EMAIL_CLAIM_LOCK = threading.Lock()
+_TRADE_EMAIL_CLAIMED_KEYS: set[str] = set()
+
+
+def _claim_trade_email(key: str) -> bool:
+    normalized = str(key or "").strip()
+    if not normalized:
+        return False
+    with _TRADE_EMAIL_CLAIM_LOCK:
+        if normalized in _TRADE_EMAIL_CLAIMED_KEYS:
+            return False
+        _TRADE_EMAIL_CLAIMED_KEYS.add(normalized)
+        return True
 
 
 def _build_kline_line_email_notifier() -> EmailNotifier | None:
@@ -229,6 +243,17 @@ def _build_kline_line_email_notifier() -> EmailNotifier | None:
     return notifier if notifier.signal_notifications_enabled else None
 
 
+def _send_kline_trade_email(subject: str, body: str) -> bool:
+    notifier = _build_kline_line_email_notifier()
+    if notifier is None:
+        return False
+    try:
+        notifier.notify_async(subject, body)
+    except Exception:
+        return False
+    return True
+
+
 def _deliver_line_alert_emails(
     *,
     workspace_entry: dict[str, object],
@@ -251,27 +276,29 @@ def _deliver_line_alert_emails(
     for event in events:
         if str(event.get("kind", "") or "") != "line_alert":
             continue
-        if str(event.get("trade_action", "") or "").strip().lower() != "notify":
-            continue
+        trade_action = str(event.get("trade_action", "") or "notify").strip().lower()
         line = lines_by_id.get(str(event.get("line_id", "") or "").strip())
         if not isinstance(line, dict) or not bool(line.get("email_enabled", False)):
             continue
         delivery_mode = str(line.get("email_delivery_mode", "once") or "once").strip().lower()
         if delivery_mode == "once" and bool(line.get("email_sent_once", False)):
             continue
-        label = str(line.get("label", "画线预警") or "画线预警").strip()
+        label = str(line.get("label", "线条触发") or "线条触发").strip()
         trigger = _line_trigger_text(str(line.get("trigger", "") or ""))
         direction = _line_trigger_text(str(event.get("direction", "") or ""))
         candle_time = int(event.get("candle_time", 0) or 0)
         candle_label = _format_bar_time(candle_time) if candle_time > 0 else "-"
-        subject = f"[QQOKX] K线画线提醒 | {symbol} | {period} | {label}"
+        action_text = {"long": "自动做多", "short": "自动做空"}.get(trade_action, "仅提醒")
+        subject = f"[QQOKX] 线条触发提醒 | {symbol} | {period} | {label}"
         body = "\n".join(
             (
+                "提醒类型：线条触发信号（不代表委托已成交）",
                 f"交易对：{symbol}",
                 f"周期：{period}",
                 f"线条：{label}",
                 f"预警条件：{trigger}",
                 f"触发方向：{direction}",
+                f"触发后操作：{action_text}",
                 f"K线时间：{candle_label}",
                 f"事件：{str(event.get('message', '') or '').strip()}",
             )
@@ -1117,7 +1144,7 @@ def _rr_management_trigger_r(value: object) -> Decimal | None:
 
 def _rr_condition_status_text(entry: RRTradeLedgerEntry | None) -> str:
     if entry is None:
-        return "条件单：未启用交易"
+        return "交易状态：未提交订单"
 
     def _link_text(label: str, link: object | None) -> str:
         if link is None:
@@ -1390,6 +1417,7 @@ class RRCardDialog(QDialog):
         symbol: str,
         period: str,
         price_increment: Decimal | None,
+        show_email_option: bool = True,
     ) -> None:
         super().__init__(parent)
         self._original_item = dict(item)
@@ -1566,7 +1594,10 @@ class RRCardDialog(QDialog):
         self._r_edit.setValue(float(str(item.get("r_multiple", "2") or "2")))
         self._leverage_edit = QLineEdit(str(item.get("leverage", "1") or "1"))
         self._fee_offset_check = QCheckBox("2倍手续费偏移")
-        self._fee_offset_check.setChecked(_rr_fee_offset_enabled(item.get("fee_offset_enabled", False)))
+        self._fee_offset_check.setChecked(_rr_fee_offset_enabled(item.get("fee_offset_enabled", True)))
+        self._email_check = QCheckBox("邮件提醒（收到委托提交回执后）")
+        self._email_check.setToolTip("使用系统信号邮件设置；提醒表示已收到委托回执，不代表已经成交。")
+        self._email_check.setChecked(bool(item.get("email_enabled", False)))
         self._locked_check = QCheckBox("锁定")
         self._locked_check.setChecked(bool(item.get("locked", False)))
         self._summary_label = QLabel("")
@@ -1581,6 +1612,9 @@ class RRCardDialog(QDialog):
         parameter_layout.addRow("R 倍数", self._r_edit)
         parameter_layout.addRow("杠杆", self._leverage_edit)
         parameter_layout.addRow(self._fee_offset_check)
+        parameter_layout.addRow(self._email_check)
+        if not show_email_option:
+            self._email_check.hide()
         parameter_layout.addRow(self._locked_check)
         parameter_layout.addRow("成交后管理", self._management_hint)
         parameter_layout.addRow("计算结果", self._summary_label)
@@ -1707,6 +1741,7 @@ class RRCardDialog(QDialog):
             "risk_amount": self._risk_edit.text().strip() or "100",
             "leverage": self._leverage_edit.text().strip() or "1",
             "fee_offset_enabled": self._fee_offset_check.isChecked(),
+            "email_enabled": self._email_check.isChecked(),
             "locked": self._locked_check.isChecked(),
         }
         super().accept()
@@ -3723,6 +3758,7 @@ if QChartView is not None:
         hoverTimeChanged = Signal(object)
         xRangeChanged = Signal(float, float)
         chartActivated = Signal()
+        drawToolCancelled = Signal()
         chartPointerPressed = Signal(float, float)
         chartPointerMoved = Signal(float, float)
         chartPointerReleased = Signal(float, float)
@@ -4208,6 +4244,10 @@ if QChartView is not None:
             return any(rect.contains(position) for rect in self._area_replay_label_rects)
 
         def mousePressEvent(self, event) -> None:  # noqa: ANN001
+            if event.button() == Qt.MouseButton.RightButton:
+                self.drawToolCancelled.emit()
+                super().mousePressEvent(event)
+                return
             if event.button() == Qt.MouseButton.LeftButton and self._area_replay_label_at(event.position()):
                 # Painted report labels are read-only: do not select/drag live drawings beneath them.
                 self._area_replay_label_pressed = True
@@ -7281,6 +7321,7 @@ class KlineAnalysisWindow(QMainWindow):
 
         self._build_header(main_layout)
         self._build_body(main_layout)
+        self._restore_line_trade_armed_for_binding()
         self._toggle_left_panel(self._left_panel_hidden)
         self._refresh_history_trade_availability()
         self._sync_primary_period_buttons()
@@ -7487,6 +7528,12 @@ class KlineAnalysisWindow(QMainWindow):
     def set_area_shape_monitor(self, monitor: object | None) -> None:
         self._area_shape_monitor = monitor
         if monitor is not None:
+            plans_getter = getattr(monitor, "plans", None)
+            if callable(plans_getter):
+                for plan in plans_getter():
+                    for event in getattr(plan, "events", ()):
+                        if isinstance(event, dict) and str(event.get("kind", "")) == "paper_entry":
+                            _claim_trade_email(self._area_paper_trade_email_key(plan.plan_id, event))
             monitor.plan_updated.connect(self._on_area_plan_updated)
             monitor.status_changed.connect(self._on_area_monitor_status)
             self._refresh_area_shape_status()
@@ -7499,6 +7546,11 @@ class KlineAnalysisWindow(QMainWindow):
     def set_area_shape_execution_monitor(self, monitor: object | None) -> None:
         self._area_shape_execution_monitor = monitor
         if monitor is not None:
+            sessions_getter = getattr(monitor, "sessions", None)
+            if callable(sessions_getter):
+                for session in sessions_getter():
+                    if isinstance(session, dict) and isinstance(session.get("position"), dict):
+                        _claim_trade_email(self._area_exchange_trade_email_key(session))
             monitor.session_updated.connect(self._on_area_demo_session_updated)
             monitor.status_changed.connect(self._on_area_demo_monitor_status)
             self._area_shape_demo_refresh_timer = QTimer(self)
@@ -8322,7 +8374,7 @@ class KlineAnalysisWindow(QMainWindow):
         drawing_layout = QVBoxLayout(drawing_page)
         drawing_layout.setContentsMargins(4, 6, 4, 4)
         drawing_layout.setSpacing(6)
-        control_tabs.addTab(drawing_page, "画线告警")
+        control_tabs.addTab(drawing_page, "线条触发")
 
         rr_page = QWidget()
         rr_layout = QVBoxLayout(rr_page)
@@ -8537,23 +8589,20 @@ class KlineAnalysisWindow(QMainWindow):
         self._structure_hint.setWordWrap(True)
         analysis_layout.addWidget(self._structure_hint)
 
-        drawing_layout.addWidget(QLabel("画线预警"))
+        drawing_layout.addWidget(QLabel("绘图与规则"))
         line_toolbar = QHBoxLayout()
-        cursor_btn = QPushButton("光标")
-        cursor_btn.clicked.connect(lambda: self._set_draw_tool("none"))
-        line_toolbar.addWidget(cursor_btn)
-        hline_btn = QPushButton("水平线")
-        hline_btn.clicked.connect(lambda: self._set_draw_tool("horizontal"))
-        line_toolbar.addWidget(hline_btn)
-        trend_btn = QPushButton("趋势线")
-        trend_btn.clicked.connect(lambda: self._set_draw_tool("trend"))
-        line_toolbar.addWidget(trend_btn)
-        rr_long_btn = QPushButton("RR多")
-        rr_long_btn.clicked.connect(lambda: self._set_draw_tool("rr_long"))
-        line_toolbar.addWidget(rr_long_btn)
-        rr_short_btn = QPushButton("RR空")
-        rr_short_btn.clicked.connect(lambda: self._set_draw_tool("rr_short"))
-        line_toolbar.addWidget(rr_short_btn)
+        self._line_hline_btn = QPushButton("水平线")
+        self._line_hline_btn.setCheckable(True)
+        self._line_hline_btn.clicked.connect(lambda: self._set_draw_tool("horizontal" if self._draw_tool != "horizontal" else "none"))
+        line_toolbar.addWidget(self._line_hline_btn)
+        self._line_trend_btn = QPushButton("趋势线")
+        self._line_trend_btn.setCheckable(True)
+        self._line_trend_btn.clicked.connect(lambda: self._set_draw_tool("trend" if self._draw_tool != "trend" else "none"))
+        line_toolbar.addWidget(self._line_trend_btn)
+        self._line_draw_tool_hint = QLabel("再次点击当前工具或在图表按右键，返回普通光标。")
+        self._line_draw_tool_hint.setObjectName("Subtle")
+        self._line_draw_tool_hint.setWordWrap(True)
+        line_toolbar.addWidget(self._line_draw_tool_hint, 1)
         drawing_layout.addLayout(line_toolbar)
 
         self._line_label_edit = QLineEdit()
@@ -8581,16 +8630,17 @@ class KlineAnalysisWindow(QMainWindow):
         self._line_trigger_combo.addItem("触碰", "touch")
         line_rule_row.addWidget(self._line_trigger_combo, 1)
         self._line_action_combo = QComboBox()
-        self._line_action_combo.addItem("提醒", "notify")
-        self._line_action_combo.addItem("做多", "long")
-        self._line_action_combo.addItem("做空", "short")
+        self._line_action_combo.addItem("仅提醒", "notify")
+        self._line_action_combo.addItem("自动做多", "long")
+        self._line_action_combo.addItem("自动做空", "short")
         self._line_action_combo.currentIndexChanged.connect(lambda _index: self._refresh_line_email_controls())
+        self._line_action_combo.currentIndexChanged.connect(lambda _index: self._refresh_line_trade_controls())
         line_rule_row.addWidget(self._line_action_combo, 1)
         drawing_layout.addLayout(line_rule_row)
 
         line_email_row = QHBoxLayout()
         self._line_email_enabled_check = QCheckBox("邮件提醒")
-        self._line_email_enabled_check.setToolTip("触发“提醒”时按系统邮箱配置发送邮件。")
+        self._line_email_enabled_check.setToolTip("触发后按系统信号邮件配置发送；自动做多/做空的提醒表示触发信号，不代表委托已成交。")
         self._line_email_enabled_check.toggled.connect(lambda _checked: self._refresh_line_email_controls())
         line_email_row.addWidget(self._line_email_enabled_check)
         self._line_email_delivery_mode_combo = QComboBox()
@@ -8600,28 +8650,49 @@ class KlineAnalysisWindow(QMainWindow):
         line_email_row.addWidget(self._line_email_delivery_mode_combo, 1)
         drawing_layout.addLayout(line_email_row)
 
-        self._line_enabled_check = QCheckBox("启用当前线条")
+        self._line_enabled_check = QCheckBox("启用规则")
+        self._line_enabled_check.setToolTip("启用后，这条线参与检测，并按“触发后执行”设置提醒或自动交易。")
         drawing_layout.addWidget(self._line_enabled_check)
 
         line_trade_row = QHBoxLayout()
-        self._line_trade_enabled_check = QCheckBox("启用线条交易")
-        self._line_trade_enabled_check.setToolTip("仅允许该线条在触发时创建交易计划；默认关闭。")
-        line_trade_row.addWidget(self._line_trade_enabled_check)
         self._line_trade_execution_mode_combo = QComboBox()
         self._line_trade_execution_mode_combo.addItem("限价", "limit")
         self._line_trade_execution_mode_combo.addItem("市价", "market")
         self._line_trade_execution_mode_combo.addItem("盘口追单", "chase_best_quote")
         self._line_trade_execution_mode_combo.setToolTip("线条触发后的开仓方式。")
         line_trade_row.addWidget(self._line_trade_execution_mode_combo, 1)
-        line_trade_config_btn = QPushButton("交易参数")
-        line_trade_config_btn.clicked.connect(self._open_line_trade_card_for_selected)
-        line_trade_row.addWidget(line_trade_config_btn)
+        self._line_trade_config_btn = QPushButton("交易参数")
+        self._line_trade_config_btn.clicked.connect(self._open_line_trade_card_for_selected)
+        line_trade_row.addWidget(self._line_trade_config_btn)
         drawing_layout.addLayout(line_trade_row)
-        self._line_trade_armed_check = QCheckBox("全局线条交易")
-        self._line_trade_armed_check.setToolTip("总开关默认关闭。开启后，满足条件的线条触发才会自动提交订单。")
+        self._line_stop_mode_combo = QComboBox()
+        self._line_stop_mode_combo.addItem("固定止损价", "fixed")
+        self._line_stop_mode_combo.addItem("ATR 止损（上一根已完成 K 线）", "atr")
+        self._line_stop_mode_combo.currentIndexChanged.connect(self._refresh_line_stop_controls)
+        self._line_atr_period_combo = QComboBox()
+        for period in (10, 14, 20):
+            self._line_atr_period_combo.addItem(f"ATR {period}", period)
+        self._line_atr_multiple_edit = QLineEdit("1.5")
+        self._line_atr_multiple_edit.setPlaceholderText("倍数，例如 1.5")
+        self._line_stop_row = QHBoxLayout()
+        self._line_stop_row.addWidget(QLabel("止损方式"))
+        self._line_stop_row.addWidget(self._line_stop_mode_combo, 1)
+        self._line_stop_row.addWidget(self._line_atr_period_combo)
+        self._line_stop_row.addWidget(self._line_atr_multiple_edit)
+        drawing_layout.addLayout(self._line_stop_row)
+        self._line_stop_preview = QLabel("默认固定止损：做空在线价上方 1%，做多在线价下方 1%。")
+        self._line_stop_preview.setObjectName("Subtle")
+        self._line_stop_preview.setWordWrap(True)
+        drawing_layout.addWidget(self._line_stop_preview)
+        self._refresh_line_stop_controls()
+
+        self._line_trade_armed_check = QCheckBox("线条自动交易")
+        self._line_trade_armed_check.setToolTip("总开关：开启后，启用规则且选择自动做多/做空的线条可提交新开仓。重启后按保存状态恢复。")
+        self._line_trade_armed_check.setChecked(self._line_trade_armed_saved())
         self._line_trade_armed_check.toggled.connect(self._on_line_trade_armed_toggled)
         drawing_layout.addWidget(self._line_trade_armed_check)
-        self._line_trade_hint = QLabel("线条交易默认关闭：需同时启用当前线条、启用线条交易和全局线条交易。")
+        drawing_layout.insertWidget(1, self._line_trade_armed_check)
+        self._line_trade_hint = QLabel("触发提醒可单独运行；自动开仓需启用规则、选择自动方向并开启总控。")
         self._line_trade_hint.setObjectName("Subtle")
         self._line_trade_hint.setWordWrap(True)
         drawing_layout.addWidget(self._line_trade_hint)
@@ -8636,7 +8707,7 @@ class KlineAnalysisWindow(QMainWindow):
         drawing_layout.addLayout(line_manage_row)
 
         self._line_table = QTableWidget(0, 6)
-        self._line_table.setHorizontalHeaderLabels(["标签", "类型", "价格", "触发", "操作", "状态"])
+        self._line_table.setHorizontalHeaderLabels(["规则", "类型", "价格", "触发条件", "触发后执行", "运行状态"])
         self._line_table.verticalHeader().setVisible(False)
         self._line_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self._line_table.itemSelectionChanged.connect(self._on_line_selected)
@@ -8646,19 +8717,19 @@ class KlineAnalysisWindow(QMainWindow):
 
         rr_layout.addWidget(QLabel("RR 工作区"))
         rr_draw_row = QHBoxLayout()
-        for text, tool in (("RR多", "rr_long"), ("RR空", "rr_short"), ("光标", "none")):
+        self._rr_draw_buttons: dict[str, QPushButton] = {}
+        for text, tool in (("RR多", "rr_long"), ("RR空", "rr_short")):
             button = QPushButton(text)
-            button.clicked.connect(lambda _checked=False, tool=tool: self._set_draw_tool(tool))
+            button.setCheckable(True)
+            button.clicked.connect(lambda _checked=False, tool=tool: self._toggle_draw_tool(tool))
             rr_draw_row.addWidget(button)
+            self._rr_draw_buttons[tool] = button
         rr_layout.addLayout(rr_draw_row)
-        rr_workflow_hint = _WrappedStatusLabel("先选 RR多/空，在图上确定入场和止损；选中 RR 后点“交易参数”，保存后再启用交易。")
+        rr_workflow_hint = _WrappedStatusLabel("绘制多单/空单并依次点入场、止损；方案会自动保存。选中后设置参数，再预览并提交订单。")
         rr_workflow_hint.setObjectName("Subtle")
         rr_layout.addWidget(rr_workflow_hint)
         rr_manage_row = QVBoxLayout()
         rr_manage_top = QHBoxLayout()
-        save_rr_btn = QPushButton("保存 RR")
-        save_rr_btn.clicked.connect(self._save_rr_item)
-        rr_manage_top.addWidget(save_rr_btn)
         edit_rr_btn = QPushButton("交易参数")
         edit_rr_btn.clicked.connect(self._open_rr_card_for_selected)
         rr_manage_top.addWidget(edit_rr_btn)
@@ -8677,18 +8748,10 @@ class KlineAnalysisWindow(QMainWindow):
         rr_manage_row.addLayout(rr_manage_bottom)
         rr_layout.addLayout(rr_manage_row)
 
-        rr_risk_row = QHBoxLayout()
-        rr_risk_row.addWidget(QLabel("风险金(U)"))
         self._rr_risk_edit = QLineEdit("100")
-        self._rr_risk_edit.setPlaceholderText("默认 100")
         self._rr_risk_edit.setToolTip(
             "每笔交易最多按此金额承担止损风险。实际下单风险会受合约最小张数取整影响。"
         )
-        rr_risk_row.addWidget(self._rr_risk_edit, 1)
-        rr_layout.addLayout(rr_risk_row)
-        rr_risk_note = _WrappedStatusLabel("默认 100 U；保存 RR 后生效。")
-        rr_risk_note.setObjectName("Subtle")
-        rr_layout.addWidget(rr_risk_note)
 
         self._rr_table = QTableWidget(0, 9)
         self._rr_table.setHorizontalHeaderLabels(["方向", "入场", "止损", "止盈", "管理", "R", "K线", "锁定", "风险金"])
@@ -8764,7 +8827,9 @@ class KlineAnalysisWindow(QMainWindow):
         self._rr_tracking_summary.setObjectName("Subtle")
         rr_layout.addWidget(self._rr_tracking_summary)
         rr_execution_row = QHBoxLayout()
-        self._rr_enable_trade_btn = QPushButton("启用交易")
+        self._rr_enable_trade_btn = QPushButton("提交订单")
+        self._rr_enable_trade_btn.setToolTip("立即按当前 RR 参数向交易所提交入场委托，并由 RR 交易服务管理止盈止损。")
+        self._rr_enable_trade_btn.setEnabled(False)
         self._rr_enable_trade_btn.setObjectName("Primary")
         self._rr_enable_trade_btn.clicked.connect(self._enable_selected_rr_trade)
         rr_execution_row.addWidget(self._rr_enable_trade_btn)
@@ -8780,7 +8845,7 @@ class KlineAnalysisWindow(QMainWindow):
         self._rr_action_status.setObjectName("Subtle")
         self._rr_action_status.hide()
         rr_layout.addWidget(self._rr_action_status)
-        self._rr_condition_status = _WrappedStatusLabel("条件单：未启用交易")
+        self._rr_condition_status = _WrappedStatusLabel("交易状态：未提交订单")
         self._rr_condition_status.setObjectName("Subtle")
         rr_layout.addWidget(self._rr_condition_status)
 
@@ -10546,6 +10611,7 @@ class KlineAnalysisWindow(QMainWindow):
         if not selected:
             self._runtime = None
             self._last_profile_name = ""
+            self._restore_line_trade_armed_for_binding()
             self._sync_account_context()
             return
         self._profile_snapshots, _selected_profile = load_profile_snapshots()
@@ -10555,10 +10621,12 @@ class KlineAnalysisWindow(QMainWindow):
             return
         runtime = load_runtime(selected)
         if runtime is None:
+            self._restore_line_trade_armed_for_binding()
             self._sync_account_context()
             return
         self._runtime = runtime
         self._last_profile_name = selected
+        self._restore_line_trade_armed_for_binding()
         self._sync_account_context()
         self._load_data()
 
@@ -12331,6 +12399,7 @@ class KlineAnalysisWindow(QMainWindow):
             view: QChartView = InteractiveKlineChartView(chart)
             if allow_draw_clicks:
                 view.chartPointClicked.connect(self._on_native_chart_clicked)  # type: ignore[attr-defined]
+                view.drawToolCancelled.connect(self._cancel_draw_tool_from_chart)  # type: ignore[attr-defined]
                 view.chartDoubleClicked.connect(self._on_native_chart_double_clicked)  # type: ignore[attr-defined]
                 view.chartPointerPressed.connect(self._on_chart_pointer_pressed)  # type: ignore[attr-defined]
                 view.chartPointerMoved.connect(self._on_chart_pointer_moved)  # type: ignore[attr-defined]
@@ -14594,8 +14663,62 @@ class KlineAnalysisWindow(QMainWindow):
             plan = AreaShapePlan.from_dict(payload)
         except (TypeError, ValueError, KeyError):
             return
+        if plan.config.email_enabled:
+            for event in plan.events:
+                if not isinstance(event, dict) or str(event.get("kind", "")) != "paper_entry":
+                    continue
+                if not _claim_trade_email(self._area_paper_trade_email_key(plan.plan_id, event)):
+                    continue
+                side = "多头" if plan.config.direction == "long" else "空头"
+                _send_kline_trade_email(
+                    f"[QQOKX] 智能辅助交易已触发 | {plan.symbol} | {side}",
+                    "\n".join((
+                        "纸面计划已确认模拟入场；请查看智能辅助交易页的当前计划和事件。",
+                        f"交易对：{plan.symbol} | 周期：{plan.period} | 方向：{side}",
+                        f"账户：{plan.profile_name} | 环境：{plan.environment} | 模式：纸面演练",
+                        f"入场：{event.get('entry', '-')} | 止损：{event.get('stop', '-')}",
+                        f"形态：{event.get('pattern', '-')} | 时间：{event.get('candle_ts', '-')}",
+                        str(event.get("message", "") or ""),
+                    )),
+                )
         if plan.symbol == self._selected_symbol().strip().upper() and plan.profile_name == self._active_profile_name() and plan.environment == self._active_environment():
             self._refresh_area_shape_status(plan)
+
+    @staticmethod
+    def _area_paper_trade_email_key(plan_id: str, event: dict[str, object]) -> str:
+        event_id = event.get("signal_key") or event.get("candle_ts") or event.get("occurred_at") or ""
+        return f"area-paper:{plan_id}:{event_id}"
+
+    @staticmethod
+    def _area_exchange_trade_email_key(session: dict[str, object]) -> str:
+        position = session.get("position") if isinstance(session.get("position"), dict) else {}
+        intent = session.get("pending_intent") if isinstance(session.get("pending_intent"), dict) else {}
+        entry_id = intent.get("cl_ord_id") or position.get("entry_ts") or position.get("entry") or "unknown"
+        return f"area-exchange:{session.get('session_id', '')}:{entry_id}"
+
+    def _notify_area_exchange_entry_email(self, session: dict[str, object]) -> None:
+        snapshot = session.get("plan_snapshot") if isinstance(session.get("plan_snapshot"), dict) else {}
+        config = snapshot.get("config") if isinstance(snapshot.get("config"), dict) else {}
+        position = session.get("position") if isinstance(session.get("position"), dict) else {}
+        if not bool(config.get("email_enabled", False)) or not position:
+            return
+        if not _claim_trade_email(self._area_exchange_trade_email_key(session)):
+            return
+        direction = str(position.get("direction", config.get("direction", "")))
+        side = "多头" if direction == "long" else "空头"
+        environment = str(session.get("environment", ""))
+        order_id = str((session.get("pending_intent") or {}).get("cl_ord_id", "") or "-")
+        _send_kline_trade_email(
+            f"[QQOKX] 智能辅助入场已成交 | {session.get('symbol', '')} | {side}",
+            "\n".join((
+                "智能辅助交易已确认实际入场成交；请检查持仓与保护单状态。",
+                f"账户：{session.get('profile_name', '-')} | 环境：{'实盘' if environment == 'live' else '模拟盘'}",
+                f"交易对：{session.get('symbol', '-')} | 方向：{side}",
+                f"成交均价：{position.get('entry', '-')} | 成交数量：{position.get('size', '-')}",
+                f"止损：{position.get('stop', '-')} | 止盈：{position.get('take_profit', '-')}",
+                f"当前执行状态：{session.get('status', '-')} | 入场委托：{order_id}",
+            )),
+        )
 
     @Slot(str)
     def _on_area_monitor_status(self, status: str) -> None:
@@ -14888,6 +15011,7 @@ class KlineAnalysisWindow(QMainWindow):
     @Slot(object)
     def _on_area_demo_session_updated(self, payload: object) -> None:
         if isinstance(payload, dict):
+            self._notify_area_exchange_entry_email(payload)
             symbol = str(payload.get("symbol", "")).strip().upper()
             profile = str(payload.get("profile_name", "")).strip()
             environment = str(payload.get("environment", "")).strip().lower()
@@ -15189,6 +15313,7 @@ class KlineAnalysisWindow(QMainWindow):
         target_index = self._selected_line_index if selected_index is None else selected_index
         if target_index < 0 or target_index >= len(records):
             target_index = -1
+        ledger_entries = self._all_rr_trade_ledger_entries()
         self._line_table.blockSignals(True)
         self._line_table.setRowCount(len(records))
         for row, item in enumerate(records):
@@ -15196,8 +15321,25 @@ class KlineAnalysisWindow(QMainWindow):
             kind = _line_kind_text(str(item.get("kind", "") or ""))
             price = _line_price_table_text(item, self._current_rr_price_increment(item))
             trigger = _line_trigger_text(str(item.get("trigger", "") or ""))
-            action = _line_action_text(str(item.get("action", "") or ""))
-            state = _line_state_text(bool(item.get("enabled", True)))
+            stored_action = str(item.get("action", "notify") or "notify").lower()
+            can_auto_trade = stored_action in {"long", "short"} and bool(item.get("trade_enabled", False))
+            action = (f"自动{_line_action_text(stored_action)}" if can_auto_trade else "仅提醒")
+            execution_state = self._line_execution_status(str(item.get("id", "") or ""), item, ledger_entries)
+            if execution_state:
+                state = execution_state
+            elif not bool(item.get("enabled", True)):
+                state = "规则已停用"
+            elif not can_auto_trade:
+                state = "等待提醒"
+            elif not self._line_trade_armed_check.isChecked():
+                state = "总控已暂停"
+            elif (
+                str(item.get("stop_loss_mode", "fixed") or "fixed") == "fixed"
+                and _parse_rr_optional_decimal(item.get("stop_loss_price")) is None
+            ):
+                state = "参数未完成"
+            else:
+                state = "等待触发"
             for column, value in enumerate((label, kind, price, trigger, action, state)):
                 self._line_table.setItem(row, column, QTableWidgetItem(value))
         self._line_table.blockSignals(False)
@@ -15207,16 +15349,51 @@ class KlineAnalysisWindow(QMainWindow):
             return
         self._selected_line_index = -1
         self._line_table.clearSelection()
+        self._line_label_edit.clear()
         self._line_price_a_edit.clear()
         self._line_price_b_edit.clear()
         self._refresh_line_price_controls(None)
+        self._line_action_combo.setCurrentIndex(max(0, self._line_action_combo.findData("notify")))
         self._line_enabled_check.setChecked(True)
         self._line_email_enabled_check.setChecked(False)
         self._line_email_delivery_mode_combo.setCurrentIndex(0)
         self._refresh_line_email_controls()
-        self._line_trade_enabled_check.setChecked(False)
         self._line_trade_execution_mode_combo.setCurrentIndex(0)
+        self._line_stop_mode_combo.setCurrentIndex(0)
+        self._line_atr_period_combo.setCurrentIndex(0)
+        self._line_atr_multiple_edit.setText("1.5")
+        self._refresh_line_stop_controls()
+        self._refresh_line_trade_controls()
         self._refresh_line_trade_hint(None)
+
+    def _line_execution_status(self, line_id: str, line: dict[str, object], ledger_entries: list[RRTradeLedgerEntry]) -> str:
+        if not line_id:
+            return ""
+        profile = str(line.get("trade_profile_name", "") or "").strip()
+        environment = str(line.get("trade_environment", "") or "").strip().lower()
+        matching = [
+            entry for entry in ledger_entries
+            if f":{line_id}:" in str(entry.plan.plan_id or "")
+            and (not profile or entry.plan.profile_name.strip() == profile)
+            and (not environment or entry.plan.environment.strip().lower() == environment)
+        ]
+        if not matching:
+            return ""
+        latest = max(matching, key=lambda entry: str(entry.updated_at or entry.created_at or ""))
+        status = str(latest.status or "").strip().lower()
+        labels = {
+            "entry_working": "追单中",
+            "entry_partially_filled": "部分成交",
+            "protected": "已成交·保护中",
+            "protected_break_even": "保本保护中",
+            "protected_trailing": "移动保护中",
+            "protected_cancelled_remainder": "部分成交·余单已撤",
+            "manual_review": "待核对",
+            "failed": "执行失败",
+            "cancelled": "上次已撤销",
+            "closed": "上次已结束",
+        }
+        return labels.get(status, "待核对")
 
     def _populate_rr_table(self, selected_index: int | None = None) -> None:
         entry = self._workspace_entry()
@@ -15256,6 +15433,7 @@ class KlineAnalysisWindow(QMainWindow):
             self._apply_rr_record_to_form(target_index, record)
             return
         self._selected_rr_index = -1
+        self._rr_enable_trade_btn.setEnabled(False)
         self._rr_table.clearSelection()
         self._rr_side_combo.setCurrentIndex(0)
         self._rr_management_mode_combo.setCurrentIndex(0)
@@ -15264,7 +15442,7 @@ class KlineAnalysisWindow(QMainWindow):
         self._rr_r_edit.setValue(2.0)
         self._rr_risk_edit.setText("100")
         self._rr_bar_edit.setText("0")
-        self._rr_fee_offset_check.setChecked(False)
+        self._rr_fee_offset_check.setChecked(True)
         self._rr_locked_check.setChecked(False)
         self._rr_preview.setText("止盈会按入场、止损和 R 倍数自动计算。")
         self._refresh_rr_tracking_summary(None)
@@ -15318,6 +15496,7 @@ class KlineAnalysisWindow(QMainWindow):
         records = list(raw_rr) if isinstance(raw_rr, list) else []
         if row < 0 or row >= len(records):
             self._selected_rr_index = -1
+            self._rr_enable_trade_btn.setEnabled(False)
             if self._pending_payload is not None:
                 self._render_to_chart(self._pending_payload)
             return
@@ -15334,18 +15513,29 @@ class KlineAnalysisWindow(QMainWindow):
         self._line_price_b_edit.setText(_format_rr_table_price(item.get("price_b", ""), price_increment))
         self._refresh_line_price_controls(item)
         self._line_trigger_combo.setCurrentIndex(max(0, self._line_trigger_combo.findData(item.get("trigger"))))
-        self._line_action_combo.setCurrentIndex(max(0, self._line_action_combo.findData(item.get("action"))))
+        action = str(item.get("action", "notify") or "notify").strip().lower()
+        if action in {"long", "short"} and not bool(item.get("trade_enabled", False)):
+            action = "notify"
+        self._line_action_combo.setCurrentIndex(max(0, self._line_action_combo.findData(action)))
         self._line_enabled_check.setChecked(bool(item.get("enabled", True)))
         self._line_email_enabled_check.setChecked(bool(item.get("email_enabled", False)))
         self._line_email_delivery_mode_combo.setCurrentIndex(
             max(0, self._line_email_delivery_mode_combo.findData(str(item.get("email_delivery_mode", "once") or "once")))
         )
         self._refresh_line_email_controls()
-        self._line_trade_enabled_check.setChecked(_rr_fee_offset_enabled(item.get("trade_enabled", False)))
         self._line_trade_execution_mode_combo.setCurrentIndex(
             max(0, self._line_trade_execution_mode_combo.findData(str(item.get("entry_execution_mode", "limit") or "limit")))
         )
+        self._line_stop_mode_combo.setCurrentIndex(
+            max(0, self._line_stop_mode_combo.findData(str(item.get("stop_loss_mode", "fixed") or "fixed")))
+        )
+        self._line_atr_period_combo.setCurrentIndex(
+            max(0, self._line_atr_period_combo.findData(int(item.get("atr_period", 10) or 10)))
+        )
+        self._line_atr_multiple_edit.setText(str(item.get("atr_multiple", "1.5") or "1.5"))
+        self._refresh_line_stop_controls()
         self._refresh_line_trade_hint(item)
+        self._refresh_line_trade_controls()
 
     def _refresh_line_price_controls(self, item: dict[str, object] | None) -> None:
         kind = str(item.get("kind", "horizontal") or "horizontal").strip().lower() if isinstance(item, dict) else "horizontal"
@@ -15357,50 +15547,106 @@ class KlineAnalysisWindow(QMainWindow):
         self._line_price_b_edit.setVisible(is_trend)
 
     def _refresh_line_email_controls(self) -> None:
-        is_notify = str(self._line_action_combo.currentData() or "notify") == "notify"
-        self._line_email_enabled_check.setEnabled(is_notify)
-        self._line_email_delivery_mode_combo.setEnabled(is_notify and self._line_email_enabled_check.isChecked())
+        self._line_email_enabled_check.setEnabled(True)
+        self._line_email_delivery_mode_combo.setEnabled(self._line_email_enabled_check.isChecked())
 
     def _refresh_line_trade_hint(self, item: dict[str, object] | None) -> None:
         if not hasattr(self, "_line_trade_hint"):
             return
         if not isinstance(item, dict):
-            self._line_trade_hint.setText("线条交易默认关闭：需同时启用当前线条、启用线条交易和全局线条交易。")
+            self._line_trade_hint.setText("触发提醒可单独运行；自动开仓需启用规则、选择自动方向并开启总控。")
             return
         action = str(item.get("action", "notify") or "notify").strip().lower()
+        if action in {"long", "short"} and not bool(item.get("trade_enabled", False)):
+            action = "notify"
         if action not in {"long", "short"}:
             self._line_trade_hint.setText("当前线条为提醒模式，不会下单。请选择做多或做空后再配置交易参数。")
             return
-        enabled = _rr_fee_offset_enabled(item.get("trade_enabled", False))
+        line_monitoring = _rr_fee_offset_enabled(item.get("enabled", True))
         risk = _format_rr_table_price(item.get("risk_amount", "100")) or "100"
-        stop = _format_rr_table_price(item.get("stop_loss_price", "")) or "未设置"
+        stop = (
+            f"ATR({int(item.get('atr_period', 10) or 10)})×{item.get('atr_multiple', 1.5)}"
+            if str(item.get("stop_loss_mode", "fixed") or "fixed") == "atr"
+            else (_format_rr_table_price(item.get("stop_loss_price", "")) or "未设置")
+        )
         r_multiple = _format_rr_table_price(item.get("direct_take_profit_r", "2")) or "2"
         armed = "已开启" if self._line_trade_armed_check.isChecked() else "未开启"
         self._line_trade_hint.setText(
-            f"线条交易：{'已启用' if enabled else '未启用'} | 风险 {risk} | 止损 {stop} | R {r_multiple} | 全局开关：{armed}"
+            f"规则：{'启用' if line_monitoring else '停用'} | 触发后：自动{_line_action_text(action)} | "
+            f"风险 {risk} | 止损 {stop} | R {r_multiple} | 线条自动交易：{armed}"
         )
+
+    def _line_trade_settings_key(self) -> str:
+        profile = self._active_profile_name().strip()
+        environment = self._active_environment().strip().lower()
+        if not profile or not environment:
+            return ""
+        return f"line-trading/armed/{profile}/{environment}"
+
+    def _line_trade_armed_saved(self) -> bool:
+        key = self._line_trade_settings_key()
+        return bool(QSettings("qqokx", "roll-terminal-qt").value(key, False, type=bool)) if key else False
+
+    def _restore_line_trade_armed_for_binding(self) -> None:
+        if not hasattr(self, "_line_trade_armed_check"):
+            return
+        self._line_trade_armed_check.blockSignals(True)
+        self._line_trade_armed_check.setChecked(self._line_trade_armed_saved())
+        self._line_trade_armed_check.blockSignals(False)
+        if hasattr(self, "_line_table"):
+            self._populate_line_table()
+
+    def _refresh_line_stop_controls(self, *_args: object) -> None:
+        atr_mode = str(self._line_stop_mode_combo.currentData() or "fixed") == "atr"
+        trading = str(self._line_action_combo.currentData() or "notify") in {"long", "short"}
+        self._line_atr_period_combo.setVisible(atr_mode and trading)
+        self._line_atr_multiple_edit.setVisible(atr_mode and trading)
+        self._line_stop_mode_combo.setVisible(trading)
+        self._line_stop_preview.setVisible(trading)
+        if atr_mode:
+            self._line_stop_preview.setText(
+                "触发时取上一根已完成 K 线 ATR × 倍数；多头止损=入场参考价−(ATR×倍数)，空头止损=入场参考价＋(ATR×倍数)。"
+                "每笔使用固定止损价，并按风险额和止损距离重算张数。"
+            )
+        else:
+            self._line_stop_preview.setText("默认固定止损：做空在线价上方 1%，做多在线价下方 1%。")
+
+    def _refresh_line_trade_controls(self, *_args: object) -> None:
+        trading = str(self._line_action_combo.currentData() or "notify") in {"long", "short"}
+        self._line_trade_execution_mode_combo.setEnabled(trading)
+        self._line_trade_config_btn.setEnabled(trading and self._selected_line_index >= 0)
+        self._refresh_line_stop_controls()
 
     @Slot(bool)
     def _on_line_trade_armed_toggled(self, enabled: bool) -> None:
-        if not enabled:
-            self._refresh_line_trade_hint(self._selected_line_payload_or_none())
-            return
-        confirmed = QMessageBox.question(
-            self,
-            "启用全局线条交易",
-            "开启后，满足线条条件的做多/做空预警会自动向当前 API 提交订单。\n\n"
-            "仍需线条本身启用且勾选“启用线条交易”。是否确认开启？",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No,
-        )
-        if confirmed != QMessageBox.StandardButton.Yes:
-            self._line_trade_armed_check.blockSignals(True)
-            self._line_trade_armed_check.setChecked(False)
-            self._line_trade_armed_check.blockSignals(False)
-            self._set_status("已取消开启全局线条交易。")
-        else:
-            self._set_status("全局线条交易已开启，请确认当前 API 与环境。")
+        if enabled:
+            confirmed = QMessageBox.question(
+                self,
+                "启用线条自动交易",
+                "所有已启用且选择了自动做多/自动做空的线条触发后，都可能向当前 API 提交订单。是否确认开启？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if confirmed != QMessageBox.StandardButton.Yes:
+                self._line_trade_armed_check.blockSignals(True)
+                self._line_trade_armed_check.setChecked(False)
+                self._line_trade_armed_check.blockSignals(False)
+                self._set_status("已取消开启线条自动交易。")
+            else:
+                self._set_status("线条自动交易已开启，将按账户和环境保存运行状态。")
+        key = self._line_trade_settings_key()
+        if key:
+            QSettings("qqokx", "roll-terminal-qt").setValue(key, self._line_trade_armed_check.isChecked())
+        self._populate_line_table()
         self._refresh_line_trade_hint(self._selected_line_payload_or_none())
+
+    def _toggle_draw_tool(self, tool: str) -> None:
+        self._set_draw_tool("none" if self._draw_tool == tool else tool)
+
+    @Slot()
+    def _cancel_draw_tool_from_chart(self) -> None:
+        if self._draw_tool != "none":
+            self._set_draw_tool("none")
 
     def _selected_line_payload_or_none(self) -> dict[str, object] | None:
         entry = self._workspace_entry()
@@ -15434,7 +15680,7 @@ class KlineAnalysisWindow(QMainWindow):
             "price_stop": decimal_to_text(stop_price),
             "r_multiple": line.get("direct_take_profit_r", "2"),
             "risk_amount": line.get("risk_amount", "100"),
-            "fee_offset_enabled": line.get("fee_offset_enabled", False),
+            "fee_offset_enabled": line.get("fee_offset_enabled", True),
             "locked": True,
         }
         dialog = RRCardDialog(
@@ -15444,11 +15690,15 @@ class KlineAnalysisWindow(QMainWindow):
             symbol=self._selected_symbol(),
             period=self._period_combo.currentText().strip(),
             price_increment=self._current_rr_price_increment(),
+            show_email_option=False,
         )
         dialog.setWindowTitle(f"线条交易参数 | {str(line.get('label', '') or '线条')}")
         dialog._side_combo.setEnabled(False)
         dialog._entry_edit.setReadOnly(True)
         dialog._locked_check.setVisible(False)
+        if str(line.get("stop_loss_mode", "fixed") or "fixed") == "atr":
+            dialog._stop_edit.setEnabled(False)
+            dialog._stop_edit.setToolTip("此线使用 ATR 止损；触发时按上一根已完成 K 线计算止损价。")
         if dialog.exec() != int(QDialog.DialogCode.Accepted):
             return
         result = dialog.result_payload()
@@ -15462,11 +15712,11 @@ class KlineAnalysisWindow(QMainWindow):
         updated.update(
             {
                 "risk_amount": result.get("risk_amount", "100"),
-                "stop_loss_price": result.get("price_stop", ""),
+                "stop_loss_price": result.get("price_stop", "") if str(updated.get("stop_loss_mode", "fixed")) == "fixed" else updated.get("stop_loss_price", ""),
                 "direct_take_profit_r": result.get("direct_take_profit_r", "2"),
                 "management_mode": result.get("management_mode", "fixed_tp"),
                 "entry_execution_mode": str(self._line_trade_execution_mode_combo.currentData() or "limit"),
-                "fee_offset_enabled": result.get("fee_offset_enabled", False),
+                "fee_offset_enabled": result.get("fee_offset_enabled", True),
             }
         )
         lines[self._selected_line_index] = updated
@@ -15476,6 +15726,7 @@ class KlineAnalysisWindow(QMainWindow):
 
     def _apply_rr_record_to_form(self, row: int, item: dict[str, object]) -> None:
         self._selected_rr_index = row
+        self._rr_enable_trade_btn.setEnabled(True)
         side = str(item.get("side", "long") or "long").strip().lower()
         price_increment = self._current_rr_price_increment(item)
         self._rr_side_combo.setCurrentIndex(1 if side == "short" else 0)
@@ -15490,7 +15741,7 @@ class KlineAnalysisWindow(QMainWindow):
         self._rr_execution_mode_combo.setCurrentIndex(
             max(0, self._rr_execution_mode_combo.findData(str(item.get("entry_execution_mode", "limit") or "limit")))
         )
-        self._rr_fee_offset_check.setChecked(_rr_fee_offset_enabled(item.get("fee_offset_enabled", False)))
+        self._rr_fee_offset_check.setChecked(_rr_fee_offset_enabled(item.get("fee_offset_enabled", True)))
         self._rr_locked_check.setChecked(bool(item.get("locked", False)))
         price_tp_text = _format_rr_table_price(item.get("price_tp", ""), price_increment) or "-"
         self._rr_preview.setText(f"自动止盈：{price_tp_text}")
@@ -15528,7 +15779,7 @@ class KlineAnalysisWindow(QMainWindow):
         take_profit = self._parse_rr_decimal(str(payload.get("price_tp", "") or ""), "止盈价")
         r_multiple = self._parse_rr_decimal(str(payload.get("r_multiple", "") or ""), "R 倍数")
         round_trip_fee_rate = Decimal("0")
-        if _rr_fee_offset_enabled(payload.get("fee_offset_enabled", False)):
+        if _rr_fee_offset_enabled(payload.get("fee_offset_enabled", True)):
             round_trip_fee_rate = _dynamic_two_taker_fee_offset_live(entry_price, enabled=True) / entry_price
         plan = build_rr_trade_plan(
             plan_id=f"{profile_name}:{str(getattr(instrument, 'inst_id', '') or '')}:{trade_ref or rr_id}",
@@ -15586,14 +15837,29 @@ class KlineAnalysisWindow(QMainWindow):
         if candle_time <= 0:
             raise RuntimeError("线条触发事件缺少 K 线时间。")
         entry_price = Decimal(str(line_value_at(line, candle_time)))
-        stop_price = self._parse_rr_decimal(str(line.get("stop_loss_price", "") or ""), "线条止损价")
+        stop_mode = str(line.get("stop_loss_mode", "fixed") or "fixed")
+        if stop_mode == "atr":
+            period = max(1, int(line.get("atr_period", 10) or 10))
+            multiple = Decimal(str(line.get("atr_multiple", "1.5") or "1.5"))
+            payload_candles = list(self._pending_payload.candles) if self._pending_payload is not None else []
+            prior_candles = [item for item in payload_candles if int(item.get("time", 0) or 0) < candle_time]
+            atr_values = _atr_chart_values(prior_candles, period)
+            atr_value = atr_values[-1] if atr_values else None
+            if atr_value is None or atr_value <= 0:
+                raise RuntimeError(f"上一根已完成 K 线的 ATR({period}) 不可用，未提交交易。")
+            distance = Decimal(str(atr_value)) * multiple
+            stop_raw = entry_price - distance if action == "long" else entry_price + distance
+            tick_size = instrument.tick_size if instrument.tick_size > 0 else Decimal("0.1")
+            stop_price = snap_to_increment(stop_raw, tick_size, "down" if action == "long" else "up")
+        else:
+            stop_price = self._parse_rr_decimal(str(line.get("stop_loss_price", "") or ""), "线条止损价")
         risk_amount = self._parse_rr_decimal(str(line.get("risk_amount", "") or ""), "风险金额")
         direct_take_profit_r = self._parse_rr_decimal(str(line.get("direct_take_profit_r", "") or ""), "止盈 R 倍数")
         entry_execution_mode = str(line.get("entry_execution_mode", "limit") or "limit").strip().lower()
         if entry_execution_mode not in {"limit", "market", "chase_best_quote"}:
             entry_execution_mode = "limit"
         round_trip_fee_rate = Decimal("0")
-        if _rr_fee_offset_enabled(line.get("fee_offset_enabled", False)):
+        if _rr_fee_offset_enabled(line.get("fee_offset_enabled", True)):
             round_trip_fee_rate = _dynamic_two_taker_fee_offset_live(entry_price, enabled=True) / entry_price
         return build_rr_trade_plan(
             plan_id=f"{profile_name}:{str(getattr(instrument, 'inst_id', '') or '')}:{line_id}:{candle_time}",
@@ -15905,32 +16171,37 @@ class KlineAnalysisWindow(QMainWindow):
     def _enable_selected_rr_trade(self) -> None:
         try:
             plan = self._build_selected_rr_trade_plan()
+            email_enabled = bool(self._selected_rr_payload().get("email_enabled", False))
             if plan.plan_id in self._pending_rr_activation_plan_ids:
-                raise RuntimeError("该 RR 的启用请求正在处理，请勿重复提交。")
+                raise RuntimeError("该 RR 的订单提交请求正在处理，请勿重复提交。")
             existing = self._find_rr_trade_ledger_entry(plan.plan_id)
             if existing is not None and existing.status not in {"cancelled", "manual_review"}:
                 raise RuntimeError(f"该 RR 已有交易记录，当前状态：{existing.status}。")
             confirmed = QMessageBox.question(
                 self,
-                "启用 RR 交易",
+                "提交 RR 订单",
                 (
-                    f"合约：{plan.inst_id}\n方向：{'多头' if plan.direction == 'long' else '空头'}\n"
-                    f"入场方式：{plan.entry_execution_mode}\n数量：{_rr_plan_position_text(plan)}\n"
-                    f"止损：{format_decimal(plan.stop_loss_price)}\n止盈：{format_decimal(plan.take_profit_price)}\n\n"
-                    "确认后才会向当前 API 提交订单。"
+                    f"账户：{plan.profile_name}（{'实盘' if plan.environment == 'live' else '模拟盘'}）\n"
+                    f"合约：{plan.inst_id}｜方向：{'多头' if plan.direction == 'long' else '空头'}\n"
+                    f"入场：{format_decimal(plan.entry_price)}｜方式：{plan.entry_execution_mode}\n"
+                    f"数量：{_rr_plan_position_text(plan)}\n"
+                    f"风险金：目标 {format_decimal(plan.risk_amount)} U，预计实际 {format_decimal(plan.sizing.actual_risk_amount)} U\n"
+                    f"止损：{format_decimal(plan.stop_loss_price)}｜止盈：{format_decimal(plan.take_profit_price)}\n"
+                    f"2倍手续费偏移：{'开启' if plan.round_trip_fee_rate > 0 else '关闭'}\n\n"
+                    "确认后会立即向交易所提交入场委托。"
                 ),
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 QMessageBox.StandardButton.No,
             )
             if confirmed != QMessageBox.StandardButton.Yes:
-                self._set_status("已取消启用 RR 交易。")
+                self._set_status("已取消提交 RR 订单。")
                 return
             plan_profile = str(getattr(plan, "profile_name", "") or "").strip()
             runtime = self._runtime_for_task_profile(plan_profile) if plan_profile else self._runtime
             if runtime is None:
                 raise RuntimeError(f"API {plan.profile_name} 不可用。")
         except Exception as exc:  # noqa: BLE001
-            self._set_status(f"无法启用 RR 交易：{exc}")
+            self._set_status(f"无法提交 RR 订单：{exc}")
             return
 
         requested_at = time.perf_counter()
@@ -15938,13 +16209,15 @@ class KlineAnalysisWindow(QMainWindow):
         self._set_rr_activation_status("正在提交 RR 交易…", pending=True)
         self._start_rr_execution_action(
             action=lambda: self._activate_rr_trade(plan, runtime, requested_at),
-            on_success=lambda entry: self._handle_rr_activation_success(entry, runtime, requested_at),
+            on_success=lambda entry: self._handle_rr_activation_success(
+                entry, runtime, requested_at, email_enabled=email_enabled,
+            ),
             on_failure=lambda message: self._handle_rr_activation_failure(plan.plan_id, message),
             queue_if_busy=True,
             queued_status_text="当前正在同步已报 RR，新的启用请求已排队，稍后自动提交。",
         )
         if self._rr_execution_in_flight and self._pending_rr_execution_requests:
-            self._set_rr_activation_status("RR 启用请求已排队，当前任务结束后优先提交。", pending=True)
+            self._set_rr_activation_status("RR 订单提交请求已排队，当前任务结束后优先提交。", pending=True)
 
     def _rr_client(self, runtime) -> OkxRestClient:
         credentials = runtime.credentials
@@ -15971,7 +16244,9 @@ class KlineAnalysisWindow(QMainWindow):
                 config=_build_strategy_config(plan.inst_id, runtime), plan=plan,
             )
 
-    def _handle_rr_activation_success(self, entry: RRTradeLedgerEntry, runtime, requested_at: float) -> None:
+    def _handle_rr_activation_success(
+        self, entry: RRTradeLedgerEntry, runtime, requested_at: float, *, email_enabled: bool = False,
+    ) -> None:
         self._pending_rr_activation_plan_ids.discard(entry.plan.plan_id)
         order = entry.entry_order
         if order is not None and order.order_id:
@@ -15992,6 +16267,20 @@ class KlineAnalysisWindow(QMainWindow):
             with measure_ui_step("rr.publish_ack", profile=plan.profile_name, environment=plan.environment, order=order.order_id):
                 store.publish_order_updates(profile_name=plan.profile_name, environment=plan.environment, orders=[view])
             store.confirm_submitted_order(runtime=runtime, profile_name=plan.profile_name, order=view)
+        if email_enabled and order is not None:
+            plan = entry.plan
+            side_text = "多头" if plan.direction == "long" else "空头"
+            _send_kline_trade_email(
+                f"[QQOKX] RR委托已提交 | {plan.inst_id} | {side_text}",
+                "\n".join((
+                    "RR交易已收到委托提交回执；请检查委托/成交和保护单状态。",
+                    f"账户：{plan.profile_name} | 环境：{plan.environment}",
+                    f"合约：{plan.inst_id} | 方向：{side_text}",
+                    f"入场参考：{format_decimal(plan.entry_price)} | 止损：{format_decimal(plan.stop_loss_price)} | 止盈：{format_decimal(plan.take_profit_price)}",
+                    f"数量：{_rr_plan_position_text(plan)} | 订单号：{order.order_id or order.client_id or '-'}",
+                    f"当前状态：{entry.status}（回执不代表成交）",
+                )),
+            )
         self._set_rr_activation_status("RR 下单已收到回执，委托已发布；确认状态见下方委托列表。")
         append_log_line(f"[rr_latency] ack_published plan={entry.plan.plan_id} total_ms={(time.perf_counter() - requested_at) * 1000:.1f}")
 
@@ -16231,7 +16520,7 @@ class KlineAnalysisWindow(QMainWindow):
         r_text = str(item.get("r_multiple", "") or "-")
         risk_text = _format_rr_table_price(item.get("risk_amount", "100")) or "100"
         locked_text = "已锁定" if bool(item.get("locked", False)) else "未锁定"
-        fee_text = "开启" if _rr_fee_offset_enabled(item.get("fee_offset_enabled", False)) else "关闭"
+        fee_text = "开启" if _rr_fee_offset_enabled(item.get("fee_offset_enabled", True)) else "关闭"
         management_text = _rr_management_mode_text(item.get("management_mode"))
         ledger_entry = self._rr_ledger_entry_for_item(item)
         if hasattr(self, "_rr_condition_status"):
@@ -16302,7 +16591,7 @@ class KlineAnalysisWindow(QMainWindow):
         self._rr_entry_edit.setText(str(payload.get("price_entry", "") or ""))
         self._rr_stop_edit.setText(str(payload.get("price_stop", "") or ""))
         self._rr_r_edit.setValue(float(str(payload.get("r_multiple", "") or "2")))
-        self._rr_fee_offset_check.setChecked(_rr_fee_offset_enabled(payload.get("fee_offset_enabled", False)))
+        self._rr_fee_offset_check.setChecked(_rr_fee_offset_enabled(payload.get("fee_offset_enabled", True)))
         self._rr_locked_check.setChecked(bool(payload.get("locked", False)))
         self._rr_execution_mode_combo.setCurrentIndex(
             max(0, self._rr_execution_mode_combo.findData(str(payload.get("entry_execution_mode", "limit") or "limit")))
@@ -16313,6 +16602,21 @@ class KlineAnalysisWindow(QMainWindow):
         if tool in {"rr_long", "rr_short"}:
             self._select_rr_workspace_mode("direct")
         self._draw_tool = tool
+        if hasattr(self, "_line_hline_btn"):
+            self._line_hline_btn.blockSignals(True)
+            self._line_hline_btn.setChecked(tool == "horizontal")
+            self._line_hline_btn.blockSignals(False)
+            self._line_trend_btn.blockSignals(True)
+            self._line_trend_btn.setChecked(tool == "trend")
+            self._line_trend_btn.blockSignals(False)
+            self._line_draw_tool_hint.setText(
+                "再次点击当前工具或在图表按右键，返回普通光标。"
+                if tool == "none" else "绘图中：再次点击当前工具或在图表按右键，返回普通光标。"
+            )
+        for rr_tool, button in getattr(self, "_rr_draw_buttons", {}).items():
+            button.blockSignals(True)
+            button.setChecked(tool == rr_tool)
+            button.blockSignals(False)
         self._pending_line_start = None
         self._pending_rr_start = None
         self._clear_line_drag_state(unlock_view=True)
@@ -16592,15 +16896,16 @@ class KlineAnalysisWindow(QMainWindow):
                 label=self._next_line_label("horizontal"),
                 trigger=str(self._line_trigger_combo.currentData()),
                 action=str(self._line_action_combo.currentData()),
+                trade_enabled=str(self._line_action_combo.currentData()) in {"long", "short"},
+                stop_loss_mode=str(self._line_stop_mode_combo.currentData() or "fixed"),
+                atr_period=int(self._line_atr_period_combo.currentData() or 10),
+                atr_multiple=float(_parse_rr_optional_decimal(self._line_atr_multiple_edit.text()) or Decimal("1.5")),
                 time_a=candle_time,
                 price_a=price,
                 time_b=candle_time,
                 price_b=price,
                 enabled=self._line_enabled_check.isChecked() if self._selected_line_index >= 0 else True,
-                email_enabled=(
-                    self._line_email_enabled_check.isChecked()
-                    and str(self._line_action_combo.currentData() or "notify") == "notify"
-                ),
+                email_enabled=self._line_email_enabled_check.isChecked(),
                 email_delivery_mode=str(self._line_email_delivery_mode_combo.currentData() or "once"),
             )
             self._append_line_rule(line)
@@ -16621,15 +16926,16 @@ class KlineAnalysisWindow(QMainWindow):
             label=self._next_line_label("trend"),
             trigger=str(self._line_trigger_combo.currentData()),
             action=str(self._line_action_combo.currentData()),
+            trade_enabled=str(self._line_action_combo.currentData()) in {"long", "short"},
+            stop_loss_mode=str(self._line_stop_mode_combo.currentData() or "fixed"),
+            atr_period=int(self._line_atr_period_combo.currentData() or 10),
+            atr_multiple=float(_parse_rr_optional_decimal(self._line_atr_multiple_edit.text()) or Decimal("1.5")),
             time_a=start_time,
             price_a=start_price,
             time_b=candle_time,
             price_b=price,
             enabled=self._line_enabled_check.isChecked() if self._selected_line_index >= 0 else True,
-            email_enabled=(
-                self._line_email_enabled_check.isChecked()
-                and str(self._line_action_combo.currentData() or "notify") == "notify"
-            ),
+            email_enabled=self._line_email_enabled_check.isChecked(),
             email_delivery_mode=str(self._line_email_delivery_mode_combo.currentData() or "once"),
         )
         self._append_line_rule(line)
@@ -17238,9 +17544,7 @@ class KlineAnalysisWindow(QMainWindow):
         item["enabled"] = self._line_enabled_check.isChecked()
         previous_email_enabled = bool(item.get("email_enabled", False))
         previous_email_delivery_mode = str(item.get("email_delivery_mode", "once") or "once")
-        item["email_enabled"] = (
-            self._line_email_enabled_check.isChecked() and item["action"] == "notify"
-        )
+        item["email_enabled"] = self._line_email_enabled_check.isChecked()
         item["email_delivery_mode"] = str(self._line_email_delivery_mode_combo.currentData() or "once")
         if (
             not item["email_enabled"]
@@ -17249,7 +17553,7 @@ class KlineAnalysisWindow(QMainWindow):
         ):
             item["email_sent_once"] = False
         was_trade_enabled = _rr_fee_offset_enabled(item.get("trade_enabled", False))
-        trade_enabled = self._line_trade_enabled_check.isChecked()
+        trade_enabled = item["action"] in {"long", "short"}
         item["trade_enabled"] = trade_enabled
         if trade_enabled and (not was_trade_enabled or not str(item.get("trade_profile_name", "") or "").strip()):
             item["trade_profile_name"] = self._active_profile_name()
@@ -17258,6 +17562,13 @@ class KlineAnalysisWindow(QMainWindow):
             item.pop("trade_profile_name", None)
             item.pop("trade_environment", None)
         item["entry_execution_mode"] = str(self._line_trade_execution_mode_combo.currentData() or "limit")
+        item["stop_loss_mode"] = str(self._line_stop_mode_combo.currentData() or "fixed")
+        item["atr_period"] = int(self._line_atr_period_combo.currentData() or 10)
+        atr_multiple = _parse_rr_optional_decimal(self._line_atr_multiple_edit.text())
+        if item["action"] in {"long", "short"} and item["stop_loss_mode"] == "atr" and (atr_multiple is None or atr_multiple <= 0):
+            self._set_status("ATR 倍数必须大于 0。")
+            return
+        item["atr_multiple"] = float(atr_multiple if atr_multiple is not None and atr_multiple > 0 else Decimal("1.5"))
         lines[self._selected_line_index] = item
         selected_index = self._selected_line_index
         self._save_workspace_snapshot()
