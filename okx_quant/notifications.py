@@ -436,13 +436,23 @@ class EmailNotifier:
             name="qqokx-email-notifier",
         ).start()
 
-    def _send(self, subject: str, body: str, html_body: str | None = None) -> None:
+    def send_message_sync(self, subject: str, body: str, *, recipients: tuple[str, ...] | None = None) -> bool:
+        """Send one message and return only after SMTP confirms success."""
+        if not self._config.enabled or not self._config.smtp_host.strip():
+            return False
+        before = tuple(item.strip() for item in (recipients if recipients is not None else self._config.recipient_emails) if item.strip())
+        if not before:
+            return False
+        return self._send(subject, body, recipient_override=list(before))
+
+    def _send(self, subject: str, body: str, html_body: str | None = None,
+              recipient_override: list[str] | None = None) -> bool:
         config = self._config
         sender = (config.sender_email or config.smtp_username).strip()
-        recipients = self._recipients(config)
+        recipients = recipient_override if recipient_override is not None else self._recipients(config)
         if not sender or not recipients:
             self._log(f"邮件发送失败 | {subject} | 原因=发件邮箱或收件邮箱为空")
-            return
+            return False
 
         message = EmailMessage()
         message["From"] = sender
@@ -463,10 +473,13 @@ class EmailNotifier:
                     smtp.ehlo()
                     self._login_and_send(smtp, sender, recipients, message, config=config)
             self._log(f"邮件已发送 | {subject}")
+            return True
         except smtplib.SMTPAuthenticationError as exc:
             self._log(f"邮件发送失败 | {subject} | {self._format_auth_error(exc, sender)}")
+            return False
         except Exception as exc:
             self._log(f"邮件发送失败 | {subject} | {exc}")
+            return False
 
     def _login_and_send(
         self,

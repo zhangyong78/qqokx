@@ -80,6 +80,9 @@ class AreaShapeConfig:
     fixed_stop_price: Decimal = Decimal("0")
     fee_offset_enabled: bool = True
     email_enabled: bool = False
+    notification_events: dict[str, bool] = field(default_factory=lambda: {
+        "signal": False, "accepted": False, "filled": True, "error": True,
+    })
     resting_entry_enabled: bool = False
     exit_template: str = "fixed_1r"
     trigger_price_type: str = "last"
@@ -185,6 +188,11 @@ class AreaShapeConfig:
             # Older plans did not expose a fee-offset switch; preserve their behavior.
             fee_offset_enabled=bool(raw.get("fee_offset_enabled", False)),
             email_enabled=bool(raw.get("email_enabled", False)),
+            notification_events=(
+                {str(key): bool(value) for key, value in raw["notification_events"].items()}
+                if isinstance(raw.get("notification_events"), dict)
+                else {"signal": False, "accepted": False, "filled": bool(raw.get("email_enabled", False)), "error": False}
+            ),
             # Kept in the serialized schema for compatibility with older
             # snapshots, but pattern mode no longer supports a pre-hung GTC.
             resting_entry_enabled=False,

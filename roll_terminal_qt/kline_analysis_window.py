@@ -9,6 +9,7 @@ import sys
 import threading
 import time
 import copy
+from hashlib import sha256
 from bisect import bisect_right
 from dataclasses import dataclass, field, replace
 from datetime import datetime
@@ -72,6 +73,10 @@ from okx_quant.strategy_live_chart import build_auto_channel_live_chart_snapshot
 from okx_quant.deribit_client import DeribitRestClient, DeribitVolatilityCandle
 from okx_quant.models import Candle, EmailNotificationConfig
 from okx_quant.notifications import EmailNotifier
+from okx_quant.trade_notifications import (
+    TradeNotificationQueue, merged_recipients, normalize_plan_notification_events,
+    start_background_worker,
+)
 from okx_quant.okx_candle_ws import CandleStreamKey
 from okx_quant.deribit_volatility_ui import (
     DERIBIT_BASE_HOURLY_RESOLUTION,
@@ -87,7 +92,9 @@ from okx_quant.deribit_volatility_ui import (
     _to_average_price_candles,
     _to_average_volatility_candles,
 )
-from okx_quant.kline_rr_execution import RRTradeExecutionService
+from okx_quant.kline_rr_execution import (
+    RRTradeExecutionService, clear_rr_submission_intent, pending_rr_submission_intents,
+)
 from okx_quant.kline_rr_trade import RRTradeLedgerEntry, RRTradePlan, build_rr_trade_plan
 from okx_quant.area_shape_trade import (
     AREA_DYNAMIC_TAKE_PROFIT_R, AREA_MIN_ENTRY_SPACE_R, AreaShapeConfig, AreaShapePlan,
@@ -203,21 +210,6 @@ _HISTORY_TRADE_LOSS_COLOR = "#ef4444"
 _HISTORY_TRADE_FLAT_COLOR = "#94a3b8"
 _CHART_CROSSHAIR_COLOR = "#6b7280"
 _REPLAY_SIGNAL_NEAR_MA_MAX_PCT = 0.006
-_TRADE_EMAIL_CLAIM_LOCK = threading.Lock()
-_TRADE_EMAIL_CLAIMED_KEYS: set[str] = set()
-
-
-def _claim_trade_email(key: str) -> bool:
-    normalized = str(key or "").strip()
-    if not normalized:
-        return False
-    with _TRADE_EMAIL_CLAIM_LOCK:
-        if normalized in _TRADE_EMAIL_CLAIMED_KEYS:
-            return False
-        _TRADE_EMAIL_CLAIMED_KEYS.add(normalized)
-        return True
-
-
 def _build_kline_line_email_notifier() -> EmailNotifier | None:
     snapshot = load_notification_snapshot()
     recipients = tuple(
@@ -243,15 +235,64 @@ def _build_kline_line_email_notifier() -> EmailNotifier | None:
     return notifier if notifier.signal_notifications_enabled else None
 
 
-def _send_kline_trade_email(subject: str, body: str) -> bool:
-    notifier = _build_kline_line_email_notifier()
-    if notifier is None:
+def _trade_notification_settings() -> dict[str, object]:
+    return dict(load_notification_snapshot())
+
+
+def format_trade_context(*, profile: object = "", environment: object = "", symbol: object = "",
+                         execution_mode: object = "", trade_mode: object = "", position_mode: object = "",
+                         paper: bool = False) -> str:
+    if paper:
+        return f"执行上下文：纸面模式（不提交API订单） | {symbol or '-'}"
+    bound = str(profile or "").strip()
+    env = str(environment or "").strip()
+    status = "已绑定" if bound and env else "待确认绑定"
+    details = [f"执行账户：{bound or '未绑定'}", f"环境：{env or '未绑定'}", f"品种：{symbol or '-'}"]
+    if execution_mode:
+        details.append(f"委托：{execution_mode}")
+    if trade_mode:
+        details.append(f"保证金：{trade_mode}")
+    if position_mode:
+        details.append(f"持仓：{position_mode}")
+    return f"{status} | " + " | ".join(details)
+
+
+def _api_key_fingerprint(runtime: object) -> str:
+    credentials = getattr(runtime, "credentials", None)
+    api_key = str(getattr(credentials, "api_key", "") or "")
+    return sha256(api_key.encode("utf-8")).hexdigest() if api_key else ""
+
+
+def _send_queued_trade_notification(row: dict[str, object], settings: dict[str, object]) -> bool:
+    payload = row.get("payload") if isinstance(row.get("payload"), dict) else {}
+    overrides = settings.get("api_sender_email_overrides", {})
+    api_recipients = overrides.get(str(payload.get("profile", "")), "") if isinstance(overrides, dict) else ""
+    recipients = merged_recipients(settings.get("recipient_emails", ""), api_recipients)
+    recipients = merged_recipients(recipients, row.get("recipients", []))
+    if not bool(settings.get("enabled", False)) or not str(settings.get("smtp_host", "")).strip() or not recipients:
         return False
-    try:
-        notifier.notify_async(subject, body)
-    except Exception:
-        return False
-    return True
+    notifier = EmailNotifier(EmailNotificationConfig(
+        enabled=True, smtp_host=str(settings.get("smtp_host", "")), smtp_port=int(settings.get("smtp_port", 465)),
+        smtp_username=str(settings.get("smtp_username", "")), smtp_password=str(settings.get("smtp_password", "")),
+        sender_email=str(settings.get("sender_email", "")), recipient_emails=tuple(recipients),
+        use_ssl=bool(settings.get("use_ssl", True)),
+        notify_trade_fills=bool(settings.get("notify_trade_fills", True)),
+        notify_signals=bool(settings.get("notify_signals", True)), notify_errors=bool(settings.get("notify_errors", True)),
+    ))
+    kind = str(row.get("kind", ""))
+    labels = {"signal": "信号触发", "accepted": "委托已受理", "filled": "首次入场成交", "error": "交易异常"}
+    event_label = "纸面模拟入场（未向交易所报单）" if payload.get("simulated") else labels.get(kind, "交易提醒")
+    subject = str(payload.get("subject") or f"[QQOKX] {event_label} | {payload.get('inst_id', '-')}")
+    body = "\n".join((
+        f"计划：{row.get('plan_id', '-')}", f"账户：{payload.get('profile', '-')}",
+        f"环境：{payload.get('environment', '-')}", f"执行模式：{payload.get('execution_mode', 'exchange')}",
+        f"合约：{payload.get('inst_id', '-')}",
+        f"订单号：{payload.get('order_id') or payload.get('client_id') or '-'}",
+        f"状态：{payload.get('status', '-')}", f"成交数量：{payload.get('filled_size', '-')}",
+        f"成交均价：{payload.get('average_price', '-')}",
+        str(payload.get("message", "") or ""),
+    ))
+    return notifier.send_message_sync(subject, body, recipients=tuple(recipients))
 
 
 def _deliver_line_alert_emails(
@@ -280,6 +321,12 @@ def _deliver_line_alert_emails(
         line = lines_by_id.get(str(event.get("line_id", "") or "").strip())
         if not isinstance(line, dict) or not bool(line.get("email_enabled", False)):
             continue
+        event_preferences = normalize_plan_notification_events(
+            line.get("notification_events"), legacy_enabled=line.get("email_enabled", False),
+            legacy_event="signal",
+        )
+        if not event_preferences["signal"]:
+            continue
         delivery_mode = str(line.get("email_delivery_mode", "once") or "once").strip().lower()
         if delivery_mode == "once" and bool(line.get("email_sent_once", False)):
             continue
@@ -303,10 +350,20 @@ def _deliver_line_alert_emails(
                 f"事件：{str(event.get('message', '') or '').strip()}",
             )
         )
-        notifier.notify_async(subject, body)
-        sent_count += 1
-        if delivery_mode == "once":
-            line["email_sent_once"] = True
+        event_id = (f"line:{line.get('id', '')}:signal" if delivery_mode == "once"
+                    else f"line:{line.get('id', '')}:signal:{candle_time}")
+        try:
+            TradeNotificationQueue().enqueue(
+                event_id=event_id, plan_id=f"line:{line.get('id', '')}", kind="signal",
+                payload={"source": "line_alert", "profile": line.get("trade_profile_name", ""),
+                         "environment": line.get("trade_environment", ""), "inst_id": symbol,
+                         "subject": subject, "message": body}, eligible=event_preferences["signal"],
+            )
+            sent_count += 1
+            if delivery_mode == "once":
+                line["email_sent_once"] = True
+        except Exception:
+            pass
     return sent_count
 _REPLAY_SIGNAL_LONG_COLOR = "#38bdf8"
 _REPLAY_SIGNAL_SHORT_COLOR = "#f97316"
@@ -1418,6 +1475,9 @@ class RRCardDialog(QDialog):
         period: str,
         price_increment: Decimal | None,
         show_email_option: bool = True,
+        active_profile: str = "",
+        active_environment: str = "demo",
+        show_binding: bool = False,
     ) -> None:
         super().__init__(parent)
         self._original_item = dict(item)
@@ -1425,6 +1485,9 @@ class RRCardDialog(QDialog):
         self._symbol = symbol
         self._period = period
         self._price_increment = price_increment
+        self._active_profile = str(active_profile or "").strip()
+        self._active_environment = str(active_environment or "demo").strip().lower()
+        self._show_binding = bool(show_binding)
         self._result_payload: dict[str, object] | None = None
         self.setWindowTitle(f"RR 参数卡片 | {str(item.get('rr_id', '') or 'RR')}")
         self.setWindowFlags(
@@ -1595,9 +1658,43 @@ class RRCardDialog(QDialog):
         self._leverage_edit = QLineEdit(str(item.get("leverage", "1") or "1"))
         self._fee_offset_check = QCheckBox("2倍手续费偏移")
         self._fee_offset_check.setChecked(_rr_fee_offset_enabled(item.get("fee_offset_enabled", True)))
-        self._email_check = QCheckBox("邮件提醒（收到委托提交回执后）")
-        self._email_check.setToolTip("使用系统信号邮件设置；提醒表示已收到委托回执，不代表已经成交。")
-        self._email_check.setChecked(bool(item.get("email_enabled", False)))
+        notification_events = normalize_plan_notification_events(
+            item.get("notification_events"), legacy_enabled=item.get("email_enabled", False),
+            legacy_event="accepted", is_new_plan=not bool(item.get("rr_id")),
+        )
+        self._notification_event_checks = {
+            kind: QCheckBox(label) for kind, label in (
+                ("signal", "信号触发"), ("accepted", "委托已受理"),
+                ("filled", "首次入场成交"), ("error", "交易异常"),
+            )
+        }
+        for kind, checkbox in self._notification_event_checks.items():
+            checkbox.setChecked(notification_events[kind])
+        self._email_check = self._notification_event_checks["accepted"]
+        self._email_check.setToolTip("已受理表示收到委托提交回执，不代表已经成交。")
+        self._binding_profile_combo = QComboBox()
+        self._binding_profile_combo.addItem("选择 API…", "")
+        try:
+            self._binding_profile_combo.addItems(list(profile_names()))
+        except Exception:
+            pass
+        bound_profile = str(item.get("trade_profile_name", "") or "").strip()
+        index = self._binding_profile_combo.findText(bound_profile)
+        if index >= 0:
+            self._binding_profile_combo.setCurrentIndex(index)
+        elif bound_profile:
+            self._binding_profile_combo.addItem(bound_profile, bound_profile)
+            self._binding_profile_combo.setCurrentIndex(self._binding_profile_combo.count() - 1)
+            self._binding_profile_combo.setToolTip("保存的绑定账户当前不可用；保存卡片会保留原绑定。")
+        self._binding_profile_combo.setEnabled(False)
+        self._binding_environment_label = QLabel(str(item.get("trade_environment", "") or "未绑定"))
+        self._binding_environment_label.setObjectName("Subtle")
+        self._binding_api_key_fingerprint = str(item.get("api_key_fingerprint", "") or "")
+        self._bind_current_button = QPushButton("绑定当前已解锁 API")
+        self._bind_current_button.clicked.connect(self._bind_current_api)
+        if isinstance(item.get("trade_binding"), dict):
+            self._bind_current_button.setEnabled(False)
+            self._bind_current_button.setToolTip("交易已启用并冻结账户绑定；如需调整，请先结束该计划。")
         self._locked_check = QCheckBox("锁定")
         self._locked_check.setChecked(bool(item.get("locked", False)))
         self._summary_label = QLabel("")
@@ -1612,9 +1709,22 @@ class RRCardDialog(QDialog):
         parameter_layout.addRow("R 倍数", self._r_edit)
         parameter_layout.addRow("杠杆", self._leverage_edit)
         parameter_layout.addRow(self._fee_offset_check)
-        parameter_layout.addRow(self._email_check)
+        event_row = QHBoxLayout()
+        for checkbox in self._notification_event_checks.values():
+            event_row.addWidget(checkbox)
+        parameter_layout.addRow("邮件事件", event_row)
+        binding_row = QHBoxLayout()
+        binding_row.addWidget(self._binding_profile_combo)
+        binding_row.addWidget(self._binding_environment_label)
+        binding_row.addWidget(self._bind_current_button)
+        parameter_layout.addRow("账户/环境绑定", binding_row)
+        if not show_binding:
+            self._binding_profile_combo.hide()
+            self._binding_environment_label.hide()
+            self._bind_current_button.hide()
         if not show_email_option:
-            self._email_check.hide()
+            for checkbox in self._notification_event_checks.values():
+                checkbox.hide()
         parameter_layout.addRow(self._locked_check)
         parameter_layout.addRow("成交后管理", self._management_hint)
         parameter_layout.addRow("计算结果", self._summary_label)
@@ -1661,6 +1771,27 @@ class RRCardDialog(QDialog):
         self._fee_offset_check.toggled.connect(self._refresh_summary)
         self._locked_check.toggled.connect(self._refresh_summary)
         self._refresh_summary()
+
+    def _bind_current_api(self) -> None:
+        profile = self._active_profile
+        if not profile:
+            self._binding_environment_label.setText("未绑定")
+            return
+        owner = self.parent()
+        ensure_access = getattr(owner, "_ensure_profile_access", None)
+        if callable(ensure_access) and not ensure_access(profile):
+            self._binding_environment_label.setText("请先解锁当前 API")
+            return
+        runtime = load_runtime(profile)
+        if runtime is None:
+            self._binding_environment_label.setText("请先解锁当前 API")
+            return
+        index = self._binding_profile_combo.findText(profile)
+        if index < 0:
+            return
+        self._binding_profile_combo.setCurrentIndex(index)
+        self._binding_environment_label.setText(str(getattr(runtime, "environment", "") or "未绑定"))
+        self._binding_api_key_fingerprint = _api_key_fingerprint(runtime)
 
     def _refresh_summary(self) -> None:
         management_mode = str(self._management_mode_combo.currentData() or "fixed_tp")
@@ -1742,6 +1873,10 @@ class RRCardDialog(QDialog):
             "leverage": self._leverage_edit.text().strip() or "1",
             "fee_offset_enabled": self._fee_offset_check.isChecked(),
             "email_enabled": self._email_check.isChecked(),
+            "notification_events": {kind: checkbox.isChecked() for kind, checkbox in self._notification_event_checks.items()},
+            "trade_profile_name": str(self._binding_profile_combo.currentText() if self._binding_profile_combo.currentData() is None else self._binding_profile_combo.currentData()).strip(),
+            "trade_environment": str(self._binding_environment_label.text() if self._binding_environment_label.text() != "未绑定" else ""),
+            "api_key_fingerprint": self._binding_api_key_fingerprint,
             "locked": self._locked_check.isChecked(),
         }
         super().accept()
@@ -7528,12 +7663,6 @@ class KlineAnalysisWindow(QMainWindow):
     def set_area_shape_monitor(self, monitor: object | None) -> None:
         self._area_shape_monitor = monitor
         if monitor is not None:
-            plans_getter = getattr(monitor, "plans", None)
-            if callable(plans_getter):
-                for plan in plans_getter():
-                    for event in getattr(plan, "events", ()):
-                        if isinstance(event, dict) and str(event.get("kind", "")) == "paper_entry":
-                            _claim_trade_email(self._area_paper_trade_email_key(plan.plan_id, event))
             monitor.plan_updated.connect(self._on_area_plan_updated)
             monitor.status_changed.connect(self._on_area_monitor_status)
             self._refresh_area_shape_status()
@@ -7546,11 +7675,6 @@ class KlineAnalysisWindow(QMainWindow):
     def set_area_shape_execution_monitor(self, monitor: object | None) -> None:
         self._area_shape_execution_monitor = monitor
         if monitor is not None:
-            sessions_getter = getattr(monitor, "sessions", None)
-            if callable(sessions_getter):
-                for session in sessions_getter():
-                    if isinstance(session, dict) and isinstance(session.get("position"), dict):
-                        _claim_trade_email(self._area_exchange_trade_email_key(session))
             monitor.session_updated.connect(self._on_area_demo_session_updated)
             monitor.status_changed.connect(self._on_area_demo_monitor_status)
             self._area_shape_demo_refresh_timer = QTimer(self)
@@ -7862,6 +7986,10 @@ class KlineAnalysisWindow(QMainWindow):
         self._account_context = QLabel("")
         self._account_context.setObjectName("Subtle")
         top_row.addWidget(self._account_context, 0)
+        self._plan_execution_context = QLabel("")
+        self._plan_execution_context.setObjectName("Subtle")
+        self._plan_execution_context.setWordWrap(True)
+        self._plan_execution_context.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Minimum)
 
         self._period_combo = QComboBox()
         self._period_combo.addItems([period for _, period in _PRIMARY_PERIOD_OPTIONS])
@@ -8313,6 +8441,7 @@ class KlineAnalysisWindow(QMainWindow):
 
         self._layout_context_panel.setVisible(False)
         header_layout.addLayout(top_row)
+        header_layout.addWidget(self._plan_execution_context)
         header_layout.addLayout(workspace_row)
         header_layout.addWidget(self._layout_context_panel)
 
@@ -8375,6 +8504,7 @@ class KlineAnalysisWindow(QMainWindow):
         drawing_layout.setContentsMargins(4, 6, 4, 4)
         drawing_layout.setSpacing(6)
         control_tabs.addTab(drawing_page, "线条触发")
+        self._control_line_tab_index = control_tabs.indexOf(drawing_page)
 
         rr_page = QWidget()
         rr_layout = QVBoxLayout(rr_page)
@@ -8528,6 +8658,12 @@ class KlineAnalysisWindow(QMainWindow):
         self._rr_trade_hint.setObjectName("Subtle")
         self._rr_trade_hint.setWordWrap(True)
         rr_layout.addWidget(self._rr_trade_hint)
+        self._retry_trade_notifications_button = QPushButton("重试失败邮件")
+        self._retry_trade_notifications_button.clicked.connect(self._retry_trade_notifications)
+        rr_layout.addWidget(self._retry_trade_notifications_button)
+        self._reconcile_rr_intents_button = QPushButton("核对未知 RR 委托")
+        self._reconcile_rr_intents_button.clicked.connect(self._reconcile_pending_rr_intent)
+        rr_layout.addWidget(self._reconcile_rr_intents_button)
 
         analysis_layout.addWidget(QLabel("告警引擎"))
         self._ma_cross_alert_check = QCheckBox("EMA 15 与 SMA 50 交叉")
@@ -8649,6 +8785,15 @@ class KlineAnalysisWindow(QMainWindow):
         self._line_email_delivery_mode_combo.setToolTip("“仅一次”在该线首次触发并提交邮件后不再重复发送。")
         line_email_row.addWidget(self._line_email_delivery_mode_combo, 1)
         drawing_layout.addLayout(line_email_row)
+        self._line_event_checks = {
+            kind: QCheckBox(label) for kind, label in (
+                ("accepted", "委托已受理"), ("filled", "首次成交"), ("error", "交易异常"),
+            )
+        }
+        line_event_row = QHBoxLayout()
+        for checkbox in self._line_event_checks.values():
+            line_event_row.addWidget(checkbox)
+        drawing_layout.addLayout(line_event_row)
 
         self._line_enabled_check = QCheckBox("启用规则")
         self._line_enabled_check.setToolTip("启用后，这条线参与检测，并按“触发后执行”设置提醒或自动交易。")
@@ -8664,6 +8809,9 @@ class KlineAnalysisWindow(QMainWindow):
         self._line_trade_config_btn = QPushButton("交易参数")
         self._line_trade_config_btn.clicked.connect(self._open_line_trade_card_for_selected)
         line_trade_row.addWidget(self._line_trade_config_btn)
+        self._line_bind_api_button = QPushButton("绑定当前 API")
+        self._line_bind_api_button.clicked.connect(self._bind_selected_line_to_current_api)
+        line_trade_row.addWidget(self._line_bind_api_button)
         drawing_layout.addLayout(line_trade_row)
         self._line_stop_mode_combo = QComboBox()
         self._line_stop_mode_combo.addItem("固定止损价", "fixed")
@@ -8946,6 +9094,7 @@ class KlineAnalysisWindow(QMainWindow):
             return
         rr_tab_index = int(getattr(self, "_control_rr_tab_index", -1))
         area_tab_index = int(getattr(self, "_control_area_tab_index", -1))
+        self._refresh_plan_execution_context()
         if int(index) in {rr_tab_index, area_tab_index}:
             mode = "area" if int(index) == area_tab_index else "direct"
             combo = getattr(self, "_rr_workspace_mode_combo", None)
@@ -8970,6 +9119,7 @@ class KlineAnalysisWindow(QMainWindow):
         panel.setMinimumWidth(panel_minimum)
         tabs.setSizePolicy(tabs_policy)
         tabs.setMinimumWidth(tabs_minimum)
+        self._refresh_plan_execution_context()
 
     def _select_rr_workspace_mode(self, mode: str) -> None:
         combo = getattr(self, "_rr_workspace_mode_combo", None)
@@ -8993,6 +9143,7 @@ class KlineAnalysisWindow(QMainWindow):
         if target_tab >= 0 and tabs.currentIndex() != target_tab:
             tabs.setCurrentIndex(target_tab)
         self._refresh_rr_workspace_other_status(mode)
+        self._refresh_plan_execution_context()
 
     def _refresh_rr_workspace_other_status(self, mode: str | None = None) -> None:
         direct_label = getattr(self, "_rr_workspace_other_status", None)
@@ -10509,9 +10660,59 @@ class KlineAnalysisWindow(QMainWindow):
         profile_name = self._active_profile_name() or "-"
         environment = self._active_environment() or "-"
         if hasattr(self, "_account_context"):
-            self._account_context.setText(f"账户 {profile_name} | {environment}")
+            self._account_context.setText(f"浏览账户 {profile_name} | {environment}")
+        self._refresh_plan_execution_context()
         self._refresh_rr_trade_hint()
         self._sync_account_drawer_context()
+
+    def _refresh_plan_execution_context(self) -> None:
+        label = getattr(self, "_plan_execution_context", None)
+        if label is None:
+            return
+        tabs = getattr(self, "_control_tabs", None)
+        current_tab = tabs.currentIndex() if tabs is not None else -1
+        if current_tab == int(getattr(self, "_control_area_tab_index", -2)):
+            plan = self._current_area_plan()
+            exec_mode = str(self._area_shape_mode_combo.currentData() or "paper") if hasattr(self, "_area_shape_mode_combo") else "paper"
+            if plan is None or exec_mode == "paper":
+                label.setText(format_trade_context(symbol=self._selected_symbol(), paper=True))
+            else:
+                label.setText(format_trade_context(
+                    profile=plan.profile_name, environment=plan.environment, symbol=plan.symbol,
+                    execution_mode=exec_mode, paper=False,
+                ))
+            return
+        if current_tab == int(getattr(self, "_control_line_tab_index", -2)):
+            lines = self._workspace_entry().get("lines", [])
+            line = (lines[self._selected_line_index] if isinstance(lines, list)
+                    and 0 <= self._selected_line_index < len(lines)
+                    and isinstance(lines[self._selected_line_index], dict) else None)
+            if isinstance(line, dict) and line.get("action") in {"long", "short"}:
+                label.setText(format_trade_context(
+                    profile=line.get("trade_profile_name", ""), environment=line.get("trade_environment", ""),
+                    symbol=self._selected_symbol(), execution_mode=line.get("entry_execution_mode", ""),
+                ))
+            else:
+                label.setText(f"仅提醒，不提交API订单 | 品种：{self._selected_symbol()}")
+            return
+        if current_tab == int(getattr(self, "_control_rr_tab_index", -2)) and self._selected_rr_index >= 0:
+            try:
+                rr = self._selected_rr_payload()
+            except Exception:
+                rr = {}
+            label.setText(format_trade_context(
+                profile=rr.get("trade_profile_name", ""), environment=rr.get("trade_environment", ""),
+                symbol=self._selected_symbol(), execution_mode=rr.get("entry_execution_mode", ""),
+            ))
+            return
+        try:
+            rr = self._selected_rr_payload()
+        except Exception:
+            rr = {}
+        label.setText(format_trade_context(
+            profile=rr.get("trade_profile_name", ""), environment=rr.get("trade_environment", ""),
+            symbol=self._selected_symbol(), execution_mode=rr.get("entry_execution_mode", ""),
+        ))
 
     def _sync_account_drawer_context(self, *, refresh_if_visible: bool = True) -> None:
         if self._account_drawer is None:
@@ -10829,8 +11030,61 @@ class KlineAnalysisWindow(QMainWindow):
         profile_name = self._active_profile_name() or "-"
         environment = self._active_environment() or "-"
         display_symbol = (symbol or self._selected_symbol()).strip().upper() or "-"
+        storage_error = ""
+        pending_intents = 0
+        try:
+            rows = TradeNotificationQueue().rows()
+            pending = sum(row.get("status") in {"pending", "sending"} for row in rows)
+            failed = sum(row.get("status") == "failed" for row in rows)
+        except Exception as exc:
+            pending, failed = 0, 0
+            storage_error = f" | 邮件队列存储异常：{exc}"
+        try:
+            pending_intents = len(pending_rr_submission_intents())
+        except Exception as exc:
+            storage_error += f" | RR核对记录异常：{exc}"
+        self._retry_trade_notifications_button.setEnabled(failed > 0)
+        self._reconcile_rr_intents_button.setEnabled(pending_intents > 0 and not self._rr_execution_in_flight)
         self._rr_trade_hint.setText(
-            f"RR账本：{profile_name} | {environment} | {display_symbol} | 记录 {len(matched)}"
+            f"RR账本当前浏览账户 {profile_name}/{environment} | 记录 {len(matched)} | 未知待核对 {pending_intents} | 邮件待发 {pending} | 失败 {failed}{storage_error}"
+        )
+
+    def _retry_trade_notifications(self) -> None:
+        try:
+            count = TradeNotificationQueue().retry_failed()
+            if count:
+                start_background_worker(_trade_notification_settings, _send_queued_trade_notification)
+        except Exception as exc:
+            self._set_status(f"邮件队列暂不可用：{exc}")
+        self._refresh_rr_trade_hint()
+
+    def _reconcile_pending_rr_intent(self) -> None:
+        try:
+            intents = pending_rr_submission_intents()
+            intent = next((row for row in intents if row.get("plan")), None)
+            if intent is None:
+                self._set_rr_activation_status("没有可核对的RR未知提交意图。")
+                return
+            plan = RRTradePlan.from_dict(dict(intent["plan"]))
+            runtime = self._runtime_for_task_profile(plan.profile_name)
+            if runtime is None or not self._ensure_profile_access(plan.profile_name):
+                self._set_rr_activation_status(f"等待核对：请解锁冻结账户 {plan.profile_name}/{plan.environment}。")
+                return
+            if str(getattr(runtime, "environment", "")) != plan.environment:
+                self._set_rr_activation_status(f"等待核对：当前解锁环境与原委托 {plan.environment} 不一致。")
+                return
+        except Exception as exc:
+            self._set_rr_activation_status(f"读取RR核对意图失败：{exc}")
+            return
+        requested_at = time.perf_counter()
+        self._set_rr_activation_status(f"正在按原client ID核对 {plan.profile_name}/{plan.environment} 委托；不会重新提交。", pending=True)
+        self._start_rr_execution_action(
+            action=lambda: self._rr_trade_execution_service.activate(
+                client=self._rr_client(runtime), credentials=runtime.credentials,
+                config=_build_strategy_config(plan.inst_id, runtime), plan=plan,
+            ),
+            on_success=lambda entry: self._handle_rr_activation_success(entry, runtime, requested_at),
+            on_failure=lambda message: self._handle_rr_activation_failure(plan.plan_id, message, plan=plan),
         )
 
     def _current_primary_request_key(self) -> tuple[Any, ...]:
@@ -14429,6 +14683,7 @@ class KlineAnalysisWindow(QMainWindow):
             return
         dialog = AreaShapeConfigDialog(
             plan.config, self, support_price=plan.support_price, pressure_price=plan.pressure_price,
+            paper_mode=str(self._area_shape_mode_combo.currentData() or "paper") == "paper",
         )
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
@@ -14663,62 +14918,8 @@ class KlineAnalysisWindow(QMainWindow):
             plan = AreaShapePlan.from_dict(payload)
         except (TypeError, ValueError, KeyError):
             return
-        if plan.config.email_enabled:
-            for event in plan.events:
-                if not isinstance(event, dict) or str(event.get("kind", "")) != "paper_entry":
-                    continue
-                if not _claim_trade_email(self._area_paper_trade_email_key(plan.plan_id, event)):
-                    continue
-                side = "多头" if plan.config.direction == "long" else "空头"
-                _send_kline_trade_email(
-                    f"[QQOKX] 智能辅助交易已触发 | {plan.symbol} | {side}",
-                    "\n".join((
-                        "纸面计划已确认模拟入场；请查看智能辅助交易页的当前计划和事件。",
-                        f"交易对：{plan.symbol} | 周期：{plan.period} | 方向：{side}",
-                        f"账户：{plan.profile_name} | 环境：{plan.environment} | 模式：纸面演练",
-                        f"入场：{event.get('entry', '-')} | 止损：{event.get('stop', '-')}",
-                        f"形态：{event.get('pattern', '-')} | 时间：{event.get('candle_ts', '-')}",
-                        str(event.get("message", "") or ""),
-                    )),
-                )
         if plan.symbol == self._selected_symbol().strip().upper() and plan.profile_name == self._active_profile_name() and plan.environment == self._active_environment():
             self._refresh_area_shape_status(plan)
-
-    @staticmethod
-    def _area_paper_trade_email_key(plan_id: str, event: dict[str, object]) -> str:
-        event_id = event.get("signal_key") or event.get("candle_ts") or event.get("occurred_at") or ""
-        return f"area-paper:{plan_id}:{event_id}"
-
-    @staticmethod
-    def _area_exchange_trade_email_key(session: dict[str, object]) -> str:
-        position = session.get("position") if isinstance(session.get("position"), dict) else {}
-        intent = session.get("pending_intent") if isinstance(session.get("pending_intent"), dict) else {}
-        entry_id = intent.get("cl_ord_id") or position.get("entry_ts") or position.get("entry") or "unknown"
-        return f"area-exchange:{session.get('session_id', '')}:{entry_id}"
-
-    def _notify_area_exchange_entry_email(self, session: dict[str, object]) -> None:
-        snapshot = session.get("plan_snapshot") if isinstance(session.get("plan_snapshot"), dict) else {}
-        config = snapshot.get("config") if isinstance(snapshot.get("config"), dict) else {}
-        position = session.get("position") if isinstance(session.get("position"), dict) else {}
-        if not bool(config.get("email_enabled", False)) or not position:
-            return
-        if not _claim_trade_email(self._area_exchange_trade_email_key(session)):
-            return
-        direction = str(position.get("direction", config.get("direction", "")))
-        side = "多头" if direction == "long" else "空头"
-        environment = str(session.get("environment", ""))
-        order_id = str((session.get("pending_intent") or {}).get("cl_ord_id", "") or "-")
-        _send_kline_trade_email(
-            f"[QQOKX] 智能辅助入场已成交 | {session.get('symbol', '')} | {side}",
-            "\n".join((
-                "智能辅助交易已确认实际入场成交；请检查持仓与保护单状态。",
-                f"账户：{session.get('profile_name', '-')} | 环境：{'实盘' if environment == 'live' else '模拟盘'}",
-                f"交易对：{session.get('symbol', '-')} | 方向：{side}",
-                f"成交均价：{position.get('entry', '-')} | 成交数量：{position.get('size', '-')}",
-                f"止损：{position.get('stop', '-')} | 止盈：{position.get('take_profit', '-')}",
-                f"当前执行状态：{session.get('status', '-')} | 入场委托：{order_id}",
-            )),
-        )
 
     @Slot(str)
     def _on_area_monitor_status(self, status: str) -> None:
@@ -15011,7 +15212,6 @@ class KlineAnalysisWindow(QMainWindow):
     @Slot(object)
     def _on_area_demo_session_updated(self, payload: object) -> None:
         if isinstance(payload, dict):
-            self._notify_area_exchange_entry_email(payload)
             symbol = str(payload.get("symbol", "")).strip().upper()
             profile = str(payload.get("profile_name", "")).strip()
             environment = str(payload.get("environment", "")).strip().lower()
@@ -15356,6 +15556,8 @@ class KlineAnalysisWindow(QMainWindow):
         self._line_action_combo.setCurrentIndex(max(0, self._line_action_combo.findData("notify")))
         self._line_enabled_check.setChecked(True)
         self._line_email_enabled_check.setChecked(False)
+        for checkbox in self._line_event_checks.values():
+            checkbox.setChecked(False)
         self._line_email_delivery_mode_combo.setCurrentIndex(0)
         self._refresh_line_email_controls()
         self._line_trade_execution_mode_combo.setCurrentIndex(0)
@@ -15497,11 +15699,13 @@ class KlineAnalysisWindow(QMainWindow):
         if row < 0 or row >= len(records):
             self._selected_rr_index = -1
             self._rr_enable_trade_btn.setEnabled(False)
+            self._refresh_plan_execution_context()
             if self._pending_payload is not None:
                 self._render_to_chart(self._pending_payload)
             return
         item = records[row] if isinstance(records[row], dict) else {}
         self._apply_rr_record_to_form(row, item)
+        self._refresh_plan_execution_context()
         if self._pending_payload is not None:
             self._render_to_chart(self._pending_payload)
 
@@ -15519,6 +15723,12 @@ class KlineAnalysisWindow(QMainWindow):
         self._line_action_combo.setCurrentIndex(max(0, self._line_action_combo.findData(action)))
         self._line_enabled_check.setChecked(bool(item.get("enabled", True)))
         self._line_email_enabled_check.setChecked(bool(item.get("email_enabled", False)))
+        line_events = normalize_plan_notification_events(
+            item.get("notification_events"), legacy_enabled=item.get("email_enabled", False),
+            legacy_event="signal",
+        )
+        for kind, checkbox in self._line_event_checks.items():
+            checkbox.setChecked(line_events[kind])
         self._line_email_delivery_mode_combo.setCurrentIndex(
             max(0, self._line_email_delivery_mode_combo.findData(str(item.get("email_delivery_mode", "once") or "once")))
         )
@@ -15549,18 +15759,23 @@ class KlineAnalysisWindow(QMainWindow):
     def _refresh_line_email_controls(self) -> None:
         self._line_email_enabled_check.setEnabled(True)
         self._line_email_delivery_mode_combo.setEnabled(self._line_email_enabled_check.isChecked())
+        trading = str(self._line_action_combo.currentData() or "notify") in {"long", "short"}
+        for checkbox in self._line_event_checks.values():
+            checkbox.setEnabled(trading)
 
     def _refresh_line_trade_hint(self, item: dict[str, object] | None) -> None:
         if not hasattr(self, "_line_trade_hint"):
             return
         if not isinstance(item, dict):
             self._line_trade_hint.setText("触发提醒可单独运行；自动开仓需启用规则、选择自动方向并开启总控。")
+            self._refresh_plan_execution_context()
             return
         action = str(item.get("action", "notify") or "notify").strip().lower()
         if action in {"long", "short"} and not bool(item.get("trade_enabled", False)):
             action = "notify"
         if action not in {"long", "short"}:
             self._line_trade_hint.setText("当前线条为提醒模式，不会下单。请选择做多或做空后再配置交易参数。")
+            self._refresh_plan_execution_context()
             return
         line_monitoring = _rr_fee_offset_enabled(item.get("enabled", True))
         risk = _format_rr_table_price(item.get("risk_amount", "100")) or "100"
@@ -15575,6 +15790,7 @@ class KlineAnalysisWindow(QMainWindow):
             f"规则：{'启用' if line_monitoring else '停用'} | 触发后：自动{_line_action_text(action)} | "
             f"风险 {risk} | 止损 {stop} | R {r_multiple} | 线条自动交易：{armed}"
         )
+        self._refresh_plan_execution_context()
 
     def _line_trade_settings_key(self) -> str:
         profile = self._active_profile_name().strip()
@@ -15615,7 +15831,55 @@ class KlineAnalysisWindow(QMainWindow):
         trading = str(self._line_action_combo.currentData() or "notify") in {"long", "short"}
         self._line_trade_execution_mode_combo.setEnabled(trading)
         self._line_trade_config_btn.setEnabled(trading and self._selected_line_index >= 0)
+        self._line_bind_api_button.setEnabled(trading and self._selected_line_index >= 0)
         self._refresh_line_stop_controls()
+
+    @Slot()
+    def _bind_selected_line_to_current_api(self) -> None:
+        if self._selected_line_index < 0:
+            return
+        profile = self._active_profile_name().strip()
+        runtime = load_runtime(profile) if profile else None
+        if runtime is None:
+            self._set_status("请先解锁当前 API，再绑定线条。")
+            return
+        if not self._ensure_profile_access(profile):
+            self._set_status("当前 API 尚未解锁，不能绑定线条。")
+            return
+        entry = self._workspace_entry()
+        lines = entry.get("lines")
+        if not isinstance(lines, list) or self._selected_line_index >= len(lines):
+            return
+        line = lines[self._selected_line_index]
+        if not isinstance(line, dict) or self._area_line_is_frozen(str(line.get("id", ""))):
+            self._set_status("当前线条已被活动区域计划冻结，不能更改绑定。")
+            return
+        line_id = str(line.get("id", ""))
+        for ledger_entry in self._all_rr_trade_ledger_entries():
+            if (getattr(ledger_entry.plan, "source", "rr") == "line"
+                    and line_id in ledger_entry.plan.plan_id
+                    and ledger_entry.status not in {"closed", "cancelled", "rejected", "entry_canceled"}):
+                self._set_status("线条仍有活动RR委托/持仓记录；先停止新入场并处理原绑定，不能改绑。")
+                return
+        environment = str(getattr(runtime, "environment", "") or "").strip().lower()
+        answer = QMessageBox.question(
+            self, "确认线条账户绑定",
+            f"将该线条固定绑定到 {profile}/{environment}。切换浏览账户不会改变此绑定。确认？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        fingerprint = _api_key_fingerprint(runtime)
+        if not fingerprint:
+            self._set_status("当前API凭据缺少可用指纹，未绑定。")
+            return
+        line["trade_profile_name"] = profile
+        line["trade_environment"] = environment
+        line["api_key_fingerprint"] = fingerprint
+        self._save_workspace_snapshot()
+        self._refresh_line_trade_hint(line)
+        self._set_status(f"线条已绑定 {profile}/{environment}。")
 
     @Slot(bool)
     def _on_line_trade_armed_toggled(self, enabled: bool) -> None:
@@ -15623,7 +15887,7 @@ class KlineAnalysisWindow(QMainWindow):
             confirmed = QMessageBox.question(
                 self,
                 "启用线条自动交易",
-                "所有已启用且选择了自动做多/自动做空的线条触发后，都可能向当前 API 提交订单。是否确认开启？",
+                "所有已启用且选择自动方向的线条，将按各自已绑定 API 提交订单。是否确认开启？",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 QMessageBox.StandardButton.No,
             )
@@ -15746,6 +16010,7 @@ class KlineAnalysisWindow(QMainWindow):
         price_tp_text = _format_rr_table_price(item.get("price_tp", ""), price_increment) or "-"
         self._rr_preview.setText(f"自动止盈：{price_tp_text}")
         self._refresh_rr_tracking_summary(item)
+        self._refresh_plan_execution_context()
 
     def _selected_rr_payload(self) -> dict[str, object]:
         entry = self._workspace_entry()
@@ -15758,17 +16023,16 @@ class KlineAnalysisWindow(QMainWindow):
         return dict(payload)
 
     def _build_selected_rr_trade_plan(self):
-        runtime = self._runtime
-        if runtime is None:
-            raise RuntimeError("未加载可用 API，请先选择账户。")
         payload = self._selected_rr_payload()
         instrument = self._instrument_for_symbol()
         if instrument is None or str(getattr(instrument, "inst_type", "") or "").upper() != "SWAP":
             raise RuntimeError("第一阶段 RR 交易只支持永续合约（SWAP）。")
-        profile_name = self._active_profile_name()
-        environment = self._active_environment()
+        profile_name = str(payload.get("trade_profile_name", "") or "").strip()
+        environment = str(payload.get("trade_environment", "") or "").strip()
         if not profile_name or not environment:
-            raise RuntimeError("当前 API 账户或环境无效。")
+            raise RuntimeError("RR计划尚未确认API账户和环境绑定，请打开参数卡片完成绑定。")
+        if not str(payload.get("api_key_fingerprint", "") or ""):
+            raise RuntimeError("RR计划缺少API密钥指纹，请打开参数卡片重新绑定当前已解锁API。")
         rr_id = str(payload.get("rr_id", "") or "").strip()
         trade_ref = str(payload.get("trade_ref", "") or "").strip()
         if not rr_id:
@@ -15795,6 +16059,11 @@ class KlineAnalysisWindow(QMainWindow):
             stop_loss_price=stop_price,
             direct_take_profit_r=r_multiple,
             round_trip_fee_rate=round_trip_fee_rate,
+            notification_events=normalize_plan_notification_events(
+                payload.get("notification_events"), legacy_enabled=payload.get("email_enabled", False),
+                legacy_event="accepted", is_new_plan="notification_events" in payload,
+            ),
+            api_key_fingerprint=str(payload.get("api_key_fingerprint", "") or ""),
         )
         return replace(plan, take_profit_price=take_profit)
 
@@ -15825,14 +16094,13 @@ class KlineAnalysisWindow(QMainWindow):
         instrument = self._instrument_for_symbol()
         if instrument is None or str(getattr(instrument, "inst_type", "") or "").upper() != "SWAP":
             raise RuntimeError("第一阶段线条交易只支持永续合约（SWAP）。")
-        profile_name = str(line.get("trade_profile_name", "") or "").strip() or self._active_profile_name()
-        environment = str(line.get("trade_environment", "") or "").strip() or self._active_environment()
+        profile_name = str(line.get("trade_profile_name", "") or "").strip()
+        environment = str(line.get("trade_environment", "") or "").strip()
         if not profile_name or not environment:
-            raise RuntimeError("当前 API 账户或环境无效。")
-        if not str(line.get("trade_profile_name", "") or "").strip():
-            line_record["trade_profile_name"] = profile_name
-            line_record["trade_environment"] = environment
-            self._save_workspace_snapshot()
+            raise RuntimeError("该交易线条尚未确认 API 账户和环境绑定，请先在交易设置中确认后再启用。")
+        api_key_fingerprint = str(line.get("api_key_fingerprint", "") or "")
+        if not api_key_fingerprint:
+            raise RuntimeError("线条绑定缺少API密钥指纹，请重新确认账户绑定后再启用。")
         candle_time = int(event.get("candle_time", 0) or 0)
         if candle_time <= 0:
             raise RuntimeError("线条触发事件缺少 K 线时间。")
@@ -15875,6 +16143,12 @@ class KlineAnalysisWindow(QMainWindow):
             stop_loss_price=stop_price,
             direct_take_profit_r=direct_take_profit_r,
             round_trip_fee_rate=round_trip_fee_rate,
+            notification_events=normalize_plan_notification_events(
+                line.get("notification_events"), legacy_enabled=line.get("email_enabled", False),
+                legacy_event="signal", is_new_plan="notification_events" in line,
+            ),
+            source="line",
+            api_key_fingerprint=api_key_fingerprint,
         )
 
     def _build_armed_line_trade_plans(self, events: list[dict[str, object]]) -> list[RRTradePlan]:
@@ -15982,6 +16256,7 @@ class KlineAnalysisWindow(QMainWindow):
         snapshot = self._rr_trade_ledger_snapshot if isinstance(self._rr_trade_ledger_snapshot, dict) else {}
         records = list(snapshot.get("entries", [])) if isinstance(snapshot.get("entries"), list) else []
         saved = False
+        previous = None
         normalized_records: list[dict[str, object]] = []
         for raw in records:
             if not isinstance(raw, dict):
@@ -15991,6 +16266,7 @@ class KlineAnalysisWindow(QMainWindow):
             except Exception:
                 continue
             if existing.entry_id == entry.entry_id:
+                previous = existing
                 normalized_records.append(entry.to_dict())
                 saved = True
             else:
@@ -15999,6 +16275,27 @@ class KlineAnalysisWindow(QMainWindow):
             normalized_records.append(entry.to_dict())
         self._rr_trade_ledger_snapshot = {"entries": normalized_records}
         save_kline_rr_trade_ledger_snapshot(normalized_records)
+        if entry.entry_order is not None and entry.entry_order.order_id:
+            try:
+                clear_rr_submission_intent(entry.plan.plan_id)
+            except Exception:
+                pass
+        if entry.filled_size > 0:
+            event_preferences = normalize_plan_notification_events(
+                entry.plan.notification_events, legacy_enabled=False, legacy_event="accepted",
+            )
+            try:
+                TradeNotificationQueue().enqueue(
+                    event_id=f"{entry.plan.plan_id}:filled", plan_id=entry.plan.plan_id, kind="filled",
+                    payload={"source": "rr_order_reconcile", "profile": entry.plan.profile_name,
+                             "environment": entry.plan.environment, "inst_id": entry.plan.inst_id,
+                             "order_id": getattr(entry.entry_order, "order_id", ""),
+                             "client_id": getattr(entry.entry_order, "client_id", ""),
+                             "filled_size": str(entry.filled_size), "status": entry.status},
+                    eligible=event_preferences["filled"],
+                )
+            except Exception:
+                pass  # notification storage failure must not alter trading/protection state
         self._bind_rr_trade_entry(entry)
         self._refresh_rr_trade_hint()
         records = self._workspace_entry().get("rr", [])
@@ -16006,6 +16303,13 @@ class KlineAnalysisWindow(QMainWindow):
             selected = records[self._selected_rr_index]
             if isinstance(selected, dict):
                 self._refresh_rr_tracking_summary(selected)
+
+    def _rr_item_for_entry(self, entry: RRTradeLedgerEntry) -> dict[str, object]:
+        index = self._find_rr_item_index_for_entry(entry)
+        records = self._workspace_entry().get("rr", [])
+        if isinstance(records, list) and 0 <= index < len(records) and isinstance(records[index], dict):
+            return dict(records[index])
+        return {}
 
     def _drop_rr_trade_ledger_entry(self, plan_id: str) -> bool:
         target_plan_id = str(plan_id or "").strip()
@@ -16139,11 +16443,39 @@ class KlineAnalysisWindow(QMainWindow):
                 plan=plan,
             ),
             on_success=lambda entry: self._handle_line_trade_execution_result(entry),
-            on_failure=lambda _message: self._start_next_line_trade_execution(),
+            on_failure=lambda message: self._handle_line_trade_execution_failure(plan, message),
         )
 
     def _handle_line_trade_execution_result(self, entry: RRTradeLedgerEntry) -> None:
+        plan = entry.plan
+        try:
+            preferences = normalize_plan_notification_events(plan.notification_events)
+            TradeNotificationQueue().enqueue(
+                event_id=f"{plan.plan_id}:accepted", plan_id=plan.plan_id, kind="accepted",
+                payload={"source": "line_submit_ack", "profile": plan.profile_name,
+                         "environment": plan.environment, "inst_id": plan.inst_id,
+                         "order_id": getattr(entry.entry_order, "order_id", ""),
+                         "client_id": getattr(entry.entry_order, "client_id", ""), "status": entry.status},
+                eligible=preferences["accepted"],
+            )
+        except Exception:
+            pass
         self._set_status(f"线条交易已启用：{entry.plan.inst_id} | {entry.status}")
+        self._start_next_line_trade_execution()
+
+    def _handle_line_trade_execution_failure(self, plan: RRTradePlan, message: str) -> None:
+        try:
+            preferences = normalize_plan_notification_events(plan.notification_events)
+            TradeNotificationQueue().enqueue(
+                event_id=f"{plan.plan_id}:error", plan_id=plan.plan_id, kind="error",
+                payload={"source": "line_submit_error", "profile": plan.profile_name,
+                         "environment": plan.environment, "inst_id": plan.inst_id,
+                         "status": "error", "message": str(message)},
+                eligible=preferences["error"],
+            )
+        except Exception:
+            pass
+        self._set_status(f"线条交易提交异常：{message}")
         self._start_next_line_trade_execution()
 
     @Slot()
@@ -16164,8 +16496,33 @@ class KlineAnalysisWindow(QMainWindow):
                 config=_build_strategy_config(entry.plan.inst_id, runtime),
                 entry=entry,
             ),
-            on_success=lambda _updated: None,
+            on_success=self._handle_rr_monitor_result,
+            on_failure=lambda message: self._enqueue_rr_monitor_error(entry, message),
         )
+
+    def _enqueue_rr_monitor_error(self, entry: RRTradeLedgerEntry, message: str, *, phase: str = "reconcile_error") -> None:
+        try:
+            preferences = normalize_plan_notification_events(entry.plan.notification_events)
+            error_key = str(message).strip()[:120] or phase
+            TradeNotificationQueue().enqueue(
+                event_id=f"{entry.plan.plan_id}:error:{phase}:{error_key}",
+                plan_id=entry.plan.plan_id, kind="error",
+                payload={"source": "rr_reconcile_error", "profile": entry.plan.profile_name,
+                         "environment": entry.plan.environment, "inst_id": entry.plan.inst_id,
+                         "order_id": getattr(entry.entry_order, "order_id", ""),
+                         "client_id": getattr(entry.entry_order, "client_id", ""),
+                         "phase": phase, "error_kind": phase, "status": "error", "message": str(message)},
+                eligible=preferences["error"],
+            )
+        except Exception:
+            pass
+
+    def _handle_rr_monitor_result(self, entry: RRTradeLedgerEntry) -> None:
+        if entry.status == "manual_review":
+            latest = entry.events[-1] if entry.events else None
+            message = str(getattr(latest, "message", "RR交易进入人工核对") or "RR交易进入人工核对")
+            phase = str(getattr(latest, "kind", "manual_review") or "manual_review")
+            self._enqueue_rr_monitor_error(entry, message, phase=phase)
 
     @Slot()
     def _enable_selected_rr_trade(self) -> None:
@@ -16205,6 +16562,17 @@ class KlineAnalysisWindow(QMainWindow):
             return
 
         requested_at = time.perf_counter()
+        try:
+            preferences = normalize_plan_notification_events(plan.notification_events)
+            TradeNotificationQueue().enqueue(
+                event_id=f"{plan.plan_id}:signal:user-confirmed-submit", plan_id=plan.plan_id, kind="signal",
+                payload={"source": "rr_user_confirmed_submit", "profile": plan.profile_name,
+                         "environment": plan.environment, "inst_id": plan.inst_id,
+                         "status": "user_confirmed", "message": "用户确认提交RR入场请求"},
+                eligible=preferences["signal"],
+            )
+        except Exception:
+            pass
         self._pending_rr_activation_plan_ids.add(plan.plan_id)
         self._set_rr_activation_status("正在提交 RR 交易…", pending=True)
         self._start_rr_execution_action(
@@ -16212,7 +16580,7 @@ class KlineAnalysisWindow(QMainWindow):
             on_success=lambda entry: self._handle_rr_activation_success(
                 entry, runtime, requested_at, email_enabled=email_enabled,
             ),
-            on_failure=lambda message: self._handle_rr_activation_failure(plan.plan_id, message),
+            on_failure=lambda message: self._handle_rr_activation_failure(plan.plan_id, message, plan=plan),
             queue_if_busy=True,
             queued_status_text="当前正在同步已报 RR，新的启用请求已排队，稍后自动提交。",
         )
@@ -16267,26 +16635,51 @@ class KlineAnalysisWindow(QMainWindow):
             with measure_ui_step("rr.publish_ack", profile=plan.profile_name, environment=plan.environment, order=order.order_id):
                 store.publish_order_updates(profile_name=plan.profile_name, environment=plan.environment, orders=[view])
             store.confirm_submitted_order(runtime=runtime, profile_name=plan.profile_name, order=view)
-        if email_enabled and order is not None:
+        if order is not None:
             plan = entry.plan
-            side_text = "多头" if plan.direction == "long" else "空头"
-            _send_kline_trade_email(
-                f"[QQOKX] RR委托已提交 | {plan.inst_id} | {side_text}",
-                "\n".join((
-                    "RR交易已收到委托提交回执；请检查委托/成交和保护单状态。",
-                    f"账户：{plan.profile_name} | 环境：{plan.environment}",
-                    f"合约：{plan.inst_id} | 方向：{side_text}",
-                    f"入场参考：{format_decimal(plan.entry_price)} | 止损：{format_decimal(plan.stop_loss_price)} | 止盈：{format_decimal(plan.take_profit_price)}",
-                    f"数量：{_rr_plan_position_text(plan)} | 订单号：{order.order_id or order.client_id or '-'}",
-                    f"当前状态：{entry.status}（回执不代表成交）",
-                )),
+            event_preferences = normalize_plan_notification_events(
+                plan.notification_events, legacy_enabled=email_enabled, legacy_event="accepted",
             )
+            try:
+                TradeNotificationQueue().enqueue(
+                    event_id=f"{plan.plan_id}:accepted", plan_id=plan.plan_id, kind="accepted",
+                    payload={"source": "rr_submit_ack", "profile": plan.profile_name,
+                             "environment": plan.environment, "inst_id": plan.inst_id,
+                             "order_id": order.order_id, "client_id": order.client_id,
+                             "status": entry.status},
+                    eligible=event_preferences["accepted"],
+                )
+            except Exception:
+                pass
         self._set_rr_activation_status("RR 下单已收到回执，委托已发布；确认状态见下方委托列表。")
         append_log_line(f"[rr_latency] ack_published plan={entry.plan.plan_id} total_ms={(time.perf_counter() - requested_at) * 1000:.1f}")
 
-    def _handle_rr_activation_failure(self, plan_id: str, message: str) -> None:
+    def _handle_rr_activation_failure(self, plan_id: str, message: str, *, plan: RRTradePlan | None = None) -> None:
         self._pending_rr_activation_plan_ids.discard(plan_id)
-        self._set_rr_activation_status(f"RR 提交未确认：{message}；请核对订单状态，勿连续重复提交。")
+        is_rejected = str(message).startswith("RR_SUBMISSION_REJECTED:")
+        is_unknown = str(message).startswith("RR_SUBMISSION_UNKNOWN:")
+        phase = "rejected" if is_rejected else "unknown" if is_unknown else "execution_error"
+        if plan is not None:
+            try:
+                preferences = normalize_plan_notification_events(plan.notification_events)
+                TradeNotificationQueue().enqueue(
+                    event_id=f"{plan_id}:error:{phase}", plan_id=plan_id, kind="error",
+                    payload={"source": "rr_submit_error", "profile": plan.profile_name,
+                             "environment": plan.environment, "inst_id": plan.inst_id,
+                             "status": phase, "phase": phase,
+                             "error_kind": "permission_or_business_rejection" if is_rejected else phase,
+                             "message": str(message)},
+                    eligible=preferences["error"],
+                )
+            except Exception:
+                pass
+        if is_rejected:
+            self._set_rr_activation_status(f"RR提交被拒绝：{message}")
+        elif is_unknown:
+            self._set_rr_activation_status(f"RR提交结果未知：等待核对。请点击“核对未知 RR 委托”，系统将查询原client ID且不会重复提交。{message}")
+        else:
+            self._set_rr_activation_status(f"RR交易异常：{message}")
+        self._refresh_rr_trade_hint()
 
     @Slot()
     def _cancel_selected_rr_trade(self) -> None:
@@ -16527,10 +16920,10 @@ class KlineAnalysisWindow(QMainWindow):
             condition_text = _rr_condition_status_text(ledger_entry)
             self._rr_condition_status.setText(condition_text)
             self._rr_condition_status.setToolTip(condition_text)
-        ledger_text = "交易：未启用"
+        ledger_text = "交易：未提交"
         if ledger_entry is not None:
             status_text = {
-                "entry_working": "追单中",
+                "entry_working": "已挂单/未成交",
                 "entry_partially_filled": "部分成交",
                 "protected": "已保护",
                 "protected_break_even": "已保本",
@@ -16578,6 +16971,9 @@ class KlineAnalysisWindow(QMainWindow):
             symbol=self._selected_symbol(),
             period=self._period_combo.currentText().strip(),
             price_increment=price_increment,
+            active_profile=self._active_profile_name(),
+            active_environment=self._active_environment(),
+            show_binding=True,
         )
         if dialog.exec() != int(QDialog.DialogCode.Accepted):
             return
@@ -17360,6 +17756,7 @@ class KlineAnalysisWindow(QMainWindow):
                 {
                 "rr_id": self._next_rr_id(),
                 "trade_ref": uuid4().hex,
+                "notification_events": {"signal": False, "accepted": False, "filled": True, "error": True},
                 "side": side,
                 "bar_entry": self._bar_index_for_candle_time(normalized_entry_time),
                 "bar_stop": self._bar_index_for_candle_time(normalized_stop_time),
@@ -17540,11 +17937,16 @@ class KlineAnalysisWindow(QMainWindow):
         else:
             item["price_b"] = float(price_a)
         item["trigger"] = str(self._line_trigger_combo.currentData())
+        was_trade_enabled = _rr_fee_offset_enabled(item.get("trade_enabled", False))
         item["action"] = str(self._line_action_combo.currentData())
         item["enabled"] = self._line_enabled_check.isChecked()
         previous_email_enabled = bool(item.get("email_enabled", False))
         previous_email_delivery_mode = str(item.get("email_delivery_mode", "once") or "once")
         item["email_enabled"] = self._line_email_enabled_check.isChecked()
+        item["notification_events"] = {
+            "signal": item["email_enabled"],
+            **{kind: checkbox.isChecked() for kind, checkbox in self._line_event_checks.items()},
+        }
         item["email_delivery_mode"] = str(self._line_email_delivery_mode_combo.currentData() or "once")
         if (
             not item["email_enabled"]
@@ -17552,13 +17954,12 @@ class KlineAnalysisWindow(QMainWindow):
             or previous_email_delivery_mode != item["email_delivery_mode"]
         ):
             item["email_sent_once"] = False
-        was_trade_enabled = _rr_fee_offset_enabled(item.get("trade_enabled", False))
         trade_enabled = item["action"] in {"long", "short"}
         item["trade_enabled"] = trade_enabled
-        if trade_enabled and (not was_trade_enabled or not str(item.get("trade_profile_name", "") or "").strip()):
-            item["trade_profile_name"] = self._active_profile_name()
-            item["trade_environment"] = self._active_environment()
-        elif not trade_enabled:
+        if trade_enabled and not was_trade_enabled and "notification_events" not in item:
+            self._line_event_checks["filled"].setChecked(True)
+            self._line_event_checks["error"].setChecked(True)
+        if not trade_enabled:
             item.pop("trade_profile_name", None)
             item.pop("trade_environment", None)
         item["entry_execution_mode"] = str(self._line_trade_execution_mode_combo.currentData() or "limit")
@@ -17740,6 +18141,8 @@ class KlineAnalysisWindow(QMainWindow):
                 "fee_offset_enabled": self._rr_fee_offset_check.isChecked(),
                 "locked": self._rr_locked_check.isChecked(),
             }
+            if not isinstance(existing_payload.get("notification_events"), dict):
+                payload["notification_events"] = {"signal": False, "accepted": False, "filled": True, "error": True}
             if isinstance(extra_payload, dict):
                 payload.update(extra_payload)
             payload = self._normalized_rr_payload(payload)

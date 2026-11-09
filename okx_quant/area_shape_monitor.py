@@ -5,6 +5,7 @@ from __future__ import annotations
 import queue
 import threading
 import time
+from hashlib import sha1
 from typing import Any, Callable
 
 from PySide6.QtCore import QObject, Signal
@@ -14,6 +15,7 @@ from okx_quant.area_shape_trade import AreaShapePlan
 from okx_quant.models import Candle
 from okx_quant.okx_candle_ws import CandleStreamKey
 from okx_quant.okx_client import OkxRestClient
+from okx_quant.trade_notifications import TradeNotificationQueue
 
 
 _ACTIVE_STATUSES = {"monitoring", "touched", "paper_pending", "paper_position", "paper_break_even", "paper_locked"}
@@ -144,7 +146,7 @@ class AreaShapeMonitor(QObject):
             plan.execution_mode = execution_mode
             self._persist_locked()
             snapshot = AreaShapePlan.from_dict(plan.to_dict())
-        self.plan_updated.emit(snapshot.to_dict())
+        self._emit_plan_updated(snapshot)
         try:
             self._queue.put_nowait(("__reload__", None))
         except queue.Full:
@@ -168,7 +170,7 @@ class AreaShapeMonitor(QObject):
             plan.execution_mode = execution_mode
             self._persist_locked()
             snapshot = AreaShapePlan.from_dict(plan.to_dict())
-        self.plan_updated.emit(snapshot.to_dict())
+        self._emit_plan_updated(snapshot)
         return snapshot
 
     def mark_demo_execution(self, plan_id: str) -> AreaShapePlan:
@@ -182,7 +184,7 @@ class AreaShapeMonitor(QObject):
             plan.pause()
             self._persist_locked()
             snapshot = AreaShapePlan.from_dict(plan.to_dict())
-        self.plan_updated.emit(snapshot.to_dict())
+        self._emit_plan_updated(snapshot)
         try:
             self._queue.put_nowait(("__reload__", None))
         except queue.Full:
@@ -195,7 +197,7 @@ class AreaShapeMonitor(QObject):
             plan.cancel()
             self._persist_locked()
             snapshot = AreaShapePlan.from_dict(plan.to_dict())
-        self.plan_updated.emit(snapshot.to_dict())
+        self._emit_plan_updated(snapshot)
         try:
             self._queue.put_nowait(("__reload__", None))
         except queue.Full:
@@ -204,6 +206,44 @@ class AreaShapeMonitor(QObject):
     def _persist_locked(self) -> None:
         self._require_writable_store()
         self._store_save([plan.to_dict() for plan in self._plans.values()])
+
+    def _emit_plan_updated(self, plan: AreaShapePlan) -> None:
+        """Rebuild idempotent notifications from durable paper-plan events."""
+        preferences = plan.config.notification_events
+        for event in plan.events:
+            if not isinstance(event, dict):
+                continue
+            event_kind = str(event.get("kind", ""))
+            if event_kind == "paper_pending" and preferences.get("signal", False):
+                category, source, status = "signal", "area_paper_signal", "signal_pending"
+            elif event_kind == "paper_entry" and preferences.get("filled", False):
+                category, source, status = "filled", "area_paper_entry", "paper_entry"
+            elif event_kind in {"history_gap", "catchup_failed", "store_manual_review", "manual_review"} and preferences.get("error", False):
+                category, source, status = "error", "area_paper_error", event_kind
+            else:
+                continue
+            stable_error_key = sha1(
+                f"{event_kind}|{event.get('message', '')}".encode("utf-8")
+            ).hexdigest()[:16]
+            event_key = str(
+                event.get("signal_key") or event.get("candle_ts") or event.get("occurred_at")
+                or event.get("ts") or (stable_error_key if category == "error" else event_kind)
+            )
+            payload = {"source": source, "profile": plan.profile_name, "environment": plan.environment,
+                       "inst_id": plan.symbol, "execution_mode": "paper", "simulated": event_kind == "paper_entry",
+                       "client_id": event_key, "status": status,
+                       "phase": event_kind if category == "error" else "",
+                       "error_kind": event_kind if category == "error" else "",
+                       "average_price": event.get("entry", "-"),
+                       "message": event.get("message", "纸面模拟；不会提交API订单")}
+            try:
+                TradeNotificationQueue().enqueue(
+                    event_id=f"{plan.plan_id}:{category}:{event_key}", plan_id=plan.plan_id,
+                    kind=category, payload=payload,
+                )
+            except Exception:
+                pass
+        self.plan_updated.emit(plan.to_dict())
 
     def _require_writable_store(self) -> None:
         if self._store_write_blocked:
@@ -356,7 +396,7 @@ class AreaShapeMonitor(QObject):
             if changed:
                 self._persist_locked()
         for plan in changed:
-            self.plan_updated.emit(plan.to_dict())
+            self._emit_plan_updated(plan)
 
     @staticmethod
     def _plan_cursor(plan: AreaShapePlan) -> int:
@@ -417,7 +457,7 @@ class AreaShapeMonitor(QObject):
             if updated:
                 self._persist_locked()
         for plan in updated:
-            self.plan_updated.emit(plan.to_dict())
+            self._emit_plan_updated(plan)
 
     def _process_unconfirmed_price(self, key: tuple[str, str], candle: Candle) -> None:
         """Use the current 1H candle's last price for direct paper entries and exits."""
@@ -458,7 +498,7 @@ class AreaShapeMonitor(QObject):
             if updated:
                 self._persist_locked()
         for plan in updated:
-            self.plan_updated.emit(plan.to_dict())
+            self._emit_plan_updated(plan)
 
     def _process_plan_candle(self, plan: AreaShapePlan, candles: list[Candle], candle: Candle) -> bool:
         previous_ts = plan.last_candle_ts

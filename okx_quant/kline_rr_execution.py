@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import json
+import threading
+from hashlib import sha256
 from dataclasses import replace
 from datetime import datetime, timezone
 from decimal import Decimal, ROUND_FLOOR
@@ -14,12 +17,78 @@ from okx_quant.models import Candle, OrderPlan
 from okx_quant.okx_client import OkxOrderStatus
 from okx_quant.pricing import snap_to_increment
 from okx_quant.pending_order_chase import get_pending_order_chase_service
+from okx_quant.app_paths import state_dir_path
+from okx_quant.okx_client import OkxApiError
 
 
 _WORKING_STATES = {"live", "partially_filled"}
 _CANCELLED_STATES = {"canceled", "mmp_canceled"}
 _MINUTE_MS = 60_000
 _HOUR_MS = 60 * _MINUTE_MS
+_DEFINITE_SUBMIT_REJECTIONS = {"50120", "51000", "51008"}
+
+
+class RRSubmissionRejected(RuntimeError):
+    """Typed definite exchange rejection; no order was accepted."""
+
+
+class RRSubmissionUnknown(RuntimeError):
+    """Submit outcome is unknown; only the original client ID may be queried."""
+_RR_INTENT_LOCK = threading.RLock()
+def _rr_intent_file(path: Any = None):
+    return path if path is not None else state_dir_path() / "rr_submission_intents.json"
+
+
+def _load_submission_intents(path: Any = None) -> dict[str, dict[str, Any]]:
+    target = _rr_intent_file(path)
+    try:
+        raw = json.loads(target.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError) as exc:
+        raise RuntimeError("RR提交意图存储不可读；为避免重复委托已停止提交") from exc
+    if not isinstance(raw, dict) or any(not isinstance(value, dict) for value in raw.values()):
+        raise RuntimeError("RR提交意图存储格式无效；为避免重复委托已停止提交")
+    return raw
+
+
+def _save_submission_intents(rows: dict[str, dict[str, Any]], path: Any = None) -> None:
+    target = _rr_intent_file(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temp = target.with_suffix(".json.tmp")
+    temp.write_text(json.dumps(rows, ensure_ascii=False, indent=2), encoding="utf-8")
+    temp.replace(target)
+
+
+def clear_rr_submission_intent(plan_id: str, path: Any = None) -> None:
+    with _RR_INTENT_LOCK:
+        rows = _load_submission_intents(path)
+        if rows.pop(str(plan_id), None) is not None:
+            _save_submission_intents(rows, path)
+
+
+def pending_rr_submission_intents(path: Any = None) -> list[dict[str, Any]]:
+    with _RR_INTENT_LOCK:
+        return [dict(value) for value in _load_submission_intents(path).values()]
+
+
+def _plan_fingerprint(plan: RRTradePlan) -> dict[str, Any]:
+    payload = plan.to_dict()
+    payload.pop("created_at", None)
+    return payload
+
+
+def _assert_frozen_api(plan: RRTradePlan, credentials: Any, config: Any) -> None:
+    environment = str(getattr(config, "environment", "") or "")
+    profile = str(getattr(credentials, "profile_name", "") or "")
+    if environment and environment != plan.environment:
+        raise RuntimeError("执行环境与RR冻结计划不一致；已阻止委托写操作")
+    if profile and profile != plan.profile_name:
+        raise RuntimeError("API账户与RR冻结计划不一致；已阻止委托写操作")
+    if plan.api_key_fingerprint:
+        actual = sha256(str(getattr(credentials, "api_key", "") or "").encode("utf-8")).hexdigest()
+        if actual != plan.api_key_fingerprint:
+            raise RuntimeError("冻结API凭据已变化；已阻止追单、撤单或保护写操作")
 
 
 def _parse_optional_decimal(value: object) -> Decimal | None:
@@ -56,6 +125,9 @@ def best_quote_entry_price(*, plan: RRTradePlan, order_book: Any) -> Decimal:
 class RRTradeExecutionService:
     """Reconciles one RR-created entry order without creating duplicate exposure."""
 
+    def __init__(self, intent_path: Any = None) -> None:
+        self._intent_path = intent_path
+
     @staticmethod
     def should_monitor_status(status: str) -> bool:
         return str(status or "").strip().lower() in {
@@ -69,20 +141,80 @@ class RRTradeExecutionService:
     def activate(self, *, client: Any, credentials: Any, config: Any, plan: RRTradePlan) -> RRTradeLedgerEntry:
         if plan.inst_id.upper().endswith("-SWAP") is False:
             raise ValueError("RR exchange execution currently supports SWAP instruments only")
-        entry_price = self._entry_price(client=client, plan=plan)
-        order_plan = self._order_plan(plan=plan, entry_price=entry_price, config=config)
+        _assert_frozen_api(plan, credentials, config)
+        if not plan.api_key_fingerprint:
+            raise RuntimeError("RR绑定缺少API密钥指纹；请重新确认账户绑定后再提交")
+        current_fingerprint = sha256(str(getattr(credentials, "api_key", "") or "").encode("utf-8")).hexdigest()
+        if current_fingerprint != plan.api_key_fingerprint:
+            raise RuntimeError("冻结API凭据已变化；请重新绑定账户后再提交或接管委托")
         client_id = self._client_id(plan.plan_id, "entry", revision=0)
-        result = self._submit_entry(
-            client=client,
-            credentials=credentials,
-            config=config,
-            plan=plan,
-            order_plan=order_plan,
-            client_id=client_id,
-        )
+        entry_price = None
+        order_plan = None
+        with _RR_INTENT_LOCK:
+            intents = _load_submission_intents(self._intent_path)
+            intent = intents.get(plan.plan_id)
+            if intent is not None:
+                if str(intent.get("client_id", "")) != client_id or str(intent.get("profile", "")) != plan.profile_name or str(intent.get("environment", "")) != plan.environment:
+                    raise RuntimeError("RR持久提交意图与冻结计划不一致；禁止重提")
+                try:
+                    recovered = client.get_order(credentials, config, inst_id=plan.inst_id, cl_ord_id=client_id)
+                except OkxApiError as exc:
+                    if str(exc.code or "") == "51603":
+                        raise RRSubmissionUnknown("RR_SUBMISSION_UNKNOWN: 原client ID回查暂未找到委托；结果仍未知，保留原意图并禁止自动重复提交") from exc
+                    else:
+                        raise RRSubmissionUnknown(f"RR_SUBMISSION_UNKNOWN: 原client ID回查失败(code={exc.code})，保留原意图且禁止重复提交") from exc
+                except Exception as exc:
+                    raise RRSubmissionUnknown("RR_SUBMISSION_UNKNOWN: 原client ID回查失败，保留原意图且禁止重复提交") from exc
+                if intent is not None:
+                    if intent.get("plan") != _plan_fingerprint(plan):
+                        raise RuntimeError("RR待核实提交的冻结计划参数已变化；禁止用新参数接管原委托")
+                    raw = recovered.raw if isinstance(recovered.raw, dict) else {}
+                    if (str(raw.get("instId") or "").upper() != plan.inst_id.upper()
+                            or str(raw.get("clOrdId") or "") != client_id
+                            or str(recovered.ord_id or "") != str(intent.get("order_id", recovered.ord_id) or "")):
+                        raise RuntimeError("原client ID回查返回订单身份不匹配；禁止重复提交")
+                    return self._entry_from_order_status(plan=plan, status=recovered, client_id=client_id)
+        if intent is None:
+            entry_price = self._entry_price(client=client, plan=plan)
+            order_plan = self._order_plan(plan=plan, entry_price=entry_price, config=config)
+            with _RR_INTENT_LOCK:
+                intents = _load_submission_intents(self._intent_path)
+                if plan.plan_id in intents:
+                    raise RuntimeError("RR提交意图被并发创建；请回查原client ID后再操作")
+                intents[plan.plan_id] = {"plan_id": plan.plan_id, "profile": plan.profile_name,
+                                         "environment": plan.environment, "inst_id": plan.inst_id,
+                                         "client_id": client_id, "status": "submitting",
+                                         "plan": _plan_fingerprint(plan), "entry_price": str(entry_price)}
+                _save_submission_intents(intents, self._intent_path)
+        try:
+            result = self._submit_entry(client=client, credentials=credentials, config=config,
+                                        plan=plan, order_plan=order_plan, client_id=client_id)
+        except OkxApiError as exc:
+            if str(exc.code or "") in _DEFINITE_SUBMIT_REJECTIONS:
+                clear_rr_submission_intent(plan.plan_id, self._intent_path)
+                raise RRSubmissionRejected(f"RR_SUBMISSION_REJECTED: OKX明确拒绝(code={exc.code}, http={exc.status})：{exc}") from exc
+            raise RRSubmissionUnknown(f"RR_SUBMISSION_UNKNOWN: 提交响应不确定(code={exc.code}, http={exc.status})；保留原client ID，不重复提交") from exc
+        except Exception as exc:
+            raise RRSubmissionUnknown(f"RR_SUBMISSION_UNKNOWN: 提交请求异常，保留原client ID并禁止重复提交：{exc}") from exc
         order_id = str(getattr(result, "ord_id", "") or "").strip()
         if not order_id:
-            raise RuntimeError("OKX accepted RR entry but did not return an order identifier")
+            raise RRSubmissionUnknown("RR_SUBMISSION_UNKNOWN: OKX回执缺少订单号，保留原client ID并禁止重复提交")
+        with _RR_INTENT_LOCK:
+            intents = _load_submission_intents(self._intent_path)
+            if plan.plan_id in intents:
+                intents[plan.plan_id].update(status="accepted", order_id=order_id)
+                _save_submission_intents(intents, self._intent_path)
+        return self._entry_from_order_status(plan=plan, status=None, client_id=client_id,
+                                             order_id=order_id, price=entry_price,
+                                             returned_client_id=str(getattr(result, "cl_ord_id", "") or client_id))
+
+    def _entry_from_order_status(self, *, plan: RRTradePlan, status: Any | None, client_id: str,
+                                 order_id: str = "", price: Decimal | None = None,
+                                 returned_client_id: str = "") -> RRTradeLedgerEntry:
+        if status is not None:
+            order_id = str(status.ord_id or "")
+            price = status.price or plan.entry_price
+            returned_client_id = str(status.client_order_id or client_id)
         size = plan.sizing.contract_size
         now = _utc_now()
         return RRTradeLedgerEntry(
@@ -93,25 +225,45 @@ class RRTradeExecutionService:
                 role="entry",
                 channel="order",
                 order_id=order_id,
-                client_id=str(getattr(result, "cl_ord_id", "") or client_id),
-                state="live",
+                client_id=returned_client_id or client_id,
+                state=str(getattr(status, "state", "live") or "live"),
                 size=size,
-                price=entry_price,
+                price=price or plan.entry_price,
             ),
             stop_loss_order=self._pending_protection_link(plan=plan, role="stop_loss", size=size),
             take_profit_order=self._pending_protection_link(plan=plan, role="take_profit", size=size),
-            filled_size=Decimal("0"),
-            remaining_size=size,
-            events=(self._event("entry_submitted", f"RR entry submitted at {entry_price}"),),
+            filled_size=(status.filled_size or Decimal("0")) if status is not None else Decimal("0"),
+            remaining_size=max(size - ((status.filled_size or Decimal("0")) if status is not None else Decimal("0")), Decimal("0")),
+            events=(self._event("entry_submitted", f"RR entry submitted at {price or plan.entry_price}"),),
             created_at=now,
             updated_at=now,
         )
 
     def reconcile(self, *, client: Any, credentials: Any, config: Any, entry: RRTradeLedgerEntry) -> RRTradeLedgerEntry:
+        _assert_frozen_api(entry.plan, credentials, config)
         order = entry.entry_order
         if order is None or not order.order_id:
             return self._with_event(entry, status="manual_review", kind="missing_entry_order", message="RR entry order identifier is missing")
         status = client.get_order(credentials, config, inst_id=entry.plan.inst_id, ord_id=order.order_id)
+        raw = status.raw if isinstance(status.raw, dict) else {}
+        returned_inst = str(raw.get("instId") or "").strip().upper()
+        returned_ord = str(raw.get("ordId") or "").strip()
+        returned_client = str(raw.get("clOrdId") or "").strip()
+        expected_client = str(order.client_id or "").strip()
+        identity_mismatch = (
+            (returned_inst and returned_inst != entry.plan.inst_id.upper())
+            or (returned_ord and returned_ord != order.order_id)
+            or (returned_client and expected_client and returned_client != expected_client)
+            or (str(getattr(status, "ord_id", "") or "").strip()
+                and str(status.ord_id).strip() != order.order_id)
+            or (str(getattr(status, "client_order_id", "") or "").strip()
+                and expected_client and str(status.client_order_id).strip() != expected_client)
+        )
+        if identity_mismatch:
+            return self._with_event(
+                entry, status="manual_review", kind="entry_order_identity_mismatch",
+                message="RR回读委托与本计划冻结的产品/订单号/client ID不匹配；禁止采用成交量",
+            )
         updated = self._reconcile_status(
             client=client,
             credentials=credentials,
@@ -171,6 +323,7 @@ class RRTradeExecutionService:
         entry: RRTradeLedgerEntry,
         confirmed_for_filled: bool,
     ) -> RRTradeLedgerEntry:
+        _assert_frozen_api(entry.plan, credentials, config)
         order = entry.entry_order
         if order is None or not order.order_id:
             return self._with_event(entry, status="manual_review", kind="cancel_failed", message="RR entry order identifier is missing")

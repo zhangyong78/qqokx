@@ -5,6 +5,7 @@ from __future__ import annotations
 import threading
 import time
 import copy
+from hashlib import sha1
 from decimal import Decimal
 from typing import Any, Callable
 
@@ -33,10 +34,34 @@ from okx_quant.models import StrategyConfig
 from okx_quant.okx_client import OkxRestClient
 from okx_quant.pricing import snap_to_increment
 from okx_quant.pending_order_chase import get_pending_order_chase_service
+from okx_quant.trade_notifications import TradeNotificationQueue
 
 
 _ACTIVE = {"arming", "armed", "signal_pending", "entry_intent", "position_unprotected", "tp_pending", "protected", "closing_pending", "manual_control"}
 _TERMINAL = {"closed", "cancelled", "expired"}
+
+
+def _enqueue_area_notification(session: dict[str, Any], kind: str, payload: dict[str, Any]) -> None:
+    snapshot = session.get("plan_snapshot") if isinstance(session.get("plan_snapshot"), dict) else {}
+    config = snapshot.get("config") if isinstance(snapshot.get("config"), dict) else {}
+    events = config.get("notification_events") if isinstance(config.get("notification_events"), dict) else {}
+    if not bool(events.get(kind, False)):
+        return
+    try:
+        event_suffix = ":".join(str(value) for value in (
+            payload.get("client_id") or payload.get("order_id") or "plan",
+            payload.get("phase") or payload.get("status") or "event",
+            payload.get("error_code") or payload.get("error_kind") or "",
+        ))
+        TradeNotificationQueue().enqueue(
+            event_id=f"{session.get('plan_id', session.get('session_id', ''))}:{kind}:{event_suffix}",
+            plan_id=str(session.get("plan_id", session.get("session_id", ""))), kind=kind,
+            payload={"profile": session.get("profile_name", ""), "environment": _session_environment(session),
+                     "inst_id": session.get("symbol", ""), **payload}, eligible=True,
+        )
+    except Exception:
+        # Notifications never interrupt order reconciliation or protection.
+        pass
 
 
 class AreaShapeDemoExecutionMonitor(QObject):
@@ -568,9 +593,16 @@ class AreaShapeDemoExecutionMonitor(QObject):
                 take_profit_price=(Decimal(intent["take_profit_price"])
                                    if intent.get("take_profit_price") else None),
             )
-        except Exception:
+            _enqueue_area_notification(session, "accepted", {
+                "source": "area_gtc_ack", "client_id": intent.get("cl_ord_id", ""),
+                "phase": "entry_gtc", "status": "accepted",
+            })
+        except Exception as exc:
             # The POST may have succeeded; only query this original clOrdId.
-            pass
+            _enqueue_area_notification(session, "error", {
+                "source": "area_gtc_submit_error", "client_id": intent.get("cl_ord_id", ""),
+                "phase": "entry_gtc", "status": "result_unknown", "message": str(exc),
+            })
         self._reconcile_resting_entry(session_id, force_cancel=False)
 
     def _adopt_authorized_entry_amendment(self, session: dict[str, Any], intent: dict[str, Any], status: Any, runtime: Any) -> None:
@@ -1373,6 +1405,12 @@ class AreaShapeDemoExecutionMonitor(QObject):
                     current["last_signal_key"] = str(pending.get("signal_key", ""))
             self._persist_locked()
             emitted = dict(current)
+        if event and event.get("kind") == "paper_pending":
+            pending_event = event.get("paper_position") if isinstance(event.get("paper_position"), dict) else {}
+            _enqueue_area_notification(emitted, "signal", {
+                "source": "area_signal", "client_id": pending_event.get("signal_key", ""),
+                "status": "signal_pending", "message": event.get("message", ""),
+            })
         self.session_updated.emit(emitted)
 
     def _try_live_entry(self, session_id: str) -> None:
@@ -1502,9 +1540,17 @@ class AreaShapeDemoExecutionMonitor(QObject):
                     take_profit_price=Decimal(intent["take_profit_price"]) if intent.get("take_profit_price") else None,
                     client_order_id=intent["cl_ord_id"], stop_algo_client_order_id=intent["stop_algo_cl_ord_id"],
                 )
-        except Exception:
+        except Exception as exc:
             # The POST may have succeeded. Reconcile this same algoClOrdId only.
-            pass
+            _enqueue_area_notification(session, "error", {
+                "source": "area_entry_exception", "client_id": intent.get("cl_ord_id", ""),
+                "status": "result_unknown", "message": str(exc),
+            })
+        else:
+            _enqueue_area_notification(session, "accepted", {
+                "source": "area_entry_ack", "client_id": intent.get("cl_ord_id", ""),
+                "status": "accepted",
+            })
         self._reconcile_entry_intent(session_id)
 
     def _protect_fill(self, session_id: str, order_status: Any, fill_time: int, *, intent: dict[str, Any] | None = None) -> None:
@@ -1551,6 +1597,25 @@ class AreaShapeDemoExecutionMonitor(QObject):
                 current["resting_entry_intent"] = None
                 current.pop("cancel_requested", None)
             self._persist_locked()
+        # Enqueue only after the original order/client ID and fill were verified.
+        plan_snapshot = session.get("plan_snapshot") if isinstance(session.get("plan_snapshot"), dict) else {}
+        config_payload = plan_snapshot.get("config") if isinstance(plan_snapshot.get("config"), dict) else {}
+        if bool(config_payload.get("notification_events", {}).get("filled", config_payload.get("email_enabled", False))):
+            try:
+                TradeNotificationQueue().enqueue(
+                    event_id=f"{session.get('plan_id', session_id)}:filled",
+                    plan_id=str(session.get("plan_id", session_id)), kind="filled",
+                    payload={"source": "area_confirmed_order_fill", "profile": session.get("profile_name", ""),
+                             "environment": _session_environment(session), "inst_id": session.get("symbol", ""),
+                             "client_id": intent.get("cl_ord_id", ""), "order_id": getattr(order_status, "ord_id", ""),
+                             "filled_size": str(size), "average_price": str(entry)},
+                )
+            except Exception as exc:
+                try:
+                    from okx_quant.log_utils import append_log_line
+                    append_log_line(f"[trade_notification] enqueue failed; execution continues | plan={session.get('plan_id', session_id)} | {exc}")
+                except Exception:
+                    pass
         unsafe_stop = (plan.config.direction == "long" and stop >= entry) or (plan.config.direction == "short" and stop <= entry)
         positions_flat = False
         try:
@@ -2287,6 +2352,12 @@ class AreaShapeDemoExecutionMonitor(QObject):
             session["status"] = status
             session.setdefault("events", []).append({"kind": status, "ts": int(time.time() * 1000), "message": message})
             self._persist_locked()
+        if status in {"manual_review", "position_unprotected", "tp_pending", "closing_pending"}:
+            message_key = sha1(str(message).encode("utf-8")).hexdigest()[:12]
+            _enqueue_area_notification(session, "error", {
+                "source": "area_execution_error", "client_id": f"{status}:{message_key}",
+                "status": status, "message": message,
+            })
         self.session_updated.emit(copy.deepcopy(session))
         self.status_changed.emit(message)
 

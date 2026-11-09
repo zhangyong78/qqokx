@@ -53,6 +53,7 @@ class AreaShapeConfigDialog(QDialog):
     def __init__(
         self, config: AreaShapeConfig | None = None, parent=None, *,
         support_price: Decimal | None = None, pressure_price: Decimal | None = None,
+        paper_mode: bool = False,
     ) -> None:  # noqa: ANN001
         super().__init__(parent)
         self.setWindowTitle("智能辅助交易参数")
@@ -137,9 +138,18 @@ class AreaShapeConfigDialog(QDialog):
         self.fee_offset_enabled = QCheckBox("计入双边 Taker 手续费")
         self.fee_offset_enabled.setChecked(self._initial.fee_offset_enabled)
         self.fee_offset_enabled.setToolTip("勾选后，保本和锁盈触发R按扣除入场与退出两侧手续费后的净R判断，保护止损价也按双边手续费计算。纸面估算使用固定Taker费率，OKX实盘/模拟盘使用对应账户费率。")
-        self.email_enabled = QCheckBox("入场成交后邮件提醒")
-        self.email_enabled.setChecked(self._initial.email_enabled)
-        self.email_enabled.setToolTip("使用系统信号邮件配置；智能辅助交易确认实际入场成交后发送，信号或未成交委托不会触发邮件。")
+        self.notification_event_checks = {
+            kind: QCheckBox(label) for kind, label in (
+                ("signal", "信号触发"), ("accepted", "委托已受理"),
+                ("filled", "首次入场成交"), ("error", "交易异常"),
+            )
+        }
+        for kind, checkbox in self.notification_event_checks.items():
+            checkbox.setChecked(bool(self._initial.notification_events.get(kind, False)))
+        if paper_mode:
+            self.notification_event_checks["accepted"].setEnabled(False)
+            self.notification_event_checks["accepted"].setToolTip("纸面模式不提交API订单，因此没有委托受理事件。")
+        self.email_enabled = self.notification_event_checks["filled"]
         self.entry_trigger_mode.currentIndexChanged.connect(self._refresh_entry_mode)
         self.exit_template = QComboBox()
         self.exit_template.addItem("固定止盈", "fixed_1r")
@@ -192,7 +202,10 @@ class AreaShapeConfigDialog(QDialog):
         form.addRow("", self.time_break_even_enabled)
         form.addRow("持仓时长（1H根数）", self.time_break_even_bars)
         form.addRow("手续费偏移", self.fee_offset_enabled)
-        form.addRow("交易提醒", self.email_enabled)
+        notification_row = QVBoxLayout()
+        for checkbox in self.notification_event_checks.values():
+            notification_row.addWidget(checkbox)
+        form.addRow("交易提醒", notification_row)
         form.addRow("", self.exit_note)
         self._lock_parameter_widgets = (
             self.lock_trigger_r, self.lock_profit_r,
@@ -422,6 +435,7 @@ class AreaShapeConfigDialog(QDialog):
             fixed_stop_price=Decimal(str(self.fixed_stop_price.value())),
             fee_offset_enabled=self.fee_offset_enabled.isChecked(),
             email_enabled=self.email_enabled.isChecked(),
+            notification_events={kind: checkbox.isChecked() for kind, checkbox in self.notification_event_checks.items()},
             resting_entry_enabled=False,
             exit_template=str(self.exit_template.currentData()),
             trigger_price_type="last",

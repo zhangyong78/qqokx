@@ -194,6 +194,10 @@ def make_line_rule(
             "entry_execution_mode": entry_execution_mode,
             "fee_offset_enabled": fee_offset_enabled,
             "email_enabled": email_enabled,
+            "notification_events": (
+                {"signal": bool(email_enabled), "accepted": False, "filled": bool(trade_enabled), "error": bool(trade_enabled)}
+                if trade_enabled else {"signal": bool(email_enabled), "accepted": False, "filled": False, "error": False}
+            ),
             "email_delivery_mode": email_delivery_mode,
             "email_sent_once": email_sent_once,
         }
@@ -346,6 +350,8 @@ def _normalize_line_rule(item: object) -> dict[str, object]:
         "entry_execution_mode": _safe_choice(raw.get("entry_execution_mode"), _LINE_TRADE_ENTRY_MODES, default="limit"),
         "fee_offset_enabled": _safe_bool(raw.get("fee_offset_enabled"), default=True),
         "email_enabled": _safe_bool(raw.get("email_enabled"), default=False),
+        **({"notification_events": dict(raw["notification_events"])}
+           if isinstance(raw.get("notification_events"), dict) else {}),
         "email_delivery_mode": _safe_choice(
             raw.get("email_delivery_mode"),
             _LINE_EMAIL_DELIVERY_MODES,

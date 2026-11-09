@@ -43,7 +43,10 @@ from roll_terminal_qt.line_trading_window import LineTradingQtWindow
 from roll_terminal_qt.module_overview import ModuleOverview, build_module_overview, launcher_module_specs
 from roll_terminal_qt.option_strategy_window import OptionStrategyQtWindow
 from roll_terminal_qt.option_roll_execution_window import OptionRollExecutionQtWindow
-from roll_terminal_qt.kline_analysis_window import KlineAnalysisWindow
+from roll_terminal_qt.kline_analysis_window import (
+    KlineAnalysisWindow, _send_queued_trade_notification, _trade_notification_settings,
+)
+from okx_quant.trade_notifications import start_background_worker, stop_background_worker
 from roll_terminal_qt.ai_snapshot_service import AIQuickSnapshotWorker, AISnapshotWorker
 from roll_terminal_qt.btc_dvol_overview import BtcDvolOverviewPanel, EthDvolOverviewPanel
 from roll_terminal_qt.sample_prediction_window import SamplePredictionWindow
@@ -1624,6 +1627,8 @@ def run(argv: Iterable[str] | None = None) -> int:
         QCoreApplication.setAttribute(Qt.ApplicationAttribute.AA_UseSoftwareOpenGL)
         app = QApplication(sys.argv[:1])
     apply_qt_application_identity(app)
+    start_background_worker(_trade_notification_settings, _send_queued_trade_notification)
+    app.aboutToQuit.connect(stop_background_worker)
     app.setStyleSheet(APP_STYLE)
     window = create_root_window(args.module)
     apply_qt_window_icon(window)

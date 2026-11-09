@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Literal
@@ -75,6 +75,9 @@ class RRTradePlan:
     instrument_settle_ccy: str | None
     sizing: RRTradeSizing
     created_at: datetime
+    notification_events: dict[str, bool] = field(default_factory=dict)
+    source: str = "rr"
+    api_key_fingerprint: str = ""
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -102,6 +105,9 @@ class RRTradePlan:
             "instrument_settle_ccy": self.instrument_settle_ccy,
             "sizing": self.sizing.to_dict(),
             "created_at": _datetime_to_text(self.created_at),
+            "notification_events": dict(self.notification_events),
+            "source": self.source,
+            "api_key_fingerprint": self.api_key_fingerprint,
         }
 
     @classmethod
@@ -132,6 +138,10 @@ class RRTradePlan:
             instrument_settle_ccy=_normalize_optional_text(payload.get("instrument_settle_ccy")),
             sizing=RRTradeSizing.from_dict(sizing_payload if isinstance(sizing_payload, dict) else {}),
             created_at=_parse_datetime(payload.get("created_at")) or datetime.now(timezone.utc),
+            notification_events={str(key): bool(value) for key, value in
+                                 (payload.get("notification_events", {}) if isinstance(payload.get("notification_events", {}), dict) else {}).items()},
+            source=str(payload.get("source", "rr") or "rr"),
+            api_key_fingerprint=str(payload.get("api_key_fingerprint", "") or ""),
         )
 
 
@@ -283,6 +293,9 @@ def build_rr_trade_plan(
     direct_take_profit_r: Decimal,
     round_trip_fee_rate: Decimal,
     created_at: datetime | None = None,
+    notification_events: dict[str, bool] | None = None,
+    source: str = "rr",
+    api_key_fingerprint: str = "",
 ) -> RRTradePlan:
     if instrument.inst_type != "SWAP":
         raise ValueError("RR trade plan currently supports SWAP instruments only")
@@ -371,6 +384,9 @@ def build_rr_trade_plan(
             actual_risk_amount=actual_risk_amount,
         ),
         created_at=created_at or datetime.now(timezone.utc),
+        notification_events=dict(notification_events or {}),
+        source=str(source or "rr"),
+        api_key_fingerprint=str(api_key_fingerprint or ""),
     )
 
 

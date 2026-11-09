@@ -3661,7 +3661,7 @@ class RollTerminalQtWindowHelperTests(QtWidgetTestCase):
                 window._rr_stop_edit.setText("59000")
                 window._rr_r_edit.setValue(2.0)
                 window._rr_bar_edit.setText("12")
-                window._save_rr_item()
+                window._save_rr_item(extra_payload={"trade_profile_name": "moni", "trade_environment": "demo", "api_key_fingerprint": "offline-test-fingerprint"})
                 window._rr_execution_mode_combo.setCurrentIndex(
                     window._rr_execution_mode_combo.findData("chase_best_quote")
                 )
@@ -4080,6 +4080,7 @@ class RollTerminalQtWindowHelperTests(QtWidgetTestCase):
                     "fee_offset_enabled": False,
                     "trade_profile_name": "api1",
                     "trade_environment": "live",
+                    "api_key_fingerprint": "offline-test-fingerprint",
                 }]
                 event = {"kind": "line_alert", "line_id": "line-1", "trade_action": "long", "trade_enabled": True, "candle_time": 200}
                 with patch.object(window, "_instrument_for_symbol", return_value=instrument):
@@ -4190,6 +4191,7 @@ class RollTerminalQtWindowHelperTests(QtWidgetTestCase):
                     "stop_loss_price": 59000.0, "risk_amount": 125.0, "direct_take_profit_r": 2.0,
                     "management_mode": "fixed_tp", "entry_execution_mode": "limit", "fee_offset_enabled": False,
                     "trade_profile_name": "api1", "trade_environment": "live",
+                    "api_key_fingerprint": "offline-test-fingerprint",
                 }]
                 event = {"kind": "line_alert", "line_id": "line-1", "trade_action": "long", "trade_enabled": True, "candle_time": 200}
                 with patch.object(window, "_instrument_for_symbol", return_value=instrument):
@@ -4228,6 +4230,7 @@ class RollTerminalQtWindowHelperTests(QtWidgetTestCase):
                     "stop_loss_price": 59000.0, "risk_amount": 125.0, "direct_take_profit_r": 2.0,
                     "management_mode": "fixed_tp", "entry_execution_mode": "limit", "fee_offset_enabled": False,
                     "trade_profile_name": "api1", "trade_environment": "live",
+                    "api_key_fingerprint": "offline-test-fingerprint",
                 }]
                 event = {"kind": "line_alert", "line_id": "line-1", "trade_action": "long", "trade_enabled": True, "candle_time": 200}
                 window._line_trade_armed_check.blockSignals(True)
@@ -4690,7 +4693,7 @@ class RollTerminalQtWindowHelperTests(QtWidgetTestCase):
                 window._rr_r_edit.setValue(5.0)
                 window._rr_bar_edit.setText("12")
                 window._rr_fee_offset_check.setChecked(True)
-                window._save_rr_item()
+                window._save_rr_item(extra_payload={"trade_profile_name": "moni", "trade_environment": "demo", "api_key_fingerprint": "offline-test-fingerprint"})
                 with patch.object(window, "_instrument_for_symbol", return_value=instrument):
                     plan = window._build_selected_rr_trade_plan()
 

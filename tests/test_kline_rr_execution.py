@@ -5,6 +5,9 @@ from decimal import Decimal
 from types import SimpleNamespace
 from unittest import TestCase
 from unittest.mock import patch
+from hashlib import sha256
+from pathlib import Path
+from tempfile import TemporaryDirectory
 
 from okx_quant.kline_rr_execution import RRTradeExecutionService
 from okx_quant.kline_rr_trade import RRTradeLedgerEntry, RRTradeOrderLink, build_rr_trade_plan
@@ -44,6 +47,7 @@ def _plan(*, direction: str = "long", execution_mode: str = "chase_best_quote"):
         stop_loss_price=Decimal("59000") if direction == "long" else Decimal("61000"),
         direct_take_profit_r=Decimal("2"),
         round_trip_fee_rate=Decimal("0"),
+        api_key_fingerprint=sha256(b"offline-rr-test-key").hexdigest(),
     )
 
 
@@ -211,8 +215,10 @@ class _FakeClient:
 
 class KlineRRExecutionTest(TestCase):
     def setUp(self) -> None:
-        self.service = RRTradeExecutionService()
-        self.credentials = SimpleNamespace(profile_name="moni")
+        directory = TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.service = RRTradeExecutionService(intent_path=Path(directory.name) / "rr-intents.json")
+        self.credentials = SimpleNamespace(profile_name="moni", api_key="offline-rr-test-key")
         self.config = SimpleNamespace(position_mode="net")
 
     def test_closed_rr_position_requires_two_absent_account_snapshots(self) -> None:
