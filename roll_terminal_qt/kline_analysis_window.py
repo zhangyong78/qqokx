@@ -10923,14 +10923,37 @@ class KlineAnalysisWindow(QMainWindow):
 
     def open_rr_monitor_dialog(self) -> None:
         entries = self._monitorable_rr_trade_ledger_entries()
+        line_conditions: list[tuple[str, str, str, str, str, str]] = []
+        fallback_profile = self._active_profile_name()
+        for workspace_key, workspace_entry in self._workspace_entries.items():
+            if not isinstance(workspace_entry, dict):
+                continue
+            lines = workspace_entry.get("lines", [])
+            if not isinstance(lines, list):
+                continue
+            symbol = str(workspace_entry.get("inst_id", workspace_entry.get("symbol", workspace_key)) or workspace_key)
+            for line in lines:
+                if not isinstance(line, dict):
+                    continue
+                if not bool(line.get("enabled", True)) or not _rr_fee_offset_enabled(line.get("trade_enabled", False)):
+                    continue
+                profile = str(line.get("trade_profile_name", "") or "").strip() or fallback_profile
+                line_conditions.append((
+                    profile or "-",
+                    symbol,
+                    str(line.get("label", "线条交易") or "线条交易"),
+                    _line_trigger_text(str(line.get("trigger", "") or "")),
+                    _line_action_text(str(line.get("action", line.get("operation", "")) or "")),
+                    str(line.get("price", line.get("price_a", "-")) or "-"),
+                ))
         dialog = QDialog(self)
-        dialog.setWindowTitle("RR 监控")
+        dialog.setWindowTitle("本地交易监控")
         dialog.setMinimumWidth(880)
 
         layout = QVBoxLayout(dialog)
         hint = QLabel(
-            "这里列出本程序仍在轮询的 RR 账本记录。清空仅停止本程序监控，"
-            "不会平仓，也不会撤销 OKX 的止盈止损单。",
+            f"RR 监控 {len(entries)} 条；已启用的线条交易条件 {len(line_conditions)} 条。"
+            "下方分别列出。清空操作只移除 RR 本地监控记录，不会平仓或撤销 OKX 保护单。",
             dialog,
         )
         hint.setWordWrap(True)
@@ -10969,8 +10992,23 @@ class KlineAnalysisWindow(QMainWindow):
                 table.setItem(row, column, QTableWidgetItem(str(value)))
         layout.addWidget(table)
 
+        line_title = QLabel("已启用的线条交易条件", dialog)
+        layout.addWidget(line_title)
+        line_table = QTableWidget(len(line_conditions), 6, dialog)
+        line_table.setHorizontalHeaderLabels(["账户", "合约", "线条", "触发", "操作", "价格"])
+        line_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        line_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        line_table.verticalHeader().setVisible(False)
+        for column in range(6):
+            line_table.horizontalHeader().setSectionResizeMode(column, QHeaderView.ResizeMode.ResizeToContents)
+        line_table.horizontalHeader().setStretchLastSection(True)
+        for row, values in enumerate(line_conditions):
+            for column, value in enumerate(values):
+                line_table.setItem(row, column, QTableWidgetItem(value))
+        layout.addWidget(line_table)
+
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close, parent=dialog)
-        clear_button = buttons.addButton("清空本地监控", QDialogButtonBox.ButtonRole.DestructiveRole)
+        clear_button = buttons.addButton("清空RR本地监控", QDialogButtonBox.ButtonRole.DestructiveRole)
         buttons.rejected.connect(dialog.reject)
         buttons.accepted.connect(dialog.accept)
         layout.addWidget(buttons)
