@@ -14,6 +14,7 @@ import roll_terminal_qt.account_positions_home as account_positions_module
 from roll_terminal_qt.account_positions_home import (
     AccountPositionsHomeWidget,
     LegacyOptionToolsHost,
+    POSITION_COLUMNS,
     PositionProtectionDialog,
     _position_break_even_price,
     _break_even_taker_fee_rate,
@@ -195,8 +196,10 @@ class PositionDisplayForegroundColorsTest(TestCase):
             },
         )
 
-        self.assertEqual(values[23], "6.00 USDT")
-        self.assertEqual(values[24], "≈100 USDT")
+        self.assertEqual(values[25], "6.00 USDT")
+        self.assertEqual(values[26], "≈100 USDT")
+        self.assertEqual(len(values), len(POSITION_COLUMNS))
+        self.assertEqual(values[15:20], ("--", "--", "--", "--", "--"))
 
     def test_history_position_kline_markers_use_open_and_close_timestamps(self) -> None:
         history_item = SimpleNamespace(

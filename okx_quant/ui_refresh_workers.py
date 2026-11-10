@@ -66,12 +66,14 @@ def record_server_resources(app: object) -> None:
         load = _system_memory_load_percent()
         workers = getattr(app, "_display_refresh_workers", None)
         pending = workers._jobs.qsize() if workers is not None else 0
+        ui_pending = getattr(getattr(app, "root", None), "pending_worker_callbacks", 0)
         app._enqueue_log(
             f"服务器资源 | 系统内存={load if load is not None else '-'}%"
             f" | 进程私有内存={snapshot.get('private_mb', '-')}MB"
             f" | 工作集={snapshot.get('working_set_mb', '-')}MB"
             f" | Python活动线程={threading.active_count()}"
             f" | 句柄={snapshot.get('handles', '-')} | 显示等待任务={pending}"
+            f" | 界面回调等待={ui_pending}"
         )
     except (RuntimeError, MemoryError, OSError):
         # An optional diagnostic must not interrupt runtime bookkeeping.

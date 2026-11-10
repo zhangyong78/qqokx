@@ -1352,8 +1352,11 @@ def _position_break_even_price(
 
 def _group_row_values_with_break_even(group_type: str, metrics: dict[str, object]) -> tuple[str, ...]:
     values = list(_build_group_row_values(group_type, metrics))
-    values.insert(15, "--")
-    values.insert(23, str(metrics.get("estimated_close_fee") or "--"))
+    values[14:14] = ["--", "--"]
+    values.insert(17, "--")
+    values.insert(25, str(metrics.get("estimated_close_fee") or "--"))
+    for index in (16, 18, 19):
+        values[index] = "--"
     return tuple(values)
 
 DEFAULT_VISIBLE_COLUMNS: tuple[str, ...] = (

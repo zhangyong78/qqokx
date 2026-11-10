@@ -3419,7 +3419,11 @@ class _RecentLogQueue(queue.Queue[str]):
 
 class QuantApp(UiPositionsMixin, UiProtectionMixin, UiBacktestEntryMixin, UiStrategySessionsMixin):
     def __init__(self) -> None:
-        self.root = Tk()
+        if APP_DISTRIBUTION == "server":
+            from okx_quant.ui_callback_queue import ServerTk
+            self.root = ServerTk()
+        else:
+            self.root = Tk()
         apply_window_icon(self.root)
         self.root.title(build_app_title())
         screen_width = self.root.winfo_screenwidth()
