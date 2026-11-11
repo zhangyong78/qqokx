@@ -36,6 +36,7 @@ except Exception:  # pragma: no cover - fallback for environments without QtWebE
     QWebEngineView = None  # type: ignore[assignment]
 from PySide6.QtWidgets import (
     QCheckBox,
+    QButtonGroup,
     QComboBox,
     QDialog,
     QDialogButtonBox,
@@ -45,6 +46,7 @@ from PySide6.QtWidgets import (
     QGridLayout,
     QHeaderView,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QLineEdit,
     QMainWindow,
@@ -109,6 +111,7 @@ from okx_quant.engine import _dynamic_two_taker_fee_offset_live
 from okx_quant.pricing import format_decimal, format_decimal_by_increment, format_decimal_fixed, snap_to_increment
 from okx_quant.ui_shell import _format_history_size_amount, _history_display_amount
 from okx_quant.persistence import (
+    _write_json_atomic,
     deribit_volatility_cache_file_path,
     load_kline_analysis_workspace_entries,
     load_kline_rr_trade_ledger_snapshot,
@@ -132,6 +135,7 @@ from roll_terminal_qt.kline_box_rules import AUTO_BOX_MAX_CANDIDATES, is_auto_bo
 from roll_terminal_qt.history_service import load_local_position_history, merge_position_history_cache
 from roll_terminal_qt.perf_metrics import measure_ui_step
 from okx_quant.log_utils import append_log_line
+from okx_quant.app_paths import state_dir_path
 from roll_terminal_qt.kline_alerts import (
     build_workspace_key,
     evaluate_workspace_alerts,
@@ -7359,6 +7363,15 @@ class KlineAnalysisWindow(QMainWindow):
         self._active_chart_target = "primary"
         self._trade_recommendation_dialog: KlineTradeRecommendationDialog | None = None
         self._symbol_tab_bar: QTabBar | None = None
+        self._view_preset_bar: QTabBar | None = None
+        self._view_preset_label: QLabel | None = None
+        self._view_presets: list[dict[str, Any]] = []
+        self._header_top_content: QWidget | None = None
+        self._header_top_scroll: QScrollArea | None = None
+        self._header_workspace_content: QWidget | None = None
+        self._header_workspace_scroll: QScrollArea | None = None
+        self._kline_display_panel: QFrame | None = None
+        self._kline_display_panel_row: QWidget | None = None
         self._symbol_link_all_check: QCheckBox | None = None
         self._updating_symbol_tabs = False
         self._chart_mode_cycle_btn: QPushButton | None = None
@@ -7761,6 +7774,9 @@ class KlineAnalysisWindow(QMainWindow):
     def _refresh_compact_shape_button(self, *_args: object) -> None:
         if hasattr(self, "_shape_settings_button"):
             self._shape_settings_button.setText("形态：开" if self.pattern_signals_enabled() else "形态：关")
+        content = getattr(self, "_header_workspace_content", None)
+        if content is not None:
+            content.adjustSize()
 
     @Slot(bool)
     def _on_shape_signal_visibility_changed(self, _enabled: bool) -> None:
@@ -7944,6 +7960,237 @@ class KlineAnalysisWindow(QMainWindow):
         super().resizeEvent(event)
         self._schedule_chart_layout_refresh(80)
 
+    def refresh_global_font(self) -> None:
+        """Recompute the header's scroll content after the application font changes."""
+        self._refresh_primary_header_button_sizes()
+        for content in (self._header_top_content, self._header_workspace_content):
+            if content is None:
+                continue
+            layout = content.layout()
+            if layout is not None:
+                layout.invalidate()
+                layout.activate()
+            content.adjustSize()
+        self._refresh_header_scroll_content_sizes()
+        QTimer.singleShot(0, self._refresh_header_scroll_content_sizes)
+
+    def _refresh_primary_header_button_sizes(self) -> None:
+        """Keep period and chart-count button cells wide enough for the active font."""
+        buttons = list(self._primary_period_buttons.values())
+        buttons.extend(getattr(self, "_chart_count_buttons", {}).values())
+        for button in buttons:
+            button.ensurePolished()
+            hint = button.sizeHint()
+            text_width = button.fontMetrics().horizontalAdvance(button.text())
+            text_height = button.fontMetrics().height()
+            # The global stylesheet's padding can be too tight for these compact
+            # toolbar cells at large font sizes. Keep an explicit text margin.
+            extra_width = 32 if button in self._primary_period_buttons.values() else 24
+            button.setFixedSize(
+                max(_PRIMARY_PERIOD_BUTTON_WIDTH, hint.width() + 12, text_width + extra_width),
+                max(_PRIMARY_PERIOD_BUTTON_HEIGHT, hint.height(), text_height + 12),
+            )
+
+    def _refresh_header_scroll_content_sizes(self) -> None:
+        for content, scroll, minimum_height in (
+            (self._header_top_content, self._header_top_scroll, 56),
+            (self._header_workspace_content, self._header_workspace_scroll, 70),
+        ):
+            if content is None or scroll is None:
+                continue
+            layout = content.layout()
+            if layout is not None:
+                layout.invalidate()
+                layout.activate()
+            content.adjustSize()
+            bar_height = scroll.horizontalScrollBar().sizeHint().height()
+            scroll.setFixedHeight(max(minimum_height, content.sizeHint().height() + bar_height))
+            scroll.updateGeometry()
+
+    def _toggle_kline_display_panel(self, visible: bool) -> None:
+        if self._kline_display_panel_row is not None:
+            self._kline_display_panel_row.setVisible(bool(visible))
+        if self._header_panel is not None:
+            self._header_panel.updateGeometry()
+            parent = self._header_panel.parentWidget()
+            parent_layout = parent.layout() if parent is not None else None
+            if parent_layout is not None:
+                parent_layout.invalidate()
+
+    def _view_presets_path(self):
+        return state_dir_path() / "kline_view_presets.json"
+
+    def _load_view_presets(self, *, selected_index: int | None = None) -> None:
+        path = self._view_presets_path()
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8")) if path.exists() else []
+            self._view_presets = [item for item in payload if self._valid_view_preset(item)] if isinstance(payload, list) else []
+        except Exception:
+            self._view_presets = []
+        bar = self._view_preset_bar
+        if self._view_preset_label is not None:
+            self._view_preset_label.setText(f"看盘方案 · {len(self._view_presets)}")
+        if bar is None:
+            return
+        bar.blockSignals(True)
+        while bar.count():
+            bar.removeTab(bar.count() - 1)
+        for item in self._view_presets:
+            bar.addTab(str(item["name"]))
+        if selected_index is not None and 0 <= selected_index < bar.count():
+            bar.setCurrentIndex(selected_index)
+        bar.blockSignals(False)
+
+    @staticmethod
+    def _valid_view_preset(item: object) -> bool:
+        if not isinstance(item, dict) or not isinstance(item.get("name"), str) or not isinstance(item.get("view"), dict):
+            return False
+        view = item["view"]
+        return (isinstance(view.get("symbols"), list) and len(view["symbols"]) == 4
+                and isinstance(view.get("periods"), list) and len(view["periods"]) == 4
+                and isinstance(view.get("options"), dict) and type(view.get("count")) is int and view["count"] in {1, 2, 3, 4}
+                and type(view.get("limit")) is int and 50 <= view["limit"] <= 5000
+                and isinstance(view.get("local"), bool)
+                and isinstance(view.get("layout"), str) and view.get("layout") in ("horizontal", "vertical")
+                and isinstance(view.get("kind"), str) and view.get("kind") in ("kline", "volatility")
+                and (view.get("volatility_currency") is None or view.get("volatility_currency") in ("BTC", "ETH"))
+                and all(isinstance(x, str) for x in view["symbols"] + view["periods"])
+                and all(type(value) is bool for value in view["options"].values()))
+
+    def _persist_view_presets(self) -> None:
+        path = self._view_presets_path()
+        try:
+            _write_json_atomic(path, self._view_presets)
+        except Exception as exc:
+            self._status.setText(f"看盘方案保存失败：{exc}")
+            self._status.setToolTip(self._status.text())
+
+    def _capture_view_preset(self) -> dict[str, Any]:
+        return {
+            "symbols": [self._symbol_combo.currentText(), self._secondary_symbol_combo.currentText(),
+                        self._selected_tertiary_symbol(), self._selected_quaternary_symbol()],
+            "periods": [self._period_combo.currentText(), self._secondary_period_combo.currentText(),
+                        self._tertiary_period_combo.currentText(), self._quaternary_period_combo.currentText()],
+            "count": 4 if self._quaternary_chart_check.isChecked() else 3 if self._tertiary_chart_check.isChecked() else 2 if self._secondary_chart_check.isChecked() else 1,
+            "layout": self._secondary_layout_mode_value, "kind": self._secondary_chart_kind_mode,
+            "shape_size_metric": self._shape_signal_size_metric_value(),
+            "volatility_currency": self._current_volatility_currency() if self._secondary_chart_kind() == "volatility" else None,
+            "limit": self._limit_spin.value(), "local": self._prefer_local_checkbox.isChecked(),
+            "options": {key: widget.isChecked() for key, widget in {
+                "ema15": self._ema9, "sma50": self._ema21, "ema21_55": self._ema21_55_check,
+                "atr10": self._atr10_check, "best": self._best_parameter_indicators_check,
+                "average": self._secondary_average_kline_check, "primary_average_secondary_normal": self._primary_average_secondary_normal_check,
+                "reverse": self._reverse_kline_check, "day_separators": self._trading_day_separators_check,
+                "shape1h": self._show_1h_shape_signal_check, "shape4h": self._show_4h_shape_signal_check,
+                "shape1d": self._show_1d_shape_signal_check, "shape1w": self._show_1w_shape_signal_check,
+                "shape_ma_touch": self._shape_signal_ma_touch_check,
+                "history_trades": self._show_history_trades_check,
+            }.items()},
+        }
+
+    def _save_view_preset_as(self) -> None:
+        name, ok = QInputDialog.getText(self, "保存看盘方案", "方案名称")
+        name = name.strip()
+        if not ok or not name:
+            return
+        if any(item["name"] == name for item in self._view_presets):
+            QMessageBox.information(self, "看盘方案", "名称已存在，请使用右键菜单更新现有方案。")
+            return
+        self._view_presets.append({"name": name, "view": self._capture_view_preset()})
+        self._persist_view_presets()
+        self._load_view_presets(selected_index=len(self._view_presets) - 1)
+
+    def _show_view_preset_menu(self, point) -> None:
+        bar = self._view_preset_bar
+        index = bar.tabAt(point) if bar is not None else -1
+        if index < 0:
+            return
+        menu = QMenu(bar)
+        rename = menu.addAction("重命名")
+        update = menu.addAction("用当前视图更新")
+        delete = menu.addAction("删除")
+        action = menu.exec(bar.mapToGlobal(point))
+        item = self._view_presets[index]
+        if action == rename:
+            name, ok = QInputDialog.getText(self, "重命名看盘方案", "方案名称", text=item["name"])
+            if ok and name.strip() and not any(i["name"] == name.strip() and i is not item for i in self._view_presets):
+                item["name"] = name.strip()
+        elif action == update:
+            item["view"] = self._capture_view_preset()
+        elif action == delete:
+            self._view_presets.pop(index)
+        else:
+            return
+        self._persist_view_presets()
+        self._load_view_presets(selected_index=min(index, len(self._view_presets) - 1))
+
+    def _on_view_preset_selected(self, index: int) -> None:
+        if index < 0 or index >= len(self._view_presets):
+            return
+        view = self._view_presets[index].get("view", {})
+        old_symbols = [self._symbol_combo.currentText(), self._secondary_symbol_combo.currentText(),
+                       self._selected_tertiary_symbol(), self._selected_quaternary_symbol()]
+        widgets = [self._symbol_combo, self._secondary_symbol_combo, self._tertiary_symbol_combo, self._quaternary_symbol_combo,
+                   self._period_combo, self._secondary_period_combo, self._tertiary_period_combo, self._quaternary_period_combo,
+                   self._secondary_chart_check, self._tertiary_chart_check, self._quaternary_chart_check,
+                   self._limit_spin, self._prefer_local_checkbox]
+        widgets += [self._ema9, self._ema21, self._ema21_55_check, self._atr10_check, self._best_parameter_indicators_check,
+                    self._secondary_average_kline_check, self._primary_average_secondary_normal_check, self._reverse_kline_check,
+                    self._trading_day_separators_check, self._show_1h_shape_signal_check, self._show_4h_shape_signal_check,
+                    self._show_1d_shape_signal_check, self._show_1w_shape_signal_check, self._shape_signal_ma_touch_check,
+                    self._show_history_trades_check]
+        old = [widget.blockSignals(True) for widget in widgets]
+        try:
+            for widget, value in zip(widgets[:4], view.get("symbols", [])): widget.setCurrentText(str(value))
+            for widget, value in zip(widgets[4:8], view.get("periods", [])): widget.setCurrentText(str(value))
+            count = max(1, min(4, int(view.get("count", 1))))
+            for value, button in self._chart_count_buttons.items():
+                button.setChecked(value == count)
+            for i, widget in enumerate(widgets[8:11], 2): widget.setChecked(count >= i)
+            self._limit_spin.setValue(max(50, min(5000, int(view.get("limit", 1200)))))
+            self._prefer_local_checkbox.setChecked(bool(view.get("local", False)))
+            opts = view.get("options", {})
+            for key, widget in zip(("ema15", "sma50", "ema21_55", "atr10", "best", "average", "primary_average_secondary_normal", "reverse", "day_separators", "shape1h", "shape4h", "shape1d", "shape1w", "shape_ma_touch", "history_trades"), widgets[13:]):
+                widget.setChecked(bool(opts.get(key, widget.isChecked())))
+            self._secondary_layout_mode_value = str(view.get("layout", "horizontal"))
+            self._secondary_chart_kind_mode = str(view.get("kind", "kline"))
+            metric = view.get("shape_size_metric")
+            self._shape_signal_size_metric = metric if metric in ("body", "range") else "body"
+            currency = view.get("volatility_currency")
+            self._active_volatility_currency = currency if isinstance(currency, str) and currency in {"BTC", "ETH"} else None
+        finally:
+            for widget, previous in zip(widgets, old): widget.blockSignals(previous)
+        new_symbols = view.get("symbols", [])
+        for target, old_symbol, new_symbol in zip(("primary", "secondary", "tertiary", "quaternary"), old_symbols, new_symbols):
+            if old_symbol != new_symbol:
+                self._prepare_chart_for_symbol_reload(target)
+        self._refresh_secondary_layout_button()
+        self._refresh_secondary_chart_kind_button()
+        self._apply_secondary_chart_visibility()
+        if self._active_chart_target == "quaternary" and not self._quaternary_chart_check.isChecked():
+            self._set_active_chart_target("primary")
+        elif self._active_chart_target == "tertiary" and not self._tertiary_chart_check.isChecked():
+            self._set_active_chart_target("primary")
+        elif self._active_chart_target == "secondary" and not self._secondary_chart_check.isChecked():
+            self._set_active_chart_target("primary")
+        self._sync_primary_period_buttons()
+        self._refresh_timer.setInterval(self._auto_refresh_interval_ms(self._period_combo.currentText()))
+        self._sync_account_drawer_context(refresh_if_visible=False)
+        self._refresh_symbol_tab_selection()
+        self._refresh_plan_execution_context()
+        self._sync_chart_options()
+        self._refresh_indicator_menu_labels()
+        self._refresh_shape_signal_size_metric_button()
+        self._refresh_compact_shape_button()
+        for label, action in self._shape_setting_actions.items():
+            checkbox = {"1H": self._show_1h_shape_signal_check, "4H": self._show_4h_shape_signal_check,
+                        "1D": self._show_1d_shape_signal_check, "1W": self._show_1w_shape_signal_check,
+                        "碰均线": self._shape_signal_ma_touch_check}.get(label)
+            if checkbox is not None:
+                action.setChecked(checkbox.isChecked())
+        self._invalidate_pending_chart_results(targets=("primary", "secondary", "tertiary", "quaternary"))
+        self._load_data()
+
     def _build_header(self, parent_layout: QVBoxLayout) -> None:
         header = QFrame()
         self._header_panel = header
@@ -7955,11 +8202,28 @@ class KlineAnalysisWindow(QMainWindow):
         header_layout.setContentsMargins(12, 8, 12, 8)
         header_layout.setSpacing(6)
 
+        preset_row = QHBoxLayout()
+        self._view_preset_label = QLabel()
+        preset_row.addWidget(self._view_preset_label)
+        self._view_preset_bar = QTabBar()
+        self._view_preset_bar.setUsesScrollButtons(True)
+        self._view_preset_bar.setExpanding(False)
+        self._view_preset_bar.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self._view_preset_bar.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self._view_preset_bar.tabBarClicked.connect(self._on_view_preset_selected)
+        self._view_preset_bar.customContextMenuRequested.connect(self._show_view_preset_menu)
+        preset_row.addWidget(self._view_preset_bar, 1)
+        save_preset_btn = QPushButton("保存当前")
+        save_preset_btn.clicked.connect(self._save_view_preset_as)
+        preset_row.addWidget(save_preset_btn)
+        self._load_view_presets()
+
         top_row = QHBoxLayout()
         top_row.setSpacing(8)
 
-        title = QLabel("全球 K线分析")
-        title.setObjectName("SectionTitle")
+        title = QLabel("K线分析")
+        title.setObjectName("Subtle")
+        title.setMinimumWidth(100)
         top_row.addWidget(title, 0)
 
         top_row.addSpacing(12)
@@ -7974,22 +8238,20 @@ class KlineAnalysisWindow(QMainWindow):
 
         top_row.addSpacing(8)
         self._api_profile_label = QLabel("API")
-        top_row.addWidget(self._api_profile_label)
         self._api_profile_combo = QComboBox()
         self._api_profile_combo.setMinimumWidth(110)
         self._api_profile_combo.currentIndexChanged.connect(lambda _index: self._on_api_profile_changed())
-        top_row.addWidget(self._api_profile_combo, 0)
         if self._embedded:
             self._api_profile_label.hide()
             self._api_profile_combo.hide()
 
         self._account_context = QLabel("")
         self._account_context.setObjectName("Subtle")
-        top_row.addWidget(self._account_context, 0)
         self._plan_execution_context = QLabel("")
         self._plan_execution_context.setObjectName("Subtle")
-        self._plan_execution_context.setWordWrap(True)
-        self._plan_execution_context.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Minimum)
+        self._plan_execution_context.setWordWrap(False)
+        self._plan_execution_context.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+        self._plan_execution_context.setMaximumWidth(250)
 
         self._period_combo = QComboBox()
         self._period_combo.addItems([period for _, period in _PRIMARY_PERIOD_OPTIONS])
@@ -8013,11 +8275,26 @@ class KlineAnalysisWindow(QMainWindow):
             period_toolbar_layout.addWidget(button)
         top_row.addWidget(period_toolbar, 0)
 
+        chart_count_group = QButtonGroup(header)
+        chart_count_group.setExclusive(True)
+        for count_label, count in (("1图", 1), ("2图", 2), ("3图", 3), ("4图", 4)):
+            button = QPushButton(count_label)
+            button.setCheckable(True)
+            button.setFixedHeight(_PRIMARY_PERIOD_BUTTON_HEIGHT)
+            chart_count_group.addButton(button, count)
+            button.clicked.connect(lambda _checked=False, value=count: self._set_chart_count(value))
+            top_row.addWidget(button)
+            if count == 1:
+                self._chart_count_buttons = {}
+            self._chart_count_buttons[count] = button
+        self._chart_count_buttons[1].setChecked(True)
+        self._refresh_primary_header_button_sizes()
+
         self._toggle_left_panel_btn = QPushButton("显示左栏")
         self._toggle_left_panel_btn.setCheckable(True)
         self._toggle_left_panel_btn.toggled.connect(self._toggle_left_panel)
         self._toggle_left_panel_btn.setChecked(self._left_panel_hidden)
-        top_row.addWidget(self._toggle_left_panel_btn, 0)
+        self._toggle_left_panel_btn.setMaximumWidth(84)
 
         top_row.addSpacing(10)
         ma_group = QFrame()
@@ -8162,6 +8439,10 @@ class KlineAnalysisWindow(QMainWindow):
         self._shape_settings_button = QPushButton("形态：关")
         self._shape_settings_button.setToolTip(shape_signal_tooltip)
         shape_menu = QMenu(self._shape_settings_button)
+        size_metric_action = QWidgetAction(shape_menu)
+        size_metric_action.setDefaultWidget(self._shape_signal_size_metric_btn)
+        shape_menu.addAction(size_metric_action)
+        shape_menu.addSeparator()
         self._shape_setting_actions: dict[str, QAction] = {}
         for label, checkbox in (
             ("1H", self._show_1h_shape_signal_check),
@@ -8183,15 +8464,13 @@ class KlineAnalysisWindow(QMainWindow):
         history_action = shape_menu.addAction("历史形态信号")
         history_action.triggered.connect(self._open_shape_signal_history)
         self._shape_settings_button.setMenu(shape_menu)
-        if self._embedded:
-            self._shape_signal_group.hide()
-        else:
-            self._shape_settings_button.hide()
+        self._shape_signal_group.hide()
+        self._shape_settings_button.show()
 
         self._status = QLabel("就绪")
         self._status.setObjectName("Subtle")
-        top_row.addStretch(1)
-        top_row.addWidget(self._status, 3, Qt.AlignmentFlag.AlignRight)
+        self._status.setToolTip(self._status.text())
+        top_row.addWidget(self._status, 0, Qt.AlignmentFlag.AlignRight)
         self._layout_context_panel = QFrame()
         linkage_row = QHBoxLayout(self._layout_context_panel)
         linkage_row.setContentsMargins(0, 0, 0, 0)
@@ -8200,7 +8479,7 @@ class KlineAnalysisWindow(QMainWindow):
         self._secondary_chart_check.toggled.connect(self._on_secondary_chart_toggled)
         linkage_row.addWidget(self._secondary_chart_check)
 
-        self._secondary_symbol_label = QLabel("副图交易对")
+        self._secondary_symbol_label = QLabel("图2")
         linkage_row.addWidget(self._secondary_symbol_label)
         self._secondary_symbol_combo = QComboBox()
         self._secondary_symbol_combo.addItems(KLINE_SYMBOL_OPTIONS)
@@ -8216,7 +8495,7 @@ class KlineAnalysisWindow(QMainWindow):
         self._tertiary_chart_check = QCheckBox("三图联动")
         self._tertiary_chart_check.toggled.connect(self._on_tertiary_chart_toggled)
         linkage_row.addWidget(self._tertiary_chart_check)
-        self._tertiary_symbol_label = QLabel("第三图交易对")
+        self._tertiary_symbol_label = QLabel("图3")
         linkage_row.addWidget(self._tertiary_symbol_label)
         self._tertiary_symbol_combo = QComboBox()
         self._tertiary_symbol_combo.addItems(KLINE_SYMBOL_OPTIONS)
@@ -8228,7 +8507,7 @@ class KlineAnalysisWindow(QMainWindow):
         self._tertiary_symbol_combo.currentTextChanged.connect(self._on_tertiary_symbol_changed)
         linkage_row.addWidget(self._tertiary_symbol_combo, 0)
         self._tertiary_symbol_label.hide()
-        self._tertiary_period_label = QLabel("第三图周期")
+        self._tertiary_period_label = QLabel("周期")
         linkage_row.addWidget(self._tertiary_period_label)
         self._tertiary_period_combo = QComboBox()
         self._tertiary_period_combo.addItems([period for _, period in _PRIMARY_PERIOD_OPTIONS])
@@ -8242,7 +8521,7 @@ class KlineAnalysisWindow(QMainWindow):
         self._quaternary_chart_check = QCheckBox("四图联动")
         self._quaternary_chart_check.toggled.connect(self._on_quaternary_chart_toggled)
         linkage_row.addWidget(self._quaternary_chart_check)
-        self._quaternary_symbol_label = QLabel("第四图交易对")
+        self._quaternary_symbol_label = QLabel("图4")
         linkage_row.addWidget(self._quaternary_symbol_label)
         self._quaternary_symbol_combo = QComboBox()
         self._quaternary_symbol_combo.addItems(KLINE_SYMBOL_OPTIONS)
@@ -8254,7 +8533,7 @@ class KlineAnalysisWindow(QMainWindow):
         self._quaternary_symbol_combo.currentTextChanged.connect(self._on_quaternary_symbol_changed)
         linkage_row.addWidget(self._quaternary_symbol_combo, 0)
         self._quaternary_symbol_label.hide()
-        self._quaternary_period_label = QLabel("第四图周期")
+        self._quaternary_period_label = QLabel("周期")
         linkage_row.addWidget(self._quaternary_period_label)
         self._quaternary_period_combo = QComboBox()
         self._quaternary_period_combo.addItems([period for _, period in _PRIMARY_PERIOD_OPTIONS])
@@ -8265,7 +8544,7 @@ class KlineAnalysisWindow(QMainWindow):
         linkage_row.addWidget(self._quaternary_period_combo, 0)
         self._quaternary_period_label.hide()
 
-        self._secondary_period_label = QLabel("副图周期")
+        self._secondary_period_label = QLabel("周期")
         linkage_row.addWidget(self._secondary_period_label)
         self._secondary_period_combo = QComboBox()
         self._secondary_period_combo.addItems([period for _, period in _PRIMARY_PERIOD_OPTIONS])
@@ -8276,6 +8555,11 @@ class KlineAnalysisWindow(QMainWindow):
         self._secondary_period_combo.currentTextChanged.connect(self._on_secondary_period_changed)
         linkage_row.addWidget(self._secondary_period_combo, 0)
         self._secondary_period_label.hide()
+        linkage_row.removeWidget(self._secondary_period_label)
+        linkage_row.removeWidget(self._secondary_period_combo)
+        secondary_symbol_position = linkage_row.indexOf(self._secondary_symbol_combo)
+        linkage_row.insertWidget(secondary_symbol_position + 1, self._secondary_period_label)
+        linkage_row.insertWidget(secondary_symbol_position + 2, self._secondary_period_combo)
 
         self._secondary_layout_cycle_btn = QPushButton("")
         self._secondary_layout_cycle_btn.setEnabled(False)
@@ -8296,7 +8580,16 @@ class KlineAnalysisWindow(QMainWindow):
         self._daily_timezone_compare_btn = QPushButton("UTC+8/UTC日线")
         self._daily_timezone_compare_btn.setToolTip("同一交易对左右比较：左图 UTC+8 日线，右图 UTC 日线")
         self._daily_timezone_compare_btn.clicked.connect(self._on_daily_timezone_compare_clicked)
-        linkage_row.addWidget(self._daily_timezone_compare_btn)
+        layout_shortcuts = QFrame(self._layout_context_panel)
+        layout_shortcuts.setObjectName("ToolbarGroup")
+        shortcut_layout = QHBoxLayout(layout_shortcuts)
+        shortcut_layout.setContentsMargins(6, 2, 6, 2)
+        shortcut_layout.setSpacing(4)
+        shortcut_layout.addWidget(QLabel("布局"))
+        for control in (self._secondary_layout_cycle_btn, self._secondary_chart_kind_btn,
+                        self._secondary_sync_period_btn, self._daily_timezone_compare_btn):
+            linkage_row.removeWidget(control)
+            shortcut_layout.addWidget(control)
         linkage_row.addStretch(1)
 
         view_options_menu = QMenu(header)
@@ -8413,20 +8706,51 @@ class KlineAnalysisWindow(QMainWindow):
         self._chart_range_mode_btn = QPushButton("全量视图")
         self._chart_range_mode_btn.clicked.connect(self._toggle_chart_view_range_mode)
         workspace_row = QHBoxLayout()
+        workspace_row.addWidget(self._toggle_left_panel_btn, 0)
         workspace_row.setSpacing(8)
-        workspace_row.addWidget(ma_group, 0)
-        workspace_row.addWidget(self._best_parameter_indicators_check, 0)
-        workspace_row.addWidget(self._history_trade_group, 0)
-        workspace_row.addWidget(shape_group, 0)
+        self._header_menu_buttons = {}
+        ma_group_layout.addWidget(self._best_parameter_indicators_check)
+        for button_text, content_widget in (("均线", ma_group),):
+            menu = QMenu(header)
+            action = QWidgetAction(menu)
+            action.setDefaultWidget(content_widget)
+            menu.addAction(action)
+            menu_button = QPushButton(button_text)
+            menu_button.setMenu(menu)
+            self._header_menu_buttons[button_text] = menu_button
+            workspace_row.addWidget(menu_button, 0)
+        kline_display_button = QPushButton("显示 反转/日分隔")
+        kline_display_button.setCheckable(True)
+        kline_display_button.setToolTip("展开平均K线、K线反转和交易日分隔选项；再次点击收起。")
+        kline_display_button.toggled.connect(self._toggle_kline_display_panel)
+        self._header_menu_buttons["K线显示"] = kline_display_button
+        workspace_row.addWidget(kline_display_button, 0)
+        button_text = "交易标记"
+        menu = QMenu(header)
+        action = QWidgetAction(menu)
+        action.setDefaultWidget(self._history_trade_group)
+        menu.addAction(action)
+        menu_button = QPushButton(button_text)
+        menu_button.setMenu(menu)
+        self._header_menu_buttons[button_text] = menu_button
+        workspace_row.addWidget(menu_button, 0)
         workspace_row.addWidget(self._shape_settings_button, 0)
-        workspace_row.addWidget(kline_display_group, 0)
-        for chart_check in (
+        layout_menu = QMenu(header)
+        layout_action = QWidgetAction(layout_menu)
+        layout_action.setDefaultWidget(layout_shortcuts)
+        layout_menu.addAction(layout_action)
+        layout_menu_button = QPushButton("布局")
+        layout_menu_button.setMenu(layout_menu)
+        workspace_row.addWidget(layout_menu_button, 0)
+        workspace_row.addWidget(self._layout_context_panel, 1)
+        self._chart_count_checkboxes = (
             self._secondary_chart_check,
             self._tertiary_chart_check,
             self._quaternary_chart_check,
-        ):
+        )
+        for chart_check in self._chart_count_checkboxes:
             linkage_row.removeWidget(chart_check)
-            workspace_row.addWidget(chart_check, 0)
+            chart_check.hide()
         workspace_row.addStretch(1)
         workspace_row.addWidget(self._trade_recommendation_button, 0)
         self._account_drawer_button = QPushButton("委托/持仓")
@@ -8440,10 +8764,59 @@ class KlineAnalysisWindow(QMainWindow):
         workspace_row.addWidget(self._chart_range_mode_btn, 0)
 
         self._layout_context_panel.setVisible(False)
-        header_layout.addLayout(top_row)
-        header_layout.addWidget(self._plan_execution_context)
-        header_layout.addLayout(workspace_row)
-        header_layout.addWidget(self._layout_context_panel)
+        top_content = QWidget(header)
+        self._header_top_content = top_content
+        top_content.setLayout(top_row)
+        top_scroll = QScrollArea(header)
+        self._header_top_scroll = top_scroll
+        top_scroll.setWidgetResizable(False)
+        top_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        top_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        top_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        top_scroll.setFixedHeight(56)
+        top_scroll.setWidget(top_content)
+        header_layout.addWidget(top_scroll)
+        header_layout.addLayout(preset_row)
+        workspace_content = QWidget(header)
+        self._header_workspace_content = workspace_content
+        workspace_content.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+        workspace_content.setLayout(workspace_row)
+        workspace_scroll = QScrollArea(header)
+        self._header_workspace_scroll = workspace_scroll
+        workspace_scroll.setWidgetResizable(False)
+        workspace_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        workspace_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        workspace_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        workspace_scroll.setFixedHeight(70)
+        workspace_scroll.setWidget(workspace_content)
+        second_row = QHBoxLayout()
+        second_row.addWidget(workspace_scroll, 1)
+        context_panel = QWidget(header)
+        context_layout = QVBoxLayout(context_panel)
+        context_layout.setContentsMargins(4, 0, 0, 0)
+        context_layout.setSpacing(0)
+        api_row = QHBoxLayout()
+        api_row.setContentsMargins(0, 0, 0, 0)
+        api_row.addWidget(self._api_profile_label)
+        api_row.addWidget(self._api_profile_combo, 1)
+        if self._embedded:
+            self._api_profile_label.hide()
+            self._api_profile_combo.hide()
+        context_layout.addLayout(api_row)
+        context_layout.addWidget(self._account_context)
+        context_layout.addWidget(self._plan_execution_context)
+        context_panel.setFixedWidth(245)
+        second_row.addWidget(context_panel)
+        header_layout.addLayout(second_row)
+        kline_display_panel_row = QWidget(header)
+        self._kline_display_panel_row = kline_display_panel_row
+        kline_display_panel_layout = QHBoxLayout(kline_display_panel_row)
+        kline_display_panel_layout.setContentsMargins(4, 0, 4, 2)
+        kline_display_panel_layout.addWidget(kline_display_group, 0, Qt.AlignmentFlag.AlignLeft)
+        kline_display_panel_layout.addStretch(1)
+        self._kline_display_panel = kline_display_group
+        header_layout.addWidget(kline_display_panel_row)
+        kline_display_panel_row.hide()
 
         self._refresh_api_profiles()
         parent_layout.addWidget(header)
@@ -9081,6 +9454,46 @@ class KlineAnalysisWindow(QMainWindow):
 
         self._refresh_timer = QTimer(self)
         self._refresh_timer.timeout.connect(self._load_data)
+        for option in (self._ema9, self._ema21, self._ema21_55_check, self._atr10_check,
+                       self._best_parameter_indicators_check, self._secondary_average_kline_check,
+                       self._primary_average_secondary_normal_check, self._reverse_kline_check,
+                       self._trading_day_separators_check, self._show_1h_shape_signal_check,
+                       self._show_4h_shape_signal_check, self._show_1d_shape_signal_check,
+                       self._show_1w_shape_signal_check, self._shape_signal_ma_touch_check):
+            option.toggled.connect(self._refresh_indicator_menu_labels)
+        self._refresh_indicator_menu_labels()
+
+    def _refresh_indicator_menu_labels(self, *_args) -> None:
+        if not hasattr(self, "_header_menu_buttons"):
+            return
+        active_ma = [label for label, widget in (("15", self._ema9), ("50", self._ema21),
+                     ("21/55", self._ema21_55_check), ("ATR", self._atr10_check),
+                     ("最佳", self._best_parameter_indicators_check)) if widget.isChecked()]
+        self._header_menu_buttons["均线"].setText("均线 " + ("/".join(active_ma) if active_ma else "关"))
+        displays = [label for label, widget in (("平均", self._secondary_average_kline_check),
+                    ("主均副普", self._primary_average_secondary_normal_check),
+                    ("反转", self._reverse_kline_check), ("日分隔", self._trading_day_separators_check)) if widget.isChecked()]
+        self._header_menu_buttons["K线显示"].setText("显示 " + ("/".join(displays) if displays else "普通"))
+        content = getattr(self, "_header_workspace_content", None)
+        if content is not None:
+            content.adjustSize()
+
+    def _set_chart_count(self, count: int) -> None:
+        count = max(1, min(4, int(count)))
+        for index, checkbox in enumerate(self._chart_count_checkboxes, start=2):
+            checkbox.blockSignals(True)
+            checkbox.setChecked(count >= index)
+            checkbox.blockSignals(False)
+        if count == 1 or (self._active_chart_target == "quaternary" and count < 4) or (self._active_chart_target == "tertiary" and count < 3):
+            self._set_active_chart_target("primary")
+        elif self._active_chart_target == "secondary" and count < 2:
+            self._set_active_chart_target("primary")
+        for value, button in self._chart_count_buttons.items():
+            button.setChecked(value == count)
+        self._apply_secondary_chart_visibility()
+        self._sync_primary_period_buttons()
+        self._invalidate_pending_chart_results(targets=("secondary", "tertiary", "quaternary"))
+        self._load_data()
 
     def _on_trading_day_separators_toggled(self, visible: bool) -> None:
         for view in self.findChildren(InteractiveKlineChartView):
@@ -10068,6 +10481,12 @@ class KlineAnalysisWindow(QMainWindow):
         self._update_secondary_controls_state()
         self._apply_secondary_chart_layout()
         self._refresh_chart_mode_cycle_button()
+        if hasattr(self, "_chart_count_buttons"):
+            active_count = 4 if self._quaternary_chart_check.isChecked() else 3 if self._tertiary_chart_check.isChecked() else 2 if enabled else 1
+            for value, button in self._chart_count_buttons.items():
+                button.setChecked(value == active_count)
+        if hasattr(self, "_header_workspace_content"):
+            self._header_workspace_content.adjustSize()
         self._schedule_chart_layout_refresh(0)
 
     def _active_period_value(self) -> str:
@@ -10669,15 +11088,18 @@ class KlineAnalysisWindow(QMainWindow):
         label = getattr(self, "_plan_execution_context", None)
         if label is None:
             return
+        def set_context(text: str) -> None:
+            label.setText(text)
+            label.setToolTip(text)
         tabs = getattr(self, "_control_tabs", None)
         current_tab = tabs.currentIndex() if tabs is not None else -1
         if current_tab == int(getattr(self, "_control_area_tab_index", -2)):
             plan = self._current_area_plan()
             exec_mode = str(self._area_shape_mode_combo.currentData() or "paper") if hasattr(self, "_area_shape_mode_combo") else "paper"
             if plan is None or exec_mode == "paper":
-                label.setText(format_trade_context(symbol=self._selected_symbol(), paper=True))
+                set_context(format_trade_context(symbol=self._selected_symbol(), paper=True))
             else:
-                label.setText(format_trade_context(
+                set_context(format_trade_context(
                     profile=plan.profile_name, environment=plan.environment, symbol=plan.symbol,
                     execution_mode=exec_mode, paper=False,
                 ))
@@ -10688,19 +11110,19 @@ class KlineAnalysisWindow(QMainWindow):
                     and 0 <= self._selected_line_index < len(lines)
                     and isinstance(lines[self._selected_line_index], dict) else None)
             if isinstance(line, dict) and line.get("action") in {"long", "short"}:
-                label.setText(format_trade_context(
+                set_context(format_trade_context(
                     profile=line.get("trade_profile_name", ""), environment=line.get("trade_environment", ""),
                     symbol=self._selected_symbol(), execution_mode=line.get("entry_execution_mode", ""),
                 ))
             else:
-                label.setText(f"仅提醒，不提交API订单 | 品种：{self._selected_symbol()}")
+                set_context(f"仅提醒，不提交API订单 | 品种：{self._selected_symbol()}")
             return
         if current_tab == int(getattr(self, "_control_rr_tab_index", -2)) and self._selected_rr_index >= 0:
             try:
                 rr = self._selected_rr_payload()
             except Exception:
                 rr = {}
-            label.setText(format_trade_context(
+            set_context(format_trade_context(
                 profile=rr.get("trade_profile_name", ""), environment=rr.get("trade_environment", ""),
                 symbol=self._selected_symbol(), execution_mode=rr.get("entry_execution_mode", ""),
             ))
@@ -10709,7 +11131,7 @@ class KlineAnalysisWindow(QMainWindow):
             rr = self._selected_rr_payload()
         except Exception:
             rr = {}
-        label.setText(format_trade_context(
+        set_context(format_trade_context(
             profile=rr.get("trade_profile_name", ""), environment=rr.get("trade_environment", ""),
             symbol=self._selected_symbol(), execution_mode=rr.get("entry_execution_mode", ""),
         ))
@@ -18314,6 +18736,7 @@ class KlineAnalysisWindow(QMainWindow):
 
     def _set_status(self, text: str) -> None:
         self._status.setText(text)
+        self._status.setToolTip(text)
 
     def _update_refresh_hint(self) -> None:
         if not self._auto_refresh_btn.isChecked():
