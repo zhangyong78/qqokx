@@ -7,6 +7,7 @@ from dataclasses import dataclass, replace
 from decimal import Decimal
 from typing import Iterable
 
+from shiboken6 import isValid
 from PySide6.QtCore import QThread, QTimer, Qt, Signal
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
@@ -521,6 +522,9 @@ class KlineAccountDrawer(QWidget):
         self._shared_order_store.refresh_failed.connect(self._apply_shared_order_refresh_error)
         self._realtime_store = get_shared_realtime_account_store()
         self._realtime_store.snapshot_ready.connect(self._apply_realtime_snapshot)
+        realtime_signal = self._realtime_store.snapshot_ready
+        realtime_slot = self._apply_realtime_snapshot
+        self.destroyed.connect(lambda: realtime_signal.disconnect(realtime_slot))
         self._build_ui()
 
     def _build_ui(self) -> None:
@@ -1428,6 +1432,8 @@ def _shared_apply_shared_order_snapshot(
 
 
 def _shared_apply_realtime_snapshot(self: KlineAccountDrawer, snapshot: object) -> None:
+    if not isValid(self) or not isValid(self._status_label):
+        return
     if not isinstance(snapshot, AccountRealtimeSnapshot):
         return
     if snapshot.profile_name != self._profile_name or snapshot.environment != self._environment:

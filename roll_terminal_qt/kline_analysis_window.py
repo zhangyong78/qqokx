@@ -7124,6 +7124,7 @@ class SecondaryVolatilityDataLoader(QThread):
                 "source": source,
                 "local_count": local_count,
                 "remote_added_count": remote_added_count,
+                "average_kline": self._average_kline,
                 "local_stale": False,
                 "cache_synced": cache_synced,
                 "start_ms": time_points[0] if time_points else None,
@@ -7361,6 +7362,7 @@ class KlineAnalysisWindow(QMainWindow):
         self._quad_grid_layout = None
         self._primary_period_buttons: dict[str, QPushButton] = {}
         self._active_chart_target = "primary"
+        self._chart_display_options = {target: {"average": False, "reverse": False} for target in ("primary", "secondary", "tertiary", "quaternary")}
         self._trade_recommendation_dialog: KlineTradeRecommendationDialog | None = None
         self._symbol_tab_bar: QTabBar | None = None
         self._view_preset_bar: QTabBar | None = None
@@ -7423,7 +7425,7 @@ class KlineAnalysisWindow(QMainWindow):
         self._account_prefetch_timer = QTimer(self)
         self._account_prefetch_timer.setSingleShot(True)
         self._account_prefetch_timer.timeout.connect(self._prefetch_account_drawer_after_chart_ready)
-        self._left_panel_hidden = True
+        self._left_panel_hidden = False
         self._secondary_volatility_loader: SecondaryVolatilityDataLoader | None = None
         self._syncing_chart_range = False
         self._pending_reload_after_load = False
@@ -7505,6 +7507,11 @@ class KlineAnalysisWindow(QMainWindow):
         super().showEvent(event)
         self._page_active = True
         _debug_log("[kline] showEvent")
+        # Apply the persisted font mode again after the page becomes visible;
+        # pre-show size hints can be stale when the app starts in large mode.
+        self.refresh_global_font()
+        QTimer.singleShot(0, self.refresh_global_font)
+        QTimer.singleShot(100, self.refresh_global_font)
         self._apply_default_splitter_sizes()
         self._schedule_chart_layout_refresh(80)
         if self._initial_load_requested:
@@ -8076,6 +8083,7 @@ class KlineAnalysisWindow(QMainWindow):
             "shape_size_metric": self._shape_signal_size_metric_value(),
             "volatility_currency": self._current_volatility_currency() if self._secondary_chart_kind() == "volatility" else None,
             "limit": self._limit_spin.value(), "local": self._prefer_local_checkbox.isChecked(),
+            "chart_display_options": {target: dict(options) for target, options in self._chart_display_options.items()},
             "options": {key: widget.isChecked() for key, widget in {
                 "ema15": self._ema9, "sma50": self._ema21, "ema21_55": self._ema21_55_check,
                 "atr10": self._atr10_check, "best": self._best_parameter_indicators_check,
@@ -8089,9 +8097,18 @@ class KlineAnalysisWindow(QMainWindow):
         }
 
     def _save_view_preset_as(self) -> None:
-        name, ok = QInputDialog.getText(self, "保存看盘方案", "方案名称")
+        bar = self._view_preset_bar
+        selected_index = bar.currentIndex() if bar is not None else -1
+        selected_item = self._view_presets[selected_index] if 0 <= selected_index < len(self._view_presets) else None
+        default_name = str(selected_item["name"]) if selected_item is not None else ""
+        name, ok = QInputDialog.getText(self, "保存看盘方案", "方案名称", text=default_name)
         name = name.strip()
         if not ok or not name:
+            return
+        if selected_item is not None and name == selected_item["name"]:
+            selected_item["view"] = self._capture_view_preset()
+            self._persist_view_presets()
+            self._load_view_presets(selected_index=selected_index)
             return
         if any(item["name"] == name for item in self._view_presets):
             QMessageBox.information(self, "看盘方案", "名称已存在，请使用右键菜单更新现有方案。")
@@ -8160,6 +8177,18 @@ class KlineAnalysisWindow(QMainWindow):
             self._active_volatility_currency = currency if isinstance(currency, str) and currency in {"BTC", "ETH"} else None
         finally:
             for widget, previous in zip(widgets, old): widget.blockSignals(previous)
+        saved_display = view.get("chart_display_options")
+        legacy_options = view.get("options", {})
+        for target, options in self._chart_display_options.items():
+            saved = saved_display.get(target, {}) if isinstance(saved_display, dict) else {}
+            if not isinstance(saved, dict):
+                saved = {}
+            options["average"] = bool(saved.get("average", legacy_options.get("average", False) or (target == "primary" and legacy_options.get("primary_average_secondary_normal", False))))
+            options["reverse"] = bool(saved.get("reverse", legacy_options.get("reverse", False)))
+        previous = self._primary_average_secondary_normal_check.blockSignals(True)
+        self._primary_average_secondary_normal_check.setChecked(False)
+        self._primary_average_secondary_normal_check.blockSignals(previous)
+        self._sync_chart_display_controls()
         new_symbols = view.get("symbols", [])
         for target, old_symbol, new_symbol in zip(("primary", "secondary", "tertiary", "quaternary"), old_symbols, new_symbols):
             if old_symbol != new_symbol:
@@ -8262,7 +8291,7 @@ class KlineAnalysisWindow(QMainWindow):
         period_toolbar = QWidget()
         period_toolbar_layout = QHBoxLayout(period_toolbar)
         period_toolbar_layout.setContentsMargins(0, 0, 0, 0)
-        period_toolbar_layout.setSpacing(6)
+        period_toolbar_layout.setSpacing(10)
         period_toolbar_layout.addWidget(QLabel("级别"))
         for label, period_value in _PRIMARY_PERIOD_OPTIONS:
             button = QPushButton(label)
@@ -8469,6 +8498,9 @@ class KlineAnalysisWindow(QMainWindow):
 
         self._status = QLabel("就绪")
         self._status.setObjectName("Subtle")
+        # Status text changes during data refresh. Keep its footprint stable so
+        # the scrollable toolbar does not shift as the message length changes.
+        self._status.setFixedWidth(520)
         self._status.setToolTip(self._status.text())
         top_row.addWidget(self._status, 0, Qt.AlignmentFlag.AlignRight)
         self._layout_context_panel = QFrame()
@@ -8614,7 +8646,7 @@ class KlineAnalysisWindow(QMainWindow):
         view_options_layout.addLayout(data_options_row)
 
         self._secondary_average_kline_check = QCheckBox("平均K线")
-        self._secondary_average_kline_check.setToolTip("开启后，主图和副图都使用平均K线算法显示K线。")
+        self._secondary_average_kline_check.setToolTip("对选中图表使用平均K线；开启全部K线窗口联动时同步到各图。")
         self._secondary_average_kline_check.toggled.connect(self._on_secondary_average_kline_toggled)
 
         self._primary_average_secondary_normal_check = QCheckBox("主均副普")
@@ -8628,7 +8660,7 @@ class KlineAnalysisWindow(QMainWindow):
 
         self._reverse_kline_check = QCheckBox("K线反转")
         self._reverse_kline_check.setToolTip("开启后上下翻转K线显示，Y轴和最高/最低标记仍使用交易所真实价格；波动率副图不参与反转。")
-        self._reverse_kline_check.toggled.connect(self._load_data)
+        self._reverse_kline_check.toggled.connect(self._on_reverse_kline_toggled)
 
         self._trading_day_separators_check = QCheckBox("交易日分隔")
         self._trading_day_separators_check.setChecked(True)
@@ -8654,11 +8686,11 @@ class KlineAnalysisWindow(QMainWindow):
         kline_display_layout.addWidget(QLabel("显示"))
         for display_widget in (
             self._secondary_average_kline_check,
-            self._primary_average_secondary_normal_check,
             self._reverse_kline_check,
             self._trading_day_separators_check,
         ):
             kline_display_layout.addWidget(display_widget)
+        self._primary_average_secondary_normal_check.hide()
 
         chart_options_row = QHBoxLayout()
         self._hide_chart_btn = QPushButton("隐藏图表")
@@ -8820,6 +8852,12 @@ class KlineAnalysisWindow(QMainWindow):
 
         self._refresh_api_profiles()
         parent_layout.addWidget(header)
+        # At startup the application font is already selected, but Qt may not
+        # return final size hints until this header is attached to its page.
+        # Recompute once the page/layout activation has completed so persisted
+        # large-font mode is correct without requiring a font toggle.
+        QTimer.singleShot(0, self._refresh_primary_header_button_sizes)
+        QTimer.singleShot(0, self._refresh_header_scroll_content_sizes)
 
     def _build_body(self, parent_layout: QVBoxLayout) -> None:
         splitter = QSplitter(Qt.Orientation.Horizontal)
@@ -9817,7 +9855,7 @@ class KlineAnalysisWindow(QMainWindow):
             aggregation_text = "1W本地聚合（UTC+8周一开周）"
         else:
             aggregation_text = f"{normalized_period}本地聚合"
-        average_text = "开" if self._secondary_average_kline_enabled() else "关"
+        average_text = "开" if payload.stats.get("average_kline", False) else "关"
         currency = self._current_volatility_currency() or "-"
         source_text = str(payload.stats.get("source", f"Deribit {currency} DVOL") or f"Deribit {currency} DVOL")
         source_text = source_text.replace("（本地聚合）", "")
@@ -10240,13 +10278,25 @@ class KlineAnalysisWindow(QMainWindow):
         )
 
     def _primary_average_kline_enabled(self) -> bool:
-        return bool(
-            self._secondary_average_kline_check.isChecked()
-            or self._primary_average_secondary_normal_enabled()
-        )
+        return self._chart_display_options["primary"]["average"]
 
-    def _secondary_average_kline_enabled(self) -> bool:
-        return bool(self._secondary_average_kline_check.isChecked())
+    def _secondary_average_kline_enabled(self, target: str = "secondary") -> bool:
+        return self._chart_display_options[target]["average"]
+
+    def _sync_chart_display_controls(self) -> None:
+        options = self._chart_display_options[self._active_chart_target]
+        for widget, key in ((self._secondary_average_kline_check, "average"), (self._reverse_kline_check, "reverse")):
+            previous = widget.blockSignals(True)
+            widget.setChecked(options[key])
+            widget.blockSignals(previous)
+        self._refresh_indicator_menu_labels()
+
+    def _set_chart_display_option(self, key: str, enabled: bool) -> None:
+        linked = self._symbol_link_all_check is not None and self._symbol_link_all_check.isChecked()
+        targets = self._chart_display_options if linked else (self._active_chart_target,)
+        for target in targets:
+            self._chart_display_options[target][key] = bool(enabled)
+        self._load_data()
 
     def _sync_primary_average_secondary_normal_control_state(self) -> None:
         available = self._primary_average_secondary_normal_available()
@@ -10258,11 +10308,11 @@ class KlineAnalysisWindow(QMainWindow):
 
     @Slot(bool)
     def _on_secondary_average_kline_toggled(self, enabled: bool) -> None:
-        if enabled and self._primary_average_secondary_normal_check.isChecked():
-            self._primary_average_secondary_normal_check.blockSignals(True)
-            self._primary_average_secondary_normal_check.setChecked(False)
-            self._primary_average_secondary_normal_check.blockSignals(False)
-        self._load_data()
+        self._set_chart_display_option("average", enabled)
+
+    @Slot(bool)
+    def _on_reverse_kline_toggled(self, enabled: bool) -> None:
+        self._set_chart_display_option("reverse", enabled)
 
     @Slot(bool)
     def _on_primary_average_secondary_normal_toggled(self, enabled: bool) -> None:
@@ -10548,6 +10598,7 @@ class KlineAnalysisWindow(QMainWindow):
             self._refresh_symbol_tab_selection()
             return
         self._active_chart_target = resolved
+        self._sync_chart_display_controls()
         self._refresh_chart_selection_visuals()
         self._sync_primary_period_buttons()
         self._refresh_symbol_tab_selection()
@@ -11555,7 +11606,7 @@ class KlineAnalysisWindow(QMainWindow):
                 self._current_volatility_currency(),
                 self._period_combo.currentText().strip().upper(),
                 max(50, self._limit_spin.value()),
-                self._secondary_average_kline_enabled(),
+                self._primary_average_kline_enabled(),
             )
         return (
             "primary",
@@ -11568,7 +11619,7 @@ class KlineAnalysisWindow(QMainWindow):
             bool(getattr(self, "_auto_box_check", None) and self._auto_box_check.isChecked()),
             bool(getattr(self, "_history_box_check", None) and self._history_box_check.isChecked()),
             self.pattern_signals_enabled(),
-            bool(self._reverse_kline_check.isChecked()),
+            self._chart_display_options["primary"]["reverse"],
         )
 
     def _current_secondary_request_key(self, *, symbol: str | None = None) -> tuple[Any, ...] | None:
@@ -11595,7 +11646,7 @@ class KlineAnalysisWindow(QMainWindow):
             requested_limit,
             bool(self._prefer_local_checkbox.isChecked()),
             self._secondary_average_kline_enabled(),
-            bool(self._reverse_kline_check.isChecked()),
+            self._chart_display_options["secondary"]["reverse"],
         )
 
     def _current_tertiary_request_key(self) -> tuple[Any, ...] | None:
@@ -11608,7 +11659,7 @@ class KlineAnalysisWindow(QMainWindow):
                 self._current_volatility_currency(),
                 self._tertiary_period_combo.currentText().strip().upper(),
                 max(50, self._limit_spin.value()),
-                self._secondary_average_kline_enabled(),
+                self._secondary_average_kline_enabled("tertiary"),
             )
         return (
             "tertiary",
@@ -11617,8 +11668,8 @@ class KlineAnalysisWindow(QMainWindow):
             self._tertiary_period_combo.currentText().strip().upper(),
             max(50, self._limit_spin.value()),
             bool(self._prefer_local_checkbox.isChecked()),
-            self._secondary_average_kline_enabled(),
-            bool(self._reverse_kline_check.isChecked()),
+            self._secondary_average_kline_enabled("tertiary"),
+            self._chart_display_options["tertiary"]["reverse"],
         )
 
     def _current_quaternary_request_key(self) -> tuple[Any, ...] | None:
@@ -11631,7 +11682,7 @@ class KlineAnalysisWindow(QMainWindow):
                 self._current_volatility_currency(),
                 self._quaternary_period_combo.currentText().strip().upper(),
                 max(50, self._limit_spin.value()),
-                self._secondary_average_kline_enabled(),
+                self._secondary_average_kline_enabled("quaternary"),
             )
         return (
             "quaternary",
@@ -11640,8 +11691,8 @@ class KlineAnalysisWindow(QMainWindow):
             self._quaternary_period_combo.currentText().strip().upper(),
             max(50, self._limit_spin.value()),
             bool(self._prefer_local_checkbox.isChecked()),
-            self._secondary_average_kline_enabled(),
-            bool(self._reverse_kline_check.isChecked()),
+            self._secondary_average_kline_enabled("quaternary"),
+            self._chart_display_options["quaternary"]["reverse"],
         )
 
     def _remember_payload_cache(
@@ -11784,7 +11835,7 @@ class KlineAnalysisWindow(QMainWindow):
                 currency=self._current_volatility_currency() or "",
                 period=period,
                 limit=requested_limit,
-                average_kline=self._secondary_average_kline_enabled(),
+                average_kline=self._primary_average_kline_enabled(),
                 local_only=self._preview_mode or self._prefer_local_checkbox.isChecked(),
             )
         else:
@@ -11960,7 +12011,7 @@ class KlineAnalysisWindow(QMainWindow):
                 currency=self._current_volatility_currency() or "",
                 period=self._tertiary_period_combo.currentText().strip(),
                 limit=max(50, self._limit_spin.value()),
-                average_kline=self._secondary_average_kline_enabled(),
+                average_kline=self._secondary_average_kline_enabled("tertiary"),
                 local_only=self._preview_mode or self._prefer_local_checkbox.isChecked(),
             )
         else:
@@ -11970,7 +12021,7 @@ class KlineAnalysisWindow(QMainWindow):
                 period=self._tertiary_period_combo.currentText().strip(),
                 limit=max(50, self._limit_spin.value()),
                 local_only=self._preview_mode or self._prefer_local_checkbox.isChecked(),
-                average_kline=self._secondary_average_kline_enabled(),
+                average_kline=self._secondary_average_kline_enabled("tertiary"),
                 workspace_entry={},
                 enable_alerts=False,
                 enable_shape_signals=False,
@@ -12004,7 +12055,7 @@ class KlineAnalysisWindow(QMainWindow):
                 currency=self._current_volatility_currency() or "",
                 period=self._quaternary_period_combo.currentText().strip(),
                 limit=max(50, self._limit_spin.value()),
-                average_kline=self._secondary_average_kline_enabled(),
+                average_kline=self._secondary_average_kline_enabled("quaternary"),
                 local_only=self._preview_mode or self._prefer_local_checkbox.isChecked(),
             )
         else:
@@ -12014,7 +12065,7 @@ class KlineAnalysisWindow(QMainWindow):
                 period=self._quaternary_period_combo.currentText().strip(),
                 limit=max(50, self._limit_spin.value()),
                 local_only=self._preview_mode or self._prefer_local_checkbox.isChecked(),
-                average_kline=self._secondary_average_kline_enabled(),
+                average_kline=self._secondary_average_kline_enabled("quaternary"),
                 workspace_entry={},
                 enable_alerts=False,
                 enable_shape_signals=False,
@@ -12729,12 +12780,11 @@ class KlineAnalysisWindow(QMainWindow):
         ):
             self._render_quaternary_chart(self._quaternary_pending_payload)
 
-    def _reverse_kline_enabled_for_chart(self, *, is_secondary: bool) -> bool:
-        if not bool(self._reverse_kline_check.isChecked()):
+    def _reverse_kline_enabled_for_chart(self, *, is_secondary: bool, target: str | None = None) -> bool:
+        target = target or ("secondary" if is_secondary else "primary")
+        if not self._chart_display_options[target]["reverse"]:
             return False
-        if not is_secondary:
-            return True
-        return self._secondary_chart_kind() == "kline"
+        return not (target == "secondary" and self._secondary_chart_kind() != "kline") and not self._all_charts_volatility_enabled()
 
     def _display_payload_for_chart(self, payload: KlineChartPayload, *, is_secondary: bool) -> KlineChartPayload:
         # Reverse the vertical scale, not the prices: keep true exchange values
@@ -13264,6 +13314,7 @@ class KlineAnalysisWindow(QMainWindow):
         venue_label: str = "OKX",
         chart_note_lines: list[str] | None = None,
     ) -> None:
+        display_target = next((target for target, view in (("primary", self._native_chart_view), ("secondary", self._secondary_native_chart_view), ("tertiary", self._tertiary_native_chart_view), ("quaternary", self._quaternary_native_chart_view)) if chart_view is view), "primary")
         restore_state = None
         if isinstance(chart_view, InteractiveKlineChartView):
             restore_state = chart_view.capture_view_state()
@@ -13525,7 +13576,7 @@ class KlineAnalysisWindow(QMainWindow):
                     max_price = max(max_price, future_value)
                 chart.addSeries(series)
                 overlay_values.append(line_values)
-            if self._reverse_kline_enabled_for_chart(is_secondary=is_secondary):
+            if self._reverse_kline_enabled_for_chart(is_secondary=is_secondary, target=display_target):
                 workspace_lines = [
                     dict(
                         item,
@@ -13602,7 +13653,7 @@ class KlineAnalysisWindow(QMainWindow):
         axis_x.setGridLineVisible(False)
 
         axis_y = QValueAxis()
-        axis_y.setReverse(self._reverse_kline_enabled_for_chart(is_secondary=is_secondary))
+        axis_y.setReverse(self._reverse_kline_enabled_for_chart(is_secondary=is_secondary, target=display_target))
         top_padding, bottom_padding = _compute_axis_y_padding(min_price, max_price, show_atr=show_atr)
         axis_y.setRange(min_price - bottom_padding, max_price + top_padding)
         axis_y.setLabelFormat(_axis_y_label_format(min_price, max_price))
