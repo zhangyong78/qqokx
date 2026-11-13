@@ -62,7 +62,7 @@ class PositionDisplayForegroundColorsTest(TestCase):
             "3张（折合 0.3 ETH）",
         )
 
-    def test_estimated_close_fee_formats_usdt_equivalent_with_two_decimals(self) -> None:
+    def test_estimated_close_fee_formats_usdt_equivalent_as_integer(self) -> None:
         position = SimpleNamespace(
             position=Decimal("1"),
             inst_id="BTC-USD-SWAP",
@@ -93,7 +93,7 @@ class PositionDisplayForegroundColorsTest(TestCase):
             fee_rate=Decimal("0.0003"),
         )
 
-        self.assertEqual(text, "0.03 USDT")
+        self.assertEqual(text, "0 USDT")
 
     def test_estimated_close_fee_for_linear_perpetual_uses_quote_usdt(self) -> None:
         position = SimpleNamespace(
@@ -126,7 +126,7 @@ class PositionDisplayForegroundColorsTest(TestCase):
             fee_rate=Decimal("0.0003"),
         )
 
-        self.assertEqual(text, "6.00 USDT")
+        self.assertEqual(text, "6 USDT")
 
         group_text = _format_group_estimated_close_fee(
             [position],
@@ -135,7 +135,7 @@ class PositionDisplayForegroundColorsTest(TestCase):
             {"DOGE": Decimal("0.08")},
             fee_rate_for=lambda _inst_type: Decimal("0.0003"),
         )
-        self.assertEqual(group_text, "6.00 USDT")
+        self.assertEqual(group_text, "6 USDT")
 
     def test_estimated_close_fee_for_option_also_returns_usdt_only(self) -> None:
         position = SimpleNamespace(
@@ -168,7 +168,7 @@ class PositionDisplayForegroundColorsTest(TestCase):
             fee_rate=Decimal("0.0003"),
         )
 
-        self.assertEqual(text, "10.08 USDT")
+        self.assertEqual(text, "10 USDT")
 
     def test_group_estimated_close_fee_stays_in_its_column_after_contract_column(self) -> None:
         values = _group_row_values_with_break_even(
@@ -196,8 +196,8 @@ class PositionDisplayForegroundColorsTest(TestCase):
             },
         )
 
-        self.assertEqual(values[25], "6.00 USDT")
-        self.assertEqual(values[26], "≈100 USDT")
+        self.assertEqual(values[26], "6.00 USDT")
+        self.assertEqual(values[27], "≈100 USDT")
         self.assertEqual(len(values), len(POSITION_COLUMNS))
         self.assertEqual(values[15:20], ("--", "--", "--", "--", "--"))
 

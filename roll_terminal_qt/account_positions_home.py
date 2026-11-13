@@ -531,6 +531,7 @@ from okx_quant.ui_shell import (
     _position_note_current_key,
     _position_contract_value_snapshot,
     _position_realized_pnl_usdt,
+    _position_signed_display_amount,
     _position_signed_open_value_approx_usdt,
     _position_theta_usdt,
     _position_tree_row_id,
@@ -820,29 +821,30 @@ POSITION_COLUMNS: tuple[tuple[str, str, int, Qt.AlignmentFlag], ...] = (
     ("inst_type", "类型", 72, Qt.AlignmentFlag.AlignCenter),
     ("mgn_mode", "保证金模式", 92, Qt.AlignmentFlag.AlignCenter),
     ("time_value", "时间价值", 88, Qt.AlignmentFlag.AlignRight),
-    ("time_value_usdt", "时间≈USDT", 72, Qt.AlignmentFlag.AlignRight),
+    ("time_value_usdt", "时间\n≈USDT", 58, Qt.AlignmentFlag.AlignRight),
     ("intrinsic_value", "内在价值", 88, Qt.AlignmentFlag.AlignRight),
-    ("intrinsic_usdt", "内在≈USDT", 72, Qt.AlignmentFlag.AlignRight),
+    ("intrinsic_usdt", "内在\n≈USDT", 58, Qt.AlignmentFlag.AlignRight),
     ("bid_price", "买一价", 78, Qt.AlignmentFlag.AlignRight),
     ("bid_size", "买一量", 78, Qt.AlignmentFlag.AlignRight),
-    ("bid_usdt", "买一≈USDT", 78, Qt.AlignmentFlag.AlignRight),
+    ("bid_usdt", "买一\n≈USDT", 58, Qt.AlignmentFlag.AlignRight),
     ("ask_price", "卖一价", 78, Qt.AlignmentFlag.AlignRight),
     ("ask_size", "卖一量", 78, Qt.AlignmentFlag.AlignRight),
-    ("ask_usdt", "卖一≈USDT", 78, Qt.AlignmentFlag.AlignRight),
+    ("ask_usdt", "卖一\n≈USDT", 58, Qt.AlignmentFlag.AlignRight),
     ("mark", "标记价", 84, Qt.AlignmentFlag.AlignRight),
-    ("mark_usdt", "标记≈USDT", 72, Qt.AlignmentFlag.AlignRight),
+    ("mark_usdt", "标记\n≈USDT", 58, Qt.AlignmentFlag.AlignRight),
     ("avg", "开仓价", 84, Qt.AlignmentFlag.AlignRight),
-    ("avg_usdt", "开仓≈USDT", 72, Qt.AlignmentFlag.AlignRight),
-    ("open_value_usdt", "开仓价值≈USDT", 116, Qt.AlignmentFlag.AlignRight),
+    ("avg_usdt", "开仓\n≈USDT", 58, Qt.AlignmentFlag.AlignRight),
+    ("open_value_usdt", "开仓价值\n≈USDT", 88, Qt.AlignmentFlag.AlignRight),
+    ("option_premium", "期权权利金", 120, Qt.AlignmentFlag.AlignRight),
     ("break_even", "保本价格", 96, Qt.AlignmentFlag.AlignRight),
     ("pos", "持仓量", 170, Qt.AlignmentFlag.AlignRight),
     ("pos_contracts", "持仓张数", 100, Qt.AlignmentFlag.AlignRight),
     ("option_side", "买购:卖购 | 买沽:卖沽", 170, Qt.AlignmentFlag.AlignCenter),
     ("upl", "浮盈亏", 168, Qt.AlignmentFlag.AlignRight),
-    ("upl_usdt", "浮盈≈USDT", 108, Qt.AlignmentFlag.AlignRight),
+    ("upl_usdt", "浮盈\n≈USDT", 58, Qt.AlignmentFlag.AlignRight),
     ("realized", "已实现盈亏", 118, Qt.AlignmentFlag.AlignRight),
-    ("realized_usdt", "已实现≈USDT", 108, Qt.AlignmentFlag.AlignRight),
-    ("estimated_close_fee", "预估平仓手续费", 150, Qt.AlignmentFlag.AlignRight),
+    ("realized_usdt", "已实现\n≈USDT", 68, Qt.AlignmentFlag.AlignRight),
+    ("estimated_close_fee", "预估平仓\n手续费", 108, Qt.AlignmentFlag.AlignRight),
     ("market_value", "市值", 160, Qt.AlignmentFlag.AlignRight),
     ("liq", "强平价", 92, Qt.AlignmentFlag.AlignRight),
     ("mgn_ratio", "保证金率", 88, Qt.AlignmentFlag.AlignRight),
@@ -852,18 +854,34 @@ POSITION_COLUMNS: tuple[tuple[str, str, int, Qt.AlignmentFlag], ...] = (
     ("gamma", "Gamma(PA)", 82, Qt.AlignmentFlag.AlignRight),
     ("vega", "Vega(PA)", 82, Qt.AlignmentFlag.AlignRight),
     ("theta", "Theta(PA)", 108, Qt.AlignmentFlag.AlignRight),
-    ("theta_usdt", "Theta≈USDT", 108, Qt.AlignmentFlag.AlignRight),
+    ("theta_usdt", "Theta\n≈USDT", 66, Qt.AlignmentFlag.AlignRight),
     ("note", "备注", 200, Qt.AlignmentFlag.AlignLeft),
 )
 
 _POSITION_TREE_COLUMN_INDEX = {
     column_id: index for index, (column_id, _heading, _width, _alignment) in enumerate(POSITION_COLUMNS, start=1)
 }
+_COMPACT_USDT_COLUMN_IDS = {
+    "time_value_usdt", "intrinsic_usdt", "bid_usdt", "ask_usdt", "mark_usdt",
+    "avg_usdt", "upl_usdt", "realized_usdt", "theta_usdt",
+}
+_APPROX_USDT_COLUMN_IDS = _COMPACT_USDT_COLUMN_IDS | {"open_value_usdt"}
+_OPTION_ONLY_COLUMN_IDS = {
+    "option_premium", "bid_size", "bid_usdt", "ask_price", "ask_usdt",
+}
+
+
+def _position_delta_is_displayable(position: OkxPosition) -> bool:
+    if str(position.inst_type or "").strip().upper() != "SWAP":
+        return True
+    base = str(position.inst_id or "").split("-", 1)[0].strip().upper()
+    return base in {"BTC", "ETH"}
 _POSITION_POSITIVE_COLOR = "#13803d"
 _POSITION_NEGATIVE_COLOR = "#c23b3b"
 _POSITION_TIME_INTRINSIC_COLOR = "#7c3aed"
 _POSITION_BID_ASK_COLOR = "#d97706"
 _POSITION_MARK_AVG_COLOR = "#2563eb"
+_POSITION_APPROX_USDT_COLOR = "#0f6b78"
 
 
 def _format_position_quote_size(ticker: object | None, *, side: str) -> str:
@@ -1212,9 +1230,9 @@ def _format_estimated_close_fee_amount(value: Decimal) -> str:
 
 
 def _format_estimated_close_fee_usdt_amount(value: Decimal) -> str:
-    """Display the USDT equivalent in the holdings table with two decimals."""
-    rounded = value.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
-    return format_decimal_fixed(rounded, places=2)
+    """Display the USDT equivalent as an integer in the holdings table."""
+    rounded = value.quantize(Decimal("1"), rounding=ROUND_HALF_UP)
+    return format_decimal_fixed(rounded, places=0)
 
 
 def _format_estimated_close_fee(
@@ -1354,8 +1372,9 @@ def _group_row_values_with_break_even(group_type: str, metrics: dict[str, object
     values = list(_build_group_row_values(group_type, metrics))
     values[14:14] = ["--", "--"]
     values.insert(17, "--")
-    values.insert(25, str(metrics.get("estimated_close_fee") or "--"))
-    for index in (16, 18, 19):
+    values.insert(18, "--")
+    values.insert(26, str(metrics.get("estimated_close_fee") or "--"))
+    for index in (16, 19, 20):
         values[index] = "--"
     return tuple(values)
 
@@ -1405,6 +1424,7 @@ DEFAULT_VISIBLE_COLUMNS: tuple[str, ...] = (
     "mgn_ratio",
     "note",
     "open_value_usdt",
+    "option_premium",
     "break_even",
     "option_side",
     "pos",
@@ -1424,33 +1444,34 @@ DEFAULT_VISIBLE_COLUMNS: tuple[str, ...] = (
 DEFAULT_TREE_LABEL_WIDTH = 278
 DEFAULT_TREE_COLUMN_WIDTHS: dict[str, int] = {
     "time_value": 153,
-    "time_value_usdt": 72,
+    "time_value_usdt": 58,
     "intrinsic_value": 64,
-    "intrinsic_usdt": 66,
+    "intrinsic_usdt": 58,
     "bid_price": 88,
-    "bid_usdt": 71,
+    "bid_usdt": 58,
     "ask_price": 85,
-    "ask_usdt": 69,
+    "ask_usdt": 58,
     "mark": 85,
-    "mark_usdt": 63,
+    "mark_usdt": 58,
     "avg": 81,
-    "avg_usdt": 72,
-    "open_value_usdt": 102,
+    "avg_usdt": 58,
+    "open_value_usdt": 88,
+    "option_premium": 120,
     "break_even": 91,
     "pos": 154,
     "option_side": 185,
     "upl": 197,
-    "upl_usdt": 81,
+    "upl_usdt": 58,
     "realized": 102,
-    "realized_usdt": 81,
-    "estimated_close_fee": 150,
+    "realized_usdt": 68,
+    "estimated_close_fee": 108,
     "market_value": 196,
     "mgn_ratio": 64,
     "delta": 109,
     "gamma": 69,
     "vega": 70,
     "theta": 77,
-    "theta_usdt": 93,
+    "theta_usdt": 66,
     "note": 1230,
 }
 
@@ -4395,6 +4416,12 @@ class AccountPositionsHomeWidget(QWidget):
         header_item = self._position_tree.headerItem()
         for index in range(self._position_tree.columnCount()):
             header_item.setTextAlignment(index, int(Qt.AlignmentFlag.AlignCenter | Qt.AlignmentFlag.AlignVCenter))
+        for index, (column_id, heading, _width, _alignment) in enumerate(POSITION_COLUMNS, start=1):
+            if column_id in _COMPACT_USDT_COLUMN_IDS:
+                header_item.setToolTip(index, heading.replace("\n", "") + "；数值单位为 USDT")
+            if column_id in _APPROX_USDT_COLUMN_IDS:
+                header_item.setForeground(index, QColor(_POSITION_APPROX_USDT_COLOR))
+        header.setMinimumHeight(header.fontMetrics().height() * 2 + 8)
         self._position_tree.setColumnWidth(0, DEFAULT_TREE_LABEL_WIDTH)
         for index, (_column_id, _heading, width, _alignment) in enumerate(POSITION_COLUMNS, start=1):
             self._position_tree.setColumnWidth(index, DEFAULT_TREE_COLUMN_WIDTHS.get(_column_id, width))
@@ -6032,8 +6059,21 @@ class AccountPositionsHomeWidget(QWidget):
         self._schedule_positions_view_prefs_save()
 
     def _apply_column_visibility(self) -> None:
+        has_option_positions = any(
+            str(position.inst_type or "").strip().upper() == "OPTION"
+            for position in getattr(self, "_visible_positions", self._raw_positions)
+        )
+        has_displayable_delta = any(
+            _position_delta_is_displayable(position)
+            for position in getattr(self, "_visible_positions", self._raw_positions)
+        )
         for index, (column_id, _heading, _width, _alignment) in enumerate(POSITION_COLUMNS, start=1):
-            self._position_tree.setColumnHidden(index, column_id not in self._visible_column_ids)
+            hidden = column_id not in self._visible_column_ids
+            if column_id in _OPTION_ONLY_COLUMN_IDS and not has_option_positions:
+                hidden = True
+            if column_id == "delta" and not has_displayable_delta:
+                hidden = True
+            self._position_tree.setColumnHidden(index, hidden)
 
     def _load_positions_view_prefs(self) -> None:
         try:
@@ -6055,6 +6095,8 @@ class AccountPositionsHomeWidget(QWidget):
                 loaded_visible_columns.add("estimated_close_fee")
             if prefs_version < 3:
                 loaded_visible_columns.add("pos_contracts")
+            if prefs_version < 4:
+                loaded_visible_columns.add("option_premium")
             if loaded_visible_columns:
                 self._visible_column_ids = loaded_visible_columns
         raw_tree_column_widths = snapshot.get("tree_column_widths")
@@ -6089,6 +6131,10 @@ class AccountPositionsHomeWidget(QWidget):
         for index, (column_id, _heading, _width, _alignment) in enumerate(POSITION_COLUMNS, start=1):
             width = self._tree_column_width_overrides.get(column_id)
             if width:
+                if column_id in _COMPACT_USDT_COLUMN_IDS:
+                    width = min(width, DEFAULT_TREE_COLUMN_WIDTHS.get(column_id, width))
+                if column_id == "open_value_usdt":
+                    width = min(width, DEFAULT_TREE_COLUMN_WIDTHS.get(column_id, width))
                 self._position_tree.setColumnWidth(index, width)
 
     @Slot()
@@ -6165,6 +6211,7 @@ class AccountPositionsHomeWidget(QWidget):
 
     def _render_positions_tree(self) -> None:
         self._visible_positions = self._visible_position_list()
+        self._apply_column_visibility()
         selected_key = ""
         current = self._position_tree.currentItem()
         if current is not None:
@@ -6189,6 +6236,8 @@ class AccountPositionsHomeWidget(QWidget):
             asset_positions = [item for bucket in buckets.values() for item in bucket]
             selected_asset_positions = self._checked_positions(asset_positions)
             asset_metrics = _aggregate_position_metrics(selected_asset_positions, self._upl_usdt_prices, self._position_instruments)
+            if not any(_position_delta_is_displayable(item) for item in selected_asset_positions):
+                asset_metrics["delta"] = None
             asset_metrics["estimated_close_fee"] = _format_group_estimated_close_fee(
                 selected_asset_positions,
                 self._position_instruments,
@@ -6220,6 +6269,8 @@ class AccountPositionsHomeWidget(QWidget):
                     self._upl_usdt_prices,
                     self._position_instruments,
                 )
+                if not any(_position_delta_is_displayable(item) for item in selected_bucket_positions):
+                    bucket_metrics["delta"] = None
                 bucket_metrics["estimated_close_fee"] = _format_group_estimated_close_fee(
                     selected_bucket_positions,
                     self._position_instruments,
@@ -6263,7 +6314,17 @@ class AccountPositionsHomeWidget(QWidget):
         payload_item: object,
         payload_metrics: dict[str, object] | None,
     ) -> QTreeWidgetItem:
-        item = QTreeWidgetItem([label, *list(values)])
+        display_values = list(values)
+        original_values = list(values)
+        for index, (column_id, *_rest) in enumerate(POSITION_COLUMNS):
+            placeholder = str(display_values[index]).strip()
+            if placeholder in {"--", "-"}:
+                display_values[index] = ""
+            elif column_id == "option_side" and placeholder.replace(" ", "") == "-:-|-:-":
+                display_values[index] = ""
+            if column_id in _COMPACT_USDT_COLUMN_IDS:
+                display_values[index] = str(display_values[index]).removesuffix(" USDT")
+        item = QTreeWidgetItem([label, *display_values])
         item.setData(0, Qt.ItemDataRole.UserRole, row_key)
         self._position_row_payloads[row_key] = {
             "kind": kind,
@@ -6275,6 +6336,11 @@ class AccountPositionsHomeWidget(QWidget):
             item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsUserCheckable)
         for index, (_column_id, _heading, _width, alignment) in enumerate(POSITION_COLUMNS, start=1):
             item.setTextAlignment(index, int(alignment | Qt.AlignmentFlag.AlignVCenter))
+        for index, column_id in enumerate((column_id for column_id, *_rest in POSITION_COLUMNS), start=1):
+            if column_id in _COMPACT_USDT_COLUMN_IDS and display_values[index - 1] != original_values[index - 1]:
+                item.setToolTip(index, str(original_values[index - 1]))
+            if column_id in _APPROX_USDT_COLUMN_IDS:
+                item.setForeground(index, QColor(_POSITION_APPROX_USDT_COLOR))
         return item
 
     def _build_position_item(self, position: OkxPosition) -> QTreeWidgetItem:
@@ -6283,6 +6349,16 @@ class AccountPositionsHomeWidget(QWidget):
         if position.pos_side and position.pos_side.lower() != "net":
             pos_side_label = {"long": "多头", "short": "空头"}.get(position.pos_side.lower(), position.pos_side)
             label = f"{label} [{pos_side_label}]"
+        open_value_text = _format_optional_approx_usdt(
+            _position_signed_open_value_approx_usdt(position, self._position_instruments, self._upl_usdt_prices)
+        )
+        has_order_book = position.inst_type in {"OPTION", "SWAP", "FUTURES"}
+        option_premium_text = "-"
+        if position.inst_type == "OPTION" and position.avg_price is not None:
+            option_amount, option_currency = _position_signed_display_amount(position, self._position_instruments)
+            if option_amount is not None and option_currency:
+                premium_total = option_amount * position.avg_price
+                option_premium_text = f"{format_decimal_fixed(premium_total, 5)} {option_currency}"
         values = (
             _format_instrument_type(position.inst_type),
             _format_margin_mode(position.mgn_mode),
@@ -6290,19 +6366,18 @@ class AccountPositionsHomeWidget(QWidget):
             _format_position_option_component_usdt(position, self._upl_usdt_prices, component="time_value"),
             _format_position_option_price_component(position, self._upl_usdt_prices, component="intrinsic_value"),
             _format_position_option_component_usdt(position, self._upl_usdt_prices, component="intrinsic_value"),
-            _format_position_quote_price(position, self._position_instruments, self._position_tickers, side="bid"),
-            _format_position_quote_size(self._position_tickers.get(position.inst_id), side="bid"),
-            _format_position_quote_price_usdt(position, self._position_tickers, self._upl_usdt_prices, side="bid"),
-            _format_position_quote_price(position, self._position_instruments, self._position_tickers, side="ask"),
-            _format_position_quote_size(self._position_tickers.get(position.inst_id), side="ask"),
-            _format_position_quote_price_usdt(position, self._position_tickers, self._upl_usdt_prices, side="ask"),
+            _format_position_quote_price(position, self._position_instruments, self._position_tickers, side="bid") if has_order_book else "-",
+            _format_position_quote_size(self._position_tickers.get(position.inst_id), side="bid") if position.inst_type == "OPTION" else "-",
+            _format_position_quote_price_usdt(position, self._position_tickers, self._upl_usdt_prices, side="bid") if position.inst_type == "OPTION" else "-",
+            _format_position_quote_price(position, self._position_instruments, self._position_tickers, side="ask") if position.inst_type == "OPTION" else "-",
+            _format_position_quote_size(self._position_tickers.get(position.inst_id), side="ask") if has_order_book else "-",
+            _format_position_quote_price_usdt(position, self._position_tickers, self._upl_usdt_prices, side="ask") if position.inst_type == "OPTION" else "-",
             _format_mark_price(position),
             _format_position_mark_price_usdt(position, self._upl_usdt_prices),
             _format_position_avg_price(position, self._position_instruments),
             _format_position_avg_price_usdt(position, self._upl_usdt_prices),
-            _format_optional_approx_usdt(
-                _position_signed_open_value_approx_usdt(position, self._position_instruments, self._upl_usdt_prices)
-            ),
+            open_value_text,
+            option_premium_text,
             _format_optional_decimal_fixed(
                 _position_break_even_price(
                     position,
@@ -6312,7 +6387,7 @@ class AccountPositionsHomeWidget(QWidget):
                         inst_type=position.inst_type,
                     ),
                 ),
-                places=2,
+                places=0,
             ),
             _format_position_size(position, self._position_instruments),
             _format_position_contracts(position),
@@ -6336,11 +6411,13 @@ class AccountPositionsHomeWidget(QWidget):
             _format_ratio(position.margin_ratio, places=2),
             _format_optional_integer(position.initial_margin),
             _format_optional_integer(position.maintenance_margin),
-            _format_optional_decimal_fixed(_position_delta_value(position, self._position_instruments), places=5),
+            _format_optional_decimal_fixed(
+                _position_delta_value(position, self._position_instruments), places=5
+            ) if _position_delta_is_displayable(position) else "-",
             _format_optional_decimal_fixed(position.gamma, places=5),
             _format_optional_decimal_fixed(position.vega, places=5),
             _format_optional_decimal_fixed(position.theta, places=5),
-            _format_optional_usdt_precise(_position_theta_usdt(position, self._upl_usdt_prices), places=2),
+            _format_optional_usdt_precise(_position_theta_usdt(position, self._upl_usdt_prices), places=0),
             self._current_note_summary(position),
         )
         item = self._make_tree_item(
@@ -6374,6 +6451,8 @@ class AccountPositionsHomeWidget(QWidget):
             unrealized_pnl=position.unrealized_pnl,
         ).items():
             item.setForeground(_POSITION_TREE_COLUMN_INDEX[column_id], color)
+        for column_id in _APPROX_USDT_COLUMN_IDS:
+            item.setForeground(_POSITION_TREE_COLUMN_INDEX[column_id], QColor(_POSITION_APPROX_USDT_COLOR))
         if str(position.mgn_mode or "").strip().lower() == "cross":
             for index in range(0, self._position_tree.columnCount()):
                 item.setBackground(index, QColor("#f4f8ff"))

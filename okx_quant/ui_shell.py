@@ -12224,7 +12224,7 @@ def _build_group_row_values(group_type: str, metrics: dict[str, Decimal | int | 
         _format_optional_decimal_fixed(metrics["theta"] if isinstance(metrics["theta"], Decimal) else None, places=5),
         _format_optional_usdt_precise(
             metrics["theta_usdt"] if isinstance(metrics["theta_usdt"], Decimal) else None,
-            places=2,
+            places=0,
         ),
         "--",
     )
@@ -12433,6 +12433,21 @@ def _format_position_size(position: OkxPosition, position_instruments: dict[str,
     if amount is None:
         return "-"
     if currency and currency not in {"USD", "USDT", "USDC"} and position.inst_type in {"FUTURES", "SWAP"}:
+        if position.inst_type == "SWAP":
+            instrument = position_instruments.get(position.inst_id)
+            contract_value, contract_currency = _position_contract_value_snapshot(position, instrument)
+            if (
+                instrument is not None
+                and instrument.lot_size > 0
+                and contract_value is not None
+                and contract_value > 0
+                and contract_currency == currency
+            ):
+                multiplier = instrument.ct_mult if instrument.ct_mult is not None and instrument.ct_mult > 0 else Decimal("1")
+                amount_step = instrument.lot_size * contract_value * multiplier
+                places = _tick_size_places(amount_step)
+                if places is not None:
+                    return f"{format_decimal_fixed(amount, places)} {currency} ({direction})"
         return f"{format_decimal_fixed(amount, 4)} {currency} ({direction})"
     if currency:
         return f"{format_decimal(amount)} {currency} ({direction})"
@@ -12574,7 +12589,7 @@ def _format_position_option_component_usdt(
         value = _position_option_intrinsic_value_usdt(position, upl_usdt_prices)
     else:
         value = None
-    return _format_optional_usdt_precise(value, places=2, with_sign=False)
+    return _format_optional_usdt_precise(value, places=0, with_sign=False)
 
 
 def _position_mark_price_usdt(position: OkxPosition, upl_usdt_prices: dict[str, Decimal]) -> Decimal | None:
