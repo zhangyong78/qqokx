@@ -16,7 +16,7 @@ from PySide6.QtCharts import (
     QLineSeries,
     QValueAxis,
 )
-from PySide6.QtCore import QDateTime, QObject, QPointF, QRectF, QSignalBlocker, Qt, QThread, QTimer, Signal, Slot
+from PySide6.QtCore import QDateTime, QObject, QPointF, QRectF, QSettings, QSignalBlocker, Qt, QThread, QTimer, Signal, Slot
 from PySide6.QtGui import QColor, QGuiApplication, QPainter, QPainterPath, QPen, QPolygonF
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -34,6 +34,7 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QMainWindow,
     QMessageBox,
+    QMenu,
     QPushButton,
     QRadioButton,
     QSlider,
@@ -281,7 +282,7 @@ def _detail_coin_amount(quote: OptionQuote | None, raw_amount: object) -> str:
 
 
 def _detail_usdt_price(quote: OptionQuote | None, price: Decimal | None, coin_usdt: Decimal | None) -> str:
-    if quote is None or price is None or not price.is_finite() or price < 0:
+    if quote is None or price is None or not price.is_finite():
         return ""
     instrument = quote.instrument
     base = instrument.inst_id.split("-", 1)[0].upper()
@@ -295,6 +296,16 @@ def _detail_usdt_price(quote: OptionQuote | None, price: Decimal | None, coin_us
     else:
         return ""
     return format_decimal_fixed(result, 2)
+
+
+def _detail_usdt_summary(quote: OptionQuote | None, value: object, coin_usdt: Decimal | None) -> str:
+    if value in (None, ""):
+        return ""
+    try:
+        amount = Decimal(str(value))
+    except (InvalidOperation, ValueError):
+        return ""
+    return _detail_usdt_price(quote, amount, coin_usdt)
 
 
 def _option_position_coin_texts(
@@ -929,12 +940,20 @@ class _OptionChainThread(QThread):
                 summaries_by_inst_id = {}
             underlying_price = next((item.index_price for item in quotes if item.index_price is not None), None)
             coin_usdt_price = None
-            try:
-                spot = self._client.get_ticker(f"{self._family.split('-')[0]}-USDT")
-                if spot.last is not None and spot.last.is_finite() and spot.last > 0:
-                    coin_usdt_price = spot.last
-            except Exception:
-                pass
+            base_currency = self._family.split("-")[0].strip().upper()
+            for inst_id in (f"{base_currency}-USDT", f"{base_currency}-USDT-SWAP"):
+                try:
+                    reference = self._client.get_ticker(inst_id)
+                except Exception:
+                    continue
+                if reference.last is not None and reference.last.is_finite() and reference.last > 0:
+                    coin_usdt_price = reference.last
+                    break
+            if coin_usdt_price is None and underlying_price is not None and underlying_price.is_finite() and underlying_price > 0:
+                # USD-settled coin options expose a USD underlying index. It is
+                # a usable approximate USDT conversion when the spot and swap
+                # ticker requests are unavailable.
+                coin_usdt_price = underlying_price
             if self.isInterruptionRequested():
                 return
             position_coin_text_by_inst_id: dict[str, str] = {}
@@ -4672,7 +4691,10 @@ class OptionStrategyBigChartDialog(QDialog):
 
 
 class OptionStrategyQtWindow(QMainWindow):
-    def __init__(self, parent: QWidget | None = None, *, profile_name: str = "") -> None:
+    def __init__(
+        self, parent: QWidget | None = None, *, profile_name: str = "",
+        initial_chain_snapshot: ChainSnapshot | None = None, initial_expiry: str = "",
+    ) -> None:
         super().__init__(parent)
         self.setWindowTitle("期权策略计算器")
         self.resize(1880, 1180)
@@ -4742,7 +4764,49 @@ class OptionStrategyQtWindow(QMainWindow):
         self._load_saved_strategies()
         self._refresh_saved_strategy_options()
         self._seed_family_options()
-        QTimer.singleShot(150, self.refresh_chain)
+        if initial_chain_snapshot is not None:
+            self.seed_chain_snapshot(initial_chain_snapshot, initial_expiry)
+        else:
+            QTimer.singleShot(150, self.refresh_chain)
+
+    def seed_chain_snapshot(self, source: ChainSnapshot, expiry: str = "") -> None:
+        """Load an already fetched family snapshot without making a REST request."""
+        family = source.family.strip().upper()
+        self._chain_request_id += 1
+        thread = self._worker_threads.get("chain")
+        if thread is not None:
+            thread.requestInterruption()
+        self._family_combo.setCurrentText(family)
+        self._family_instruments_cache[family] = list(source.family_instruments)
+        self._family_tickers_cache[family] = dict(source.tickers_by_inst_id)
+        self._family_option_summaries_cache[family] = dict(source.option_summaries_by_inst_id)
+        self._family_coin_usdt_prices[family] = source.coin_usdt_price
+        self._chain_position_coin_text_by_inst_id = dict(source.position_coin_text_by_inst_id)
+        self._chain_option_summaries_by_inst_id = dict(source.option_summaries_by_inst_id)
+        self._all_option_instruments = list(source.family_instruments)
+        for instrument in source.family_instruments:
+            self._instrument_map[instrument.inst_id] = instrument
+        instruments_by_id = {item.inst_id: item for item in source.family_instruments}
+        for inst_id, ticker in source.tickers_by_inst_id.items():
+            instrument = instruments_by_id.get(inst_id)
+            if instrument:
+                self._quotes_by_inst_id[instrument.inst_id] = _build_option_quote(instrument, ticker)
+        preferred = expiry if expiry in source.expiries else source.expiry
+        instruments = [item for item in source.family_instruments
+                       if parse_option_contract(item.inst_id).expiry_code == preferred]
+        quotes = tuple(_build_option_quote(item, source.tickers_by_inst_id.get(item.inst_id)) for item in instruments)
+        seeded = ChainSnapshot(
+            family=family, expiry=preferred, expiries=source.expiries,
+            chain_rows=tuple(build_option_chain_rows(list(quotes))), quotes=quotes,
+            family_instruments=source.family_instruments, tickers_by_inst_id=dict(source.tickers_by_inst_id),
+            underlying_price=next((item.index_price for item in quotes if item.index_price is not None), source.underlying_price),
+            position_coin_text_by_inst_id=dict(source.position_coin_text_by_inst_id),
+            option_summaries_by_inst_id=dict(source.option_summaries_by_inst_id),
+            coin_usdt_price=source.coin_usdt_price,
+        )
+        self._sync_expiry_options(preferred=preferred)
+        self._apply_chain_snapshot(self._chain_request_id, seeded)
+        self._status_label.setText(f"已载入 T 形报价缓存 {family} {preferred}，未重复请求行情。")
 
     def closeEvent(self, event) -> None:  # type: ignore[override]
         if not self._closing:
@@ -5286,21 +5350,36 @@ class OptionStrategyQtWindow(QMainWindow):
         if not self._chain_rows:
             QMessageBox.information(self, "期权链详细显示", "请先刷新期权链。")
             return
-        # Bind every displayed row to this exact chain generation. If a refresh
-        # or expiry/family switch happens while the modal window is open, the
-        # old rows remain readable but cannot be used to add a mis-mapped leg.
-        chain_rows = tuple(self._chain_rows)
-        chain_context = self._chain_display_context
-        request_id = self._chain_request_id
-        positions = dict(self._chain_position_coin_text_by_inst_id)
-        tickers = dict(self._family_tickers_cache.get(self._family_combo.currentText().strip().upper(), {}))
-        summaries = dict(self._chain_option_summaries_by_inst_id)
-        coin_usdt = self._family_coin_usdt_prices.get(chain_context[0]) if chain_context else None
+        family = self._family_combo.currentText().strip().upper()
+        settings = QSettings("qqokx", "roll-terminal-qt")
+        settings_prefix = f"option_strategy/detailed_chain/{family}"
+        expiries = sorted({parse_option_contract(item.inst_id).expiry_code
+                           for item in self._family_instruments_cache.get(family, ())})
         dialog = QDialog(self)
+        dialog.setWindowFlags(
+            dialog.windowFlags() | Qt.WindowType.WindowMinimizeButtonHint | Qt.WindowType.WindowMaximizeButtonHint
+        )
         dialog.setWindowTitle(f"期权链详细显示 | {self._current_chain_context_text()}")
-        dialog.setWindowState(dialog.windowState() | Qt.WindowState.WindowMaximized)
+        dialog.resize(1800, 1000)
+        saved_geometry = settings.value(f"{settings_prefix}/geometry")
+        if not saved_geometry or not dialog.restoreGeometry(saved_geometry):
+            dialog.setWindowState(dialog.windowState() | Qt.WindowState.WindowMaximized)
         layout = QVBoxLayout(dialog)
-        hint = QLabel("左侧认购 · 右侧认沽　｜　盘口量按合约面值折算为币，≈USDT 按币对 USDT 最新价折算。刷新后请重新打开此窗口。")
+        toolbar = QHBoxLayout()
+        expiry_label = QLabel("到期日")
+        toolbar.addWidget(expiry_label)
+        expiry_buttons: dict[str, QPushButton] = {}
+        current_expiry = self._selected_expiry_code()
+        for code in expiries:
+            button = QPushButton(format_option_expiry_label(code))
+            button.setCheckable(True)
+            button.setProperty("expiry_code", code)
+            button.setChecked(code == current_expiry)
+            expiry_buttons[code] = button
+            toolbar.addWidget(button)
+        toolbar.addStretch(1)
+        layout.addLayout(toolbar)
+        hint = QLabel("左侧认购 · 右侧认沽　｜　盘口量按合约面值折算为币，≈USDT 按币对 USDT 最新价折算。")
         hint.setWordWrap(True)
         layout.addWidget(hint)
         quote_columns = (
@@ -5313,16 +5392,25 @@ class OptionStrategyQtWindow(QMainWindow):
             ("ask_usdt", "卖价≈USDT"),
             ("ask_size", "卖量（币）"),
         )
-        inner_columns = (
+        greek_columns = (
             ("iv", "IV"), ("delta", "Delta PA"), ("gamma", "Gamma PA"),
-            ("vega", "Vega PA"), ("theta", "Theta PA"), ("position", "持仓"),
+            ("vega", "Vega PA"), ("theta", "Theta PA"), ("theta_usdt", "Theta≈USDT"),
         )
-        call_columns = quote_columns + inner_columns
-        put_columns = tuple(reversed(inner_columns)) + quote_columns
+        position_column = (("position", "持仓"),)
+        # Keep both sides in market order: bid on the outside, mark in the middle,
+        # ask on the inside. Reversing the call quote columns made the two sides
+        # appear to have opposite meanings.
+        call_columns = tuple(reversed(greek_columns)) + quote_columns + position_column
+        put_columns = position_column + quote_columns + greek_columns
         columns = call_columns + (("strike", "行权价"),) + put_columns
         headers = [label for _, label in columns]
-        table = QTableWidget(len(chain_rows), len(headers))
+        table = QTableWidget(0, len(headers))
         table.setHorizontalHeaderLabels(headers)
+        table.horizontalHeader().setDefaultAlignment(Qt.AlignmentFlag.AlignCenter | Qt.AlignmentFlag.AlignVCenter)
+        approx_usdt_color = QColor("#0f6b78")
+        for column, (key, _label) in enumerate(columns):
+            if key.endswith("_usdt"):
+                table.horizontalHeaderItem(column).setForeground(approx_usdt_color)
         table.verticalHeader().setVisible(False)
         table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
@@ -5331,58 +5419,65 @@ class OptionStrategyQtWindow(QMainWindow):
         header = table.horizontalHeader()
         header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
         header.setStretchLastSection(False)
+        columns_button = QPushButton("列设置")
+        columns_menu = QMenu(columns_button)
+        columns_button.setMenu(columns_menu)
+        layout.insertWidget(0, columns_button, 0, Qt.AlignmentFlag.AlignRight)
+
+        state: dict[str, Any] = {}
 
         def quote_values(quote: OptionQuote | None) -> dict[str, str]:
             if quote is None:
                 return {}
             instrument = quote.instrument
             inst_id = instrument.inst_id
-            ticker = tickers.get(inst_id)
+            ticker = state["tickers"].get(inst_id)
             raw = ticker.raw if ticker is not None else {}
-            summary = summaries.get(inst_id, {})
+            summary = state["summaries"].get(inst_id, {})
             values = {
-                "position": positions.get(inst_id, ""),
+                "position": state["positions"].get(inst_id, ""),
                 "bid_size": _detail_coin_amount(quote, raw.get("bidSz")),
                 "ask_size": _detail_coin_amount(quote, raw.get("askSz")),
                 "iv": _format_option_summary_value(summary.get("markVol"), percent=True),
+                "theta_usdt": _detail_usdt_summary(quote, summary.get("theta"), state["coin_usdt"]),
             }
             for key in ("delta", "gamma", "vega", "theta"):
                 values[key] = _format_option_summary_value(summary.get(key))
             for key, price in (("bid", quote.bid_price), ("mark", quote.mark_price), ("ask", quote.ask_price)):
                 values[key] = _format_price(price, instrument.tick_size) if price is not None else ""
-                values[f"{key}_usdt"] = _detail_usdt_price(quote, price, coin_usdt)
+                values[f"{key}_usdt"] = _detail_usdt_price(quote, price, state["coin_usdt"])
             return values
 
         colors = {
-            "bid": "#13803d", "bid_usdt": "#13803d",
-            "ask": "#c23b3b", "ask_usdt": "#c23b3b",
-            "mark": "#2563eb", "mark_usdt": "#2563eb", "iv": "#7c3aed",
+            "bid": "#13803d", "ask": "#c23b3b",
+            "mark": "#2563eb", "iv": "#7c3aed",
         }
-        for row_index, chain_row in enumerate(chain_rows):
-            call_values = quote_values(chain_row.call_quote)
-            put_values = quote_values(chain_row.put_quote)
-            values = (
-                [call_values.get(key, "") for key, _ in call_columns]
-                + [format_decimal(chain_row.strike)]
-                + [put_values.get(key, "") for key, _ in put_columns]
-            )
-            for column, ((key, _), value) in enumerate(zip(columns, values)):
-                item = QTableWidgetItem(value)
-                item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-                if key == "strike":
-                    item.setBackground(QColor("#dce8f5"))
-                    item.setForeground(QColor("#28496b"))
-                    item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-                elif key in colors:
-                    item.setForeground(QColor(colors[key]))
-                table.setItem(row_index, column, item)
-        table.resizeColumnsToContents()
-        put_indexes = {key: index for index, (key, _) in enumerate(put_columns, len(call_columns) + 1)}
-        for call_index, (key, _) in enumerate(call_columns):
-            put_index = put_indexes[key]
-            width = max(table.columnWidth(call_index), table.columnWidth(put_index))
-            table.setColumnWidth(call_index, width)
-            table.setColumnWidth(put_index, width)
+        paired_column_indexes: dict[str, list[int]] = {}
+        visibility = settings.value(f"{settings_prefix}/visible_columns", None)
+        visible_keys = set(str(item) for item in visibility) if visibility is not None else {key for key, _ in columns if key != "strike"}
+        for column, (key, label) in enumerate(columns):
+            if key == "strike":
+                continue
+            indexes = paired_column_indexes.setdefault(key, [])
+            indexes.append(column)
+            table.setColumnHidden(column, key not in visible_keys)
+            if len(indexes) == 1:
+                action = columns_menu.addAction(label)
+                action.setCheckable(True)
+                action.setChecked(key in visible_keys)
+                action.toggled.connect(
+                    lambda visible, column_key=key: [
+                        table.setColumnHidden(index, not visible)
+                        for index in paired_column_indexes[column_key]
+                    ]
+                )
+                action.toggled.connect(
+                    lambda _visible: settings.setValue(
+                        f"{settings_prefix}/visible_columns",
+                        sorted(action_key for action_key, indexes in paired_column_indexes.items()
+                               if indexes and not table.isColumnHidden(indexes[0]))
+                    )
+                )
         layout.addWidget(table, 1)
         actions = QHBoxLayout()
         for label, option_type, side in (
@@ -5392,12 +5487,113 @@ class OptionStrategyQtWindow(QMainWindow):
             button = QPushButton(label)
             button.clicked.connect(
                 lambda _checked=False, ot=option_type, sd=side: self._add_detailed_chain_leg(
-                    table, chain_rows, chain_context, request_id, ot, sd
+                    table, state["rows"], state["context"], state["request_id"], ot, sd
                 )
             )
             actions.addWidget(button)
         actions.addStretch(1)
         layout.addLayout(actions)
+
+        def render_current_chain() -> None:
+            first_render = "rows" not in state
+            chain_rows = tuple(self._chain_rows)
+            chain_context = self._chain_display_context
+            if not chain_rows or chain_context is None:
+                return
+            state.update(
+                rows=chain_rows,
+                context=chain_context,
+                request_id=self._chain_request_id,
+                positions=dict(self._chain_position_coin_text_by_inst_id),
+                tickers=dict(self._family_tickers_cache.get(family, {})),
+                summaries=dict(self._chain_option_summaries_by_inst_id),
+                coin_usdt=self._family_coin_usdt_prices.get(family),
+            )
+            table.setRowCount(len(chain_rows))
+            for row_index, chain_row in enumerate(chain_rows):
+                call_values = quote_values(chain_row.call_quote)
+                put_values = quote_values(chain_row.put_quote)
+                values = ([call_values.get(key, "") for key, _ in call_columns]
+                          + [format_decimal(chain_row.strike)]
+                          + [put_values.get(key, "") for key, _ in put_columns])
+                for column, ((key, _), value) in enumerate(zip(columns, values)):
+                    item = QTableWidgetItem(value)
+                    item.setTextAlignment(Qt.AlignmentFlag.AlignCenter | Qt.AlignmentFlag.AlignVCenter)
+                    if key == "strike":
+                        item.setBackground(QColor("#dce8f5"))
+                        item.setForeground(QColor("#28496b"))
+                    elif key.endswith("_usdt") and value:
+                        item.setForeground(approx_usdt_color)
+                    elif key in colors:
+                        item.setForeground(QColor(colors[key]))
+                    table.setItem(row_index, column, item)
+            if first_render:
+                table.resizeColumnsToContents()
+                put_indexes = {key: index for index, (key, _) in enumerate(put_columns, len(call_columns) + 1)}
+                for call_index, (key, _) in enumerate(call_columns):
+                    put_index = put_indexes[key]
+                    width = max(table.columnWidth(call_index), table.columnWidth(put_index))
+                    table.setColumnWidth(call_index, width)
+                    table.setColumnWidth(put_index, width)
+                saved_widths = settings.value(f"{settings_prefix}/column_widths", None)
+                if saved_widths:
+                    try:
+                        for index, width in enumerate(saved_widths[:table.columnCount()]):
+                            table.setColumnWidth(index, max(24, int(width)))
+                    except (TypeError, ValueError):
+                        pass
+            dialog.setWindowTitle(f"期权链详细显示 | {self._current_chain_context_text()}")
+
+        def on_expiry_changed(expiry: str) -> None:
+            expiry = str(expiry).strip()
+            if not expiry:
+                return
+            if expiry == state.get("context", (family, ""))[1]:
+                expiry_buttons[expiry].setChecked(True)
+                return
+            self._expiry_combo.setCurrentText(f"{expiry} ({format_option_expiry_label(expiry)})")
+            for code, button in expiry_buttons.items():
+                button.setChecked(code == expiry)
+            if self._chain_display_context == (family, expiry):
+                render_current_chain()
+                return
+            thread = self._worker_threads.get("chain")
+            if thread is None or not thread.isRunning():
+                self.refresh_chain()
+                thread = self._worker_threads.get("chain")
+            if thread is None or not thread.isRunning():
+                return
+            request_id = self._chain_request_id
+            for button in expiry_buttons.values():
+                button.setEnabled(False)
+
+            def wait_for_expiry_snapshot() -> None:
+                if not dialog.isVisible():
+                    return
+                if self._chain_display_context == (family, expiry):
+                    render_current_chain()
+                    for button in expiry_buttons.values():
+                        button.setEnabled(True)
+                elif self._chain_request_id != request_id or not thread.isRunning():
+                    for button in expiry_buttons.values():
+                        button.setEnabled(True)
+                    current = state.get("context", (family, self._selected_expiry_code()))[1]
+                    for code, button in expiry_buttons.items():
+                        button.setChecked(code == current)
+                    self._expiry_combo.setCurrentText(f"{current} ({format_option_expiry_label(current)})")
+                else:
+                    QTimer.singleShot(80, wait_for_expiry_snapshot)
+
+            QTimer.singleShot(80, wait_for_expiry_snapshot)
+
+        for code, button in expiry_buttons.items():
+            button.clicked.connect(lambda _checked=False, expiry=code: on_expiry_changed(expiry))
+        render_current_chain()
+        dialog.finished.connect(lambda _result: (
+            settings.setValue(f"{settings_prefix}/geometry", dialog.saveGeometry()),
+            settings.setValue(f"{settings_prefix}/column_widths",
+                              [table.columnWidth(index) for index in range(table.columnCount())]),
+        ))
         dialog.exec()
 
     def _add_detailed_chain_leg(
@@ -5412,17 +5608,23 @@ class OptionStrategyQtWindow(QMainWindow):
             QMessageBox.information(self, "添加策略腿", "请先在详细期权链中选择一个行权价。")
             return
         selected = chain_rows[row_index]
+        expected = selected.call_quote if option_type == "C" else selected.put_quote
+        if expected is None:
+            QMessageBox.information(self, "添加策略腿", "所选到期日的该侧合约不可用。")
+            return
+        selected_inst_id = expected.instrument.inst_id
         current_index = next(
-            (index for index, row in enumerate(self._chain_rows) if row.strike == selected.strike),
+            (index for index, row in enumerate(self._chain_rows)
+             if (row.call_quote if option_type == "C" else row.put_quote) is not None
+             and (row.call_quote if option_type == "C" else row.put_quote).instrument.inst_id == selected_inst_id),
             None,
         )
         if current_index is None:
             QMessageBox.information(self, "添加策略腿", "当前行权价已变化，请关闭此窗口并重新打开详细显示。")
             return
         current = self._chain_rows[current_index]
-        expected = selected.call_quote if option_type == "C" else selected.put_quote
         actual = current.call_quote if option_type == "C" else current.put_quote
-        if expected is None or actual is None or expected.instrument.inst_id != actual.instrument.inst_id:
+        if actual is None or expected.instrument.inst_id != actual.instrument.inst_id:
             QMessageBox.information(self, "添加策略腿", "当前合约已变化或不可用，请关闭此窗口并重新打开详细显示。")
             return
         self._chain_table.selectRow(current_index)
@@ -5654,11 +5856,15 @@ class OptionStrategyQtWindow(QMainWindow):
         if quote is None:
             QMessageBox.information(self, "添加策略腿", "当前行权价没有对应的可用合约。")
             return
+        self.add_chain_quote(quote, side)
+
+    def add_chain_quote(self, quote: OptionQuote, side: str) -> bool:
+        """Add the exact contract selected in an option chain to the strategy."""
         try:
             quantity = self._parse_positive_decimal(self._default_qty_edit.text(), "默认数量")
         except Exception as exc:  # noqa: BLE001
             QMessageBox.critical(self, "数量错误", str(exc))
-            return
+            return False
         old_default_formula = build_default_formula(self._legs)
         self._alias_counter += 1
         leg = StrategyLegDefinition(
@@ -5679,6 +5885,7 @@ class OptionStrategyQtWindow(QMainWindow):
         self._refresh_leg_greeks()
         self._render_legs()
         self._refresh_strategy_summary()
+        return True
 
     @Slot()
     def remove_selected_leg(self) -> None:

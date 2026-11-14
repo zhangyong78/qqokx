@@ -81,6 +81,7 @@ class WorkspaceHeader(QFrame):
         ("page:roll", "专业套利"),
         ("page:daily-report", "交易汇总"),
         ("tool:smart-order", "无限下单"),
+        ("option:option-chain", "期权 T 形报价"),
         ("option:option-strategy", "期权策略计算器"),
         ("option:deribit-volatility", "Deribit 波动率"),
         ("option:option-roll", "期权移仓"),
@@ -134,8 +135,8 @@ class WorkspaceHeader(QFrame):
         trading_tools_button.setObjectName("WorkspacePageButton")
         self._page_buttons["smart-order"] = trading_tools_button
         layout.addWidget(trading_tools_button)
-        layout.addWidget(self._menu_button("期权工具", self._ROUTES[5:8]))
-        layout.addWidget(self._menu_button("AI", self._ROUTES[8:14]))
+        layout.addWidget(self._menu_button("期权工具", self._ROUTES[5:9]))
+        layout.addWidget(self._menu_button("AI", self._ROUTES[9:15]))
         layout.addStretch(1)
 
         self.connection_label = QLabel("行情连接中", self)
@@ -217,7 +218,7 @@ class WorkspaceHeader(QFrame):
             font_menu.addAction(action)
             self._font_actions[mode] = action
         menu.addSeparator()
-        for route_key, label in self._ROUTES[14:]:
+        for route_key, label in self._ROUTES[15:]:
             menu.addAction(self._register_action(route_key, label))
         button = QToolButton(self)
         button.setText("⚙")

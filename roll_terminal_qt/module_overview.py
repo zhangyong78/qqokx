@@ -78,6 +78,12 @@ def launcher_module_specs() -> tuple[LauncherModuleSpec, ...]:
             status="Qt 原生",
         ),
         LauncherModuleSpec(
+            key="option-chain",
+            title="期权 T 形报价",
+            subtitle="BTC 与 ETH 期权报价窗口，支持到期日与行权价筛选，并可将合约带入策略计算器。",
+            status="Qt 原生",
+        ),
+        LauncherModuleSpec(
             key="option-strategy",
             title="期权策略计算器",
             subtitle="纯 Qt 版复刻期权策略计算器，支持期权链、策略腿、盈亏图、组合 K 线与持仓导入。",

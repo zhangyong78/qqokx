@@ -123,12 +123,18 @@ class OptionStrategyOptimizationTest(QtWidgetTestCase):
         row_index = 1
         headers = [table.horizontalHeaderItem(column).text() for column in range(table.columnCount())]
         strike_column = headers.index("行权价")
-        self.assertEqual(headers[strike_column - 1:strike_column + 2], ["持仓", "行权价", "持仓"])
-        self.assertEqual(table.columnWidth(strike_column - 1), table.columnWidth(strike_column + 1))
-        for start, end in ((0, strike_column), (strike_column + 1, len(headers))):
-            side_headers = headers[start:end]
-            self.assertLess(side_headers.index("买价"), side_headers.index("标记价"))
-            self.assertLess(side_headers.index("标记价"), side_headers.index("卖价"))
+        self.assertEqual(headers[strike_column], "行权价")
+        self.assertEqual(table.columnWidth(0), table.columnWidth(len(headers) - 1))
+        call_headers = headers[:strike_column]
+        put_headers = headers[strike_column + 1:]
+        self.assertEqual(call_headers[-1], "持仓")
+        self.assertEqual(put_headers[0], "持仓")
+        self.assertLess(call_headers.index("买价"), call_headers.index("标记价"))
+        self.assertLess(call_headers.index("标记价"), call_headers.index("卖价"))
+        self.assertLess(call_headers.index("Theta≈USDT"), call_headers.index("Theta PA"))
+        self.assertLess(put_headers.index("买价"), put_headers.index("标记价"))
+        self.assertLess(put_headers.index("标记价"), put_headers.index("卖价"))
+        self.assertGreater(put_headers.index("Theta≈USDT"), put_headers.index("Theta PA"))
         call_values = {label: table.item(row_index, index).text() for index, label in enumerate(headers[:strike_column])}
         self.assertEqual(call_values["买量（币）"], "3.2")
         self.assertEqual(call_values["卖量（币）"], "0.25")
@@ -138,6 +144,9 @@ class OptionStrategyOptimizationTest(QtWidgetTestCase):
         self.assertEqual(call_values["Gamma PA"], "0.0007")
         self.assertEqual(call_values["Vega PA"], "12.3457")
         self.assertEqual(call_values["Theta PA"], "-3.4568")
+        self.assertEqual(call_values["Theta≈USDT"], "-276542.40")
+        put_headers = headers[strike_column + 1:]
+        self.assertGreater(put_headers.index("Theta≈USDT"), put_headers.index("Theta PA"))
         table.selectRow(row_index)
         with patch("roll_terminal_qt.option_strategy_window.QMessageBox.information") as info:
             self.window._add_detailed_chain_leg(

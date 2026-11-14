@@ -1253,7 +1253,7 @@ class OkxRestClient:
                 mark_params = {"instType": "OPTION"}
                 family = str(inst_family or uly or "").strip().upper()
                 if family:
-                    mark_params["uly"] = family
+                    mark_params["instFamily"] = family
                 mark_payload = self._request(
                     "GET",
                     "/api/v5/public/mark-price",

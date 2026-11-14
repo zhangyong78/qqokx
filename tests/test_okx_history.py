@@ -716,7 +716,7 @@ class OkxHistoryParsingTest(TestCase):
         self.assertEqual(items[0].last, Decimal("0.0175"))
         self.assertEqual(items[0].mark, Decimal("0.0073"))
         self.assertEqual(requests[1][0], "/api/v5/public/mark-price")
-        self.assertEqual(requests[1][1]["uly"], "BTC-USD")
+        self.assertEqual(requests[1][1]["instFamily"], "BTC-USD")
 
     def test_get_option_ticker_fills_missing_mark_from_public_mark_price(self) -> None:
         client = OkxRestClient()
