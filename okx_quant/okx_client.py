@@ -615,6 +615,17 @@ class OkxRestClient:
     def get_option_instruments(self, *, uly: str | None = None, inst_family: str | None = None) -> list[Instrument]:
         return self.get_instruments("OPTION", uly=uly, inst_family=inst_family)
 
+    def get_option_summaries(self, inst_family: str) -> list[dict[str, Any]]:
+        """Fetch public option summary data, including exchange IV and Greeks."""
+        normalized_family = str(inst_family or "").strip().upper()
+        if not re.fullmatch(r"[A-Z0-9]+-[A-Z0-9]+", normalized_family):
+            raise ValueError("期权行情摘要缺少有效的 instFamily。")
+        payload = self._request(
+            "GET", "/api/v5/public/opt-summary", params={"instFamily": normalized_family}
+        )
+        data = payload.get("data")
+        return [item for item in data if isinstance(item, dict)] if isinstance(data, list) else []
+
     def get_option_tick_bands(self, inst_family: str, *, force_refresh: bool = False) -> list[OptionTickBand]:
         """Return the live OKX price bands required for option order prices."""
         normalized_family = str(inst_family or "").strip().upper()

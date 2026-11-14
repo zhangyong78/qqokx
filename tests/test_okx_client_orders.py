@@ -12,6 +12,26 @@ from okx_quant.okx_client import OkxApiError, OkxOrderStatus, OkxRestClient, Okx
 
 
 class OkxClientOrderRequestTest(TestCase):
+    def test_get_option_summaries_uses_inst_family(self) -> None:
+        client = OkxRestClient()
+        client._request = MagicMock(return_value={"data": [{"instId": "BTC-USD-261225-80000-C"}]})
+
+        summaries = client.get_option_summaries("btc-usd")
+
+        self.assertEqual(summaries[0]["instId"], "BTC-USD-261225-80000-C")
+        client._request.assert_called_once_with(
+            "GET", "/api/v5/public/opt-summary", params={"instFamily": "BTC-USD"}
+        )
+
+    def test_get_option_summaries_rejects_invalid_family(self) -> None:
+        client = OkxRestClient()
+        client._request = MagicMock()
+
+        with self.assertRaises(ValueError):
+            client.get_option_summaries("")
+
+        client._request.assert_not_called()
+
     def test_detach_profile_websockets_removes_connections_before_they_stop(self) -> None:
         client = OkxRestClient()
         credentials = Credentials(api_key="key", secret_key="secret", passphrase="pass", profile_name="159")

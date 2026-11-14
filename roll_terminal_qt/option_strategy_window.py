@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
 import traceback
@@ -252,6 +252,51 @@ def _format_greek_number(value: Decimal | None) -> str:
     return format_decimal_fixed(rounded, 8).rstrip("0").rstrip(".")
 
 
+def _format_option_summary_value(value: object, *, percent: bool = False) -> str:
+    if value in (None, ""):
+        return ""
+    try:
+        number = Decimal(str(value))
+        if not number.is_finite():
+            return ""
+        if percent:
+            return f"{number * 100:.2f}%"
+        rounded = number.quantize(Decimal("0.0001"))
+        return format(rounded, "f").rstrip("0").rstrip(".") or "0"
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _detail_coin_amount(quote: OptionQuote | None, raw_amount: object) -> str:
+    if quote is None or raw_amount in (None, ""):
+        return ""
+    try:
+        amount = Decimal(str(raw_amount))
+        if not amount.is_finite() or amount < 0:
+            return ""
+        coin = option_contract_coin_quantity(quote.instrument, amount)
+        return format_decimal(coin) if coin is not None else ""
+    except (InvalidOperation, ValueError):
+        return ""
+
+
+def _detail_usdt_price(quote: OptionQuote | None, price: Decimal | None, coin_usdt: Decimal | None) -> str:
+    if quote is None or price is None or not price.is_finite() or price < 0:
+        return ""
+    instrument = quote.instrument
+    base = instrument.inst_id.split("-", 1)[0].upper()
+    settlement = (instrument.settle_ccy or "").strip().upper()
+    if settlement == "USDT":
+        result = price
+    elif settlement == base or (not settlement and quote.parsed.inst_family.endswith("-USD")):
+        if coin_usdt is None or not coin_usdt.is_finite() or coin_usdt <= 0:
+            return ""
+        result = price * coin_usdt
+    else:
+        return ""
+    return format_decimal_fixed(result, 2)
+
+
 def _option_position_coin_texts(
     positions: list[OkxPosition],
     instruments_by_inst_id: dict[str, Instrument],
@@ -297,6 +342,8 @@ class ChainSnapshot:
     tickers_by_inst_id: dict[str, OkxTicker]
     underlying_price: Decimal | None
     position_coin_text_by_inst_id: dict[str, str]
+    option_summaries_by_inst_id: dict[str, dict[str, Any]] = field(default_factory=dict)
+    coin_usdt_price: Decimal | None = None
 
 
 @dataclass(frozen=True)
@@ -872,7 +919,22 @@ class _OptionChainThread(QThread):
                 item for item in family_instruments if parse_option_contract(item.inst_id).expiry_code == selected_expiry
             ]
             quotes = tuple(_build_option_quote(item, tickers_by_inst_id.get(item.inst_id)) for item in selected_instruments)
+            try:
+                option_summaries = self._client.get_option_summaries(self._family)
+                summaries_by_inst_id = {
+                    str(item.get("instId", "")): item for item in option_summaries if item.get("instId")
+                }
+            except Exception:
+                # Summary is supplemental; keep bid/ask/mark and position data available.
+                summaries_by_inst_id = {}
             underlying_price = next((item.index_price for item in quotes if item.index_price is not None), None)
+            coin_usdt_price = None
+            try:
+                spot = self._client.get_ticker(f"{self._family.split('-')[0]}-USDT")
+                if spot.last is not None and spot.last.is_finite() and spot.last > 0:
+                    coin_usdt_price = spot.last
+            except Exception:
+                pass
             if self.isInterruptionRequested():
                 return
             position_coin_text_by_inst_id: dict[str, str] = {}
@@ -903,6 +965,8 @@ class _OptionChainThread(QThread):
                 tickers_by_inst_id=tickers_by_inst_id,
                 underlying_price=underlying_price,
                 position_coin_text_by_inst_id=position_coin_text_by_inst_id,
+                option_summaries_by_inst_id=summaries_by_inst_id,
+                coin_usdt_price=coin_usdt_price,
             )
             if not self.isInterruptionRequested():
                 self.snapshot_ready.emit(self._request_id, snapshot)
@@ -4617,6 +4681,8 @@ class OptionStrategyQtWindow(QMainWindow):
         self._all_option_instruments: list[Instrument] = []
         self._family_instruments_cache: dict[str, list[Instrument]] = {}
         self._family_tickers_cache: dict[str, dict[str, OkxTicker]] = {}
+        self._family_option_summaries_cache: dict[str, dict[str, dict[str, Any]]] = {}
+        self._family_coin_usdt_prices: dict[str, Decimal | None] = {}
         self._instrument_map: dict[str, Instrument] = {}
         self._quotes_by_inst_id: dict[str, OptionQuote] = {}
         self._chain_rows: list[OptionChainRow] = []
@@ -4851,6 +4917,9 @@ class OptionStrategyQtWindow(QMainWindow):
         self._chain_context_label = QLabel("点击左右两侧仓位单元格可查看 K 线；选择一个行权价后，可直接加入策略腿。")
         self._chain_context_label.setWordWrap(True)
         chain_layout.addWidget(self._chain_context_label)
+        self._chain_detail_button = QPushButton("详细显示")
+        self._chain_detail_button.clicked.connect(self.open_detailed_chain)
+        chain_layout.addWidget(self._chain_detail_button, 0, Qt.AlignmentFlag.AlignRight)
         self._chain_table = QTableWidget(0, 7)
         self._chain_table.setHorizontalHeaderLabels(("认购仓位", "认购买一", "认购卖一", "行权价", "认沽买一", "认沽卖一", "认沽仓位"))
         for column, tooltip in enumerate((
@@ -5181,6 +5250,8 @@ class OptionStrategyQtWindow(QMainWindow):
             tickers_by_inst_id=dict(tickers_by_inst_id),
             underlying_price=next((item.index_price for item in quotes if item.index_price is not None), self._current_underlying_price),
             position_coin_text_by_inst_id=dict(self._chain_position_coin_text_by_inst_id),
+            option_summaries_by_inst_id=dict(self._family_option_summaries_cache.get(family, {})),
+            coin_usdt_price=self._family_coin_usdt_prices.get(family),
         )
         self._apply_chain_snapshot(self._chain_request_id, snapshot)
         self._status_label.setText(f"已切换到 {family} {expiry}，期权链已按当前到期日更新。")
@@ -5209,6 +5280,153 @@ class OptionStrategyQtWindow(QMainWindow):
         if row < 0 or row >= len(self._chain_rows):
             return None
         return self._chain_rows[row]
+
+    @Slot()
+    def open_detailed_chain(self) -> None:
+        if not self._chain_rows:
+            QMessageBox.information(self, "期权链详细显示", "请先刷新期权链。")
+            return
+        # Bind every displayed row to this exact chain generation. If a refresh
+        # or expiry/family switch happens while the modal window is open, the
+        # old rows remain readable but cannot be used to add a mis-mapped leg.
+        chain_rows = tuple(self._chain_rows)
+        chain_context = self._chain_display_context
+        request_id = self._chain_request_id
+        positions = dict(self._chain_position_coin_text_by_inst_id)
+        tickers = dict(self._family_tickers_cache.get(self._family_combo.currentText().strip().upper(), {}))
+        summaries = dict(self._chain_option_summaries_by_inst_id)
+        coin_usdt = self._family_coin_usdt_prices.get(chain_context[0]) if chain_context else None
+        dialog = QDialog(self)
+        dialog.setWindowTitle(f"期权链详细显示 | {self._current_chain_context_text()}")
+        dialog.setWindowState(dialog.windowState() | Qt.WindowState.WindowMaximized)
+        layout = QVBoxLayout(dialog)
+        hint = QLabel("左侧认购 · 右侧认沽　｜　盘口量按合约面值折算为币，≈USDT 按币对 USDT 最新价折算。刷新后请重新打开此窗口。")
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+        quote_columns = (
+            ("bid_size", "买量（币）"),
+            ("bid_usdt", "买价≈USDT"),
+            ("bid", "买价"),
+            ("mark", "标记价"),
+            ("mark_usdt", "标记≈USDT"),
+            ("ask", "卖价"),
+            ("ask_usdt", "卖价≈USDT"),
+            ("ask_size", "卖量（币）"),
+        )
+        inner_columns = (
+            ("iv", "IV"), ("delta", "Delta PA"), ("gamma", "Gamma PA"),
+            ("vega", "Vega PA"), ("theta", "Theta PA"), ("position", "持仓"),
+        )
+        call_columns = quote_columns + inner_columns
+        put_columns = tuple(reversed(inner_columns)) + quote_columns
+        columns = call_columns + (("strike", "行权价"),) + put_columns
+        headers = [label for _, label in columns]
+        table = QTableWidget(len(chain_rows), len(headers))
+        table.setHorizontalHeaderLabels(headers)
+        table.verticalHeader().setVisible(False)
+        table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        table.setAlternatingRowColors(True)
+        header = table.horizontalHeader()
+        header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        header.setStretchLastSection(False)
+
+        def quote_values(quote: OptionQuote | None) -> dict[str, str]:
+            if quote is None:
+                return {}
+            instrument = quote.instrument
+            inst_id = instrument.inst_id
+            ticker = tickers.get(inst_id)
+            raw = ticker.raw if ticker is not None else {}
+            summary = summaries.get(inst_id, {})
+            values = {
+                "position": positions.get(inst_id, ""),
+                "bid_size": _detail_coin_amount(quote, raw.get("bidSz")),
+                "ask_size": _detail_coin_amount(quote, raw.get("askSz")),
+                "iv": _format_option_summary_value(summary.get("markVol"), percent=True),
+            }
+            for key in ("delta", "gamma", "vega", "theta"):
+                values[key] = _format_option_summary_value(summary.get(key))
+            for key, price in (("bid", quote.bid_price), ("mark", quote.mark_price), ("ask", quote.ask_price)):
+                values[key] = _format_price(price, instrument.tick_size) if price is not None else ""
+                values[f"{key}_usdt"] = _detail_usdt_price(quote, price, coin_usdt)
+            return values
+
+        colors = {
+            "bid": "#13803d", "bid_usdt": "#13803d",
+            "ask": "#c23b3b", "ask_usdt": "#c23b3b",
+            "mark": "#2563eb", "mark_usdt": "#2563eb", "iv": "#7c3aed",
+        }
+        for row_index, chain_row in enumerate(chain_rows):
+            call_values = quote_values(chain_row.call_quote)
+            put_values = quote_values(chain_row.put_quote)
+            values = (
+                [call_values.get(key, "") for key, _ in call_columns]
+                + [format_decimal(chain_row.strike)]
+                + [put_values.get(key, "") for key, _ in put_columns]
+            )
+            for column, ((key, _), value) in enumerate(zip(columns, values)):
+                item = QTableWidgetItem(value)
+                item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+                if key == "strike":
+                    item.setBackground(QColor("#dce8f5"))
+                    item.setForeground(QColor("#28496b"))
+                    item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                elif key in colors:
+                    item.setForeground(QColor(colors[key]))
+                table.setItem(row_index, column, item)
+        table.resizeColumnsToContents()
+        put_indexes = {key: index for index, (key, _) in enumerate(put_columns, len(call_columns) + 1)}
+        for call_index, (key, _) in enumerate(call_columns):
+            put_index = put_indexes[key]
+            width = max(table.columnWidth(call_index), table.columnWidth(put_index))
+            table.setColumnWidth(call_index, width)
+            table.setColumnWidth(put_index, width)
+        layout.addWidget(table, 1)
+        actions = QHBoxLayout()
+        for label, option_type, side in (
+            ("加入认购买入", "C", "buy"), ("加入认购卖出", "C", "sell"),
+            ("加入认沽买入", "P", "buy"), ("加入认沽卖出", "P", "sell"),
+        ):
+            button = QPushButton(label)
+            button.clicked.connect(
+                lambda _checked=False, ot=option_type, sd=side: self._add_detailed_chain_leg(
+                    table, chain_rows, chain_context, request_id, ot, sd
+                )
+            )
+            actions.addWidget(button)
+        actions.addStretch(1)
+        layout.addLayout(actions)
+        dialog.exec()
+
+    def _add_detailed_chain_leg(
+        self, table: QTableWidget, chain_rows: tuple[OptionChainRow, ...],
+        chain_context: tuple[str, str] | None, request_id: int, option_type: str, side: str,
+    ) -> None:
+        if request_id != self._chain_request_id or chain_context != self._chain_display_context:
+            QMessageBox.information(self, "添加策略腿", "期权链已刷新或切换，请关闭此窗口并重新打开详细显示。")
+            return
+        row_index = table.currentRow()
+        if row_index < 0 or row_index >= len(chain_rows):
+            QMessageBox.information(self, "添加策略腿", "请先在详细期权链中选择一个行权价。")
+            return
+        selected = chain_rows[row_index]
+        current_index = next(
+            (index for index, row in enumerate(self._chain_rows) if row.strike == selected.strike),
+            None,
+        )
+        if current_index is None:
+            QMessageBox.information(self, "添加策略腿", "当前行权价已变化，请关闭此窗口并重新打开详细显示。")
+            return
+        current = self._chain_rows[current_index]
+        expected = selected.call_quote if option_type == "C" else selected.put_quote
+        actual = current.call_quote if option_type == "C" else current.put_quote
+        if expected is None or actual is None or expected.instrument.inst_id != actual.instrument.inst_id:
+            QMessageBox.information(self, "添加策略腿", "当前合约已变化或不可用，请关闭此窗口并重新打开详细显示。")
+            return
+        self._chain_table.selectRow(current_index)
+        self.add_selected_chain_leg(option_type, side)
 
     @staticmethod
     def _chain_quote_for_clicked_column(chain_row: OptionChainRow, column: int) -> OptionQuote | None:
@@ -5285,8 +5503,11 @@ class OptionStrategyQtWindow(QMainWindow):
         self._chain_rows = list(snapshot.chain_rows)
         self._current_underlying_price = snapshot.underlying_price
         self._chain_position_coin_text_by_inst_id = dict(snapshot.position_coin_text_by_inst_id)
+        self._chain_option_summaries_by_inst_id = dict(snapshot.option_summaries_by_inst_id)
         self._family_instruments_cache[snapshot.family] = list(snapshot.family_instruments)
         self._family_tickers_cache[snapshot.family] = dict(snapshot.tickers_by_inst_id)
+        self._family_option_summaries_cache[snapshot.family] = dict(snapshot.option_summaries_by_inst_id)
+        self._family_coin_usdt_prices[snapshot.family] = snapshot.coin_usdt_price
         self._all_option_instruments = list(snapshot.family_instruments)
         for instrument in snapshot.family_instruments:
             self._instrument_map[instrument.inst_id] = instrument

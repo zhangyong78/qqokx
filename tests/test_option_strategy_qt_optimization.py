@@ -17,11 +17,12 @@ from okx_quant.option_strategy import (
 )
 from roll_terminal_qt.option_strategy_window import (
     ChainSnapshot, ChartSnapshot, ImportSnapshot, OptionStrategyQtWindow,
+    _detail_coin_amount, _detail_usdt_price,
 )
 from tests.qt_test_case import QtWidgetTestCase
 from tests.test_option_recommendations import NOW, prices, volatility, quote as recommendation_quote
 from okx_quant.option_recommendations import build_option_recommendations
-from PySide6.QtWidgets import QMessageBox, QPushButton
+from PySide6.QtWidgets import QMessageBox, QPushButton, QTableWidget
 
 
 def quote(strike: int = 80000, expiry: str = "261225") -> OptionQuote:
@@ -78,6 +79,74 @@ class OptionStrategyOptimizationTest(QtWidgetTestCase):
 
     def seed_chain(self):
         self.window._apply_chain_snapshot(self.window._chain_request_id, chain_snapshot())
+
+    def test_detailed_chain_conversion_requires_valid_market_and_contract_data(self):
+        item = quote()
+        self.assertEqual(_detail_coin_amount(item, "320"), "3.2")
+        self.assertEqual(_detail_coin_amount(replace(item, instrument=replace(item.instrument, ct_val=None)), "320"), "")
+        self.assertEqual(_detail_usdt_price(item, Decimal("0.05"), Decimal("80000")), "4000.00")
+        self.assertEqual(_detail_usdt_price(item, Decimal("0.05"), None), "")
+        self.assertEqual(_detail_usdt_price(replace(item, instrument=replace(item.instrument, settle_ccy="USDT")), Decimal("12.34"), None), "12.34")
+
+    def test_detailed_chain_add_rejects_snapshot_after_refresh(self):
+        self.seed_chain()
+        captured_rows = tuple(self.window._chain_rows)
+        captured_context = self.window._chain_display_context
+        captured_request_id = self.window._chain_request_id
+        table = QTableWidget(1, 1)
+        table.selectRow(0)
+        self.window._chain_request_id += 1
+        with patch("roll_terminal_qt.option_strategy_window.QMessageBox.information") as info:
+            self.window._add_detailed_chain_leg(
+                table, captured_rows, captured_context, captured_request_id, "C", "buy"
+            )
+        info.assert_called_once()
+        self.assertEqual(self.window._legs, [])
+
+    def test_detailed_chain_renders_exchange_iv_greeks_and_adds_selected_contract(self):
+        snap = chain_snapshot()
+        call_id = snap.chain_rows[1].call_quote.instrument.inst_id
+        summaries = {call_id: {"markVol": "0.42", "delta": "0.512345", "gamma": "0.0006789", "vega": "12.34567", "theta": "-3.45678"}}
+        snap = replace(snap, option_summaries_by_inst_id=summaries,
+                       tickers_by_inst_id={call_id: SimpleNamespace(raw={"bidSz": "320", "askSz": "25"})},
+                       coin_usdt_price=Decimal("80000"))
+        self.window._apply_chain_snapshot(self.window._chain_request_id, snap)
+        captured = {}
+
+        def capture_table(dialog):
+            captured["table"] = dialog.findChild(QTableWidget)
+            return 0
+
+        with patch("roll_terminal_qt.option_strategy_window.QDialog.exec", capture_table):
+            self.window.open_detailed_chain()
+        table = captured["table"]
+        row_index = 1
+        headers = [table.horizontalHeaderItem(column).text() for column in range(table.columnCount())]
+        strike_column = headers.index("行权价")
+        self.assertEqual(headers[strike_column - 1:strike_column + 2], ["持仓", "行权价", "持仓"])
+        self.assertEqual(table.columnWidth(strike_column - 1), table.columnWidth(strike_column + 1))
+        for start, end in ((0, strike_column), (strike_column + 1, len(headers))):
+            side_headers = headers[start:end]
+            self.assertLess(side_headers.index("买价"), side_headers.index("标记价"))
+            self.assertLess(side_headers.index("标记价"), side_headers.index("卖价"))
+        call_values = {label: table.item(row_index, index).text() for index, label in enumerate(headers[:strike_column])}
+        self.assertEqual(call_values["买量（币）"], "3.2")
+        self.assertEqual(call_values["卖量（币）"], "0.25")
+        self.assertEqual(call_values["标记≈USDT"], "4000.00")
+        self.assertEqual(call_values["IV"], "42.00%")
+        self.assertEqual(call_values["Delta PA"], "0.5123")
+        self.assertEqual(call_values["Gamma PA"], "0.0007")
+        self.assertEqual(call_values["Vega PA"], "12.3457")
+        self.assertEqual(call_values["Theta PA"], "-3.4568")
+        table.selectRow(row_index)
+        with patch("roll_terminal_qt.option_strategy_window.QMessageBox.information") as info:
+            self.window._add_detailed_chain_leg(
+                table, tuple(self.window._chain_rows), self.window._chain_display_context,
+                self.window._chain_request_id, "C", "sell"
+            )
+        info.assert_not_called()
+        self.assertEqual(self.window._legs[-1].inst_id, call_id)
+        self.assertEqual(self.window._legs[-1].side, "sell")
 
     def add_leg(self):
         self.seed_chain()
