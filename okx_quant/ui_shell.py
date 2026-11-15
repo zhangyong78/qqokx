@@ -12118,10 +12118,20 @@ def _aggregate_position_metrics(
                 for item, value in zip(positions, market_value_usdt_values)
                 if value is not None
                 and _extract_asset_key(item.inst_id).strip().upper() == "BTC"
+                and item.inst_type in {"SWAP", "FUTURES"}
+                and (_extract_quote_key(item.inst_id) or "").strip().upper() == "USD"
             ),
             Decimal("0"),
         )
-        if btc_price_usdt is not None and btc_price_usdt > 0
+        if btc_price_usdt is not None
+        and btc_price_usdt > 0
+        and any(
+            value is not None
+            and _extract_asset_key(item.inst_id).strip().upper() == "BTC"
+            and item.inst_type in {"SWAP", "FUTURES"}
+            and (_extract_quote_key(item.inst_id) or "").strip().upper() == "USD"
+            for item, value in zip(positions, market_value_usdt_values)
+        )
         else None
     )
     return {
@@ -12224,7 +12234,7 @@ def _build_group_row_values(group_type: str, metrics: dict[str, Decimal | int | 
         _format_optional_decimal_fixed(metrics["theta"] if isinstance(metrics["theta"], Decimal) else None, places=5),
         _format_optional_usdt_precise(
             metrics["theta_usdt"] if isinstance(metrics["theta_usdt"], Decimal) else None,
-            places=0,
+            places=2,
         ),
         "--",
     )
@@ -12334,7 +12344,7 @@ def _format_group_option_trade_side(
 
     def _slot_text(label: str) -> str:
         if label not in totals:
-            return "-"
+            return "0.00"
         amount = totals[label]
         return format_decimal_fixed(amount, 2)
 
@@ -12429,6 +12439,7 @@ def _format_position_size(position: OkxPosition, position_instruments: dict[str,
         return "-"
 
     direction = _format_pos_side(position.pos_side, position.position)
+    direction_label = {"long": "多", "short": "空"}.get(direction, direction)
     amount, currency = _position_signed_display_amount(position, position_instruments)
     if amount is None:
         return "-"
@@ -12447,11 +12458,11 @@ def _format_position_size(position: OkxPosition, position_instruments: dict[str,
                 amount_step = instrument.lot_size * contract_value * multiplier
                 places = _tick_size_places(amount_step)
                 if places is not None:
-                    return f"{format_decimal_fixed(amount, places)} {currency} ({direction})"
-        return f"{format_decimal_fixed(amount, 4)} {currency} ({direction})"
+                    return f"{format_decimal_fixed(amount, places)} {currency}（{direction_label}）"
+        return f"{format_decimal_fixed(amount, 4)} {currency}（{direction_label}）"
     if currency:
-        return f"{format_decimal(amount)} {currency} ({direction})"
-    return f"{format_decimal(amount)} ({direction})"
+        return f"{format_decimal(amount)} {currency}（{direction_label}）"
+    return f"{format_decimal(amount)}（{direction_label}）"
 
 
 def _format_position_contracts(position: OkxPosition) -> str:
@@ -12589,7 +12600,7 @@ def _format_position_option_component_usdt(
         value = _position_option_intrinsic_value_usdt(position, upl_usdt_prices)
     else:
         value = None
-    return _format_optional_usdt_precise(value, places=0, with_sign=False)
+    return _format_optional_usdt_precise(value, places=2, with_sign=False)
 
 
 def _position_mark_price_usdt(position: OkxPosition, upl_usdt_prices: dict[str, Decimal]) -> Decimal | None:

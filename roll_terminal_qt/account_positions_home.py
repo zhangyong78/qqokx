@@ -54,6 +54,9 @@ class _PositionTreeDelegate(QStyledItemDelegate):
     """Keep normal cell colors and outline the selected row without filling it."""
 
     def paint(self, painter, option, index):  # type: ignore[no-untyped-def]
+        if index.column() == _POSITION_TREE_COLUMN_INDEX.get("market_value"):
+            option = QStyleOptionViewItem(option)
+            option.displayAlignment = Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
         selected = bool(option.state & QStyle.StateFlag.State_Selected)
         if selected:
             option = QStyleOptionViewItem(option)
@@ -487,6 +490,7 @@ from okx_quant.ui_shell import (
     _format_instrument_type,
     _format_order_source,
     _format_position_unrealized_pnl,
+    _infer_upl_currency,
     _format_ratio,
     _format_mark_price,
     _format_position_mark_price_usdt,
@@ -883,6 +887,19 @@ _POSITION_MARK_AVG_COLOR = "#2563eb"
 _POSITION_APPROX_USDT_COLOR = "#0f6b78"
 
 
+def _position_pnl_color(value: object) -> QColor | None:
+    if not isinstance(value, Decimal) or not value.is_finite() or value == 0:
+        return None
+    return QColor(_POSITION_POSITIVE_COLOR if value > 0 else _POSITION_NEGATIVE_COLOR)
+
+
+def _apply_position_pnl_colors(item: QTreeWidgetItem, values: dict[str, object]) -> None:
+    for column_id in ("upl", "upl_usdt", "realized", "theta_usdt"):
+        color = _position_pnl_color(values.get(column_id))
+        if color is not None:
+            item.setForeground(_POSITION_TREE_COLUMN_INDEX[column_id], color)
+
+
 def _format_position_quote_size(ticker: object | None, *, side: str) -> str:
     raw = getattr(ticker, "raw", None)
     if not isinstance(raw, dict):
@@ -904,8 +921,16 @@ def _format_trimmed_realized_pnl(position: OkxPosition) -> str:
     value = position.realized_pnl
     if not isinstance(value, Decimal) or not value.is_finite():
         return "-"
-    text = format_decimal(value)
-    return f"+{text}" if value > 0 else text
+    currency = _infer_upl_currency(position)
+    if currency in {"USDT", "USD", "USDC"}:
+        text = format_decimal_fixed(value, 2)
+    elif getattr(position, "inst_type", "") == "FUTURES" and currency == "BTC":
+        text = format_decimal_fixed(value, 6)
+    else:
+        text = format_decimal(value)
+    if value > 0:
+        text = f"+{text}"
+    return f"{text} {currency}" if currency else text
 
 
 def _position_margin_ratio_display(position: OkxPosition) -> str:
@@ -1485,6 +1510,15 @@ def _position_break_even_display_places(
 
 def _group_row_values_with_break_even(group_type: str, metrics: dict[str, object]) -> tuple[str, ...]:
     values = list(_build_group_row_values(group_type, metrics))
+    realized = metrics.get("realized")
+    realized_currency = str(metrics.get("pnl_currency") or "").strip().upper()
+    if isinstance(realized, Decimal) and realized_currency:
+        group_realized_places = {"BTC": 6, "ETH": 5, "USDT": 2, "USD": 2, "USDC": 2}
+        places = group_realized_places.get(realized_currency)
+        realized_text = format_decimal_fixed(realized, places) if places is not None else format_decimal(realized)
+        if realized > 0:
+            realized_text = f"+{realized_text}"
+        values[20] = f"{realized_text} {realized_currency}"
     values[14:14] = ["--", "--"]
     values.insert(17, "--")
     values.insert(18, "--")
@@ -1556,36 +1590,44 @@ DEFAULT_VISIBLE_COLUMNS: tuple[str, ...] = (
 )
 
 # Default widths promoted from the current holdings-table layout.
-DEFAULT_TREE_LABEL_WIDTH = 278
+DEFAULT_TREE_LABEL_WIDTH = 331
 DEFAULT_TREE_COLUMN_WIDTHS: dict[str, int] = {
-    "time_value": 153,
-    "time_value_usdt": 58,
-    "intrinsic_value": 64,
-    "intrinsic_usdt": 58,
-    "bid_price": 88,
+    "inst_type": 72,
+    "mgn_mode": 92,
+    "time_value": 74,
+    "time_value_usdt": 77,
+    "intrinsic_value": 70,
+    "intrinsic_usdt": 80,
+    "bid_price": 78,
+    "bid_size": 78,
     "bid_usdt": 58,
-    "ask_price": 85,
+    "ask_price": 76,
+    "ask_size": 78,
     "ask_usdt": 58,
-    "mark": 85,
+    "mark": 88,
     "mark_usdt": 58,
-    "avg": 81,
+    "avg": 113,
     "avg_usdt": 58,
-    "open_value_usdt": 88,
+    "open_value_usdt": 115,
     "option_premium": 120,
-    "break_even": 91,
-    "pos": 154,
-    "option_side": 185,
-    "upl": 197,
-    "upl_usdt": 58,
-    "realized": 102,
+    "break_even": 77,
+    "pos": 153,
+    "pos_contracts": 100,
+    "option_side": 173,
+    "upl": 221,
+    "upl_usdt": 70,
+    "realized": 145,
     "realized_usdt": 68,
-    "estimated_close_fee": 108,
-    "market_value": 196,
+    "estimated_close_fee": 81,
+    "market_value": 220,
+    "liq": 92,
     "mgn_ratio": 64,
-    "delta": 109,
+    "imr": 100,
+    "mmr": 100,
+    "delta": 90,
     "gamma": 69,
     "vega": 70,
-    "theta": 77,
+    "theta": 87,
     "theta_usdt": 66,
     "note": 1230,
 }
@@ -6252,10 +6294,6 @@ class AccountPositionsHomeWidget(QWidget):
         for index, (column_id, _heading, _width, _alignment) in enumerate(POSITION_COLUMNS, start=1):
             width = self._tree_column_width_overrides.get(column_id)
             if width:
-                if column_id in _COMPACT_USDT_COLUMN_IDS:
-                    width = min(width, DEFAULT_TREE_COLUMN_WIDTHS.get(column_id, width))
-                if column_id == "open_value_usdt":
-                    width = min(width, DEFAULT_TREE_COLUMN_WIDTHS.get(column_id, width))
                 self._position_tree.setColumnWidth(index, width)
 
     @Slot()
@@ -6374,7 +6412,9 @@ class AccountPositionsHomeWidget(QWidget):
                 payload_item=selected_asset_positions,
                 payload_metrics=asset_metrics,
             )
-            asset_item.setFont(0, bold_font)
+            _apply_position_pnl_colors(asset_item, asset_metrics)
+            for column in range(self._position_tree.columnCount()):
+                asset_item.setFont(column, bold_font)
             self._position_tree.addTopLevelItem(asset_item)
             asset_item.setExpanded(asset_id in self._expanded_row_keys)
 
@@ -6407,7 +6447,10 @@ class AccountPositionsHomeWidget(QWidget):
                     payload_item=selected_bucket_positions,
                     payload_metrics=bucket_metrics,
                 )
+                _apply_position_pnl_colors(bucket_item, bucket_metrics)
                 bucket_item.setFont(0, bold_font)
+                for column_id in ("upl", "upl_usdt"):
+                    bucket_item.setFont(_POSITION_TREE_COLUMN_INDEX[column_id], bold_font)
                 asset_item.addChild(bucket_item)
                 bucket_item.setExpanded(bucket_id in self._expanded_row_keys)
                 for position in bucket_positions:
@@ -6443,6 +6486,10 @@ class AccountPositionsHomeWidget(QWidget):
                 display_values[index] = ""
             elif column_id == "option_side" and placeholder.replace(" ", "") == "-:-|-:-":
                 display_values[index] = ""
+            if column_id in {"upl", "market_value"}:
+                # Full-width brackets include visible side bearing, making
+                # right-aligned position rows appear inset from group rows.
+                display_values[index] = str(display_values[index]).strip().replace("（", "(").replace("）", ")")
             if column_id in _COMPACT_USDT_COLUMN_IDS:
                 display_values[index] = str(display_values[index]).removesuffix(" USDT")
         item = QTreeWidgetItem([label, *display_values])
@@ -6455,7 +6502,10 @@ class AccountPositionsHomeWidget(QWidget):
         }
         if kind == "group":
             item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsUserCheckable)
-        for index, (_column_id, _heading, _width, alignment) in enumerate(POSITION_COLUMNS, start=1):
+        force_right_align = {"upl", "market_value"}
+        for index, (column_id, _heading, _width, alignment) in enumerate(POSITION_COLUMNS, start=1):
+            if column_id in force_right_align:
+                alignment = Qt.AlignmentFlag.AlignRight
             item.setTextAlignment(index, int(alignment | Qt.AlignmentFlag.AlignVCenter))
         for index, column_id in enumerate((column_id for column_id, *_rest in POSITION_COLUMNS), start=1):
             if column_id in _COMPACT_USDT_COLUMN_IDS and display_values[index - 1] != original_values[index - 1]:
@@ -6544,7 +6594,7 @@ class AccountPositionsHomeWidget(QWidget):
             _format_optional_decimal_fixed(position.gamma, places=5),
             _format_optional_decimal_fixed(position.vega, places=5),
             _format_optional_decimal_fixed(position.theta, places=5),
-            _format_optional_usdt_precise(_position_theta_usdt(position, self._upl_usdt_prices), places=0),
+            _format_optional_usdt_precise(_position_theta_usdt(position, self._upl_usdt_prices), places=2),
             self._current_note_summary(position),
         )
         item = self._make_tree_item(
@@ -6560,12 +6610,6 @@ class AccountPositionsHomeWidget(QWidget):
             0,
             Qt.CheckState.Unchecked if row_key in self._unchecked_position_row_keys else Qt.CheckState.Checked,
         )
-        pnl_color = None
-        if position.unrealized_pnl is not None:
-            pnl_color = QColor("#13803d" if position.unrealized_pnl > 0 else "#c23b3b" if position.unrealized_pnl < 0 else "#1f2937")
-        if pnl_color is not None:
-            for index in (19, 20, 21, 22):
-                item.setForeground(index, pnl_color)
         for column_id, color in _position_display_foreground_colors(
             time_value_text=values[2],
             intrinsic_value_text=values[4],
@@ -6580,12 +6624,24 @@ class AccountPositionsHomeWidget(QWidget):
             item.setForeground(_POSITION_TREE_COLUMN_INDEX[column_id], color)
         for column_id in _APPROX_USDT_COLUMN_IDS:
             item.setForeground(_POSITION_TREE_COLUMN_INDEX[column_id], QColor(_POSITION_APPROX_USDT_COLOR))
+        _apply_position_pnl_colors(
+            item,
+            {
+                "upl": position.unrealized_pnl,
+                "upl_usdt": _position_unrealized_pnl_usdt(position, self._upl_usdt_prices),
+                "realized": position.realized_pnl,
+                "theta_usdt": _position_theta_usdt(position, self._upl_usdt_prices),
+            },
+        )
         if str(position.mgn_mode or "").strip().lower() == "cross":
             for index in range(0, self._position_tree.columnCount()):
                 item.setBackground(index, QColor("#f4f8ff"))
         elif str(position.mgn_mode or "").strip().lower() == "isolated":
             for index in range(0, self._position_tree.columnCount()):
                 item.setBackground(index, QColor("#fff4e5"))
+        type_color = {"OPTION": "#edf5ef", "FUTURES": "#f3eff8", "SWAP": "#edf3fa"}.get(position.inst_type)
+        if type_color:
+            item.setBackground(0, QColor(type_color))
         return item
 
     def _restore_tree_selection(self, selected_key: str) -> None:

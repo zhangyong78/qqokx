@@ -205,6 +205,66 @@ class PositionDisplayForegroundColorsTest(TestCase):
         self.assertEqual(len(values), len(POSITION_COLUMNS))
         self.assertEqual(values[15:20], ("--", "--", "--", "--", "--"))
 
+    def test_group_realized_pnl_includes_currency_and_two_usdt_decimals(self) -> None:
+        values = account_positions_module._group_row_values_with_break_even(
+            "分组",
+            {
+                "count": 1,
+                "size_display": "1 BTC",
+                "contract_count": None,
+                "option_side_display": "--",
+                "upl": None,
+                "upl_usdt": None,
+                "realized": Decimal("-788.089319717343"),
+                "realized_usdt": None,
+                "market_value_usdt": None,
+                "market_value_native": None,
+                "market_value_currency": None,
+                "pnl_currency": "USDT",
+                "imr": None,
+                "mmr": None,
+                "delta": None,
+                "gamma": None,
+                "vega": None,
+                "theta": None,
+                "theta_usdt": None,
+                "open_value_usdt": None,
+                "estimated_close_fee": None,
+            },
+        )
+
+        self.assertEqual(values[24], "-788.09 USDT")
+
+    def test_group_realized_coin_precision_is_six_for_btc_and_five_for_eth(self) -> None:
+        def render(currency: str, realized: str) -> str:
+            metrics = {
+                "count": 1,
+                "size_display": f"1 {currency}",
+                "contract_count": None,
+                "option_side_display": "--",
+                "upl": None,
+                "upl_usdt": None,
+                "realized": Decimal(realized),
+                "realized_usdt": None,
+                "market_value_usdt": None,
+                "market_value_native": None,
+                "market_value_currency": None,
+                "pnl_currency": currency,
+                "imr": None,
+                "mmr": None,
+                "delta": None,
+                "gamma": None,
+                "vega": None,
+                "theta": None,
+                "theta_usdt": None,
+                "open_value_usdt": None,
+                "estimated_close_fee": None,
+            }
+            return account_positions_module._group_row_values_with_break_even("风险单元", metrics)[24]
+
+        self.assertEqual(render("BTC", "0.2675593202224037"), "+0.267559 BTC")
+        self.assertEqual(render("ETH", "-0.0015"), "-0.00150 ETH")
+
     def test_history_position_kline_markers_use_open_and_close_timestamps(self) -> None:
         history_item = SimpleNamespace(
             update_time=1_752_300_600_000,
@@ -490,9 +550,34 @@ class AccountPositionsHistoryTabWiringTest(QtWidgetTestCase):
         self.assertEqual(_account_margin_ratio_summary(None, [cross]), ("511.77%", "OKX 返回的全仓仓位保证金率一致"))
 
     def test_realized_pnl_display_trims_trailing_zeroes_without_rounding(self) -> None:
-        position = SimpleNamespace(realized_pnl=Decimal("-0.00167500"))
+        position = SimpleNamespace(realized_pnl=Decimal("-0.00167500"), margin_ccy="BTC")
 
-        self.assertEqual(_format_trimmed_realized_pnl(position), "-0.001675")
+        self.assertEqual(_format_trimmed_realized_pnl(position), "-0.001675 BTC")
+
+    def test_realized_usdt_pnl_displays_currency_with_two_decimals(self) -> None:
+        position = SimpleNamespace(realized_pnl=Decimal("-788.089319717343"), margin_ccy="USDT")
+
+        self.assertEqual(_format_trimmed_realized_pnl(position), "-788.09 USDT")
+
+    def test_floating_pnl_and_market_value_are_right_aligned_for_group_rows(self) -> None:
+        with patch.object(AccountPositionsHomeWidget, "_start_private_threads"):
+            widget = AccountPositionsHomeWidget()
+            try:
+                item = widget._make_tree_item(
+                    row_key="test-group",
+                    label="测试分组",
+                    values=tuple("1" for _ in POSITION_COLUMNS),
+                    kind="group",
+                    payload_item=[],
+                    payload_metrics={},
+                )
+                for column_id in ("upl", "market_value"):
+                    column_index = 1 + next(
+                        index for index, column in enumerate(POSITION_COLUMNS) if column[0] == column_id
+                    )
+                    self.assertTrue(item.textAlignment(column_index) & Qt.AlignmentFlag.AlignRight)
+            finally:
+                self.dispose_widget(widget)
 
     def test_active_history_table_click_is_wired_to_kline_handler(self) -> None:
         with (

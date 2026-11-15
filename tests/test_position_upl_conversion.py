@@ -139,7 +139,7 @@ class PositionUplConversionTest(TestCase):
             ct_val_ccy="BTC",
         )
         text = _format_position_size(position, {instrument.inst_id: instrument})
-        self.assertEqual(text, "0.2 BTC (long)")
+        self.assertEqual(text, "0.2 BTC（多）")
 
     def test_format_position_size_marks_short_with_negative_amount(self) -> None:
         position = _make_position(inst_id="BTC-USD-260626-100000-C", upl="0.0015", margin_ccy="BTC")
@@ -156,19 +156,19 @@ class PositionUplConversionTest(TestCase):
             ct_val_ccy="BTC",
         )
         text = _format_position_size(position, {instrument.inst_id: instrument})
-        self.assertEqual(text, "-0.2 BTC (short)")
+        self.assertEqual(text, "-0.2 BTC（空）")
 
     def test_format_position_size_without_option_contract_specs_uses_btc_contract_value(self) -> None:
         position = _make_position(inst_id="BTC-USD-260626-100000-C", upl="0", margin_ccy="BTC")
         position = OkxPosition(**{**position.__dict__, "position": Decimal("25"), "pos_side": "net"})
 
-        self.assertEqual(_format_position_size(position, {}), "0.25 BTC (long)")
+        self.assertEqual(_format_position_size(position, {}), "0.25 BTC（多）")
 
     def test_format_position_size_without_option_specs_shows_one_btc_for_100_contracts(self) -> None:
         position = _make_position(inst_id="BTC-USD-260626-100000-C", upl="0", margin_ccy="BTC")
         position = OkxPosition(**{**position.__dict__, "position": Decimal("100"), "pos_side": "net"})
 
-        self.assertEqual(_format_position_size(position, {}), "1 BTC (long)")
+        self.assertEqual(_format_position_size(position, {}), "1 BTC（多）")
 
     def test_format_position_size_returns_dash_for_zero_position(self) -> None:
         position = _make_position(inst_id="BTC-USD-260626-100000-C", upl="0", margin_ccy="BTC")
@@ -240,7 +240,7 @@ class PositionUplConversionTest(TestCase):
         }
         self.assertEqual(
             _format_group_option_trade_side(positions, instruments),
-            "0.20 : 0.10 | - : 0.30",
+            "0.20 : 0.10 | 0.00 : 0.30",
         )
 
     def test_format_position_size_converts_usd_futures_to_base_coin(self) -> None:
@@ -265,7 +265,7 @@ class PositionUplConversionTest(TestCase):
             ct_mult=Decimal("1"),
             ct_val_ccy="USD",
         )
-        self.assertEqual(_format_position_size(position, {instrument.inst_id: instrument}), "-0.4000 BTC (short)")
+        self.assertEqual(_format_position_size(position, {instrument.inst_id: instrument}), "-0.4000 BTC（空）")
 
     def test_format_position_size_converts_coin_margined_btc_swap_without_specs(self) -> None:
         position = _make_position(inst_id="BTC-USD-SWAP", upl="0", margin_ccy="BTC")
@@ -279,7 +279,7 @@ class PositionUplConversionTest(TestCase):
             }
         )
 
-        self.assertEqual(_format_position_size(position, {}), "-0.4000 BTC (short)")
+        self.assertEqual(_format_position_size(position, {}), "-0.4000 BTC（空）")
 
     def test_format_position_size_converts_usdt_swap_without_specs(self) -> None:
         position = _make_position(inst_id="DOGE-USDT-SWAP", upl="0", margin_ccy="USDT")
@@ -292,7 +292,7 @@ class PositionUplConversionTest(TestCase):
             }
         )
 
-        self.assertEqual(_format_position_size(position, {}), "250000.0000 DOGE (long)")
+        self.assertEqual(_format_position_size(position, {}), "250000.0000 DOGE（多）")
 
     def test_aggregate_position_metrics_uses_coin_delta_for_usd_futures(self) -> None:
         futures = _make_position(inst_id="BTC-USD-260626", upl="0", margin_ccy="BTC")
@@ -345,6 +345,37 @@ class PositionUplConversionTest(TestCase):
             _build_group_row_values("分组", metrics)[22],
             "0.25 BTC（≈20000 USDT）",
         )
+
+    def test_linear_perpetual_group_market_value_does_not_add_btc(self) -> None:
+        position = _make_position(inst_id="DOGE-USDT-SWAP", upl="0", margin_ccy="USDT")
+        position = OkxPosition(
+            **{
+                **position.__dict__,
+                "inst_type": "SWAP",
+                "position": Decimal("250"),
+                "mark_price": Decimal("0.05844"),
+            }
+        )
+        instrument = Instrument(
+            inst_id="DOGE-USDT-SWAP",
+            inst_type="SWAP",
+            tick_size=Decimal("0.00001"),
+            lot_size=Decimal("0.01"),
+            min_size=Decimal("0.01"),
+            state="live",
+            ct_val=Decimal("1000"),
+            ct_mult=Decimal("1"),
+            ct_val_ccy="DOGE",
+            settle_ccy="USDT",
+        )
+        metrics = _aggregate_position_metrics(
+            [position],
+            {"BTC": Decimal("65000"), "DOGE": Decimal("0.05844")},
+            {instrument.inst_id: instrument},
+        )
+
+        self.assertIsNone(metrics["market_value_native"])
+        self.assertEqual(_build_group_row_values("分组", metrics)[22], "≈14610 USDT")
 
     def test_format_position_contracts_shows_raw_derivative_count(self) -> None:
         position = _make_position(inst_id="BTC-USD-260626-100000-C", upl="0", margin_ccy="BTC")
@@ -657,7 +688,7 @@ class PositionUplConversionTest(TestCase):
         instruments = _build_position_instrument_map(_StubClient(), [position])
 
         self.assertEqual(instruments[target.inst_id], target)
-        self.assertEqual(_format_position_size(position, instruments), "0.01 BTC (long)")
+        self.assertEqual(_format_position_size(position, instruments), "0.01 BTC（多）")
 
     def test_build_position_instrument_map_falls_back_to_uly_for_options(self) -> None:
         target = Instrument(
@@ -702,7 +733,7 @@ class PositionUplConversionTest(TestCase):
         instruments = _build_position_instrument_map(_StubClient(), [position])
 
         self.assertEqual(instruments[target.inst_id], target)
-        self.assertEqual(_format_position_size(position, instruments), "0.01 BTC (long)")
+        self.assertEqual(_format_position_size(position, instruments), "0.01 BTC（多）")
         self.assertEqual(
             calls,
             [
