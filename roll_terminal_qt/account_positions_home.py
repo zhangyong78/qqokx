@@ -482,7 +482,6 @@ from okx_quant.ui_shell import (
     _format_position_option_price_component,
     _format_position_quote_price,
     _format_position_quote_price_usdt,
-    _format_position_realized_pnl,
     _format_position_size,
     _format_position_contracts,
     _format_instrument_type,
@@ -899,6 +898,66 @@ def _format_position_quote_size(ticker: object | None, *, side: str) -> str:
     if not amount.is_finite():
         return "-"
     return format(amount.normalize(), "f")
+
+
+def _format_trimmed_realized_pnl(position: OkxPosition) -> str:
+    value = position.realized_pnl
+    if not isinstance(value, Decimal) or not value.is_finite():
+        return "-"
+    text = format_decimal(value)
+    return f"+{text}" if value > 0 else text
+
+
+def _position_margin_ratio_display(position: OkxPosition) -> str:
+    if str(position.mgn_mode or "").strip().lower() == "cross":
+        return ""
+    return _format_ratio(position.margin_ratio, places=2)
+
+
+def _account_margin_ratio_summary(
+    overview: object | None,
+    positions: list[OkxPosition],
+) -> tuple[str, str]:
+    raw = getattr(overview, "raw", None)
+    raw = raw if isinstance(raw, dict) else {}
+    account_ratio = _current_order_raw_decimal(raw, "mgnRatio")
+    if account_ratio is not None and account_ratio.is_finite():
+        return _format_ratio(account_ratio, places=2), "OKX 账户级保证金率"
+
+    detail_rows: list[tuple[str, Decimal]] = []
+    details = raw.get("details")
+    if isinstance(details, list):
+        for detail in details:
+            if not isinstance(detail, dict):
+                continue
+            ratio = _current_order_raw_decimal(detail, "mgnRatio")
+            if ratio is not None and ratio.is_finite():
+                detail_rows.append((str(detail.get("ccy") or "账户").strip(), ratio))
+    if detail_rows:
+        unique_ratios = {ratio for _currency, ratio in detail_rows}
+        if len(unique_ratios) == 1:
+            return _format_ratio(detail_rows[0][1], places=2), "各保证金币种的保证金率相同"
+        tooltip = "；".join(
+            f"{currency} {_format_ratio(ratio, places=2)}" for currency, ratio in detail_rows
+        )
+        return "按币种", tooltip
+
+    cross_rows = [
+        (position.inst_id, position.margin_ratio)
+        for position in positions
+        if str(position.mgn_mode or "").strip().lower() == "cross"
+        and isinstance(position.margin_ratio, Decimal)
+        and position.margin_ratio.is_finite()
+    ]
+    if cross_rows:
+        unique_ratios = {ratio for _inst_id, ratio in cross_rows}
+        if len(unique_ratios) == 1:
+            return _format_ratio(cross_rows[0][1], places=2), "OKX 返回的全仓仓位保证金率一致"
+        tooltip = "；".join(
+            f"{inst_id} {_format_ratio(ratio, places=2)}" for inst_id, ratio in cross_rows
+        )
+        return "多项", tooltip
+    return "-", "当前账户模式未提供账户级保证金率"
 
 
 def _position_display_foreground_colors(
@@ -1331,17 +1390,56 @@ def _position_break_even_price(
     upl_usdt_prices: dict[str, Decimal],
     *,
     fee_rate: Decimal,
+    instrument: Instrument | None = None,
 ) -> Decimal | None:
-    """Return the underlying/contract break-even price with two taker fees."""
+    """Return the exit price that offsets realized PnL and the closing fee."""
     inst_type = str(getattr(position, "inst_type", "") or "").strip().upper()
     avg_price = getattr(position, "avg_price", None)
     if not isinstance(avg_price, Decimal) or avg_price <= 0:
         return None
-    two_way_fee_rate = max(fee_rate, Decimal("0")) * Decimal("2")
+    close_fee_rate = max(fee_rate, Decimal("0"))
     is_short = _position_is_short(position)
     if inst_type in {"SWAP", "FUTURES"}:
-        multiplier = Decimal("1") - two_way_fee_rate if is_short else Decimal("1") + two_way_fee_rate
-        return avg_price * multiplier
+        inst_parts = str(getattr(position, "inst_id", "") or "").strip().upper().split("-")
+        if len(inst_parts) < 3:
+            return None
+        base_ccy, quote_ccy = inst_parts[0], inst_parts[1]
+        contracts = abs(getattr(position, "position", Decimal("0")) or Decimal("0"))
+        if contracts <= 0:
+            return None
+        realized_pnl = getattr(position, "realized_pnl", None)
+        realized_pnl = realized_pnl if isinstance(realized_pnl, Decimal) else Decimal("0")
+        contract_value, contract_ccy = _position_contract_value_snapshot(position, instrument)
+        contract_multiplier = AccountPositionsHomeWidget._position_contract_multiplier(instrument)
+        if contract_value is None or contract_value <= 0 or contract_multiplier <= 0:
+            return None
+        contract_notional = contracts * contract_value * contract_multiplier
+
+        # Linear USDT/USDC contracts settle PnL in quote currency. OKX's
+        # realizedPnl is already net of accumulated fees/funding, so only the
+        # remaining position's PnL and its projected closing fee belong here.
+        if quote_ccy in {"USDT", "USDC"} and str(contract_ccy or "").upper() == base_ccy:
+            base_quantity = contract_notional
+            if base_quantity <= 0:
+                return None
+            if is_short:
+                denominator = base_quantity * (Decimal("1") + close_fee_rate)
+                numerator = base_quantity * avg_price + realized_pnl
+            else:
+                denominator = base_quantity * (Decimal("1") - close_fee_rate)
+                numerator = base_quantity * avg_price - realized_pnl
+            return numerator / denominator if denominator > 0 and numerator > 0 else None
+
+        # Inverse USD contracts settle PnL and fees in the underlying coin.
+        if quote_ccy == "USD" and str(contract_ccy or "").upper() in {"USD", ""}:
+            if is_short:
+                denominator = contract_notional / avg_price - realized_pnl
+                numerator = contract_notional * (Decimal("1") - close_fee_rate)
+            else:
+                denominator = contract_notional / avg_price + realized_pnl
+                numerator = contract_notional * (Decimal("1") + close_fee_rate)
+            return numerator / denominator if denominator > 0 and numerator > 0 else None
+        return None
     if inst_type != "OPTION":
         return None
     parts = str(getattr(position, "inst_id", "") or "").strip().upper().split("-")
@@ -1360,12 +1458,29 @@ def _position_break_even_price(
         if underlying_price is None or underlying_price <= 0:
             return None
         premium *= underlying_price
+    two_way_fee_rate = close_fee_rate * Decimal("2")
     premium_with_fee = premium * (Decimal("1") + two_way_fee_rate)
     if option_kind == "C":
         return strike + premium_with_fee if not is_short else strike + premium * (Decimal("1") - two_way_fee_rate)
     if option_kind == "P":
         return strike - premium_with_fee if not is_short else strike - premium * (Decimal("1") - two_way_fee_rate)
     return None
+
+
+def _position_break_even_display_places(
+    position: object,
+    instrument: Instrument | None,
+    price: Decimal | None,
+) -> int:
+    """Keep integer display for normal prices, but preserve sub-unit prices."""
+    if price is None or abs(price) >= 1:
+        return 0
+    if str(getattr(position, "inst_type", "") or "").strip().upper() not in {"SWAP", "FUTURES"}:
+        return 0
+    tick_size = getattr(instrument, "tick_size", None)
+    if isinstance(tick_size, Decimal) and tick_size > 0:
+        return max(0, -tick_size.normalize().as_tuple().exponent)
+    return 8
 
 
 def _group_row_values_with_break_even(group_type: str, metrics: dict[str, object]) -> tuple[str, ...]:
@@ -4263,6 +4378,7 @@ class AccountPositionsHomeWidget(QWidget):
             ("unrealized_pnl", "未实现盈亏"),
             ("initial_margin", "初始保证金"),
             ("maintenance_margin", "维持保证金"),
+            ("account_margin_ratio", "账户保证金率"),
         ):
             metric = QVBoxLayout()
             metric.setSpacing(0)
@@ -4289,6 +4405,11 @@ class AccountPositionsHomeWidget(QWidget):
             if total is not None else "- USDT"
         )
         for key, label in getattr(self, "_equity_metric_labels", {}).items():
+            if key == "account_margin_ratio":
+                text, tooltip = _account_margin_ratio_summary(overview, getattr(self, "_raw_positions", []))
+                label.setText(text)
+                label.setToolTip(tooltip)
+                continue
             value = getattr(overview, key, None) if overview is not None else None
             label.setText(_format_optional_usdt_precise(value, places=2, with_sign=key == "unrealized_pnl"))
         self._equity_updated_label.setText(
@@ -6359,6 +6480,15 @@ class AccountPositionsHomeWidget(QWidget):
             if option_amount is not None and option_currency:
                 premium_total = option_amount * position.avg_price
                 option_premium_text = f"{format_decimal_fixed(premium_total, 5)} {option_currency}"
+        break_even_price = _position_break_even_price(
+            position,
+            self._upl_usdt_prices,
+            fee_rate=_break_even_taker_fee_rate(
+                self._profile_snapshots.get(self._last_profile_name, {}),
+                inst_type=position.inst_type,
+            ),
+            instrument=self._position_instruments.get(position.inst_id),
+        )
         values = (
             _format_instrument_type(position.inst_type),
             _format_margin_mode(position.mgn_mode),
@@ -6379,22 +6509,19 @@ class AccountPositionsHomeWidget(QWidget):
             open_value_text,
             option_premium_text,
             _format_optional_decimal_fixed(
-                _position_break_even_price(
+                break_even_price,
+                places=_position_break_even_display_places(
                     position,
-                    self._upl_usdt_prices,
-                    fee_rate=_break_even_taker_fee_rate(
-                        self._profile_snapshots.get(self._last_profile_name, {}),
-                        inst_type=position.inst_type,
-                    ),
+                    self._position_instruments.get(position.inst_id),
+                    break_even_price,
                 ),
-                places=0,
             ),
             _format_position_size(position, self._position_instruments),
             _format_position_contracts(position),
             _format_option_trade_side_display(position),
             _format_position_unrealized_pnl(position),
             _format_optional_usdt(_position_unrealized_pnl_usdt(position, self._upl_usdt_prices)),
-            _format_position_realized_pnl(position),
+            _format_trimmed_realized_pnl(position),
             _format_optional_usdt(_position_realized_pnl_usdt(position, self._upl_usdt_prices)),
             _format_estimated_close_fee(
                 position,
@@ -6408,7 +6535,7 @@ class AccountPositionsHomeWidget(QWidget):
             ),
             _format_position_market_value(position, self._position_instruments, self._upl_usdt_prices),
             _format_optional_decimal(position.liquidation_price),
-            _format_ratio(position.margin_ratio, places=2),
+            _position_margin_ratio_display(position),
             _format_optional_integer(position.initial_margin),
             _format_optional_integer(position.maintenance_margin),
             _format_optional_decimal_fixed(
@@ -7297,6 +7424,8 @@ class AccountPositionsHomeWidget(QWidget):
             self._account_overview = next_account
             if hasattr(self, "_render_account_equity"):
                 self._render_account_equity()
+        elif positions_changed and hasattr(self, "_render_account_equity"):
+            self._render_account_equity()
         if self._last_profile_name and positions_changed:
             notes_changed = _reconcile_current_position_note_records(
                 self._current_notes,

@@ -17,6 +17,10 @@ from roll_terminal_qt.account_positions_home import (
     POSITION_COLUMNS,
     PositionProtectionDialog,
     _position_break_even_price,
+    _position_break_even_display_places,
+    _position_margin_ratio_display,
+    _account_margin_ratio_summary,
+    _format_trimmed_realized_pnl,
     _break_even_taker_fee_rate,
     _current_order_view_cancel_reference,
     _current_order_view_program_owner_label,
@@ -448,7 +452,7 @@ class AccountPositionsHistoryTabWiringTest(QtWidgetTestCase):
             order_frozen=Decimal("0"),
             notional_usd=Decimal("1000"),
             details=(),
-            raw={},
+            raw={"mgnRatio": "5.1177"},
         )
         with patch.object(AccountPositionsHomeWidget, "_start_private_threads"):
             widget = AccountPositionsHomeWidget()
@@ -465,8 +469,30 @@ class AccountPositionsHistoryTabWiringTest(QtWidgetTestCase):
                 self.assertEqual(widget._equity_total_value.text(), "2831.69 USDT")
                 self.assertEqual(widget._equity_metric_labels["available_equity"].text(), "2802.48")
                 self.assertEqual(widget._equity_metric_labels["unrealized_pnl"].text(), "+29.22")
+                self.assertEqual(widget._equity_metric_labels["account_margin_ratio"].text(), "511.77%")
             finally:
                 self.dispose_widget(widget)
+
+    def test_cross_margin_ratio_moves_to_account_summary_but_isolated_stays_on_row(self) -> None:
+        cross = SimpleNamespace(
+            inst_id="BTC-USDT-SWAP",
+            mgn_mode="cross",
+            margin_ratio=Decimal("5.1177"),
+        )
+        isolated = SimpleNamespace(
+            inst_id="ETH-USDT-SWAP",
+            mgn_mode="isolated",
+            margin_ratio=Decimal("2.5"),
+        )
+
+        self.assertEqual(_position_margin_ratio_display(cross), "")
+        self.assertEqual(_position_margin_ratio_display(isolated), "250.00%")
+        self.assertEqual(_account_margin_ratio_summary(None, [cross]), ("511.77%", "OKX 返回的全仓仓位保证金率一致"))
+
+    def test_realized_pnl_display_trims_trailing_zeroes_without_rounding(self) -> None:
+        position = SimpleNamespace(realized_pnl=Decimal("-0.00167500"))
+
+        self.assertEqual(_format_trimmed_realized_pnl(position), "-0.001675")
 
     def test_active_history_table_click_is_wired_to_kline_handler(self) -> None:
         with (
@@ -840,7 +866,7 @@ class AccountPositionsHomeQtHelpersTest(TestCase):
 
         self.assertEqual(value, Decimal("64536.9216"))
 
-    def test_swap_break_even_only_adds_two_way_fee_in_position_direction(self) -> None:
+    def test_swap_break_even_uses_only_projected_close_fee(self) -> None:
         short_swap = SimpleNamespace(
             inst_id="BTC-USDT-SWAP",
             inst_type="SWAP",
@@ -848,11 +874,51 @@ class AccountPositionsHomeQtHelpersTest(TestCase):
             position=Decimal("-1"),
             avg_price=Decimal("64000"),
             margin_ccy="USDT",
+            realized_pnl=Decimal("0"),
         )
 
         value = _position_break_even_price(short_swap, {}, fee_rate=Decimal("0.00036"))
 
-        self.assertEqual(value, Decimal("63953.92000"))
+        self.assertEqual(value, Decimal("64000") / (Decimal("1") + Decimal("0.00036")))
+
+    def test_linear_swap_break_even_accounts_for_accumulated_realized_pnl(self) -> None:
+        long_swap = SimpleNamespace(
+            inst_id="BTC-USDT-SWAP",
+            inst_type="SWAP",
+            pos_side="long",
+            position=Decimal("1"),
+            avg_price=Decimal("100"),
+            margin_ccy="USDT",
+            realized_pnl=Decimal("0.2"),
+        )
+
+        value = _position_break_even_price(long_swap, {}, fee_rate=Decimal("0.001"))
+
+        self.assertEqual(value, (Decimal("1") - Decimal("0.2")) / (Decimal("0.01") * (Decimal("1") - Decimal("0.001"))))
+
+    def test_inverse_swap_break_even_accounts_for_realized_pnl_in_coin(self) -> None:
+        long_swap = SimpleNamespace(
+            inst_id="BTC-USD-SWAP",
+            inst_type="SWAP",
+            pos_side="long",
+            position=Decimal("1"),
+            avg_price=Decimal("64000"),
+            margin_ccy="BTC",
+            realized_pnl=Decimal("0.00001"),
+        )
+
+        value = _position_break_even_price(long_swap, {}, fee_rate=Decimal("0.00036"))
+
+        expected = Decimal("100") * (Decimal("1") + Decimal("0.00036")) / (Decimal("100") / Decimal("64000") + Decimal("0.00001"))
+        self.assertEqual(value, expected)
+
+    def test_sub_unit_perpetual_break_even_uses_instrument_tick_precision(self) -> None:
+        doge_swap = SimpleNamespace(inst_type="SWAP")
+        instrument = SimpleNamespace(tick_size=Decimal("0.00001"))
+
+        places = _position_break_even_display_places(doge_swap, instrument, Decimal("0.05897"))
+
+        self.assertEqual(places, 5)
 
     def test_option_fee_rate_falls_back_to_contract_taker_fee(self) -> None:
         rate = _break_even_taker_fee_rate(
