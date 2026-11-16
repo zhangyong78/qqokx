@@ -35,6 +35,8 @@ class RealtimeAccountStore(QObject):
     snapshot_ready = Signal(object)
     status_changed = Signal(str)
     _reconcile_completed = Signal(int, str, object)
+    _reconcile_progress = Signal(int, str, object)
+    _public_data_completed = Signal(int, int, object)
     _cache_completed = Signal(int, object)
     _event_received = Signal(int, str, int)
 
@@ -64,6 +66,14 @@ class RealtimeAccountStore(QObject):
         self._ws_revision = 0
         self._unsubscribers: list[Callable[[], None]] = []
         self._reconcile_in_flight = False
+        self._public_data_in_flight = False
+        self._reconcile_private_done = False
+        self._next_reconcile_id = 0
+        self._active_reconcile_id = 0
+        self._public_started_event = threading.Event()
+        self._public_completed_reconcile_id = -1
+        self._reconcile_failed_waiting_retry = False
+        self._reconcile_retry_pending = False
         self._cache_in_flight = False
         self._pending_cache_refresh = False
         self._emit_timer = QTimer(self)
@@ -78,8 +88,10 @@ class RealtimeAccountStore(QObject):
         self._reconcile_retry_delay = 5
         self._reconcile_retry_timer = QTimer(self)
         self._reconcile_retry_timer.setSingleShot(True)
-        self._reconcile_retry_timer.timeout.connect(lambda: self.request_reconcile("recovery"))
+        self._reconcile_retry_timer.timeout.connect(self._retry_reconcile_when_ready)
         self._reconcile_completed.connect(self._apply_reconcile_result)
+        self._reconcile_progress.connect(self._apply_reconcile_progress)
+        self._public_data_completed.connect(self._apply_public_data_result)
         self._cache_completed.connect(self._apply_cache_result)
         self._event_received.connect(self._queue_cache_refresh)
 
@@ -118,6 +130,12 @@ class RealtimeAccountStore(QObject):
         self._emit_timer.stop()
         self._cache_refresh_timer.stop()
         self._reconcile_in_flight = False
+        self._public_data_in_flight = False
+        self._reconcile_private_done = False
+        self._public_started_event = threading.Event()
+        self._public_completed_reconcile_id = self._active_reconcile_id
+        self._reconcile_failed_waiting_retry = False
+        self._reconcile_retry_pending = False
         self._cache_in_flight = False
         self._pending_cache_refresh = False
         for unsubscribe in self._unsubscribers:
@@ -199,19 +217,36 @@ class RealtimeAccountStore(QObject):
         )
 
     def request_reconcile(self, reason: str) -> None:
-        if self._runtime is None or self._reconcile_in_flight:
+        if self._runtime is None or self._reconcile_in_flight or self._public_data_in_flight:
             return
         self._reconcile_retry_timer.stop()
         self._reconcile_in_flight = True
+        self._public_data_in_flight = True
+        self._reconcile_private_done = False
+        self._next_reconcile_id += 1
+        self._active_reconcile_id = self._next_reconcile_id
+        self._public_started_event = threading.Event()
+        self._public_completed_reconcile_id = -1
         generation = self._generation
         runtime = self._runtime
         thread = threading.Thread(
             target=self._run_reconcile_worker,
-            args=(generation, str(reason or "manual"), runtime),
+            args=(generation, str(reason or "manual"), runtime, self._active_reconcile_id, self._public_started_event),
             daemon=True,
             name="qt-account-reconcile",
         )
         thread.start()
+
+    @Slot()
+    def _retry_reconcile_when_ready(self) -> None:
+        if not self._reconcile_failed_waiting_retry:
+            return
+        if self._reconcile_in_flight or self._public_data_in_flight:
+            self._reconcile_retry_pending = True
+            return
+        self._reconcile_retry_pending = False
+        self._reconcile_failed_waiting_retry = False
+        self.request_reconcile("recovery")
 
     def _subscribe_ws_updates(self, generation: int) -> None:
         runtime = self._runtime
@@ -238,7 +273,9 @@ class RealtimeAccountStore(QObject):
             if callable(unsubscribe):
                 self._unsubscribers.append(unsubscribe)
 
-    def _run_reconcile_worker(self, generation: int, reason: str, runtime: object) -> None:
+    def _run_reconcile_worker(self, generation: int, reason: str, runtime: object, reconcile_id: int | None = None, public_started: threading.Event | None = None) -> None:
+        reconcile_id = self._active_reconcile_id if reconcile_id is None else reconcile_id
+        public_started = self._public_started_event if public_started is None else public_started
         started_ws_revision = self._ws_revision
         try:
             credentials = getattr(runtime, "credentials")
@@ -253,6 +290,20 @@ class RealtimeAccountStore(QObject):
                         prefer_cache=False,
                     )
                 )
+            self._reconcile_progress.emit(generation, reason, {
+                "started_ws_revision": started_ws_revision,
+                "reconcile_id": reconcile_id,
+                "positions": positions,
+            })
+            public_thread = threading.Thread(
+                target=self._run_public_data_worker,
+                args=(generation, reconcile_id, positions),
+                daemon=True,
+                name="qt-account-public-data",
+            )
+            public_thread.start()
+            if public_started is not None:
+                public_started.set()
             account = self._client.get_account_overview(credentials, environment=environment, prefer_cache=False)
             account_updated_at = datetime.now(timezone.utc)
             equity_error = ""
@@ -270,78 +321,185 @@ class RealtimeAccountStore(QObject):
                 include_algo=True,
             )
             try:
-                upl_usdt_prices = _build_upl_usdt_price_map(self._client, positions)
+                pending_order_instruments = _build_position_instrument_map(self._client, list(pending_orders))
             except Exception:
-                upl_usdt_prices = {}
-            try:
-                # Current orders can refer to an instrument with no open
-                # position.  Keep the same instrument map for both sources so
-                # order tables can convert raw contract lots to coin amounts.
-                instrument_items = [*positions, *pending_orders]
-                position_instruments = _build_position_instrument_map(self._client, instrument_items)
-            except Exception:
-                position_instruments = {}
-            try:
-                position_tickers = _build_position_ticker_map(self._client, positions)
-            except Exception:
-                position_tickers = {}
+                pending_order_instruments = {}
+            private_result = {
+                "started_ws_revision": started_ws_revision,
+                "reconcile_id": reconcile_id,
+                "positions": positions,
+                "account": account,
+                "account_updated_at": account_updated_at,
+                "equity_error": equity_error,
+                "pending_orders": pending_orders,
+                "pending_order_instruments": pending_order_instruments,
+            }
+            # Publish the slow-changing private REST state before fetching public
+            # metadata and quotes, which may each require several serial requests.
+            self._reconcile_progress.emit(generation, reason, private_result)
             self._reconcile_completed.emit(
                 generation,
                 reason,
                 {
                     "started_ws_revision": started_ws_revision,
+                    "reconcile_id": reconcile_id,
                     "positions": positions,
                     "account": account,
                     "account_updated_at": account_updated_at,
                     "equity_error": equity_error,
                     "pending_orders": pending_orders,
-                    "upl_usdt_prices": upl_usdt_prices,
-                    "position_instruments": position_instruments,
-                    "position_tickers": position_tickers,
+                    "pending_order_instruments": pending_order_instruments,
                 },
             )
         except Exception as exc:  # noqa: BLE001
-            self._reconcile_completed.emit(generation, reason, exc)
+            self._reconcile_completed.emit(generation, reason, {"reconcile_id": reconcile_id, "error": exc})
+
+    def _run_public_data_worker(self, generation: int, reconcile_id: int, positions: list[OkxPosition]) -> None:
+        try:
+            try:
+                prices = _build_upl_usdt_price_map(self._client, positions)
+            except Exception:
+                prices = {}
+            self._public_data_completed.emit(generation, reconcile_id, {"positions": positions, "upl_usdt_prices": prices})
+            try:
+                instruments = _build_position_instrument_map(self._client, positions)
+            except Exception:
+                instruments = {}
+            self._public_data_completed.emit(generation, reconcile_id, {"positions": positions, "position_instruments": instruments})
+            try:
+                tickers = _build_position_ticker_map(self._client, positions)
+            except Exception:
+                tickers = {}
+            self._public_data_completed.emit(generation, reconcile_id, {"positions": positions, "position_tickers": tickers, "done": True})
+        except Exception as exc:  # noqa: BLE001
+            self._public_data_completed.emit(generation, reconcile_id, {"error": exc, "done": True})
+
+    @Slot(int, int, object)
+    def _apply_public_data_result(self, generation: int, reconcile_id: int, result: object) -> None:
+        if generation != self._generation or reconcile_id != self._active_reconcile_id:
+            return
+        if isinstance(result, dict) and result.get("done"):
+            self._public_data_in_flight = False
+            self._public_completed_reconcile_id = reconcile_id
+        elif isinstance(result, dict):
+            self._public_data_in_flight = True
+        if isinstance(result, dict):
+            current_ids = {getattr(p, "inst_id", None) for p in self._positions}
+            result_ids = {getattr(p, "inst_id", None) for p in result.get("positions", [])}
+            if result_ids == current_ids and None not in current_ids:
+                for key, attr in (
+                    ("upl_usdt_prices", "_upl_usdt_prices"),
+                    ("position_instruments", "_position_instruments"),
+                    ("position_tickers", "_position_tickers"),
+                ):
+                    value = result.get(key)
+                    if value:
+                        if key == "position_instruments":
+                            getattr(self, attr).update(value)
+                        else:
+                            setattr(self, attr, dict(value))
+                self._schedule_emit()
+        self._finish_reconcile_if_ready()
+
+    def _finish_reconcile_if_ready(self) -> None:
+        if self._reconcile_private_done and not self._public_data_in_flight:
+            self._reconcile_in_flight = False
+            if self._reconcile_retry_pending and self._reconcile_failed_waiting_retry and self._runtime is not None:
+                self._reconcile_retry_pending = False
+                self._reconcile_retry_timer.start(0)
+
+    @Slot(int, str, object)
+    def _apply_reconcile_progress(self, generation: int, _reason: str, result: object) -> None:
+        if generation != self._generation or not isinstance(result, dict):
+            return
+        if int(result.get("reconcile_id", self._active_reconcile_id)) != self._active_reconcile_id:
+            return
+        if int(result.get("started_ws_revision", self._ws_revision)) != self._ws_revision:
+            return
+        positions = result.get("positions")
+        if positions is not None:
+            self._positions = list(positions)
+        if "account" in result:
+            self._account = result["account"]
+            self._account_updated_at = result.get("account_updated_at")
+            self._orders = self._views_from_pending_orders(list(result.get("pending_orders") or []))
+            self._source = "rest"
+            if result.get("equity_error"):
+                self.status_changed.emit(str(result["equity_error"]))
+        # Empty or failed partial fetches must never erase a previously useful cache.
+        for key, attr in (
+            ("upl_usdt_prices", "_upl_usdt_prices"),
+            ("position_instruments", "_position_instruments"),
+            ("position_tickers", "_position_tickers"),
+        ):
+            value = result.get(key)
+            if value:
+                setattr(self, attr, dict(value))
+        self._schedule_emit()
 
     @Slot(int, str, object)
     def _apply_reconcile_result(self, generation: int, reason: str, result: object) -> None:
         if generation != self._generation:
             return
-        self._reconcile_in_flight = False
-        if isinstance(result, Exception):
-            self.status_changed.emit(f"账户 REST 校验失败，{self._reconcile_retry_delay}秒后自动重试：{result}")
+        reconcile_id = int(result.get("reconcile_id", self._active_reconcile_id)) if isinstance(result, dict) else self._active_reconcile_id
+        if reconcile_id != self._active_reconcile_id:
+            return
+        error = result.get("error") if isinstance(result, dict) else result if isinstance(result, Exception) else None
+        if isinstance(error, Exception):
+            self._reconcile_private_done = True
+            self._reconcile_failed_waiting_retry = True
+            if self._public_started_event.is_set() and self._public_completed_reconcile_id != reconcile_id:
+                self._public_data_in_flight = True
+            else:
+                self._public_data_in_flight = False
+                self._reconcile_in_flight = False
+            self.status_changed.emit(f"账户 REST 校验失败，{self._reconcile_retry_delay}秒后自动重试：{error}")
             if self._runtime is not None:
                 self._reconcile_retry_timer.start(self._reconcile_retry_delay * 1000)
                 self._reconcile_retry_delay = min(self._reconcile_retry_delay * 2, 30)
             return
         if not isinstance(result, dict):
+            self._reconcile_private_done = True
+            self._public_data_in_flight = False
+            self._reconcile_in_flight = False
             return
         self._reconcile_retry_timer.stop()
         self._reconcile_retry_delay = 5
+        self._reconcile_failed_waiting_retry = False
+        self._reconcile_retry_pending = False
         if int(result.get("started_ws_revision", self._ws_revision)) != self._ws_revision:
             # Account updates do not invalidate public quotes when the set of
             # held instruments is unchanged. Never apply the stale positions.
             current_ids = {getattr(p, "inst_id", None) for p in self._positions}
             result_ids = {getattr(p, "inst_id", None) for p in result.get("positions", [])}
             if current_ids == result_ids and None not in current_ids:
-                self._upl_usdt_prices = dict(result.get("upl_usdt_prices") or {})
-                self._position_tickers = dict(result.get("position_tickers") or {})
-                self._position_instruments = dict(result.get("position_instruments") or {})
+                for key, attr in (
+                    ("upl_usdt_prices", "_upl_usdt_prices"),
+                    ("position_tickers", "_position_tickers"),
+                    ("position_instruments", "_position_instruments"),
+                ):
+                    value = result.get(key)
+                    if value:
+                        setattr(self, attr, dict(value))
                 self._schedule_emit()
             self.status_changed.emit(f"账户 REST {reason} 校验结果已过期，保留较新的 WS 状态")
+            self._reconcile_private_done = True
+            self._finish_reconcile_if_ready()
             return
         self._positions = list(result.get("positions") or [])
         self._account = result.get("account")
         self._account_updated_at = result.get("account_updated_at")
-        self._upl_usdt_prices = dict(result.get("upl_usdt_prices") or {})
-        self._position_instruments = dict(result.get("position_instruments") or {})
-        self._position_tickers = dict(result.get("position_tickers") or {})
         self._orders = self._views_from_pending_orders(list(result.get("pending_orders") or []))
+        pending_instruments = result.get("pending_order_instruments")
+        if pending_instruments:
+            self._position_instruments.update(pending_instruments)
         self._source = "rest"
         self.status_changed.emit(f"账户已通过 REST {reason} 校验")
         if result.get("equity_error"):
             self.status_changed.emit(str(result["equity_error"]))
         self._schedule_emit()
+        self._reconcile_private_done = True
+        self._finish_reconcile_if_ready()
 
     @Slot(int, str, int)
     def _queue_cache_refresh(self, generation: int, _channel: str, _version: int) -> None:

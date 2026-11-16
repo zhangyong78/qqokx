@@ -853,11 +853,11 @@ POSITION_COLUMNS: tuple[tuple[str, str, int, Qt.AlignmentFlag], ...] = (
     ("mgn_ratio", "保证金率", 88, Qt.AlignmentFlag.AlignRight),
     ("imr", "初始保证金", 100, Qt.AlignmentFlag.AlignRight),
     ("mmr", "维持保证金", 100, Qt.AlignmentFlag.AlignRight),
-    ("delta", "Delta(PA)", 82, Qt.AlignmentFlag.AlignRight),
-    ("gamma", "Gamma(PA)", 82, Qt.AlignmentFlag.AlignRight),
-    ("vega", "Vega(PA)", 82, Qt.AlignmentFlag.AlignRight),
-    ("theta", "Theta(PA)", 108, Qt.AlignmentFlag.AlignRight),
-    ("theta_usdt", "Theta\n≈USDT", 66, Qt.AlignmentFlag.AlignRight),
+    ("delta", "Delta(PA)\n持仓", 82, Qt.AlignmentFlag.AlignRight),
+    ("gamma", "Gamma(PA)\n持仓", 82, Qt.AlignmentFlag.AlignRight),
+    ("vega", "Vega(PA)\n持仓", 82, Qt.AlignmentFlag.AlignRight),
+    ("theta", "Theta(PA)\n持仓", 108, Qt.AlignmentFlag.AlignRight),
+    ("theta_usdt", "持仓Theta\n≈USDT", 66, Qt.AlignmentFlag.AlignRight),
     ("note", "备注", 200, Qt.AlignmentFlag.AlignLeft),
 )
 
@@ -4582,6 +4582,8 @@ class AccountPositionsHomeWidget(QWidget):
         for index, (column_id, heading, _width, _alignment) in enumerate(POSITION_COLUMNS, start=1):
             if column_id in _COMPACT_USDT_COLUMN_IDS:
                 header_item.setToolTip(index, heading.replace("\n", "") + "；数值单位为 USDT")
+            if column_id in {"delta", "gamma", "vega", "theta", "theta_usdt"}:
+                header_item.setToolTip(index, "明细行显示该持仓的风险值；分组行显示该分组持仓的合计。")
             if column_id in _APPROX_USDT_COLUMN_IDS:
                 header_item.setForeground(index, QColor(_POSITION_APPROX_USDT_COLOR))
         header.setMinimumHeight(header.fontMetrics().height() * 2 + 8)

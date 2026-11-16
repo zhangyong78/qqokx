@@ -3273,7 +3273,7 @@ class RollTerminalQtWindowHelperTests(QtWidgetTestCase):
             window._symbol_combo.setCurrentText("SOL-USDT-SWAP")
 
             self.assertEqual(window._secondary_chart_kind(), "kline")
-            self.assertFalse(window._secondary_chart_kind_btn.isEnabled())
+            self.assertIsNone(window._secondary_chart_kind_btn)
         finally:
             self.__class__.dispose_widget(window)
 
@@ -6856,6 +6856,214 @@ class RollTerminalQtWindowHelperTests(QtWidgetTestCase):
             finally:
                 self.__class__.dispose_widget(window)
 
+    def test_linked_period_choice_updates_only_visible_charts_and_rapid_changes_win(self) -> None:
+        with patch("roll_terminal_qt.kline_analysis_window.QTimer.singleShot", return_value=None):
+            window = KlineAnalysisWindow()
+            try:
+                window._symbol_link_all_check.setChecked(True)
+                window._secondary_chart_check.setChecked(True)
+                window._tertiary_chart_check.setChecked(True)
+                window._period_combo.blockSignals(True)
+                window._period_combo.setCurrentText("1D")
+                window._period_combo.blockSignals(False)
+                window._on_period_button_clicked("1D")
+                self.assertEqual([window._secondary_period_combo.currentText(), window._tertiary_period_combo.currentText()], ["1D", "1D"])
+                self.assertNotEqual(window._quaternary_period_combo.currentText(), "1D")
+                window._sync_linked_chart_periods("4H", source="primary")
+                window._sync_linked_chart_periods("1W", source="primary")
+                self.assertEqual(window._secondary_period_combo.currentText(), "1W")
+                self.assertEqual(window._tertiary_period_combo.currentText(), "1W")
+            finally:
+                self.__class__.dispose_widget(window)
+
+    def test_linked_period_keeps_dvol_period_when_unsupported_and_unlinked_period_is_local(self) -> None:
+        with patch("roll_terminal_qt.kline_analysis_window.QTimer.singleShot", return_value=None):
+            window = KlineAnalysisWindow()
+            try:
+                window._secondary_chart_check.setChecked(True)
+                window._symbol_link_all_check.setChecked(True)
+                window._secondary_chart_kind_mode = "volatility"
+                window._secondary_period_combo.blockSignals(True)
+                window._secondary_period_combo.setCurrentText("4H")
+                window._secondary_period_combo.blockSignals(False)
+                window._sync_linked_chart_periods("15m", source="primary")
+                self.assertEqual(window._secondary_period_combo.currentText(), "4H")
+                window._symbol_link_all_check.setChecked(False)
+                window._tertiary_period_combo.blockSignals(True)
+                window._tertiary_period_combo.setCurrentText("1D")
+                window._tertiary_period_combo.blockSignals(False)
+                window._sync_linked_chart_periods("1W", source="tertiary")
+                self.assertEqual(window._period_combo.currentText(), "1D")
+            finally:
+                self.__class__.dispose_widget(window)
+
+    def test_linked_period_programmatic_changes_do_not_link_but_user_activation_does(self) -> None:
+        with patch("roll_terminal_qt.kline_analysis_window.QTimer.singleShot", return_value=None):
+            window = KlineAnalysisWindow()
+            try:
+                window._symbol_link_all_check.setChecked(True)
+                window._secondary_chart_check.setChecked(True)
+                before_secondary = window._secondary_period_combo.currentText()
+                window._period_combo.setCurrentText("1W")
+                self.assertEqual(window._secondary_period_combo.currentText(), before_secondary)
+                with patch.object(window, "_load_data") as load_data:
+                    window._on_period_button_clicked("1W")
+                self.assertEqual(window._secondary_period_combo.currentText(), "1W")
+                load_data.assert_called_once()
+            finally:
+                self.__class__.dispose_widget(window)
+
+    def test_real_period_button_click_refreshes_linked_and_unlinked_state(self) -> None:
+        with patch("roll_terminal_qt.kline_analysis_window.QTimer.singleShot", return_value=None):
+            window = KlineAnalysisWindow()
+            try:
+                window._secondary_chart_check.setChecked(True)
+                window._symbol_link_all_check.setChecked(False)
+                with patch.object(window, "_load_data") as load_data:
+                    window._primary_period_buttons["1W"].click()
+                self.assertEqual(window._period_combo.currentText(), "1W")
+                self.assertNotEqual(window._secondary_period_combo.currentText(), "1W")
+                load_data.assert_called_once()
+                self.assertEqual(window._refresh_timer.interval(), window._auto_refresh_interval_ms("1W"))
+                self.assertTrue(window._primary_period_buttons["1W"].isChecked())
+
+                window._symbol_link_all_check.setChecked(True)
+                with patch.object(window, "_load_data") as load_data:
+                    window._primary_period_buttons["4H"].click()
+                self.assertEqual(window._secondary_period_combo.currentText(), "4H")
+                load_data.assert_called_once()
+                self.assertEqual(window._refresh_timer.interval(), window._auto_refresh_interval_ms("4H"))
+                self.assertTrue(window._primary_period_buttons["4H"].isChecked())
+            finally:
+                self.__class__.dispose_widget(window)
+
+    def test_period_dropdown_activated_syncs_linked_charts(self) -> None:
+        with patch("roll_terminal_qt.kline_analysis_window.QTimer.singleShot", return_value=None):
+            window = KlineAnalysisWindow()
+            try:
+                window._secondary_chart_check.setChecked(True)
+                window._symbol_link_all_check.setChecked(True)
+                index = window._period_combo.findText("1W")
+                window._period_combo.setCurrentIndex(index)
+                with patch.object(window, "_load_data") as load_data:
+                    window._period_combo.activated.emit(index)
+                self.assertEqual(window._secondary_period_combo.currentText(), "1W")
+                self.assertTrue(window._primary_period_buttons["1W"].isChecked())
+                self.assertEqual(window._refresh_timer.interval(), window._auto_refresh_interval_ms("1W"))
+                load_data.assert_called_once()
+            finally:
+                self.__class__.dispose_widget(window)
+
+    def test_linked_utc_daily_period_is_case_insensitive_and_reports_unsupported_charts(self) -> None:
+        with patch("roll_terminal_qt.kline_analysis_window.QTimer.singleShot", return_value=None):
+            window = KlineAnalysisWindow()
+            try:
+                window._symbol_link_all_check.setChecked(True)
+                window._secondary_chart_check.setChecked(True)
+                window._tertiary_chart_check.setChecked(True)
+                window._secondary_period_combo.blockSignals(True)
+                window._secondary_period_combo.setCurrentText("1Dutc")
+                window._secondary_period_combo.blockSignals(False)
+                original_primary = window._period_combo.currentText()
+                original_tertiary = window._tertiary_period_combo.currentText()
+                window._sync_linked_chart_periods("1Dutc", source="secondary")
+                self.assertEqual(window._period_combo.currentText(), original_primary)
+                self.assertEqual(window._tertiary_period_combo.currentText(), original_tertiary)
+                self.assertIn("主图不支持 1Dutc", window._period_link_notice)
+                window._set_status("正在加载")
+                self.assertIn("周期未能全部联动", window._status.text())
+            finally:
+                self.__class__.dispose_widget(window)
+
+    def test_dvol_source_unsupported_top_period_keeps_notice_after_load_status(self) -> None:
+        with patch("roll_terminal_qt.kline_analysis_window.QTimer.singleShot", return_value=None):
+            window = KlineAnalysisWindow()
+            try:
+                window._symbol_link_all_check.setChecked(True)
+                window._secondary_chart_check.setChecked(True)
+                window._secondary_chart_kind_mode = "volatility"
+                window._secondary_period_combo.blockSignals(True)
+                window._secondary_period_combo.setCurrentText("4H")
+                window._secondary_period_combo.blockSignals(False)
+                window._set_active_chart_target("secondary")
+                with patch.object(window, "_load_data"):
+                    window._on_period_button_clicked("15m")
+                self.assertEqual(window._secondary_period_combo.currentText(), "4H")
+                self.assertIn("波动率副图仅支持", window._status.text())
+                window._symbol_link_all_check.setChecked(False)
+                self.assertEqual(window._period_link_notice, "")
+            finally:
+                self.__class__.dispose_widget(window)
+
+    def test_dvol_unsupported_dropdown_restores_last_period_and_activated_updates_regular_charts(self) -> None:
+        with patch("roll_terminal_qt.kline_analysis_window.QTimer.singleShot", return_value=None):
+            window = KlineAnalysisWindow()
+            try:
+                window._symbol_link_all_check.setChecked(True)
+                window._secondary_chart_check.setChecked(True)
+                window._tertiary_chart_check.setChecked(True)
+                window._secondary_chart_kind_mode = "volatility"
+                window._last_volatility_period = "4H"
+                index = window._secondary_period_combo.findText("15m")
+                window._secondary_period_combo.setCurrentIndex(index)
+                self.assertEqual(window._secondary_period_combo.currentText(), "4H")
+                with patch.object(window, "_load_data") as load_data:
+                    window._secondary_period_combo.activated.emit(index)
+                self.assertEqual(window._period_combo.currentText(), "15m")
+                self.assertEqual(window._tertiary_period_combo.currentText(), "15m")
+                self.assertEqual(window._secondary_period_combo.currentText(), "4H")
+                self.assertIn("波动率副图仅支持", window._status.text())
+                load_data.assert_called_once()
+            finally:
+                self.__class__.dispose_widget(window)
+
+    def test_silent_linked_dvol_period_update_refreshes_last_supported_period(self) -> None:
+        with patch("roll_terminal_qt.kline_analysis_window.QTimer.singleShot", return_value=None):
+            window = KlineAnalysisWindow()
+            try:
+                window._symbol_link_all_check.setChecked(True)
+                window._secondary_chart_check.setChecked(True)
+                window._secondary_chart_kind_mode = "volatility"
+                window._secondary_period_combo.blockSignals(True)
+                window._secondary_period_combo.setCurrentText("4H")
+                window._secondary_period_combo.blockSignals(False)
+                window._last_volatility_period = "4H"
+                window._sync_linked_chart_periods("1D", source="primary")
+                self.assertEqual(window._secondary_period_combo.currentText(), "1D")
+                self.assertEqual(window._last_volatility_period, "1D")
+                window._secondary_period_combo.setCurrentText("15m")
+                self.assertEqual(window._secondary_period_combo.currentText(), "1D")
+            finally:
+                self.__class__.dispose_widget(window)
+
+    def test_linked_third_chart_period_button_refreshes_all_and_dvol_keeps_period(self) -> None:
+        with patch("roll_terminal_qt.kline_analysis_window.QTimer.singleShot", return_value=None):
+            window = KlineAnalysisWindow()
+            try:
+                window._symbol_link_all_check.setChecked(True)
+                window._secondary_chart_check.setChecked(True)
+                window._tertiary_chart_check.setChecked(True)
+                window._secondary_chart_kind_mode = "volatility"
+                window._secondary_period_combo.blockSignals(True)
+                window._secondary_period_combo.setCurrentText("4H")
+                window._secondary_period_combo.blockSignals(False)
+                window._set_active_chart_target("tertiary")
+                with patch.object(window, "_load_data") as load_data:
+                    window._on_period_button_clicked("15m")
+                self.assertEqual(window._period_combo.currentText(), "15m")
+                self.assertEqual(window._tertiary_period_combo.currentText(), "15m")
+                self.assertEqual(window._secondary_period_combo.currentText(), "4H")
+                load_data.assert_called_once()
+                window._set_active_chart_target("secondary")
+                window._symbol_link_all_check.setChecked(True)
+                with patch.object(window, "_load_data") as load_data:
+                    window._on_period_button_clicked("15m")
+                self.assertEqual(window._secondary_period_combo.currentText(), "4H")
+                self.assertEqual(window._period_combo.currentText(), "15m")
+                load_data.assert_called_once()
+            finally:
+                self.__class__.dispose_widget(window)
+
     def test_dvol_tab_without_all_window_link_refreshes_only_secondary_chart(self) -> None:
         with patch("roll_terminal_qt.kline_analysis_window.QTimer.singleShot", return_value=None):
             window = KlineAnalysisWindow()
@@ -6896,6 +7104,86 @@ class RollTerminalQtWindowHelperTests(QtWidgetTestCase):
                 load_primary.assert_not_called()
                 load_secondary.assert_called_once_with(symbol="BTC-USDT-SWAP")
                 prepare_chart.assert_called_once_with("secondary")
+            finally:
+                self.__class__.dispose_widget(window)
+
+    def test_linked_period_change_keeps_kline_charts_when_secondary_is_dvol(self) -> None:
+        with patch("roll_terminal_qt.kline_analysis_window.QTimer.singleShot", return_value=None):
+            window = KlineAnalysisWindow()
+            try:
+                window._use_native_chart = True
+                for chart_check in (
+                    window._secondary_chart_check,
+                    window._tertiary_chart_check,
+                    window._quaternary_chart_check,
+                ):
+                    chart_check.blockSignals(True)
+                    chart_check.setChecked(True)
+                    chart_check.blockSignals(False)
+                window._symbol_combo.setCurrentText("SOL-USDT-SWAP")
+                window._secondary_symbol_combo.setCurrentText("ETH-USDT-SWAP")
+                window._tertiary_symbol_combo.setCurrentText("DOGE-USDT-SWAP")
+                window._quaternary_symbol_combo.setCurrentText("BNB-USDT-SWAP")
+                window._symbol_link_all_check.setChecked(True)
+                window._secondary_chart_kind_mode = "volatility"
+                window._active_volatility_currency = "ETH"
+                window._set_active_chart_target("secondary")
+
+                with patch.object(window, "_load_data") as load_data:
+                    window._on_period_button_clicked("4H")
+
+                self.assertEqual(window._period_combo.currentText(), "4H")
+                self.assertEqual(window._tertiary_period_combo.currentText(), "4H")
+                self.assertEqual(window._selected_symbol(), "SOL-USDT-SWAP")
+                self.assertEqual(window._selected_tertiary_symbol(), "DOGE-USDT-SWAP")
+                self.assertFalse(window._all_charts_volatility_enabled())
+                self.assertEqual(window._current_primary_request_key()[1], "SOL-USDT-SWAP")
+                self.assertEqual(window._current_tertiary_request_key()[1], "kline")
+                self.assertEqual(window._current_tertiary_request_key()[2], "DOGE-USDT-SWAP")
+                self.assertEqual(window._current_secondary_request_key()[1:3], ("volatility", "ETH"))
+                load_data.assert_called_once()
+            finally:
+                self.__class__.dispose_widget(window)
+
+    def test_linked_dvol_tab_does_not_replace_other_chart_symbols(self) -> None:
+        with patch("roll_terminal_qt.kline_analysis_window.QTimer.singleShot", return_value=None):
+            window = KlineAnalysisWindow()
+            try:
+                window._use_native_chart = True
+                for chart_check in (
+                    window._secondary_chart_check,
+                    window._tertiary_chart_check,
+                    window._quaternary_chart_check,
+                ):
+                    chart_check.blockSignals(True)
+                    chart_check.setChecked(True)
+                    chart_check.blockSignals(False)
+                window._symbol_combo.setCurrentText("SOL-USDT-SWAP")
+                window._secondary_symbol_combo.setCurrentText("ETH-USDT-SWAP")
+                window._tertiary_symbol_combo.setCurrentText("DOGE-USDT-SWAP")
+                window._quaternary_symbol_combo.setCurrentText("BNB-USDT-SWAP")
+                window._symbol_link_all_check.setChecked(True)
+                window._set_active_chart_target("secondary")
+                dvol_index = next(
+                    index
+                    for index in range(window._symbol_tab_bar.count())
+                    if window._symbol_tab_bar.tabText(index) == "BTC-DVOL"
+                )
+
+                with (
+                    patch.object(window, "_load_data") as load_primary,
+                    patch.object(window, "_load_secondary_data") as load_secondary,
+                    patch.object(window, "_prepare_chart_for_symbol_reload"),
+                ):
+                    window._symbol_tab_bar.setCurrentIndex(dvol_index)
+
+                self.assertEqual(window._selected_symbol(), "SOL-USDT-SWAP")
+                self.assertEqual(window._selected_secondary_symbol(), "BTC-USDT-SWAP")
+                self.assertEqual(window._selected_tertiary_symbol(), "DOGE-USDT-SWAP")
+                self.assertEqual(window._selected_quaternary_symbol(), "BNB-USDT-SWAP")
+                self.assertEqual(window._secondary_chart_kind(), "volatility")
+                load_primary.assert_not_called()
+                load_secondary.assert_called_once_with(symbol="BTC-USDT-SWAP")
             finally:
                 self.__class__.dispose_widget(window)
 
@@ -7080,7 +7368,7 @@ class RollTerminalQtWindowHelperTests(QtWidgetTestCase):
                 self.assertFalse(window._tertiary_symbol_combo.isHidden())
                 self.assertFalse(window._tertiary_period_combo.isHidden())
                 self.assertFalse(window._secondary_layout_cycle_btn.isEnabled())
-                self.assertFalse(window._secondary_chart_kind_btn.isEnabled())
+                self.assertIsNone(window._secondary_chart_kind_btn)
             finally:
                 self.__class__.dispose_widget(window)
 
@@ -7202,7 +7490,7 @@ class RollTerminalQtWindowHelperTests(QtWidgetTestCase):
                 window._secondary_chart_kind_mode = "volatility"
                 window._refresh_secondary_chart_kind_button()
                 window._refresh_secondary_sync_period_button()
-                self.assertEqual(window._secondary_chart_kind_btn.text(), "副图K线")
+                self.assertIsNone(window._secondary_chart_kind_btn)
                 self.assertEqual(window._secondary_sync_period_btn.text(), "同周期切换")
             finally:
                 self.__class__.dispose_widget(window)

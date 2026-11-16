@@ -7271,6 +7271,14 @@ class AreaShapeDemoActionThread(QThread):
             self.failed.emit(str(exc))
 
 
+class _WidePopupComboBox(QComboBox):
+    def showPopup(self) -> None:
+        metrics = self.fontMetrics()
+        text_width = max((metrics.horizontalAdvance(self.itemText(i)) for i in range(self.count())), default=0)
+        self.view().setMinimumWidth(max(self.width(), text_width + 36))
+        super().showPopup()
+
+
 class KlineAnalysisWindow(QMainWindow):
     _realtime_candle_received = Signal(object)
 
@@ -8257,7 +8265,7 @@ class KlineAnalysisWindow(QMainWindow):
 
         top_row.addSpacing(12)
         top_row.addWidget(QLabel("交易对"))
-        self._symbol_combo = QComboBox()
+        self._symbol_combo = _WidePopupComboBox()
         self._symbol_combo.addItems(KLINE_SYMBOL_OPTIONS)
         self._symbol_combo.setMinimumWidth(_HEADER_SYMBOL_INPUT_MIN_WIDTH)
         self._symbol_combo.setMaximumWidth(_HEADER_SYMBOL_INPUT_MAX_WIDTH)
@@ -8287,6 +8295,7 @@ class KlineAnalysisWindow(QMainWindow):
         self._period_combo.setCurrentText(_DEFAULT_SINGLE_CHART_PERIOD)
         self._period_combo.hide()
         self._period_combo.currentTextChanged.connect(self._on_period_changed)
+        self._period_combo.activated.connect(lambda index: self._on_period_activated("primary", self._period_combo.itemText(index)))
 
         period_toolbar = QWidget()
         period_toolbar_layout = QHBoxLayout(period_toolbar)
@@ -8399,6 +8408,9 @@ class KlineAnalysisWindow(QMainWindow):
         self._sync_history_trades_button.setToolTip("重新从 OKX 同步当前品种的历史开多、平多、开空、平空记录。")
         self._sync_history_trades_button.clicked.connect(lambda: self._load_history_trades(force=True))
         history_trade_layout.addWidget(self._sync_history_trades_button)
+        self._history_trade_unavailable_label = QLabel("历史交易标记仅支持 1H 周期")
+        history_trade_layout.addWidget(self._history_trade_unavailable_label)
+        self._history_trade_unavailable_label.hide()
 
         shape_signal_tooltip = (
             "形态说明：1H/4H/1D/1W 显示核心标志K触发的形态信号。\n"
@@ -8513,7 +8525,7 @@ class KlineAnalysisWindow(QMainWindow):
 
         self._secondary_symbol_label = QLabel("图2")
         linkage_row.addWidget(self._secondary_symbol_label)
-        self._secondary_symbol_combo = QComboBox()
+        self._secondary_symbol_combo = _WidePopupComboBox()
         self._secondary_symbol_combo.addItems(KLINE_SYMBOL_OPTIONS)
         self._secondary_symbol_combo.setMinimumWidth(_HEADER_SYMBOL_INPUT_MIN_WIDTH)
         self._secondary_symbol_combo.setMaximumWidth(_HEADER_SYMBOL_INPUT_MAX_WIDTH)
@@ -8529,7 +8541,7 @@ class KlineAnalysisWindow(QMainWindow):
         linkage_row.addWidget(self._tertiary_chart_check)
         self._tertiary_symbol_label = QLabel("图3")
         linkage_row.addWidget(self._tertiary_symbol_label)
-        self._tertiary_symbol_combo = QComboBox()
+        self._tertiary_symbol_combo = _WidePopupComboBox()
         self._tertiary_symbol_combo.addItems(KLINE_SYMBOL_OPTIONS)
         self._tertiary_symbol_combo.setMinimumWidth(_HEADER_SYMBOL_INPUT_MIN_WIDTH)
         self._tertiary_symbol_combo.setMaximumWidth(_HEADER_SYMBOL_INPUT_MAX_WIDTH)
@@ -8541,12 +8553,13 @@ class KlineAnalysisWindow(QMainWindow):
         self._tertiary_symbol_label.hide()
         self._tertiary_period_label = QLabel("周期")
         linkage_row.addWidget(self._tertiary_period_label)
-        self._tertiary_period_combo = QComboBox()
+        self._tertiary_period_combo = _WidePopupComboBox()
         self._tertiary_period_combo.addItems([period for _, period in _PRIMARY_PERIOD_OPTIONS])
         self._tertiary_period_combo.setCurrentText(_DEFAULT_DUAL_SECONDARY_PERIOD)
         self._tertiary_period_combo.setEnabled(False)
         self._tertiary_period_combo.hide()
         self._tertiary_period_combo.currentTextChanged.connect(self._on_tertiary_period_changed)
+        self._tertiary_period_combo.activated.connect(lambda index: self._on_period_activated("tertiary", self._tertiary_period_combo.itemText(index)))
         linkage_row.addWidget(self._tertiary_period_combo, 0)
         self._tertiary_period_label.hide()
 
@@ -8555,7 +8568,7 @@ class KlineAnalysisWindow(QMainWindow):
         linkage_row.addWidget(self._quaternary_chart_check)
         self._quaternary_symbol_label = QLabel("图4")
         linkage_row.addWidget(self._quaternary_symbol_label)
-        self._quaternary_symbol_combo = QComboBox()
+        self._quaternary_symbol_combo = _WidePopupComboBox()
         self._quaternary_symbol_combo.addItems(KLINE_SYMBOL_OPTIONS)
         self._quaternary_symbol_combo.setMinimumWidth(_HEADER_SYMBOL_INPUT_MIN_WIDTH)
         self._quaternary_symbol_combo.setMaximumWidth(_HEADER_SYMBOL_INPUT_MAX_WIDTH)
@@ -8567,24 +8580,27 @@ class KlineAnalysisWindow(QMainWindow):
         self._quaternary_symbol_label.hide()
         self._quaternary_period_label = QLabel("周期")
         linkage_row.addWidget(self._quaternary_period_label)
-        self._quaternary_period_combo = QComboBox()
+        self._quaternary_period_combo = _WidePopupComboBox()
         self._quaternary_period_combo.addItems([period for _, period in _PRIMARY_PERIOD_OPTIONS])
         self._quaternary_period_combo.setCurrentText("1W")
         self._quaternary_period_combo.setEnabled(False)
         self._quaternary_period_combo.hide()
         self._quaternary_period_combo.currentTextChanged.connect(self._on_quaternary_period_changed)
+        self._quaternary_period_combo.activated.connect(lambda index: self._on_period_activated("quaternary", self._quaternary_period_combo.itemText(index)))
         linkage_row.addWidget(self._quaternary_period_combo, 0)
         self._quaternary_period_label.hide()
 
         self._secondary_period_label = QLabel("周期")
         linkage_row.addWidget(self._secondary_period_label)
-        self._secondary_period_combo = QComboBox()
+        self._secondary_period_combo = _WidePopupComboBox()
         self._secondary_period_combo.addItems([period for _, period in _PRIMARY_PERIOD_OPTIONS])
         self._secondary_period_combo.addItem("1Dutc")
         self._secondary_period_combo.setCurrentText(_DEFAULT_DUAL_SECONDARY_PERIOD)
+        self._last_volatility_period = _DEFAULT_DUAL_SECONDARY_PERIOD
         self._secondary_period_combo.setEnabled(False)
         self._secondary_period_combo.hide()
         self._secondary_period_combo.currentTextChanged.connect(self._on_secondary_period_changed)
+        self._secondary_period_combo.activated.connect(lambda index: self._on_period_activated("secondary", self._secondary_period_combo.itemText(index)))
         linkage_row.addWidget(self._secondary_period_combo, 0)
         self._secondary_period_label.hide()
         linkage_row.removeWidget(self._secondary_period_label)
@@ -8597,11 +8613,6 @@ class KlineAnalysisWindow(QMainWindow):
         self._secondary_layout_cycle_btn.setEnabled(False)
         self._secondary_layout_cycle_btn.clicked.connect(self._on_secondary_layout_cycle_clicked)
         linkage_row.addWidget(self._secondary_layout_cycle_btn)
-
-        self._secondary_chart_kind_btn = QPushButton("")
-        self._secondary_chart_kind_btn.setEnabled(False)
-        self._secondary_chart_kind_btn.clicked.connect(self._on_secondary_chart_kind_cycle_clicked)
-        linkage_row.addWidget(self._secondary_chart_kind_btn)
 
         self._secondary_sync_period_btn = QPushButton("")
         self._secondary_sync_period_btn.setEnabled(False)
@@ -8618,7 +8629,7 @@ class KlineAnalysisWindow(QMainWindow):
         shortcut_layout.setContentsMargins(6, 2, 6, 2)
         shortcut_layout.setSpacing(4)
         shortcut_layout.addWidget(QLabel("布局"))
-        for control in (self._secondary_layout_cycle_btn, self._secondary_chart_kind_btn,
+        for control in (self._secondary_layout_cycle_btn,
                         self._secondary_sync_period_btn, self._daily_timezone_compare_btn):
             linkage_row.removeWidget(control)
             shortcut_layout.addWidget(control)
@@ -8762,6 +8773,7 @@ class KlineAnalysisWindow(QMainWindow):
         action = QWidgetAction(menu)
         action.setDefaultWidget(self._history_trade_group)
         menu.addAction(action)
+        menu.aboutToShow.connect(self._resize_history_trade_menu)
         menu_button = QPushButton(button_text)
         menu_button.setMenu(menu)
         self._header_menu_buttons[button_text] = menu_button
@@ -9481,6 +9493,7 @@ class KlineAnalysisWindow(QMainWindow):
         symbol_tab_row.addWidget(self._symbol_tab_bar, 1)
         self._symbol_link_all_check = QCheckBox("全部K线窗口联动")
         self._symbol_link_all_check.setToolTip("开启后，点击底部交易对标签会同时切换主图、副图、第三图和第四图")
+        self._symbol_link_all_check.toggled.connect(self._on_chart_link_toggled)
         symbol_tab_row.addWidget(self._symbol_link_all_check)
         chart_layout.addLayout(symbol_tab_row)
 
@@ -9748,13 +9761,12 @@ class KlineAnalysisWindow(QMainWindow):
         return bool(self._quaternary_chart_check.isChecked())
 
     def _all_charts_volatility_enabled(self) -> bool:
-        """Whether an explicit all-window link may switch every chart to DVOL."""
-        return bool(
-            self._secondary_chart_kind() == "volatility"
-            and self._current_volatility_currency()
-            and self._symbol_link_all_check is not None
-            and self._symbol_link_all_check.isChecked()
-        )
+        """Volatility is a chart type for the secondary chart only.
+
+        The all-window link synchronizes symbols/periods; it must not turn
+        ordinary K-line charts into DVOL charts as a side effect.
+        """
+        return False
 
     def _secondary_layout_mode(self) -> str:
         value = str(self._secondary_layout_mode_value or "horizontal").strip().lower()
@@ -9816,6 +9828,81 @@ class KlineAnalysisWindow(QMainWindow):
 
     def _selected_secondary_symbol(self) -> str:
         return self._secondary_symbol_combo.currentText().strip().upper()
+
+    def _sync_linked_chart_periods(self, period: str, *, source: str) -> None:
+        if self._symbol_link_all_check is None or not self._symbol_link_all_check.isChecked():
+            return
+        requested = period.strip()
+        self._period_link_notice = ""
+        unsupported: list[str] = []
+        if source == "secondary" and self._secondary_chart_kind() == "volatility" and requested.upper() not in {"1H", "4H", "1D", "1W"}:
+            unsupported.append("波动率副图仅支持 1H/4H/1D/1W，已保留原周期")
+        for target, control in (("primary", self._period_combo), ("secondary", self._secondary_period_combo), ("tertiary", self._tertiary_period_combo), ("quaternary", self._quaternary_period_combo)):
+            visible = target == "primary" or (target == "secondary" and self._secondary_chart_check.isChecked()) or (target == "tertiary" and self._triple_chart_enabled()) or (target == "quaternary" and self._quad_chart_enabled())
+            if target == source or not visible:
+                continue
+            if target == "secondary" and self._secondary_chart_kind() == "volatility" and requested.upper() not in {"1H", "4H", "1D", "1W"}:
+                unsupported.append("波动率副图仅支持 1H/4H/1D/1W")
+                continue
+            index = next((i for i in range(control.count()) if control.itemText(i).strip().casefold() == requested.casefold()), -1)
+            if index < 0:
+                unsupported.append({"primary": "主图", "secondary": "副图", "tertiary": "第三图", "quaternary": "第四图"}[target] + f"不支持 {requested}")
+                continue
+            control.blockSignals(True)
+            try:
+                control.setCurrentIndex(index)
+            finally:
+                control.blockSignals(False)
+            if target == "secondary":
+                self._remember_volatility_period(control.currentText())
+        if unsupported:
+            self._period_link_notice = "周期未能全部联动：" + "；".join(unsupported) + "。不支持的图保留原周期。"
+
+    def _on_chart_link_toggled(self, enabled: bool) -> None:
+        if not enabled:
+            self._period_link_notice = ""
+
+    def _remember_volatility_period(self, period: str) -> None:
+        value = str(period or "").strip()
+        if value.upper() in {"1H", "4H", "1D", "1W"}:
+            self._last_volatility_period = value
+
+    def _queue_period_reload(self, target: str, value: str) -> None:
+        serial = getattr(self, "_period_reload_serial", 0) + 1
+        self._period_reload_serial = serial
+        QTimer.singleShot(0, lambda: self._flush_period_reload(target, value, serial))
+
+    def _flush_period_reload(self, target: str, value: str, serial: int) -> None:
+        if serial != getattr(self, "_period_reload_serial", 0):
+            return
+        if target == "primary":
+            if self._auto_refresh_btn.isChecked():
+                self._load_data()
+        elif target == "secondary":
+            if self._secondary_chart_check.isChecked():
+                self._load_data()
+        elif target == "tertiary" and self._triple_chart_enabled():
+            self._load_tertiary_data()
+        elif target == "quaternary" and self._quad_chart_enabled():
+            self._load_quaternary_data()
+
+    def _on_period_activated(self, source: str, period: str) -> None:
+        if self._symbol_link_all_check is None or not self._symbol_link_all_check.isChecked():
+            return
+        self._period_reload_serial = getattr(self, "_period_reload_serial", 0) + 1
+        self._sync_linked_chart_periods(period, source=source)
+        self._refresh_period_link_state()
+        if self._period_link_notice:
+            self._set_status("周期联动已应用部分图表")
+        self._load_data()
+
+    def _refresh_period_link_state(self) -> None:
+        primary_period = self._period_combo.currentText()
+        self._refresh_history_trade_availability()
+        self._sync_primary_period_buttons()
+        self._refresh_timer.setInterval(self._auto_refresh_interval_ms(primary_period))
+        self._reload_workspace_view()
+        self._sync_chart_options()
 
     def _selected_tertiary_symbol(self) -> str:
         return self._tertiary_symbol_combo.currentText().strip().upper()
@@ -10372,6 +10459,7 @@ class KlineAnalysisWindow(QMainWindow):
             self._secondary_period_combo.blockSignals(True)
             self._period_combo.setCurrentText("1H")
             self._secondary_period_combo.setCurrentText("1H")
+            self._last_volatility_period = "1H"
             self._period_combo.blockSignals(False)
             self._secondary_period_combo.blockSignals(False)
             self._sync_primary_period_buttons()
@@ -10384,6 +10472,7 @@ class KlineAnalysisWindow(QMainWindow):
                 self._secondary_period_combo.blockSignals(True)
                 self._secondary_period_combo.setCurrentText("1H")
                 self._secondary_period_combo.blockSignals(False)
+                self._remember_volatility_period("1H")
         if self._secondary_chart_check.isChecked():
             self._load_data()
 
@@ -10408,6 +10497,7 @@ class KlineAnalysisWindow(QMainWindow):
         self._secondary_period_combo.blockSignals(True)
         self._period_combo.setCurrentText(primary_next)
         self._secondary_period_combo.setCurrentText(secondary_next)
+        self._remember_volatility_period(secondary_next)
         self._period_combo.blockSignals(False)
         self._secondary_period_combo.blockSignals(False)
         self._sync_primary_period_buttons()
@@ -10646,7 +10736,7 @@ class KlineAnalysisWindow(QMainWindow):
         if tab_bar is None:
             return
         symbol = self._symbol_for_chart_target()
-        if self._secondary_chart_kind() == "volatility":
+        if self._active_chart_target == "secondary" and self._secondary_chart_kind() == "volatility":
             currency = self._active_volatility_currency or self._current_volatility_currency()
             symbol = f"__DVOL_{currency}__" if currency else symbol
         target_index = next(
@@ -10681,15 +10771,11 @@ class KlineAnalysisWindow(QMainWindow):
                 break
         if volatility_currency:
             base_symbol = f"{volatility_currency}-USDT-SWAP"
-            link_all = bool(self._symbol_link_all_check is not None and self._symbol_link_all_check.isChecked())
-            linked_combos = (
-                self._symbol_combo,
-                self._secondary_symbol_combo,
-                self._tertiary_symbol_combo,
-                self._quaternary_symbol_combo,
-            ) if link_all else (self._secondary_symbol_combo,)
+            # A DVOL tab selects the secondary chart's data type and currency;
+            # it is not a market-symbol change to broadcast to every chart.
+            linked_combos = (self._secondary_symbol_combo,)
             self._invalidate_pending_chart_results(
-                targets=("primary", "secondary", "tertiary", "quaternary") if link_all else ("secondary",)
+                targets=("secondary",)
             )
             for combo in linked_combos:
                 combo.blockSignals(True)
@@ -10709,20 +10795,8 @@ class KlineAnalysisWindow(QMainWindow):
             self._set_active_chart_target("secondary")
             self._refresh_symbol_tab_selection()
             self._update_secondary_controls_state()
-            if link_all:
-                for target in ("primary", "secondary", "tertiary", "quaternary"):
-                    if target == "primary" or (
-                        target == "secondary" and self._secondary_chart_check.isChecked()
-                    ) or (
-                        target == "tertiary" and self._triple_chart_enabled()
-                    ) or (
-                        target == "quaternary" and self._quad_chart_enabled()
-                    ):
-                        self._prepare_chart_for_symbol_reload(target)
-                self._load_data()
-            else:
-                self._prepare_chart_for_symbol_reload("secondary")
-                self._load_secondary_data(symbol=base_symbol)
+            self._prepare_chart_for_symbol_reload("secondary")
+            self._load_secondary_data(symbol=base_symbol)
             return
         # 普通交易对和 DVOL 标签使用同一套切换规则。离开 DVOL 时先
         # 恢复普通 K 线模式，后续分支再按“全部联动”或当前图处理品种。
@@ -10819,6 +10893,7 @@ class KlineAnalysisWindow(QMainWindow):
         self._quaternary_period_combo.blockSignals(True)
         self._period_combo.setCurrentText(primary_period)
         self._secondary_period_combo.setCurrentText(secondary_period)
+        self._remember_volatility_period(secondary_period)
         self._tertiary_period_combo.setCurrentText(secondary_period)
         self._quaternary_period_combo.setCurrentText("1W")
         self._period_combo.blockSignals(False)
@@ -10842,6 +10917,7 @@ class KlineAnalysisWindow(QMainWindow):
         try:
             self._period_combo.setCurrentText("1W")
             self._secondary_period_combo.setCurrentText("1D")
+            self._remember_volatility_period("1D")
             self._tertiary_period_combo.setCurrentText("4H")
             self._quaternary_period_combo.setCurrentText("1H")
         finally:
@@ -10853,30 +10929,78 @@ class KlineAnalysisWindow(QMainWindow):
 
     @Slot(str)
     def _on_period_button_clicked(self, period_value: str) -> None:
+        linked = self._symbol_link_all_check is not None and self._symbol_link_all_check.isChecked()
+        source = self._active_chart_target if self._active_chart_target in {"primary", "secondary", "tertiary", "quaternary"} else "primary"
+        volatility_unsupported = source == "secondary" and self._secondary_chart_kind() == "volatility" and period_value not in {"1H", "4H", "1D", "1W"}
         if self._active_chart_target == "quaternary" and self._quad_chart_enabled():
-            if self._quaternary_period_combo.currentText().strip() != period_value:
-                self._quaternary_period_combo.setCurrentText(period_value)
+            self._sync_linked_chart_periods(period_value, source="quaternary")
+            if linked:
+                self._set_period_combo_value(self._quaternary_period_combo, period_value)
+                self._refresh_period_link_state()
+                self._load_data()
+            elif self._quaternary_period_combo.currentText().strip() != period_value:
+                self._set_period_combo_value(self._quaternary_period_combo, period_value)
+                self._on_quaternary_period_changed(period_value)
+                self._period_reload_serial = getattr(self, "_period_reload_serial", 0) + 1
+                self._load_quaternary_data()
             else:
                 self._load_quaternary_data()
             return
         if self._active_chart_target == "tertiary" and self._triple_chart_enabled():
-            if self._tertiary_period_combo.currentText().strip() != period_value:
-                self._tertiary_period_combo.setCurrentText(period_value)
+            self._sync_linked_chart_periods(period_value, source="tertiary")
+            if linked:
+                self._set_period_combo_value(self._tertiary_period_combo, period_value)
+                self._refresh_period_link_state()
+                self._load_data()
+            elif self._tertiary_period_combo.currentText().strip() != period_value:
+                self._set_period_combo_value(self._tertiary_period_combo, period_value)
+                self._on_tertiary_period_changed(period_value)
+                self._period_reload_serial = getattr(self, "_period_reload_serial", 0) + 1
+                self._load_tertiary_data()
             else:
                 self._load_tertiary_data()
             return
         if self._active_chart_target == "secondary" and self._secondary_chart_check.isChecked():
-            if self._secondary_chart_kind() == "volatility" and period_value not in {"1H", "4H", "1D", "1W"}:
-                period_value = "1H"
-            if self._secondary_period_combo.currentText().strip() != period_value:
-                self._secondary_period_combo.setCurrentText(period_value)
+            self._sync_linked_chart_periods(period_value, source="secondary")
+            if volatility_unsupported:
+                self._set_status("波动率图仅支持 1H、4H、1D、1W；波动率周期已保留，普通图按所选周期更新")
+            if linked:
+                if not volatility_unsupported:
+                    self._set_period_combo_value(self._secondary_period_combo, period_value)
+                self._refresh_period_link_state()
+                self._load_data()
+            elif volatility_unsupported:
+                return
+            elif self._secondary_period_combo.currentText().strip() != period_value:
+                self._set_period_combo_value(self._secondary_period_combo, period_value)
+                self._on_secondary_period_changed(period_value)
+                self._period_reload_serial = getattr(self, "_period_reload_serial", 0) + 1
+                self._load_data()
             else:
                 self._load_data()
             return
+        self._sync_linked_chart_periods(period_value, source="primary")
+        if linked:
+            self._set_period_combo_value(self._period_combo, period_value)
+            self._refresh_period_link_state()
+            self._load_data()
+            return
         if self._period_combo.currentText().strip() != period_value:
-            self._period_combo.setCurrentText(period_value)
+            self._set_period_combo_value(self._period_combo, period_value)
+            self._on_period_changed(period_value)
+            self._period_reload_serial = getattr(self, "_period_reload_serial", 0) + 1
+            self._load_data()
         else:
             self._load_data()
+
+    def _set_period_combo_value(self, control: QComboBox, period: str) -> None:
+        control.blockSignals(True)
+        try:
+            control.setCurrentText(period)
+        finally:
+            control.blockSignals(False)
+        if control is self._secondary_period_combo:
+            self._remember_volatility_period(control.currentText())
 
     def closeEvent(self, event) -> None:  # noqa: ANN001
         if not bool(getattr(self, "_shutdown_complete", False)):
@@ -11034,7 +11158,19 @@ class KlineAnalysisWindow(QMainWindow):
     def _refresh_history_trade_availability(self) -> None:
         if not hasattr(self, "_history_trade_group"):
             return
-        self._history_trade_group.setVisible(self._history_trades_supported())
+        supported = self._history_trades_supported()
+        for widget in (self._show_history_trades_check, self._history_trade_direction_combo, self._sync_history_trades_button):
+            widget.setVisible(supported)
+        self._history_trade_unavailable_label.setVisible(not supported)
+
+    def _resize_history_trade_menu(self) -> None:
+        menu = self._header_menu_buttons["交易标记"].menu()
+        self._history_trade_group.setMinimumSize(0, 0)
+        self._history_trade_group.layout().activate()
+        required = self._history_trade_group.minimumSizeHint()
+        self._history_trade_group.setMinimumSize(required)
+        menu.setMinimumSize(required.width() + 20, required.height() + 12)
+        menu.adjustSize()
 
     def _history_trade_direction_filter(self) -> str:
         if not hasattr(self, "_history_trade_direction_combo"):
@@ -12166,7 +12302,7 @@ class KlineAnalysisWindow(QMainWindow):
         if self._active_chart_target == "tertiary":
             self._sync_primary_period_buttons()
         if self._triple_chart_enabled():
-            self._on_tertiary_symbol_changed(self._selected_tertiary_symbol())
+            self._queue_period_reload("tertiary", _value)
 
     @Slot(str)
     def _on_quaternary_symbol_changed(self, _value: str) -> None:
@@ -12181,7 +12317,7 @@ class KlineAnalysisWindow(QMainWindow):
         if self._active_chart_target == "quaternary":
             self._sync_primary_period_buttons()
         if self._quad_chart_enabled():
-            self._on_quaternary_symbol_changed(self._selected_quaternary_symbol())
+            self._queue_period_reload("quaternary", _value)
 
     def _show_account_drawer(self, tab_name: str) -> None:
         if self._account_drawer is None or self._chart_account_splitter is None:
@@ -12229,7 +12365,7 @@ class KlineAnalysisWindow(QMainWindow):
         self._reload_workspace_view()
         self._sync_chart_options()
         if self._auto_refresh_btn.isChecked():
-            self._load_data()
+            self._queue_period_reload("primary", _value)
 
     @Slot(bool)
     def _on_secondary_chart_toggled(self, enabled: bool) -> None:
@@ -12323,14 +12459,17 @@ class KlineAnalysisWindow(QMainWindow):
     @Slot(str)
     def _on_secondary_period_changed(self, _value: str) -> None:
         if self._secondary_chart_kind() == "volatility" and _value.strip().upper() not in {"1H", "4H", "1D", "1W"}:
+            previous = getattr(self, "_last_volatility_period", "1H")
             self._secondary_period_combo.blockSignals(True)
-            self._secondary_period_combo.setCurrentText("1H")
+            self._secondary_period_combo.setCurrentText(previous)
             self._secondary_period_combo.blockSignals(False)
-            _value = "1H"
+            return
+        if self._secondary_chart_kind() == "volatility":
+            self._last_volatility_period = _value.strip()
         if self._active_chart_target == "secondary":
             self._sync_primary_period_buttons()
         if self._secondary_chart_check.isChecked():
-            self._load_data()
+            self._queue_period_reload("secondary", _value)
 
     @Slot(int, KlineChartPayload)
     def _on_data_loaded(self, request_id: int, payload: KlineChartPayload) -> None:
@@ -18786,6 +18925,9 @@ class KlineAnalysisWindow(QMainWindow):
         )
 
     def _set_status(self, text: str) -> None:
+        notice = getattr(self, "_period_link_notice", "")
+        if notice and notice not in text:
+            text = f"{text} | {notice}"
         self._status.setText(text)
         self._status.setToolTip(text)
 

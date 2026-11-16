@@ -6,6 +6,7 @@ from decimal import Decimal
 from unittest.mock import patch
 
 from PySide6.QtCore import QCoreApplication, QEvent, QThread
+from PySide6.QtGui import QFont
 from shiboken6 import isValid
 
 from tests.qt_test_case import QtWidgetTestCase
@@ -36,6 +37,50 @@ class KlineLoaderLifecycleTests(QtWidgetTestCase):
             QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
             time.sleep(.005)
         self.assertTrue(predicate())
+
+    def test_trade_marker_menu_and_secondary_symbol_popup_after_switching(self):
+        window = KlineAnalysisWindow(preview_mode=True)
+        try:
+            window.show()
+            window._secondary_chart_check.setChecked(True)
+            button = window._header_menu_buttons["交易标记"]
+            menu = button.menu()
+            for period, available in (("4H", False), ("1H", True), ("4H", False), ("1H", True)):
+                window._period_combo.setCurrentText(period)
+                window._refresh_history_trade_availability()
+                menu.popup(button.mapToGlobal(button.rect().bottomLeft()))
+                self._app.processEvents()
+                self.assertTrue(window._history_trade_group.isVisible())
+                self.assertEqual(window._show_history_trades_check.isVisible(), available)
+                self.assertEqual(window._history_trade_unavailable_label.isVisible(), not available)
+                for control in (window._show_history_trades_check, window._history_trade_direction_combo,
+                                window._sync_history_trades_button, window._history_trade_unavailable_label):
+                    if control.isVisible():
+                        self.assertGreaterEqual(control.width(), control.minimumSizeHint().width())
+                        self.assertLessEqual(control.geometry().right(), window._history_trade_group.width())
+                menu.hide()
+                self._app.processEvents()
+            menu_font = QFont(window._history_trade_group.font())
+            menu_font.setPointSize(20)
+            window._history_trade_group.setFont(menu_font)
+            menu.popup(button.mapToGlobal(button.rect().bottomLeft()))
+            self._app.processEvents()
+            for control in (window._show_history_trades_check, window._history_trade_direction_combo,
+                            window._sync_history_trades_button):
+                self.assertGreaterEqual(control.width(), control.minimumSizeHint().width())
+            menu.hide()
+            for combo in (window._secondary_symbol_combo, window._secondary_period_combo):
+                font = QFont(combo.font())
+                font.setPointSize(20)
+                combo.setFont(font)
+                combo.showPopup()
+                self._app.processEvents()
+                longest = max(combo.fontMetrics().horizontalAdvance(combo.itemText(i)) for i in range(combo.count()))
+                self.assertGreaterEqual(combo.view().minimumWidth(), longest + 36)
+                combo.hidePopup()
+        finally:
+            window.begin_shutdown()
+            self.dispose_widget(window)
 
     def test_finished_but_not_delivered_loader_cannot_be_replaced(self):
         window = KlineAnalysisWindow(preview_mode=True)

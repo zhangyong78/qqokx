@@ -336,3 +336,185 @@ def test_stale_account_result_keeps_public_quotes_for_unchanged_instruments() ->
     assert store._upl_usdt_prices == {"BTC": 80000}
     assert store._position_tickers == {current.inst_id: "quote"}
     store.stop()
+
+
+def test_public_metadata_fetch_finishes_while_pending_orders_are_blocked() -> None:
+    from types import SimpleNamespace
+
+    pending_started = threading.Event()
+    release_pending = threading.Event()
+    public_finished = threading.Event()
+
+    class SlowOrdersClient(_FakeRealtimeClient):
+        def get_positions(self, *args, **kwargs):  # noqa: ANN002, ANN003
+            return [SimpleNamespace(inst_id="BTC-USDT-SWAP", inst_type="SWAP")]
+
+        def get_account_overview(self, *args, **kwargs):  # noqa: ANN002, ANN003
+            return SimpleNamespace(details=())
+
+        def get_pending_orders(self, *args, **kwargs):  # noqa: ANN002, ANN003
+            pending_started.set()
+            assert release_pending.wait(timeout=2)
+            return []
+
+    store = RealtimeAccountStore(client=SlowOrdersClient())
+    try:
+        with patch("roll_terminal_qt.realtime_account_store._build_upl_usdt_price_map", return_value={"BTC": 1}), \
+             patch("roll_terminal_qt.realtime_account_store._build_position_instrument_map", return_value={}), \
+             patch("roll_terminal_qt.realtime_account_store._build_position_ticker_map", side_effect=lambda *_: (public_finished.set() or {})):
+            worker = threading.Thread(target=store._run_reconcile_worker, args=(0, "test", _runtime()), daemon=True)
+            worker.start()
+            assert pending_started.wait(timeout=1)
+            assert public_finished.wait(timeout=1), "Public data must finish independently of the blocked order request"
+            release_pending.set()
+            worker.join(timeout=1)
+            assert not worker.is_alive()
+    finally:
+        release_pending.set()
+        store.stop()
+
+
+def test_reconcile_remains_gated_until_both_private_and_public_workers_finish() -> None:
+    store = RealtimeAccountStore(client=_FakeRealtimeClient(), coalesce_ms=0)
+    store._runtime = _runtime()
+    store._reconcile_in_flight = True
+    store._public_data_in_flight = True
+    store._reconcile_private_done = False
+    store._positions = [SimpleNamespace(inst_id="BTC-USDT-SWAP")]
+    store._apply_public_data_result(store._generation, store._active_reconcile_id, {
+        "started_ws_revision": store._ws_revision,
+        "positions": list(store._positions),
+        "position_tickers": {"BTC-USDT-SWAP": "quote"},
+        "done": True,
+    })
+    assert store._position_tickers == {"BTC-USDT-SWAP": "quote"}
+    assert store._reconcile_in_flight is True
+    store._reconcile_private_done = True
+    store._finish_reconcile_if_ready()
+    assert store._reconcile_in_flight is False
+    store.stop()
+
+
+def test_public_results_are_emitted_per_category_before_later_fetches_finish() -> None:
+    from types import SimpleNamespace
+
+    instrument_started = threading.Event()
+    release_instruments = threading.Event()
+    emitted: list[object] = []
+    store = RealtimeAccountStore(client=_FakeRealtimeClient())
+    store._public_data_completed.connect(lambda *_args: emitted.append(_args[2]))
+
+    def slow_instruments(*_args):
+        instrument_started.set()
+        assert release_instruments.wait(timeout=2)
+        return {"BTC-USDT-SWAP": "instrument"}
+
+    try:
+        with patch("roll_terminal_qt.realtime_account_store._build_upl_usdt_price_map", return_value={"BTC": 1}), \
+             patch("roll_terminal_qt.realtime_account_store._build_position_instrument_map", side_effect=slow_instruments), \
+             patch("roll_terminal_qt.realtime_account_store._build_position_ticker_map", return_value={"BTC-USDT-SWAP": "ticker"}):
+            worker = threading.Thread(
+                target=store._run_public_data_worker,
+                args=(store._generation, store._active_reconcile_id, [SimpleNamespace(inst_id="BTC-USDT-SWAP")]),
+                daemon=True,
+            )
+            worker.start()
+            assert instrument_started.wait(timeout=1)
+            _drain_qt_events(timeout=0.1)
+            assert emitted and emitted[0].get("upl_usdt_prices") == {"BTC": 1}
+            assert "position_instruments" not in emitted[0]
+            release_instruments.set()
+            worker.join(timeout=1)
+            _drain_qt_events(timeout=0.1)
+            assert any(item.get("position_instruments") for item in emitted)
+    finally:
+        release_instruments.set()
+        store.stop()
+
+
+def test_private_failure_keeps_started_public_worker_gated_until_completion() -> None:
+    store = RealtimeAccountStore(client=_FakeRealtimeClient())
+    store._runtime = _runtime()
+    store._reconcile_in_flight = True
+    store._public_data_in_flight = True
+    store._reconcile_private_done = False
+    store._public_started_event.set()
+    statuses = []
+    store.status_changed.connect(statuses.append)
+    try:
+        store._apply_reconcile_result(store._generation, "test", {
+            "reconcile_id": store._active_reconcile_id,
+            "error": OSError("private request failed"),
+        })
+        assert store._public_data_in_flight is True
+        assert store._reconcile_in_flight is True
+        store._apply_public_data_result(store._generation, store._active_reconcile_id, {"done": True})
+        assert store._public_data_in_flight is False
+        assert store._reconcile_in_flight is False
+        assert statuses
+    finally:
+        store.stop()
+
+
+def test_public_result_allows_ws_revision_change_when_position_ids_match() -> None:
+    store = RealtimeAccountStore(client=_FakeRealtimeClient(), coalesce_ms=0)
+    current = SimpleNamespace(inst_id="BTC-USDT-SWAP")
+    store._positions = [current]
+    store._ws_revision = 4
+    store._public_data_in_flight = True
+    store._reconcile_in_flight = True
+    store._reconcile_private_done = True
+    store._apply_public_data_result(store._generation, store._active_reconcile_id, {
+        "positions": [SimpleNamespace(inst_id=current.inst_id)],
+        "position_tickers": {current.inst_id: "fresh quote"},
+        "done": True,
+    })
+    assert store._position_tickers == {current.inst_id: "fresh quote"}
+    assert store._reconcile_in_flight is False
+    store.stop()
+
+
+def test_private_success_before_public_first_signal_keeps_reconcile_gated() -> None:
+    store = RealtimeAccountStore(client=_FakeRealtimeClient(), coalesce_ms=0)
+    store._runtime = _runtime()
+    store._reconcile_in_flight = True
+    store._public_data_in_flight = True
+    store._reconcile_private_done = False
+    store._positions = [SimpleNamespace(inst_id="BTC-USDT-SWAP")]
+    store._apply_reconcile_result(store._generation, "test", {
+        "reconcile_id": store._active_reconcile_id,
+        "started_ws_revision": store._ws_revision,
+        "positions": list(store._positions),
+        "pending_orders": [],
+    })
+    assert store._reconcile_private_done is True
+    assert store._reconcile_in_flight is True
+    store._apply_public_data_result(store._generation, store._active_reconcile_id, {
+        "positions": list(store._positions), "done": True,
+    })
+    assert store._reconcile_in_flight is False
+    store.stop()
+
+
+def test_retry_that_expires_during_public_worker_runs_after_public_completion() -> None:
+    from unittest.mock import patch
+
+    store = RealtimeAccountStore(client=_FakeRealtimeClient())
+    store._runtime = _runtime()
+    store._reconcile_in_flight = True
+    store._public_data_in_flight = True
+    store._public_started_event.set()
+    try:
+        store._apply_reconcile_result(store._generation, "test", {
+            "reconcile_id": store._active_reconcile_id,
+            "error": OSError("private request failed"),
+        })
+        store._retry_reconcile_when_ready()
+        assert store._reconcile_retry_pending is True
+        with patch.object(store, "request_reconcile") as request:
+            store._apply_public_data_result(store._generation, store._active_reconcile_id, {"done": True})
+            assert store._reconcile_retry_timer.isActive()
+            _drain_qt_events(timeout=0.1)
+            request.assert_called_once_with("recovery")
+    finally:
+        store.stop()
