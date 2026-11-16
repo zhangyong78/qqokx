@@ -4734,6 +4734,7 @@ class OptionStrategyQtWindow(QMainWindow):
         ).strip()
         self._option_taker_fee_rate = _configured_option_taker_fee_rate(self._profile_name)
         self._chain_request_id = 0
+        self._chain_last_refresh_by_family: dict[str, datetime] = {}
         self._position_import_request_id = 0
         self._chart_request_id = 0
         self._overlay_chart_request_id = 0
@@ -4891,6 +4892,10 @@ class OptionStrategyQtWindow(QMainWindow):
         self._status_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         header.addWidget(title, 1)
         header.addWidget(self._status_label, 1)
+        self._chain_last_refresh_label = QLabel("最后刷新：—")
+        self._chain_last_refresh_label.setObjectName("Subtle")
+        self._chain_last_refresh_label.setToolTip("当前期权系列最后一次成功加载报价的本地时间")
+        header.addWidget(self._chain_last_refresh_label)
         layout.addLayout(header)
 
         controls = QGroupBox("策略设置")
@@ -5221,8 +5226,14 @@ class OptionStrategyQtWindow(QMainWindow):
             self._family_combo.setCurrentText(current)
         elif values:
             self._family_combo.setCurrentText(values[0])
+        self._show_chain_last_refresh_time(current or (values[0] if values else ""))
         self._status_label.setText("首次打开会自动刷新默认期权系列；也可以切换系列后手动刷新期权链。")
         self._update_chain_context_ui()
+
+    def _show_chain_last_refresh_time(self, family: str) -> None:
+        refreshed_at = self._chain_last_refresh_by_family.get(str(family or "").strip().upper())
+        text = refreshed_at.astimezone().strftime("%Y-%m-%d %H:%M:%S") if refreshed_at else "—"
+        self._chain_last_refresh_label.setText(f"最后刷新：{text}")
 
     def _selected_expiry_code(self) -> str:
         raw = self._expiry_combo.currentText().strip()
@@ -5262,6 +5273,7 @@ class OptionStrategyQtWindow(QMainWindow):
         self._current_underlying_price = None
         self._chain_table.setRowCount(0)
         self._sync_expiry_options()
+        self._show_chain_last_refresh_time(self._family_combo.currentText())
         self._status_label.setText("点击“刷新期权链”后，会把当前系列的所有到期日刷新出来。")
 
     @Slot()
@@ -5317,7 +5329,7 @@ class OptionStrategyQtWindow(QMainWindow):
             option_summaries_by_inst_id=dict(self._family_option_summaries_cache.get(family, {})),
             coin_usdt_price=self._family_coin_usdt_prices.get(family),
         )
-        self._apply_chain_snapshot(self._chain_request_id, snapshot)
+        self._apply_chain_snapshot(self._chain_request_id, snapshot, record_refresh=False)
         self._status_label.setText(f"已切换到 {family} {expiry}，期权链已按当前到期日更新。")
         return True
 
@@ -5692,13 +5704,16 @@ class OptionStrategyQtWindow(QMainWindow):
         self._start_thread("chain", thread)
 
     @Slot(int, object)
-    def _apply_chain_snapshot(self, request_id: int, snapshot: object) -> None:
+    def _apply_chain_snapshot(self, request_id: int, snapshot: object, *, record_refresh: bool = True) -> None:
         if self._closing or request_id != self._chain_request_id:
             return
         if not isinstance(snapshot, ChainSnapshot):
             return
         if snapshot.family != self._family_combo.currentText().strip().upper():
             return
+        if record_refresh:
+            self._chain_last_refresh_by_family[snapshot.family] = datetime.now().astimezone()
+            self._show_chain_last_refresh_time(snapshot.family)
         context = (snapshot.family, snapshot.expiry)
         selected = self._selected_chain_row() if self._chain_display_context == context else None
         preferred_strike = selected.strike if selected is not None else None

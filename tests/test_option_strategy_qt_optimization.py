@@ -19,6 +19,7 @@ from roll_terminal_qt.option_strategy_window import (
     ChainSnapshot, ChartSnapshot, ImportSnapshot, OptionStrategyQtWindow,
     _detail_coin_amount, _detail_usdt_price,
 )
+from roll_terminal_qt.option_chain_window import OptionChainWindow
 from tests.qt_test_case import QtWidgetTestCase
 from tests.test_option_recommendations import NOW, prices, volatility, quote as recommendation_quote
 from okx_quant.option_recommendations import build_option_recommendations
@@ -87,6 +88,18 @@ class OptionStrategyOptimizationTest(QtWidgetTestCase):
         self.assertEqual(_detail_usdt_price(item, Decimal("0.05"), Decimal("80000")), "4000.00")
         self.assertEqual(_detail_usdt_price(item, Decimal("0.05"), None), "")
         self.assertEqual(_detail_usdt_price(replace(item, instrument=replace(item.instrument, settle_ccy="USDT")), Decimal("12.34"), None), "12.34")
+
+    def test_strategy_chain_last_refresh_time_updates_on_success_only(self):
+        self.assertEqual(self.window._chain_last_refresh_label.text(), "最后刷新：—")
+        self.seed_chain()
+        refreshed = self.window._chain_last_refresh_label.text()
+        self.assertRegex(refreshed, r"^最后刷新：\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$")
+
+        self.window._family_combo.setCurrentText("ETH-USD")
+        self.assertEqual(self.window._chain_last_refresh_label.text(), "最后刷新：—")
+        self.window._family_combo.setCurrentText("BTC-USD")
+        self.assertEqual(self.window._chain_last_refresh_label.text(), refreshed)
+
 
     def test_detailed_chain_add_rejects_snapshot_after_refresh(self):
         self.seed_chain()
@@ -616,3 +629,81 @@ class OptionStrategyOptimizationTest(QtWidgetTestCase):
             self.assertEqual(recalculate.call_count, 0)
             QTest.qWait(150)
             self.assertEqual(recalculate.call_count, 1)
+
+
+class OptionChainWindowRefreshTimeTest(QtWidgetTestCase):
+    def test_last_successful_refresh_time_is_shown_per_family(self):
+        with (
+            patch("roll_terminal_qt.option_chain_window._shared_client", return_value=MagicMock()),
+            patch("roll_terminal_qt.option_chain_window.QTimer.singleShot"),
+        ):
+            window = OptionChainWindow()
+            try:
+                window._on_snapshot(window._request_id, chain_snapshot())
+                btc_time = window._last_refresh_label.text()
+                self.assertRegex(btc_time, r"^最后刷新：\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$")
+
+                window._request_id += 1
+                window._on_error(window._request_id, "网络错误")
+                self.assertEqual(window._last_refresh_label.text(), btc_time)
+
+                window._select_family("ETH-USD")
+                self.assertEqual(window._last_refresh_label.text(), "最后刷新：—")
+                window._select_family("BTC-USD")
+                self.assertEqual(window._last_refresh_label.text(), btc_time)
+            finally:
+                self.dispose_widget(window)
+
+    def test_selected_expiry_is_bold_and_expiry_column_is_toggleable(self):
+        with (
+            patch("roll_terminal_qt.option_chain_window._shared_client", return_value=MagicMock()),
+            patch("roll_terminal_qt.option_chain_window.QTimer.singleShot"),
+        ):
+            window = OptionChainWindow()
+            try:
+                window._on_snapshot(window._request_id, chain_snapshot())
+                window._select_expiry("261225")
+                expiry_column = next(i for i, (key, _label) in enumerate(window._columns) if key == "expiry")
+                selected_button = next(
+                    item.widget().findChild(QPushButton)
+                    for index in range(window._expiry_layout.count())
+                    if (item := window._expiry_layout.itemAt(index)).widget() is not None
+                    and item.widget().findChild(QPushButton) is not None
+                    and item.widget().findChild(QPushButton).text() == "2026-12-25"
+                )
+                self.assertIn("font-weight: 700", selected_button.styleSheet())
+
+                action = window._column_actions["expiry"]
+                action.setChecked(False)
+                self.assertTrue(window._table.isColumnHidden(expiry_column))
+                action.setChecked(True)
+                self.assertFalse(window._table.isColumnHidden(expiry_column))
+            finally:
+                self.dispose_widget(window)
+
+    def test_t_chain_opens_reusable_linked_kline_for_selected_strike(self):
+        with (
+            patch("roll_terminal_qt.option_chain_window._shared_client", return_value=MagicMock()),
+            patch("roll_terminal_qt.option_chain_window.QTimer.singleShot"),
+            patch("roll_terminal_qt.option_chain_window.OptionChainLinkedChartDialog") as dialog_type,
+        ):
+            window = OptionChainWindow(profile_name="159")
+            try:
+                window._on_snapshot(window._request_id, chain_snapshot())
+                window._table.selectRow(0)
+                selected_row = window._rows[0][1]
+
+                window._open_linked_chart()
+                dialog_type.assert_called_once()
+                dialog_type.return_value.apply_workspace_profile.assert_called_with("159")
+                dialog_type.return_value.show_pair.assert_called_once_with(
+                    call_quote=selected_row.call_quote,
+                    put_quote=selected_row.put_quote,
+                    bar="1H",
+                )
+
+                window._open_linked_chart()
+                dialog_type.assert_called_once()
+                self.assertEqual(dialog_type.return_value.show_pair.call_count, 2)
+            finally:
+                self.dispose_widget(window)

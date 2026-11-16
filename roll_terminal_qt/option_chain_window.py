@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime
 from decimal import Decimal, InvalidOperation
 
 from PySide6.QtCore import QSettings, Qt, QTimer
@@ -14,7 +15,7 @@ from okx_quant.option_strategy import build_option_chain_rows, format_option_exp
 from okx_quant.option_strategy_ui import _build_option_quote, _format_price
 from okx_quant.pricing import format_decimal
 from roll_terminal_qt.option_strategy_window import (
-    ChainSnapshot, OptionStrategyQtWindow, _OptionChainThread, _detail_coin_amount,
+    ChainSnapshot, OptionChainLinkedChartDialog, OptionStrategyQtWindow, _OptionChainThread, _detail_coin_amount,
     _detail_usdt_price, _detail_usdt_summary, _format_option_summary_value, _shared_client,
 )
 
@@ -37,9 +38,11 @@ class OptionChainWindow(QMainWindow):
         self._pending = []
         self._strategy = None
         self._strategy_windows = []
+        self._linked_chart_dialog = None
         self._closing = False
         self._sized_columns = False
         self._geometry_ready = False
+        self._last_refresh_by_family = {}
 
         root = QWidget()
         self.setCentralWidget(root)
@@ -56,6 +59,9 @@ class OptionChainWindow(QMainWindow):
             family_bar.addWidget(button)
         self._status = QLabel()
         family_bar.addWidget(self._status, 1)
+        self._last_refresh_label = QLabel("最后刷新：—")
+        self._last_refresh_label.setToolTip("当前期权系列最后一次成功加载报价的本地时间")
+        family_bar.addWidget(self._last_refresh_label)
         refresh = QPushButton("刷新")
         refresh.clicked.connect(self._refresh)
         family_bar.addWidget(refresh)
@@ -93,6 +99,10 @@ class OptionChainWindow(QMainWindow):
         strategy = QPushButton("打开策略计算器")
         strategy.clicked.connect(self._open_strategy)
         filters.addWidget(strategy)
+        linked_chart = QPushButton("联动 K 线")
+        linked_chart.setToolTip("选中一个行权价后，打开认购 / DVOL / 认沽三栏联动图")
+        linked_chart.clicked.connect(self._open_linked_chart)
+        filters.addWidget(linked_chart)
         layout.addLayout(filters)
 
         self._quote_keys = (("bid_size", "买量（币）"), ("bid_usdt", "买价≈USDT"),
@@ -120,7 +130,7 @@ class OptionChainWindow(QMainWindow):
         hidden = set(saved if isinstance(saved, list) else [saved])
         self._column_actions = {}
         for key, label in self._columns:
-            if key in ("expiry", "strike") or key in self._column_actions:
+            if key == "strike" or key in self._column_actions:
                 continue
             action = menu.addAction(label)
             action.setCheckable(True)
@@ -166,6 +176,7 @@ class OptionChainWindow(QMainWindow):
         self._save_filters()
         self._request_id += 1
         self._family = family
+        self._show_last_refresh_time(family)
         self._restore_filters()
         if family in self._snapshots:
             self._update_expiries()
@@ -200,6 +211,8 @@ class OptionChainWindow(QMainWindow):
         if self._closing or request_id != self._request_id or not isinstance(snapshot, ChainSnapshot) or snapshot.family != self._family:
             return
         self._snapshots[snapshot.family] = snapshot
+        self._last_refresh_by_family[snapshot.family] = datetime.now().astimezone()
+        self._show_last_refresh_time(snapshot.family)
         if self._expiry and self._expiry not in snapshot.expiries:
             self._expiry = ""
         self._update_expiries()
@@ -214,6 +227,11 @@ class OptionChainWindow(QMainWindow):
                     except (TypeError, ValueError):
                         continue
             self._sized_columns = True
+
+    def _show_last_refresh_time(self, family):
+        refreshed_at = self._last_refresh_by_family.get(family)
+        text = refreshed_at.strftime("%Y-%m-%d %H:%M:%S") if refreshed_at else "—"
+        self._last_refresh_label.setText(f"最后刷新：{text}")
 
     def _update_expiries(self):
         while self._expiry_layout.count():
@@ -233,16 +251,20 @@ class OptionChainWindow(QMainWindow):
             label = format_option_expiry_label(expiry) if expiry else "全部"
             container = QFrame(self._expiry_container)
             selected = expiry == self._expiry
-            border_color = "#4c9aff" if selected else "#d4dbe5"
-            background = "#eef5ff" if selected else "#ffffff"
+            border_color = "#2563eb" if selected else "#d4dbe5"
+            border_width = 2 if selected else 1
+            background = "#e8f1ff" if selected else "#ffffff"
             container.setStyleSheet(
-                f"QFrame {{ border: 1px solid {border_color}; border-radius: 7px; background: {background}; }}"
+                f"QFrame {{ border: {border_width}px solid {border_color}; border-radius: 7px; background: {background}; }}"
             )
             container_layout = QHBoxLayout(container)
             container_layout.setContentsMargins(4, 2, 4, 2)
             button = QPushButton(label)
             button.setFlat(True)
-            button.setStyleSheet("border: 0; background: transparent; padding: 3px 5px;")
+            button.setStyleSheet(
+                "border: 0; background: transparent; padding: 3px 5px; "
+                + ("color: #1d4ed8; font-weight: 700;" if selected else "")
+            )
             button.clicked.connect(lambda _checked=False, value=expiry: self._select_expiry(value))
             container_layout.addWidget(button)
             badge_column = QVBoxLayout()
@@ -386,6 +408,28 @@ class OptionChainWindow(QMainWindow):
         self._pending.clear()
         self._pending_label.setText("已选 0 条")
         self._pending_label.setToolTip("")
+
+    def _open_linked_chart(self):
+        index = self._table.currentRow()
+        if index < 0 or index >= len(self._rows):
+            QMessageBox.information(self, "期权联动 K 线", "请先选择一个行权价。")
+            return
+        chain_row = self._rows[index][1]
+        if chain_row.call_quote is None and chain_row.put_quote is None:
+            QMessageBox.information(self, "期权联动 K 线", "当前行没有可用的认购或认沽合约。")
+            return
+        if self._linked_chart_dialog is None:
+            self._linked_chart_dialog = OptionChainLinkedChartDialog(
+                client=self._client,
+                profile_name=self._profile_name,
+                parent=self,
+            )
+        self._linked_chart_dialog.apply_workspace_profile(self._profile_name)
+        self._linked_chart_dialog.show_pair(
+            call_quote=chain_row.call_quote,
+            put_quote=chain_row.put_quote,
+            bar="1H",
+        )
 
     def _open_strategy(self):
         if self._strategy is not None and self._strategy._legs and self._pending:
