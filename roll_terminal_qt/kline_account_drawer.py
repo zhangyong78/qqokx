@@ -522,9 +522,12 @@ class KlineAccountDrawer(QWidget):
         self._shared_order_store.refresh_failed.connect(self._apply_shared_order_refresh_error)
         self._realtime_store = get_shared_realtime_account_store()
         self._realtime_store.snapshot_ready.connect(self._apply_realtime_snapshot)
-        realtime_signal = self._realtime_store.snapshot_ready
-        realtime_slot = self._apply_realtime_snapshot
-        self.destroyed.connect(lambda: realtime_signal.disconnect(realtime_slot))
+        subscriptions = (
+            (self._shared_order_store.snapshot_changed, self._apply_shared_order_snapshot),
+            (self._shared_order_store.refresh_failed, self._apply_shared_order_refresh_error),
+            (self._realtime_store.snapshot_ready, self._apply_realtime_snapshot),
+        )
+        self.destroyed.connect(lambda *_args, items=subscriptions: _disconnect_signal_subscriptions(items))
         self._build_ui()
 
     def _build_ui(self) -> None:
@@ -1404,6 +1407,8 @@ def _shared_apply_shared_order_snapshot(
     environment: str,
     snapshot: object,
 ) -> None:
+    if not isValid(self) or not isValid(getattr(self, "_status_label", None)):
+        return
     if profile_name != self._profile_name or environment != self._environment:
         return
     if not isinstance(snapshot, SharedOrderSnapshot):
@@ -1464,9 +1469,19 @@ def _shared_apply_shared_order_refresh_error(
     environment: str,
     message: str,
 ) -> None:
+    if not isValid(self) or not isValid(getattr(self, "_status_label", None)):
+        return
     if profile_name != self._profile_name or environment != self._environment:
         return
     self._status_label.setText(f"委托刷新失败: {message}")
+
+
+def _disconnect_signal_subscriptions(subscriptions: tuple[tuple[object, object], ...]) -> None:
+    for signal, slot in subscriptions:
+        try:
+            signal.disconnect(slot)
+        except (RuntimeError, TypeError):
+            pass
 
 
 KlineAccountDrawer.set_context = _shared_set_context

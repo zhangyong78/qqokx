@@ -8,6 +8,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 from unittest import TestCase
 
+from shiboken6 import delete
 from PySide6.QtWidgets import QAbstractItemView, QMessageBox
 from PySide6.QtCore import Qt
 from PySide6.QtTest import QTest
@@ -702,6 +703,17 @@ class KlineAccountDrawerWidgetTests(QtWidgetTestCase):
             self._app.processEvents()
             self.assertEqual(drawer._history_orders_table.rowCount(), 1)
             self.assertEqual(drawer._history_orders_table.item(0, 0).text(), "BTC-USDT-SWAP")
+        finally:
+            self.dispose_widget(drawer)
+
+    def test_shared_store_callbacks_ignore_deleted_status_label(self) -> None:
+        drawer = KlineAccountDrawer()
+        try:
+            label = drawer._status_label
+            delete(label)
+
+            drawer._apply_shared_order_snapshot("159", "live", SharedOrderSnapshot())
+            drawer._apply_shared_order_refresh_error("159", "live", "network error")
         finally:
             self.dispose_widget(drawer)
 

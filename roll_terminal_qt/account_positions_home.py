@@ -430,6 +430,7 @@ from roll_terminal_qt.app_icon import apply_qt_window_icon
 from roll_terminal_qt.option_roll_window import OptionRollQtDialog
 from okx_quant.log_utils import append_log_line
 from okx_quant.app_paths import data_root
+from okx_quant.candle_cache import load_candle_cache, merge_candles, save_candle_cache
 from okx_quant.models import Candle, Credentials, EmailNotificationConfig, Instrument, OptionTickBand, StrategyConfig
 from okx_quant.notifications import EmailNotifier
 from okx_quant.option_roll import is_short_option_position
@@ -1722,6 +1723,22 @@ POSITION_KLINE_BAR_OPTIONS: tuple[tuple[str, str], ...] = (
 )
 
 
+def _position_mark_candle_cache_key(inst_id: str) -> str:
+    """Keep option mark-price candles separate from trade-price candles."""
+    return f"{inst_id.strip().upper()}::MARK"
+
+
+def _is_expired_option_inst_id(inst_id: str) -> bool:
+    parts = str(inst_id or "").strip().upper().split("-")
+    if len(parts) != 5 or parts[1] != "USD" or parts[-1] not in {"C", "P"}:
+        return False
+    try:
+        expiry_date = datetime.strptime(parts[2], "%y%m%d").date()
+    except ValueError:
+        return False
+    return expiry_date < datetime.now().date()
+
+
 def _format_trade_order_size_with_coin(item: object, instruments: dict[str, object], *, filled: bool) -> str:
     coin_text = (
         _format_trade_order_coin_filled_size_with_fallback(item, instruments)
@@ -2263,6 +2280,31 @@ class InstrumentKlineLoadThread(QThread):
     def run(self) -> None:
         source = "mark" if self._inst_type == "OPTION" else "trade"
         try:
+            if source == "mark":
+                cache_key = _position_mark_candle_cache_key(self._inst_id)
+                cached = load_candle_cache(cache_key, self._bar, limit=None)
+                expired = _is_expired_option_inst_id(self._inst_id)
+                if expired:
+                    if self._before_ts is not None:
+                        candles = [item for item in cached if item.ts < self._before_ts][-self._limit :]
+                    else:
+                        candles = cached[-self._limit :]
+                    cache_source = "mark_cache"
+                    if not candles:
+                        # Older versions of the app may have saved option trade
+                        # candles under the plain instrument id. Use them only as
+                        # a clearly labeled fallback; never present them as marks.
+                        trade_cached = load_candle_cache(self._inst_id, self._bar, limit=None)
+                        if self._before_ts is not None:
+                            candles = [item for item in trade_cached if item.ts < self._before_ts][-self._limit :]
+                        else:
+                            candles = trade_cached[-self._limit :]
+                        cache_source = "trade_cache"
+                    if not candles:
+                        raise ValueError(f"已到期合约没有本地 {self._bar} K 线缓存。")
+                    self.loaded.emit(self._inst_id, self._inst_type, self._bar, cache_source, candles)
+                    return
+
             client = OkxRestClient()
             if source == "mark":
                 candles = (
@@ -2281,6 +2323,13 @@ class InstrumentKlineLoadThread(QThread):
                     self.loaded.emit(self._inst_id, self._inst_type, self._bar, source, [])
                     return
                 raise ValueError("当前周期没有可用 K 线数据。")
+            if source == "mark":
+                save_candle_cache(
+                    _position_mark_candle_cache_key(self._inst_id),
+                    self._bar,
+                    merge_candles(cached, candles),
+                    max_records=max(12_000, len(cached), len(candles)),
+                )
             self.loaded.emit(self._inst_id, self._inst_type, self._bar, source, candles)
         except Exception as exc:  # noqa: BLE001
             self.failed.emit(self._inst_id, self._inst_type, self._bar, str(exc))
@@ -2311,6 +2360,7 @@ class InstrumentKlineDialog(QDialog):
 
         self._inst_id = ""
         self._inst_type = ""
+        self._expired_option = False
         self._underlying_usdt_price: Decimal | None = None
         self._underlying_usdt_basis = ""
         self._option_entry_price: Decimal | None = None
@@ -2396,6 +2446,7 @@ class InstrumentKlineDialog(QDialog):
     ) -> None:
         self._inst_id = inst_id.strip().upper()
         self._inst_type = inst_type.strip().upper()
+        self._expired_option = self._inst_type == "OPTION" and _is_expired_option_inst_id(self._inst_id)
         self._linked_button.setVisible(self._inst_type == "OPTION" and self._linked_requested is not None)
         self._underlying_usdt_price = underlying_usdt_price if underlying_usdt_price is not None and underlying_usdt_price > 0 else None
         self._underlying_usdt_basis = underlying_usdt_basis.strip() if self._underlying_usdt_price is not None else ""
@@ -2495,7 +2546,8 @@ class InstrumentKlineDialog(QDialog):
             self._title_label.setText("等待选择持仓")
             return
         source_label = "标记价格K线" if self._inst_type == "OPTION" else "成交价格K线"
-        self._title_label.setText(f"{self._inst_id} | {source_label}")
+        expiry_label = " | 已到期合约" if self._expired_option else ""
+        self._title_label.setText(f"{self._inst_id} | {source_label}{expiry_label}")
 
     @Slot()
     def _load_current_bar(self) -> None:
@@ -2504,7 +2556,8 @@ class InstrumentKlineDialog(QDialog):
         if self._load_thread is not None and self._load_thread.isRunning():
             return
         source_label = "标记价格" if self._inst_type == "OPTION" else "成交价格"
-        self._status_label.setText(f"正在加载 {self._inst_id} {self._current_bar} {source_label} K 线...")
+        loading_source = "本地缓存" if self._expired_option else source_label
+        self._status_label.setText(f"正在加载 {self._inst_id} {self._current_bar} {loading_source} K 线...")
         self._load_thread = InstrumentKlineLoadThread(
             inst_id=self._inst_id,
             inst_type=self._inst_type,
@@ -2551,7 +2604,9 @@ class InstrumentKlineDialog(QDialog):
             return
         if not isinstance(candles, list):
             return
-        source_label = "标记价格" if source == "mark" else "成交价格"
+        source_label = "标记价格" if source.startswith("mark") else "成交价格"
+        if source == "trade_cache":
+            self._title_label.setText(f"{inst_id} | 成交价格K线 | 已到期合约（本地缓存）")
         if self._loading_older_candles:
             self._loading_older_candles = False
             if not candles:
@@ -2583,7 +2638,8 @@ class InstrumentKlineDialog(QDialog):
         if isinstance(latest, Candle):
             latest_text = f" | 最新价 {latest.close}"
             latest_time_text = f" | 时间 {datetime.fromtimestamp(latest.ts / 1000).strftime('%Y-%m-%d %H:%M:%S')}"
-        self._status_label.setText(f"{inst_id} | {bar} | {source_label} K 线已加载{latest_text}{latest_time_text}")
+        cache_text = " | 到期合约本地标记价缓存" if source == "mark_cache" else " | 到期合约本地成交价缓存" if source == "trade_cache" else ""
+        self._status_label.setText(f"{inst_id} | {bar} | {source_label} K 线已加载{cache_text}{latest_text}{latest_time_text}")
 
     @Slot(str, str, str, str)
     def _apply_load_error(self, inst_id: str, inst_type: str, bar: str, message: str) -> None:
@@ -4428,6 +4484,8 @@ class AccountPositionsHomeWidget(QWidget):
             name.setObjectName("EquityMetricName")
             value = QLabel("-")
             value.setObjectName("EquityMetricValue")
+            if key == "account_margin_ratio":
+                value.setStyleSheet("color: #e53935; font-weight: 700;")
             self._equity_metric_labels[key] = value
             metric.addWidget(name)
             metric.addWidget(value)

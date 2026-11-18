@@ -530,6 +530,9 @@ class AccountPositionsHistoryTabWiringTest(QtWidgetTestCase):
                 self.assertEqual(widget._equity_metric_labels["available_equity"].text(), "2802.48")
                 self.assertEqual(widget._equity_metric_labels["unrealized_pnl"].text(), "+29.22")
                 self.assertEqual(widget._equity_metric_labels["account_margin_ratio"].text(), "511.77%")
+                margin_ratio_style = widget._equity_metric_labels["account_margin_ratio"].styleSheet()
+                self.assertIn("color: #e53935", margin_ratio_style)
+                self.assertIn("font-weight: 700", margin_ratio_style)
             finally:
                 self.dispose_widget(widget)
 
