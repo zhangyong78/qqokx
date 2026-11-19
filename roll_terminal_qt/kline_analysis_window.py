@@ -17208,7 +17208,9 @@ class KlineAnalysisWindow(QMainWindow):
             if runtime is None:
                 raise RuntimeError(f"API {plan.profile_name} 不可用。")
         except Exception as exc:  # noqa: BLE001
-            self._set_status(f"无法提交 RR 订单：{exc}")
+            message = f"无法提交 RR 订单：{exc}"
+            self._set_rr_activation_status(message)
+            QMessageBox.warning(self, "无法提交 RR 订单", str(exc))
             return
 
         requested_at = time.perf_counter()
@@ -17250,6 +17252,21 @@ class KlineAnalysisWindow(QMainWindow):
     def _set_rr_activation_status(self, text: str, *, pending: bool = False) -> None:
         self._rr_enable_trade_btn.setEnabled(not pending)
         self._rr_action_status.setText(text)
+        self._rr_action_status.setToolTip(text)
+        is_error = text.startswith((
+            "无法提交 RR 订单：",
+            "RR提交被拒绝：",
+            "RR提交结果未知：",
+            "RR交易异常：",
+            "读取RR核对意图失败：",
+        ))
+        if is_error:
+            self._rr_action_status.setStyleSheet(
+                "color: #991b1b; background: #fee2e2; border: 1px solid #ef4444; "
+                "border-radius: 6px; padding: 8px; font-weight: 700;"
+            )
+        else:
+            self._rr_action_status.setStyleSheet("")
         self._rr_action_status.show()
         self._set_status(text)
         self._refresh_rr_workspace_other_status()
@@ -17325,10 +17342,18 @@ class KlineAnalysisWindow(QMainWindow):
                 pass
         if is_rejected:
             self._set_rr_activation_status(f"RR提交被拒绝：{message}")
+            QMessageBox.warning(self, "RR提交被拒绝", message)
         elif is_unknown:
             self._set_rr_activation_status(f"RR提交结果未知：等待核对。请点击“核对未知 RR 委托”，系统将查询原client ID且不会重复提交。{message}")
+            QMessageBox.warning(
+                self,
+                "RR提交结果待核对",
+                f"交易所是否接收委托暂时无法确认。系统已保留原 client ID，并禁止自动重复提交。\n\n"
+                f"{message}\n\n请点击“核对未知 RR 委托”查询原委托状态。",
+            )
         else:
             self._set_rr_activation_status(f"RR交易异常：{message}")
+            QMessageBox.warning(self, "RR交易异常", message)
         self._refresh_rr_trade_hint()
 
     @Slot()

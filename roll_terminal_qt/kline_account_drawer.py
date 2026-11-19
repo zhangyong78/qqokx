@@ -39,6 +39,7 @@ from roll_terminal_qt.account_positions_home import (
     _format_fill_history_price,
     _format_fill_history_size_with_contracts,
     _format_history_side,
+    _format_position_quote_size,
     _format_position_history_fee_cell,
     _format_position_history_pnl,
     _format_position_history_price,
@@ -114,14 +115,19 @@ def _position_table_values(
         _format_position_option_price_component(position, upl_usdt_prices, component="intrinsic_value"),
         _format_position_option_component_usdt(position, upl_usdt_prices, component="intrinsic_value"),
         _format_position_quote_price(position, position_instruments, position_tickers, side="bid"),
+        _format_position_quote_size(position_tickers.get(getattr(position, "inst_id", "")), side="bid")
+        if getattr(position, "inst_type", "") == "OPTION" else "-",
         _format_position_quote_price_usdt(position, position_tickers, upl_usdt_prices, side="bid"),
         _format_position_quote_price(position, position_instruments, position_tickers, side="ask"),
+        _format_position_quote_size(position_tickers.get(getattr(position, "inst_id", "")), side="ask")
+        if getattr(position, "inst_type", "") in {"OPTION", "SWAP", "FUTURES"} else "-",
         _format_position_quote_price_usdt(position, position_tickers, upl_usdt_prices, side="ask"),
         _format_mark_price(position),
         _format_position_mark_price_usdt(position, upl_usdt_prices),
         _format_position_avg_price(position, position_instruments),
         _format_position_avg_price_usdt(position, upl_usdt_prices),
         _format_optional_approx_usdt(_position_signed_open_value_approx_usdt(position, position_instruments, upl_usdt_prices)),
+        "-",  # option premium is only calculated in the full holdings view
         _format_optional_decimal_fixed(
             _position_break_even_price(position, upl_usdt_prices, fee_rate=_break_even_taker_fee_rate({}, inst_type=getattr(position, "inst_type", ""))),
             places=2,
@@ -133,6 +139,7 @@ def _position_table_values(
         _format_optional_usdt(_position_unrealized_pnl_usdt(position, upl_usdt_prices)),
         _format_position_realized_pnl(position),
         _format_optional_usdt(_position_realized_pnl_usdt(position, upl_usdt_prices)),
+        "-",  # estimated close fee needs the profile fee settings
         _format_position_market_value(position, position_instruments, upl_usdt_prices),
         _format_optional_decimal(getattr(position, "liquidation_price", None)),
         _format_ratio(getattr(position, "margin_ratio", None), places=2),

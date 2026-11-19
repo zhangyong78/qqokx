@@ -13,7 +13,7 @@ from PySide6.QtWidgets import QAbstractItemView, QMessageBox
 from PySide6.QtCore import Qt
 from PySide6.QtTest import QTest
 
-from okx_quant.okx_client import OkxPositionHistoryItem
+from okx_quant.okx_client import OkxPosition, OkxPositionHistoryItem
 from roll_terminal_qt.kline_account_drawer import (
     AccountDrawerCancelThread,
     AccountDrawerLoadThread,
@@ -23,6 +23,7 @@ from roll_terminal_qt.kline_account_drawer import (
     order_cancel_reference,
     order_display_coin_size,
     order_source_kind,
+    _position_table_values,
 )
 from roll_terminal_qt.account_positions_home import POSITION_COLUMNS
 from roll_terminal_qt.kline_analysis_window import KlineAnalysisWindow
@@ -266,6 +267,56 @@ class KlineAccountDrawerWidgetTests(QtWidgetTestCase):
             )
         finally:
             self.dispose_widget(drawer)
+
+    def test_position_values_stay_aligned_with_holdings_columns(self) -> None:
+        inst_id = "BTC-USDT-SWAP"
+        position = OkxPosition(
+            inst_id=inst_id,
+            inst_type="SWAP",
+            pos_side="net",
+            mgn_mode="cross",
+            position=Decimal("3"),
+            avail_position=Decimal("3"),
+            avg_price=Decimal("62000"),
+            mark_price=Decimal("62100"),
+            unrealized_pnl=Decimal("0.48"),
+            unrealized_pnl_ratio=Decimal("0.0051"),
+            liquidation_price=None,
+            leverage=Decimal("5"),
+            margin_ccy="USDT",
+            last_price=Decimal("62100"),
+            realized_pnl=None,
+            margin_ratio=None,
+            initial_margin=None,
+            maintenance_margin=None,
+            delta=None,
+            gamma=None,
+            vega=None,
+            theta=None,
+            raw={},
+        )
+
+        values = _position_table_values(
+            position,
+            upl_usdt_prices={"USDT": Decimal("1")},
+            position_instruments={},
+            position_tickers={
+                inst_id: SimpleNamespace(
+                    bid=None,
+                    ask=None,
+                    last=Decimal("62100"),
+                    mark=Decimal("62100"),
+                    index=None,
+                    raw={"bidSz": "4", "askSz": "5"},
+                )
+            },
+        )
+        column_ids = [column_id for column_id, _heading, _width, _alignment in POSITION_COLUMNS]
+
+        self.assertEqual(len(values), len(column_ids) + 1)
+        self.assertIn("62000", values[column_ids.index("avg") + 1])
+        self.assertIn("0.48", values[column_ids.index("upl") + 1])
+        self.assertEqual(values[column_ids.index("ask_size") + 1], "5")
 
     def test_flatten_selected_position_passes_exact_position_and_account_context(self) -> None:
         drawer = KlineAccountDrawer()

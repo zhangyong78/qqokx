@@ -4441,6 +4441,28 @@ class RollTerminalQtWindowHelperTests(QtWidgetTestCase):
             finally:
                 self.__class__.dispose_widget(window)
 
+    def test_kline_rr_unknown_submission_shows_prominent_warning(self) -> None:
+        with (
+            patch("roll_terminal_qt.kline_analysis_window.QTimer.singleShot", return_value=None),
+            patch("roll_terminal_qt.kline_analysis_window.load_kline_analysis_workspace_entries", return_value={}),
+        ):
+            window = KlineAnalysisWindow(preview_mode=True)
+            try:
+                plan_id = "moni:BTC-USDT-SWAP:unknown"
+                window._pending_rr_activation_plan_ids.add(plan_id)
+                message = "RR_SUBMISSION_UNKNOWN: 原client ID回查未找到委托；结果仍未知"
+                with patch("roll_terminal_qt.kline_analysis_window.QMessageBox.warning") as warning:
+                    window._handle_rr_activation_failure(plan_id, message)
+
+                self.assertEqual(window._pending_rr_activation_plan_ids, set())
+                self.assertIn("RR提交结果未知", window._rr_action_status.text())
+                self.assertIn("RR_SUBMISSION_UNKNOWN", window._rr_action_status.text())
+                self.assertIn("background: #fee2e2", window._rr_action_status.styleSheet())
+                warning.assert_called_once()
+                self.assertIn("禁止自动重复提交", warning.call_args.args[2])
+            finally:
+                self.__class__.dispose_widget(window)
+
     def test_kline_rr_execution_success_callback_runs_on_gui_thread(self) -> None:
         with (
             patch("roll_terminal_qt.kline_analysis_window.QTimer.singleShot", return_value=None),
